@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { NO_CHANGES_EXIT, redactText, runExport, type ExportDeps, type StatusFields } from './export-flow.js';
-import type { AcceptedDetail, GateOutcome } from './gate.js';
+import type { AcceptedDetail, GateOutcome, HoldReason } from './gate.js';
 
 type Workflow = 'export' | 'export_squash';
 
@@ -13,6 +13,7 @@ interface World {
   gated: string[][];
   status: StatusFields | null;
   accepted?: AcceptedDetail[];
+  heldDetails: string[];
 }
 
 function harness(
@@ -38,7 +39,9 @@ function harness(
       (() => {
         world.status = null;
       }),
-    writeHeldDetail: () => {},
+    writeHeldDetail: (detail) => {
+      world.heldDetails.push(detail.sha);
+    },
     writeAcceptedDetail: (accepted) => {
       world.accepted = accepted;
     },
@@ -68,7 +71,16 @@ function harness(
 }
 
 function world(overrides: Partial<World> = {}): World {
-  return { staging: [], remote: null, pushes: [], workflows: [], gated: [], status: null, ...overrides };
+  return {
+    staging: [],
+    remote: null,
+    pushes: [],
+    workflows: [],
+    gated: [],
+    status: null,
+    heldDetails: [],
+    ...overrides,
+  };
 }
 
 const adds =
@@ -77,20 +89,19 @@ const adds =
     w.staging.push(...shas);
     return 0;
   };
-const holdOn =
+const holdWith =
+  (reasons: HoldReason[]) =>
   (...heldShas: string[]) =>
   (shas: string[]): GateOutcome => {
     const index = shas.findIndex((sha) => heldShas.includes(sha));
     if (index < 0) return { lastPassing: shas.at(-1) ?? null };
     return {
       lastPassing: index === 0 ? null : shas[index - 1],
-      held: {
-        sha: shas[index],
-        reasons: [{ source: 'scanner', where: 'a.ts:1', category: 'private-identifier' }],
-        aiFindings: [],
-      },
+      held: { sha: shas[index], reasons, aiFindings: [] },
     };
   };
+const holdOn = holdWith([{ source: 'scanner', where: 'a.ts:1', category: 'private-identifier' }]);
+const aiHoldOn = holdWith([{ source: 'ai', where: 'ai read', category: 'possible-identifier' }]);
 
 describe('runExport publishes only what this run gated on top of the public head', () => {
   it('pushes every commit gated after the public head', async () => {
@@ -194,6 +205,58 @@ describe('runExport holds and recovers within one run', () => {
     expect(code).toBe(0);
     expect(w.pushes).toEqual([]);
     expect(w.status).toMatchObject({ status: 'ok', held: undefined, lastPublished: 's1' });
+  });
+});
+
+describe('runExport never re-reads an AI hold as a squash', () => {
+  it('holds a per-commit AI hold without a squash retry, pushing only the passing prefix', async () => {
+    const w = world({ staging: ['s1'], remote: 's1' });
+    const code = await runExport(
+      harness(w, {
+        publicRemote: true,
+        copybara: (cw, workflow) => (workflow === 'export' ? adds('s2', 's3', 's4')(cw) : adds('sq')(cw)),
+        gate: aiHoldOn('s3'),
+      }),
+    );
+    expect(code).toBe(2);
+    expect(w.workflows).toEqual(['export']);
+    expect(w.gated).toEqual([['s2', 's3', 's4']]);
+    expect(w.pushes).toEqual(['s2']);
+    expect(w.heldDetails).toEqual(['s3']);
+    expect(w.status).toMatchObject({ status: 'held', workflow: 'export', held: { sha: 's3' } });
+  });
+
+  it('holds when an AI reason sits beside a scanner reason', async () => {
+    const w = world({ staging: ['s1'], remote: 's1' });
+    const code = await runExport(
+      harness(w, {
+        publicRemote: true,
+        copybara: (cw, workflow) => (workflow === 'export' ? adds('s2')(cw) : adds('sq')(cw)),
+        gate: holdWith([
+          { source: 'scanner', where: 'a.ts:1', category: 'private-identifier' },
+          { source: 'ai', where: 'ai read', category: 'possible-identifier' },
+        ])('s2'),
+      }),
+    );
+    expect(code).toBe(2);
+    expect(w.workflows).toEqual(['export']);
+    expect(w.pushes).toEqual([]);
+  });
+
+  it('records a scanner hold that the squash retry recovered', async () => {
+    const w = world({ staging: ['s1'], remote: 's1' });
+    const code = await runExport(
+      harness(w, {
+        publicRemote: true,
+        copybara: (cw, workflow) => (workflow === 'export' ? adds('s2', 'fix')(cw) : adds('sq')(cw)),
+        gate: holdOn('s2'),
+      }),
+    );
+    expect(code).toBe(0);
+    expect(w.workflows).toEqual(['export', 'export_squash']);
+    expect(w.pushes).toEqual(['sq']);
+    expect(w.heldDetails).toEqual(['s2']);
+    expect(w.status).toMatchObject({ status: 'ok', perCommitHold: { sha: 's2' } });
   });
 });
 

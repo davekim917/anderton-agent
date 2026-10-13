@@ -10,6 +10,7 @@ export interface Status {
   lastPublished: string | null;
   lastPassing: string | null;
   held?: { sha: string; reasons: HoldReason[] };
+  perCommitHold?: { sha: string; reasons: HoldReason[] };
   /** How many AI findings accepted entries dropped; counts only. */
   acceptedFindings?: number;
   error?: string;
@@ -79,7 +80,10 @@ export async function runExport(deps: ExportDeps): Promise<number> {
     let workflow: Workflow = trusted === null ? 'export_squash' : 'export';
     let result = await exportAndGate(deps, trusted, workflow);
     const accepted = [...(result.accepted ?? [])];
-    if (result.held && workflow === 'export') {
+    let perCommitHold: Status['held'];
+    if (result.held && workflow === 'export' && !result.held.reasons.some((reason) => reason.source === 'ai')) {
+      deps.writeHeldDetail({ sha: result.held.sha, aiFindings: result.held.aiFindings });
+      perCommitHold = { sha: result.held.sha, reasons: result.held.reasons };
       workflow = 'export_squash';
       result = await exportAndGate(deps, result.passing, workflow);
       accepted.push(...(result.accepted ?? []));
@@ -101,6 +105,7 @@ export async function runExport(deps: ExportDeps): Promise<number> {
       lastPublished: published,
       lastPassing: result.passing,
       held: result.held ? { sha: result.held.sha, reasons: result.held.reasons } : undefined,
+      ...(perCommitHold ? { perCommitHold } : {}),
       ...(accepted.length > 0 ? { acceptedFindings: accepted.length } : {}),
     });
     return result.held ? 2 : 0;

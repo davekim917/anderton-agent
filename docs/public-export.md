@@ -52,9 +52,11 @@ A run builds on one commit without gating it, `trustedGatedHead` in `export-flow
 
 ## Holds and recovery
 
-When a per-commit export holds, the same run retries once as `export_squash`. It squashes everything after the last passing commit into one commit and gates it. A later private commit that removed what held therefore publishes in that run. A squash with nothing to add means the held change was fully reverted, so the run is `ok`.
+When a per-commit export holds only on scanner or gate reasons, the same run retries once as `export_squash`. It squashes everything after the last passing commit into one commit and gates it. A later private commit that removed what held therefore publishes in that run. A squash with nothing to add means the held change was fully reverted, so the run is `ok`. The per-commit hold is still recorded: its detail goes to `held.json` and the status carries it as `perCommitHold`.
 
-If the squash holds too:
+A per-commit hold with any AI reason is never retried as a squash. The AI read is sampled, so a second read of the same lines can pass what the first flagged, and a retry would publish on the luckier read. The run holds instead, and a person fixes the leak or accepts the finding (see _Exemptions_).
+
+If the run holds, after the squash retry or without one:
 
 - only the passing prefix is pushed;
 - `logs/public-export-status.json` records `status: "held"`. Scanner reasons are `file:line` plus a category, with the scanner redacting identifiers in paths. An AI hold is recorded only as its batch and `possible-identifier`;
