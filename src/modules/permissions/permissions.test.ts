@@ -1,0 +1,407 @@
+/**
+ * Tests for the permissions module — canAccessAgentGroup, role helpers, and
+ * ensureUserDm. Moved here from src/access.test.ts in PR #7 alongside the
+ * approvals re-tier that deleted src/access.ts.
+ */
+import { beforeEach, afterEach, describe, expect, it } from 'vitest';
+
+import { withCentralSync } from '../../db/central-lease.js';
+import type { ChannelAdapter, OutboundMessage } from '../../channels/adapter.js';
+import { registerSlackBot } from '../../channels/slack-mentions.js';
+import {
+  initChannelAdapters,
+  registerChannelAdapter,
+  teardownChannelAdapters,
+} from '../../channels/channel-registry.js';
+import { closeDb, createAgentGroup, createMessagingGroup, initMigratedTestDb } from '../../db/index.js';
+import { canAccessAgentGroup, isSiblingBotSender } from './access.js';
+import { addMember, isMember } from './db/agent-group-members.js';
+import { createUser } from './db/users.js';
+import { grantRole, hasAnyOwner, isOwner } from './db/user-roles.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
+import { getUserDm } from './db/user-dms.js';
+import { ensureUserDm } from './user-dm.js';
+
+function now(): string {
+  return new Date().toISOString();
+}
+
+beforeEach(async () => {
+  await initMigratedTestDb();
+});
+
+afterEach(async () => {
+  await teardownChannelAdapters();
+  await closeDb();
+});
+
+async function mountMockAdapter(
+  channelType: string,
+  openDM?: (handle: string) => Promise<string>,
+  /**
+   * Registry key, when it differs from the channel type — that is what a
+   * NAMED adapter instance looks like (`slack-labs` carrying channelType
+   * `slack`). On such an install nothing is registered under the bare
+   * channel type.
+   */
+  registryKey?: string,
+): Promise<{ delivered: OutboundMessage[]; openDMCalls: string[] }> {
+  const delivered: OutboundMessage[] = [];
+  const openDMCalls: string[] = [];
+  const adapter: ChannelAdapter = {
+    name: registryKey ?? channelType,
+    channelType,
+    // The registry keys active adapters by `instance ?? channelType`, so this
+    // is what actually makes it a named instance — with it set, nothing is
+    // reachable under the bare channel type by exact key.
+    ...(registryKey ? { instance: registryKey } : {}),
+    supportsThreads: false,
+    async setup() {},
+    async teardown() {},
+    isConnected() {
+      return true;
+    },
+    async deliver(_platformId, _threadId, message) {
+      delivered.push(message);
+      return undefined;
+    },
+    async setTyping() {},
+  };
+  if (openDM) {
+    adapter.openDM = async (handle: string) => {
+      openDMCalls.push(handle);
+      return openDM(handle);
+    };
+  }
+  registerChannelAdapter(registryKey ?? channelType, { factory: () => adapter });
+  await initChannelAdapters(() => ({
+    conversations: [],
+    onInbound: () => {},
+    onInboundEvent: () => {},
+    onMetadata: () => {},
+    onAction: () => {},
+  }));
+  return { delivered, openDMCalls };
+}
+
+async function seedAgentGroup(id: string): Promise<void> {
+  await createAgentGroup({
+    id,
+    name: id.toUpperCase(),
+    folder: id,
+    agent_provider: null,
+    created_at: now(),
+  });
+}
+
+async function seedUser(id: string, kind: string): Promise<void> {
+  await createUser({ id, kind, display_name: null, created_at: now() });
+}
+
+describe('canAccessAgentGroup', () => {
+  beforeEach(async () => {
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
+  });
+
+  it('denies unknown users', async () => {
+    const d = await canAccessAgentGroup('ghost', 'ag-1');
+    expect(d.allowed).toBe(false);
+    expect(d.allowed === false && d.reason).toBe('unknown_user');
+  });
+
+  it('allows owners globally', async () => {
+    await seedUser('u-owner', 'telegram');
+    await grantRole({ user_id: 'u-owner', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
+    expect((await canAccessAgentGroup('u-owner', 'ag-1')).allowed).toBe(true);
+    expect((await canAccessAgentGroup('u-owner', 'ag-2')).allowed).toBe(true);
+  });
+
+  it('allows global admins', async () => {
+    await seedUser('u-ga', 'telegram');
+    await grantRole({ user_id: 'u-ga', role: 'admin', agent_group_id: null, granted_by: null, granted_at: now() });
+    expect((await canAccessAgentGroup('u-ga', 'ag-1')).allowed).toBe(true);
+    expect((await canAccessAgentGroup('u-ga', 'ag-2')).allowed).toBe(true);
+  });
+
+  it('scopes admins to their agent group', async () => {
+    await seedUser('u-sa', 'telegram');
+    await grantRole({ user_id: 'u-sa', role: 'admin', agent_group_id: 'ag-1', granted_by: null, granted_at: now() });
+    expect((await canAccessAgentGroup('u-sa', 'ag-1')).allowed).toBe(true);
+    const denied = await canAccessAgentGroup('u-sa', 'ag-2');
+    expect(denied.allowed).toBe(false);
+    expect(denied.allowed === false && denied.reason).toBe('not_member');
+  });
+
+  it('admin @ group is implicitly a member', async () => {
+    await seedUser('u-sa', 'telegram');
+    await grantRole({ user_id: 'u-sa', role: 'admin', agent_group_id: 'ag-1', granted_by: null, granted_at: now() });
+    expect(await withCentralSync(() => isMember('u-sa', 'ag-1'), 'test')).toBe(true);
+  });
+
+  it('allows members of the group', async () => {
+    await seedUser('u-m', 'telegram');
+    await addMember({ user_id: 'u-m', agent_group_id: 'ag-1', added_by: null, added_at: now() });
+    expect((await canAccessAgentGroup('u-m', 'ag-1')).allowed).toBe(true);
+    expect((await canAccessAgentGroup('u-m', 'ag-2')).allowed).toBe(false);
+  });
+
+  it('denies known-but-not-member users', async () => {
+    await seedUser('u-known', 'telegram');
+    const d = await canAccessAgentGroup('u-known', 'ag-1');
+    expect(d.allowed).toBe(false);
+    expect(d.allowed === false && d.reason).toBe('not_member');
+  });
+});
+
+describe('isSiblingBotSender', () => {
+  // Our own bots, keyed by their bare platform user-id (what the adapter
+  // known-bot registries expose). The sender id is namespaced by channelType.
+  const ourBots = new Set(['123456789000000001', '123456789000000015', '123456789000000016']);
+
+  it('matches a sibling bot regardless of the channelType prefix', () => {
+    // Example Agent (its bot user id) seen by the opencode adapter is still our bot.
+    expect(isSiblingBotSender('discord-opencode:123456789000000001', ourBots)).toBe(true);
+    expect(isSiblingBotSender('discord:123456789000000001', ourBots)).toBe(true);
+    expect(isSiblingBotSender('discord-codex:123456789000000015', ourBots)).toBe(true);
+  });
+
+  it('matches a slack-style namespaced sender', () => {
+    expect(isSiblingBotSender('slack:U123BOT', new Set(['U123BOT']))).toBe(true);
+  });
+
+  it('rejects a third-party / unknown bot id', () => {
+    expect(isSiblingBotSender('discord:999999999999999999', ourBots)).toBe(false);
+  });
+
+  it('fails closed on an empty registry (before the host wires the provider)', () => {
+    expect(isSiblingBotSender('discord:123456789000000001', new Set())).toBe(false);
+  });
+
+  it('rejects malformed sender ids (no separator / empty platform id)', () => {
+    expect(isSiblingBotSender('123456789000000001', ourBots)).toBe(false);
+    expect(isSiblingBotSender('discord:', ourBots)).toBe(false);
+  });
+
+  it('matches only the full platform id, not a prefix of it', () => {
+    // Guard against substring/loose matching: a partial id must not pass.
+    expect(isSiblingBotSender('discord:123456789000000004', ourBots)).toBe(false);
+  });
+});
+
+describe('role helpers', () => {
+  it('honors an owner role from a same-workspace Slack sibling adapter only', async () => {
+    const baseUser = 'slack-authz-base:UOWNER';
+    const siblingUser = 'slack-authz-codex:UOWNER';
+    const otherWorkspaceUser = 'slack-authz-other:UOWNER';
+    const baseIdentity = { userId: 'UBOTBASE', username: 'base', teamId: 'T-AUTHZ-A' };
+    const siblingIdentity = { userId: 'UBOTCODEX', username: 'codex', teamId: 'T-AUTHZ-A' };
+    const otherIdentity = { userId: 'UBOTOTHER', username: 'other', teamId: 'T-AUTHZ-B' };
+
+    await seedUser(baseUser, 'slack-authz-base');
+    await seedUser(siblingUser, 'slack-authz-codex');
+    await seedUser(otherWorkspaceUser, 'slack-authz-other');
+    await grantRole({ user_id: baseUser, role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
+
+    registerSlackBot('slack-authz-base', baseIdentity);
+    registerSlackBot('slack-authz-codex', siblingIdentity);
+    registerSlackBot('slack-authz-other', otherIdentity);
+    try {
+      expect(await withCentralSync(() => isOwner(siblingUser), 'test')).toBe(true);
+      expect(await withCentralSync(() => isOwner(otherWorkspaceUser), 'test')).toBe(false);
+    } finally {
+      // The Slack registry is process-global. Keep later tests isolated.
+      registerSlackBot('slack-authz-base', { ...baseIdentity, teamId: '__cleared__' });
+      registerSlackBot('slack-authz-codex', { ...siblingIdentity, teamId: '__cleared__' });
+      registerSlackBot('slack-authz-other', { ...otherIdentity, teamId: '__cleared__' });
+    }
+  });
+
+  it('rejects owner rows with a scope', async () => {
+    await seedUser('u-1', 'telegram');
+    // `.rejects`, not `.toThrow()`: the owner-scope check still runs before the
+    // first await, but `grantRole` is async now, so the throw surfaces as a
+    // rejected promise. `expect(asyncFn).toThrow()` sees the promise, not the
+    // error, and passes vacuously.
+    await expect(
+      grantRole({
+        user_id: 'u-1',
+        role: 'owner',
+        agent_group_id: 'ag-1',
+        granted_by: null,
+        granted_at: now(),
+      }),
+    ).rejects.toThrow('owner role must be global (agent_group_id = null)');
+  });
+
+  it('hasAnyOwner reflects owner grants', async () => {
+    await seedUser('u-1', 'telegram');
+    expect(await hasAnyOwner()).toBe(false);
+    await grantRole({ user_id: 'u-1', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
+    expect(await hasAnyOwner()).toBe(true);
+    expect(await withCentralSync(() => isOwner('u-1'), 'test')).toBe(true);
+  });
+});
+
+describe('ensureUserDm', () => {
+  it('adapter without openDM: falls through to using the bare handle as platform_id', async () => {
+    await mountMockAdapter('nodm');
+    await seedUser('nodm:123', 'nodm');
+
+    const mg = await ensureUserDm('nodm:123');
+    expect(mg).toBeDefined();
+    expect(mg!.channel_type).toBe('nodm');
+    expect(mg!.platform_id).toBe('123');
+    expect(mg!.is_group).toBe(0);
+
+    const cached = await getUserDm('nodm:123', 'nodm');
+    expect(cached?.messaging_group_id).toBe(mg!.id);
+  });
+
+  it('Telegram via chat-sdk-bridge: adapter.openDM returns prefixed platform_id', async () => {
+    const mock = await mountMockAdapter('telegram', async (handle) => `telegram:${handle}`);
+    await seedUser('telegram:6037840640', 'telegram');
+
+    const mg = await ensureUserDm('telegram:6037840640');
+    expect(mg).toBeDefined();
+    expect(mg!.platform_id).toBe('telegram:6037840640');
+    expect(mock.openDMCalls).toEqual(['6037840640']);
+
+    const mg2 = await ensureUserDm('telegram:6037840640');
+    expect(mg2!.id).toBe(mg!.id);
+    expect(mock.openDMCalls).toEqual(['6037840640']);
+  });
+
+  it('resolution-required channels: calls adapter.openDM, uses its result, caches', async () => {
+    const mock = await mountMockAdapter('discord', async (handle) => `dm-channel-${handle}`);
+    await seedUser('discord:user-1', 'discord');
+
+    const mg = await ensureUserDm('discord:user-1');
+    expect(mg).toBeDefined();
+    expect(mg!.platform_id).toBe('dm-channel-user-1');
+    expect(mock.openDMCalls).toEqual(['user-1']);
+
+    const mg2 = await ensureUserDm('discord:user-1');
+    expect(mg2!.id).toBe(mg!.id);
+    expect(mock.openDMCalls).toEqual(['user-1']);
+  });
+
+  it('stamps the requested instance on a cold DM row', async () => {
+    // A named-instance install: the adapter is registered as 'slack-labs',
+    // so nothing answers to the bare channel type 'slack'.
+    await mountMockAdapter('slack', async (handle) => `dm-${handle}`, 'slack-labs');
+    await seedUser('slack:U-owner', 'slack');
+
+    const mg = await ensureUserDm('slack:U-owner', { instance: 'slack-labs' });
+    expect(mg).toBeDefined();
+    // Read the row back: createMessagingGroup defaults an unset instance to
+    // the channel type, so the persisted value is what matters.
+    const row = await getMessagingGroup(mg!.id);
+    expect(row?.instance).toBe('slack-labs');
+  });
+
+  it('without an instance a cold DM row falls back to the bare channel type', async () => {
+    // Pins the default the fix relies on: callers that dispatch on the exact
+    // instance key must pass one, because this row names an adapter that does
+    // not exist on a named-instance install.
+    await mountMockAdapter('slack', async (handle) => `dm-${handle}`, 'slack-labs');
+    await seedUser('slack:U-owner', 'slack');
+
+    const mg = await ensureUserDm('slack:U-owner');
+    expect((await getMessagingGroup(mg!.id))?.instance).toBe('slack');
+  });
+
+  it('does not reuse a sibling instance row for the same platform_id', async () => {
+    // Direct-addressable channels make platform_id the user's own handle, so
+    // it is identical across bots. An existing row under a sibling instance
+    // must not be adopted: dispatching on its exact instance would reach the
+    // wrong bot with the wrong token.
+    await mountMockAdapter('telegram', undefined, 'telegram-bot-a');
+    await seedUser('telegram:U-owner', 'telegram');
+
+    await createMessagingGroup({
+      id: 'mg-sibling',
+      channel_type: 'telegram',
+      instance: 'telegram-bot-b',
+      platform_id: 'U-owner',
+      name: 'Sibling bot DM',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+
+    const mg = await ensureUserDm('telegram:U-owner', { instance: 'telegram-bot-a' });
+    expect(mg!.id).not.toBe('mg-sibling');
+    expect((await getMessagingGroup(mg!.id))?.instance).toBe('telegram-bot-a');
+  });
+
+  // Codex round 1 on #465: the (user_id, channel_type) cache key ignores
+  // instance on a hit, so a caller naming instance A could be handed a row
+  // cached from instance B and then dispatch delivery — content that
+  // originated on bot A, through bot B's adapter/identity.
+  it('a cache hit on a DIFFERENT instance than requested is treated as a miss and re-resolved', async () => {
+    const mockA = await mountMockAdapter('slack', async (handle) => `dm-a-${handle}`, 'slack-bot-a');
+    await mountMockAdapter('slack', async (handle) => `dm-b-${handle}`, 'slack-bot-b');
+    await seedUser('slack:U-owner', 'slack');
+
+    // Cache the user's DM on instance B first (e.g. an earlier approval on
+    // that workspace/bot).
+    const mgB = await ensureUserDm('slack:U-owner', { instance: 'slack-bot-b' });
+    expect((await getMessagingGroup(mgB!.id))?.instance).toBe('slack-bot-b');
+
+    // A caller asking for instance A must NOT receive B's cached row — it
+    // must re-resolve and land on A's own row.
+    const mgA = await ensureUserDm('slack:U-owner', { instance: 'slack-bot-a' });
+    expect(mgA!.id).not.toBe(mgB!.id);
+    expect((await getMessagingGroup(mgA!.id))?.instance).toBe('slack-bot-a');
+    expect(mockA.openDMCalls).toEqual(['U-owner']);
+  });
+
+  // Pins case 16 (the "cacheable" gate refusal, §3.2): an unaddressed caller
+  // — no instance of its own — keeps today's behavior and still gets the
+  // cached row, whichever instance it happens to be stamped with. Only a
+  // caller that NAMES an instance gets the stricter check above.
+  it('an unaddressed caller still gets the cached row regardless of its instance', async () => {
+    await mountMockAdapter('slack', async (handle) => `dm-b-${handle}`, 'slack-bot-b');
+    await seedUser('slack:U-owner', 'slack');
+
+    const mgB = await ensureUserDm('slack:U-owner', { instance: 'slack-bot-b' });
+    expect((await getMessagingGroup(mgB!.id))?.instance).toBe('slack-bot-b');
+
+    const mgAgain = await ensureUserDm('slack:U-owner');
+    expect(mgAgain!.id).toBe(mgB!.id);
+  });
+
+  it('returns null when the adapter is not registered', async () => {
+    await seedUser('missing:42', 'missing');
+    expect(await ensureUserDm('missing:42')).toBeNull();
+  });
+
+  it('returns null when adapter.openDM throws', async () => {
+    await mountMockAdapter('slack', async () => {
+      throw new Error('openDM boom');
+    });
+    await seedUser('slack:u1', 'slack');
+    expect(await ensureUserDm('slack:u1')).toBeNull();
+    expect(await getUserDm('slack:u1', 'slack')).toBeUndefined();
+  });
+
+  it('reuses an existing messaging_group row if one already matches', async () => {
+    await mountMockAdapter('telegram');
+    await seedUser('telegram:555', 'telegram');
+    const existing = {
+      id: 'mg-preexisting',
+      channel_type: 'telegram',
+      platform_id: '555',
+      name: 'Pre-existing',
+      is_group: 0 as const,
+      unknown_sender_policy: 'strict' as const,
+      created_at: now(),
+    };
+    await createMessagingGroup(existing);
+
+    const mg = await ensureUserDm('telegram:555');
+    expect(mg?.id).toBe('mg-preexisting');
+    expect((await getUserDm('telegram:555', 'telegram'))?.messaging_group_id).toBe('mg-preexisting');
+  });
+});

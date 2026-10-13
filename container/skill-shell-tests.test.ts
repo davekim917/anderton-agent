@@ -1,0 +1,358 @@
+import { execFile, execFileSync } from 'child_process';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { promisify } from 'util';
+
+import type { Dirent } from 'fs';
+
+import { describe, expect, it } from 'vitest';
+
+import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
+
+/**
+ * Structural gate for shadow-review #724's F3: `ab-net-redact.test.sh` — the
+ * only regression check on the network/HAR credential-redaction control added
+ * by #700 — never ran anywhere. Nothing in this repo executes `*.test.sh` on
+ * its own, so this gate runs every eligible shell suite under `pnpm test` and
+ * CI without requiring a sibling wrapper someone must remember to add.
+ *
+ * Rather than hand-add a second one-off wrapper (and leave the next shell
+ * suite exactly as ungated as this one was), this file DISCOVERS every
+ * `*.test.sh` anywhere under `container/` and `scripts/` at test-collection
+ * time and runs each one as its own `it()` case (see discoverShellSuites()
+ * below for why the walk is recursive rather than a fixed
+ * `<skill>/scripts/*.test.sh` pattern). A future shell suite is gated the
+ * moment it lands, with no wrapper file to remember to add.
+ *
+ * Every `execFileSync('bash', …)` call below is this file's only subprocess
+ * escape (`allowSubprocess(['bash'])` opts in visibly). `enforceHermeticity()`
+ * guards this process's Node seams, not Bash descendants: each shell suite
+ * must isolate its own external commands; buildSuiteEnv() keeps ambient
+ * environment out of them.
+ */
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(HERE, '..');
+/** Every root this gate discovers `*.test.sh` suites under. */
+const DISCOVERY_ROOTS = [path.join(REPO_ROOT, 'container'), path.join(REPO_ROOT, 'scripts')];
+
+allowSubprocess(['bash']);
+enforceHermeticity();
+
+/** Per-suite budget, generous over vitest's 5s default. Most suites finish in
+ * seconds; this is a hang detector, not a performance target. */
+const SUITE_TIMEOUT_MS = 400_000;
+
+/**
+ * Suites measured to need more than SUITE_TIMEOUT_MS, each with its own budget
+ * and the measurement behind it. Timed on pristine main 44838b67 (2026-09-22),
+ * run exactly as this file runs them, throttled: controller-live did not finish
+ * inside 450s (the builder measured 523s with #2092's cases added); pr-gate took
+ * 430s (462s on the #2092 branch). Both run hundreds of real controller fires
+ * or poll/claim loops -- they are long, not hung. A budget here is still a hang
+ * detector: roughly 1.7x the slowest measurement. Every path is asserted to
+ * exist below, so a rename cannot silently fall back to the default.
+ */
+const SLOW_SUITE_TIMEOUT_MS: Readonly<Record<string, number>> = {
+  'container/skills/smoke-test/scripts/smoke-campaign-controller-live.test.sh': 900_000,
+  'container/skills/smoke-test/scripts/smoke-pr-gate.test.sh': 800_000,
+};
+
+/** Each runs as SHARDS_PER_SUITE concurrent SMOKE_SHARD processes; select-tests.py parses this list. */
+const SHARDED_SUITES: ReadonlyArray<string> = [
+  'container/skills/smoke-test/scripts/smoke-campaign-controller-live.test.sh',
+  'container/skills/smoke-test/scripts/smoke-pr-gate.test.sh',
+];
+
+// Every shard of a suite runs at once, beside other vitest workers: keep it at 4 or below.
+const SHARDS_PER_SUITE = 4;
+
+function suiteTimeoutMs(relPath: string): number {
+  return SLOW_SUITE_TIMEOUT_MS[relPath] ?? SUITE_TIMEOUT_MS;
+}
+
+/**
+ * Suites that cannot run in this hermetic CI sandbox (Docker, a real browser,
+ * network, or a host-only path), each with the one-line reason. Every path
+ * here is asserted to still exist below, so a rename or removal fails loudly
+ * instead of the exclusion silently rotting into a no-op.
+ */
+const EXCLUDED_SUITES: ReadonlyArray<{ relPath: string; reason: string }> = [
+  {
+    relPath: 'container/claude-review-wrapper.test.sh',
+    reason: 'needs a candidate image argument ($1) and a real `docker run`; genuinely cannot run unattended in CI',
+  },
+];
+
+const EXCLUDED_REL_PATHS = new Set(EXCLUDED_SUITES.map((s) => s.relPath));
+
+/**
+ * Every `*.test.sh` anywhere under `container/` or `scripts/`, repo-relative,
+ * sorted. `container/skills/` is covered by walking `container/` — no need
+ * for a second, narrower root.
+ *
+ * Most `container/skills/` suites live at `<skill>/scripts/<name>.test.sh`,
+ * but not all — `container/skills/work-claims/claim.test.sh` sits directly
+ * under the skill directory with no `scripts/` level at all, and
+ * `container/claude-review-wrapper.test.sh` and
+ * `scripts/check-onecli-gateway-fds.test.sh` sit outside `container/skills/`
+ * entirely. A pattern hardcoded to one fixed depth or directory would
+ * silently miss suites like these (and any future one that lays itself out
+ * differently), which is exactly the kind of gap this file exists to close —
+ * so this walks each root recursively instead of assuming a fixed shape.
+ */
+function discoverShellSuites(): string[] {
+  const found: string[] = [];
+  function walk(dir: string): void {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(abs);
+      } else if (entry.isFile() && entry.name.endsWith('.test.sh')) {
+        found.push(path.relative(REPO_ROOT, abs));
+      }
+    }
+  }
+  for (const root of DISCOVERY_ROOTS) walk(root);
+  return [...new Set(found)].sort();
+}
+
+const ALL_SUITES = discoverShellSuites();
+const RUNNABLE_SUITES = ALL_SUITES.filter((relPath) => !EXCLUDED_REL_PATHS.has(relPath));
+
+/**
+ * A shell suite inherits only INHERITED_ENV from this process: no credentials,
+ * cloud profiles, tool-location variables (`GIT_DIR`) or git config overrides
+ * reach it. `HOME`, `XDG_CONFIG_HOME` and `TMPDIR` point into a fresh directory
+ * the caller removes, so ambient git config (git reads
+ * `$XDG_CONFIG_HOME/git/config` before `$HOME/.gitconfig`) stays out and a
+ * suite's temp files, including those it forgets to clean, go with it.
+ */
+const INHERITED_ENV = ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ'];
+
+function buildSuiteEnv(freshHome: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of INHERITED_ENV) if (process.env[name] !== undefined) env[name] = process.env[name];
+  const tmp = path.join(freshHome, 'tmp');
+  mkdirSync(tmp, { recursive: true });
+  return {
+    ...env,
+    HOME: freshHome,
+    TMPDIR: tmp,
+    GIT_CONFIG_NOSYSTEM: '1',
+    XDG_CONFIG_HOME: path.join(freshHome, '.config'),
+  };
+}
+
+function formatShellSuiteFailure(relPath: string, err: unknown): string {
+  const detail = err instanceof Error ? err.message : String(err);
+  const output = typeof err === 'object' && err !== null ? (err as { stdout?: unknown; stderr?: unknown }) : {};
+  return `${relPath} failed: ${detail}\n${output.stdout === undefined ? '' : String(output.stdout)}\n${
+    output.stderr === undefined ? '' : String(output.stderr)
+  }`;
+}
+
+const execFileAsync = promisify(execFile);
+
+async function runSuite(suitePath: string, budgetMs: number, shard: string | undefined): Promise<void> {
+  const freshHome = mkdtempSync(path.join(tmpdir(), 'skill-shell-test-home-'));
+  try {
+    // The budget is enforced on the suite's whole PROCESS GROUP: vitest's own
+    // timeout only stops waiting. coreutils `timeout` runs the suite in its
+    // own process group and KILLs the group, so a hung grandchild (the 09-13
+    // orphans were a `trash` under a suite, alive 9 days) dies with it instead
+    // of outliving the run. execFile's own timeout is the backstop if
+    // `timeout` itself wedges.
+    await execFileAsync(
+      'bash',
+      ['-c', 'exec timeout -s KILL "$0" bash "$1" </dev/null', `${Math.ceil(budgetMs / 1000)}s`, suitePath],
+      {
+        encoding: 'utf-8',
+        env: { ...buildSuiteEnv(freshHome), ...(shard ? { SMOKE_SHARD: shard } : {}) },
+        timeout: budgetMs + 15_000,
+        killSignal: 'SIGKILL',
+      },
+    );
+  } finally {
+    rmSync(freshHome, { recursive: true, force: true });
+  }
+}
+
+describe('every container skill shell test suite (*.test.sh)', () => {
+  it('discovery found the known shell suites (floor, not a fixed count)', () => {
+    // A regression in the discovery glob (wrong directory depth, wrong
+    // extension, wrong root) would otherwise silently collapse this to zero
+    // suites and pass green. Floor rather than exact count: a new *.test.sh
+    // landing anywhere under container/ or scripts/ should not have to edit
+    // this number.
+    expect(ALL_SUITES.length).toBeGreaterThanOrEqual(13);
+    expect(ALL_SUITES).toContain('container/skills/agent-browser/scripts/ab-net-redact.test.sh');
+    // Proves the scripts/ root is actually walked, not just container/.
+    expect(ALL_SUITES).toContain('scripts/check-onecli-gateway-fds.test.sh');
+  });
+
+  it('every slow-suite budget names a suite that still exists and is not excluded', () => {
+    for (const relPath of Object.keys(SLOW_SUITE_TIMEOUT_MS)) {
+      expect(
+        RUNNABLE_SUITES,
+        `slow-suite budget for ${relPath} names no runnable suite — update or remove it`,
+      ).toContain(relPath);
+    }
+  });
+
+  it('every sharded suite is runnable and sources smoke-case.sh', () => {
+    for (const relPath of SHARDED_SUITES) {
+      expect(RUNNABLE_SUITES, `sharded suite ${relPath} names no runnable suite`).toContain(relPath);
+      expect(readFileSync(path.join(REPO_ROOT, relPath), 'utf-8')).toMatch(/^\s*(?:\.|source)\s+.*smoke-case\.sh\b/m);
+    }
+  });
+
+  it('every excluded suite path still exists', () => {
+    for (const { relPath } of EXCLUDED_SUITES) {
+      const abs = path.join(REPO_ROOT, relPath);
+      let isFile = false;
+      try {
+        isFile = statSync(abs).isFile();
+      } catch {
+        isFile = false;
+      }
+      expect(isFile, `excluded suite no longer exists at ${relPath} — update or remove this entry`).toBe(true);
+    }
+  });
+
+  it('passes a suite no ambient git config or credential', () => {
+    // Simulates a dev machine or CI runner whose ambient environment already
+    // carries these three vars, pointed at a config with an `insteadOf`
+    // rewrite and a bogus `core.hooksPath` — exactly the class of ambient git
+    // config this repo has been bitten by twice (docs/review-notes.md).
+    const freshHome = mkdtempSync(path.join(tmpdir(), 'skill-shell-test-home-'));
+    const hostileXdg = mkdtempSync(path.join(tmpdir(), 'skill-shell-test-hostile-xdg-'));
+    const savedXdg = process.env.XDG_CONFIG_HOME;
+    const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
+    const savedSystem = process.env.GIT_CONFIG_SYSTEM;
+    const savedToken = process.env.GH_TOKEN;
+    let probeCwd: string | undefined;
+    try {
+      mkdirSync(path.join(hostileXdg, 'git'), { recursive: true });
+      const hostileConfigPath = path.join(hostileXdg, 'git', 'config');
+      writeFileSync(
+        hostileConfigPath,
+        '[url "https://github.com/"]\n' +
+          '\tinsteadOf = https://hostile.invalid/\n' +
+          '[core]\n' +
+          '\thooksPath = /nonexistent/hostile-hooks\n',
+      );
+
+      // The rest of this test's assertions run with the ambient environment
+      // already contaminated, as a real CI runner or dev machine could be.
+      process.env.XDG_CONFIG_HOME = hostileXdg;
+      process.env.GIT_CONFIG_GLOBAL = hostileConfigPath;
+      process.env.GIT_CONFIG_SYSTEM = hostileConfigPath;
+
+      // Run from an empty, repo-less directory (never this checkout): a probe
+      // run from inside the real repo would pick up ITS legitimate local
+      // `core.hooksPath` (husky sets `.husky/_`), which has nothing to do with
+      // ambient global/system config and would make this test meaningless.
+      probeCwd = mkdtempSync(path.join(tmpdir(), 'skill-shell-test-probe-cwd-'));
+
+      // Sanity check the fixture is real: this is the OLD (pre-fix) env —
+      // fresh HOME and GIT_CONFIG_NOSYSTEM=1 only — reading the hostile
+      // insteadOf straight back. If this assertion ever failed, the test below
+      // would be proving nothing.
+      const oldEnv = { ...process.env, HOME: freshHome, GIT_CONFIG_NOSYSTEM: '1' };
+      const leakedInsteadOf = execFileSync(
+        'bash',
+        ['-c', 'git config --get url.https://github.com/.insteadOf; exit 0'],
+        { encoding: 'utf-8', cwd: probeCwd, env: oldEnv },
+      ).trim();
+      expect(leakedInsteadOf).toBe('https://hostile.invalid/');
+      const leakedHooksPath = execFileSync('bash', ['-c', 'git config --get core.hooksPath; exit 0'], {
+        encoding: 'utf-8',
+        cwd: probeCwd,
+        env: oldEnv,
+      }).trim();
+      expect(leakedHooksPath).toBe('/nonexistent/hostile-hooks');
+
+      // The suite's real sandbox env must not see it, even though
+      // `process.env` still carries the hostile values when buildSuiteEnv() runs.
+      const insteadOf = execFileSync('bash', ['-c', 'git config --get url.https://github.com/.insteadOf; exit 0'], {
+        encoding: 'utf-8',
+        cwd: probeCwd,
+        env: buildSuiteEnv(freshHome),
+      }).trim();
+      expect(insteadOf).toBe('');
+
+      const hooksPath = execFileSync('bash', ['-c', 'git config --get core.hooksPath; exit 0'], {
+        encoding: 'utf-8',
+        cwd: probeCwd,
+        env: buildSuiteEnv(freshHome),
+      }).trim();
+      expect(hooksPath).toBe('');
+
+      // Removing, rather than pinning, the explicit global path means a suite
+      // can still make and verify an isolated `$HOME/.gitconfig` of its own.
+      expect(buildSuiteEnv(freshHome).GIT_CONFIG_GLOBAL).toBeUndefined();
+      expect(buildSuiteEnv(freshHome).GIT_CONFIG_SYSTEM).toBeUndefined();
+      process.env.GH_TOKEN = 'ambient-credential';
+      expect(Object.keys(buildSuiteEnv(freshHome)).sort()).toEqual(
+        [
+          ...INHERITED_ENV.filter((name) => process.env[name] !== undefined),
+          'HOME',
+          'TMPDIR',
+          'GIT_CONFIG_NOSYSTEM',
+          'XDG_CONFIG_HOME',
+        ].sort(),
+      );
+    } finally {
+      if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = savedXdg;
+      if (savedGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = savedGlobal;
+      if (savedSystem === undefined) delete process.env.GIT_CONFIG_SYSTEM;
+      else process.env.GIT_CONFIG_SYSTEM = savedSystem;
+      if (savedToken === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = savedToken;
+      if (probeCwd) rmSync(probeCwd, { recursive: true, force: true });
+      rmSync(freshHome, { recursive: true, force: true });
+      rmSync(hostileXdg, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the runner error message with suite stdout and stderr', () => {
+    const failure = Object.assign(new Error('spawn ENOENT'), { stdout: 'suite stdout', stderr: 'suite stderr' });
+    expect(formatShellSuiteFailure('container/example.test.sh', failure)).toContain('spawn ENOENT');
+    expect(formatShellSuiteFailure('container/example.test.sh', failure)).toContain('suite stdout');
+    expect(formatShellSuiteFailure('container/example.test.sh', failure)).toContain('suite stderr');
+  });
+
+  for (const relPath of RUNNABLE_SUITES) {
+    const suitePath = path.join(REPO_ROOT, relPath);
+    const budgetMs = suiteTimeoutMs(relPath);
+    const shards = SHARDED_SUITES.includes(relPath)
+      ? Array.from({ length: SHARDS_PER_SUITE }, (_, i) => `${i + 1}/${SHARDS_PER_SUITE}`)
+      : [undefined];
+    it(
+      `passes: ${relPath}`,
+      async () => {
+        const results = await Promise.allSettled(shards.map((shard) => runSuite(suitePath, budgetMs, shard)));
+        const failures = results.flatMap((result, i) =>
+          result.status === 'rejected'
+            ? [formatShellSuiteFailure(shards[i] ? `${relPath} [SMOKE_SHARD=${shards[i]}]` : relPath, result.reason)]
+            : [],
+        );
+        if (failures.length > 0) throw new Error(failures.join('\n'));
+      },
+      // Headroom over both kills in runSuite, so one of them is what fires and
+      // the suite's output reaches formatShellSuiteFailure.
+      budgetMs + 30_000,
+    );
+  }
+});

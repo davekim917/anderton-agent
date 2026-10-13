@@ -1,0 +1,6148 @@
+#!/usr/bin/env bash
+# Misconfig fail-closed wake, empty-label-set idle, the settle happy path,
+# deploy-SHA mismatch, the freeze-PR parent-CI substitution, migrations
+# refusal, claim/finish lifecycle, finish-suspends, and finish refused from a
+# non-active run. gh and curl are stubbed via PATH so every scenario runs
+# offline against fixtures, same pattern as smoke-develop-gate.test.sh.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/smoke-case.sh"
+GATE="$SCRIPT_DIR/smoke-pr-gate.sh"
+REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+LEGACY_GATE_BASE=672f03a309a4f11f1ad194900d83a710c55765d6
+
+STUB_BIN="$(mktemp -d)"
+TEST_SHARED_ROOT="$(mktemp -d)"
+cleanup() { rm -rf "$STATE_DIR" "$STUB_BIN" "$TEST_SHARED_ROOT"; }
+trap cleanup EXIT
+
+cat > "$STUB_BIN/gh" <<'STUB'
+#!/usr/bin/env bash
+set -u
+# Plain ${VAR:=default} mis-parses once the default itself contains braces
+# and quotes (bash reads the embedded `{`/`}`/`"` as shell syntax, not text),
+# so every JSON default here is set with an explicit is-it-set-at-all guard
+# instead.
+[ -n "${STUB_PR_LIST+x}" ] || STUB_PR_LIST='[]'
+[ -n "${STUB_REPO_VIEW_EXIT+x}" ] || STUB_REPO_VIEW_EXIT=0
+[ -n "${STUB_PR_VIEW+x}" ] || STUB_PR_VIEW='{}'
+[ -n "${STUB_PR_VIEW_EXIT+x}" ] || STUB_PR_VIEW_EXIT=0
+[ -n "${STUB_PR_FILES+x}" ] || STUB_PR_FILES='[]'
+[ -n "${STUB_RUN_LIST+x}" ] || STUB_RUN_LIST='[]'
+[ -n "${STUB_RUN_LIST_EXIT+x}" ] || STUB_RUN_LIST_EXIT=0
+[ -n "${STUB_PARENT_SHA+x}" ] || STUB_PARENT_SHA=''
+[ -n "${STUB_COMMIT_TREE+x}" ] || STUB_COMMIT_TREE='{"tree":{"sha":"tree-abc"}}'
+[ -n "${STUB_BLOB_RESPONSE+x}" ] || STUB_BLOB_RESPONSE='{"sha":"blob-abc"}'
+[ -n "${STUB_TREE_RESPONSE+x}" ] || STUB_TREE_RESPONSE='{"sha":"tree-new"}'
+[ -n "${STUB_COMMIT_RESPONSE+x}" ] || STUB_COMMIT_RESPONSE='{"sha":"freeze-sha-abc"}'
+[ -n "${STUB_REF_RESPONSE+x}" ] || STUB_REF_RESPONSE='{"ref":"refs/heads/x"}'
+[ -n "${STUB_BRANCH_EXISTS+x}" ] || STUB_BRANCH_EXISTS=false
+[ -n "${STUB_PR_LIST_EXIT+x}" ] || STUB_PR_LIST_EXIT=0
+[ -n "${STUB_PR_FILES_EXIT+x}" ] || STUB_PR_FILES_EXIT=0
+# The head commit itself (freeze_head_probe): parent from STUB_PARENT_BY_COMMIT /
+# STUB_PARENT_SHA, files per sha from STUB_COMMIT_FILES_BY_SHA, else the PR's
+# file list (and its exit code) — so every fixture that describes a freeze by
+# STUB_PR_FILES still describes its head that way.
+[ -n "${STUB_COMMIT_FILES_BY_SHA+x}" ] || STUB_COMMIT_FILES_BY_SHA='{}'
+[ -n "${STUB_COMMIT_GET_EXIT+x}" ] || STUB_COMMIT_GET_EXIT=0
+[ -n "${STUB_COMPARE_FILES+x}" ] || STUB_COMPARE_FILES='{"files":[]}'
+[ -n "${STUB_COMPARE_EXIT+x}" ] || STUB_COMPARE_EXIT=0
+# Freeze-campaign baseline binding (resolve_campaign_baseline): a ledger GO's
+# freeze commit -> its first parent, and freeze PR number -> its head SHA.
+[ -n "${STUB_PARENT_BY_COMMIT+x}" ] || STUB_PARENT_BY_COMMIT='{}'
+[ -n "${STUB_PULL_HEADS+x}" ] || STUB_PULL_HEADS='{}'
+[ -n "${STUB_BINDING_EXIT+x}" ] || STUB_BINDING_EXIT=0
+# Recursive-tree GETs (the complete file list when compare is at its 300 cap):
+# commit sha -> tree response, plus a log of which shas were asked for.
+[ -n "${STUB_TREES_BY_SHA+x}" ] || STUB_TREES_BY_SHA='{}'
+[ -n "${STUB_TREE_GET_EXIT+x}" ] || STUB_TREE_GET_EXIT=0
+# A fixture too big for one env string (the kernel caps each at 128 KiB, same
+# limit as an argv string) comes from a file instead: {sha: tree-response}.
+[ -n "${STUB_TREES_FILE+x}" ] || STUB_TREES_FILE=''
+
+sequenced_run_list() {
+  local n=1 out count_file
+  if [ -z "${STUB_RUN_LIST_SEQUENCE_FILE:-}" ]; then
+    printf '%s' "$STUB_RUN_LIST"
+    return
+  fi
+  count_file="${STUB_RUN_LIST_SEQUENCE_COUNT:-${STUB_RUN_LIST_SEQUENCE_FILE}.count}"
+  if [ -s "$count_file" ]; then n="$(cat "$count_file")"; fi
+  printf '%s\n' "$(( n + 1 ))" > "$count_file"
+  out="$(sed -n "${n}p" "$STUB_RUN_LIST_SEQUENCE_FILE")"
+  [ -n "$out" ] || out="$(tail -n 1 "$STUB_RUN_LIST_SEQUENCE_FILE")"
+  printf '%s' "$out"
+}
+
+case "$1" in
+  repo)
+    # Reachability probe. A repo that does not resolve 404s here even though
+    # `pr list` answered it with a cheerful empty array.
+    if [ "$STUB_REPO_VIEW_EXIT" = 0 ]; then echo '{"name":"repo"}'; fi
+    exit "$STUB_REPO_VIEW_EXIT" ;;
+  run)
+    # CI facts now come from `gh run list --branch` (the check-runs REST
+    # endpoint is invisible to the container's scoped token — see the gate).
+    sequenced_run_list; exit "$STUB_RUN_LIST_EXIT" ;;
+  pr)
+    case "$2" in
+      list) printf '%s' "$STUB_PR_LIST"; exit "$STUB_PR_LIST_EXIT" ;;
+      view) if [ "$STUB_PR_VIEW_EXIT" = 0 ]; then printf '%s' "$STUB_PR_VIEW"; fi; exit "$STUB_PR_VIEW_EXIT" ;;
+      create)
+        if [ "${STUB_PR_CREATE_EXIT:-0}" = 0 ]; then
+          echo "https://github.com/org/repo/pull/${STUB_NEW_PR_NUMBER:-1}"
+        fi
+        exit "${STUB_PR_CREATE_EXIT:-0}" ;;
+      *) echo '{}'; exit 0 ;;
+    esac ;;
+  api)
+    P="$2"
+    if printf '%s' "$P" | grep -qF '/actions/runs?'; then
+      sequenced_run_list; exit "$STUB_RUN_LIST_EXIT"
+    fi
+    # Parent-sha lookup for freeze PRs: smoke-pr-gate.sh queries the plain
+    # (non-git) commits endpoint with this --jq expression; check it before
+    # any path-based branch so it matches regardless of the exact endpoint.
+    if printf '%s' "$*" | grep -qF '.parents[0].sha'; then
+      MAPPED="$(jq -r --arg c "${P##*/commits/}" '.[$c] // empty' <<<"$STUB_PARENT_BY_COMMIT")"
+      if [ -n "$MAPPED" ]; then
+        [ "$STUB_BINDING_EXIT" = 0 ] || exit "$STUB_BINDING_EXIT"
+        printf '%s' "$MAPPED"; exit 0
+      fi
+      printf '%s' "$STUB_PARENT_SHA"; exit 0
+    fi
+    if printf '%s' "$P" | grep -qE '^repos/[^/]+/[^/]+/commits/[0-9a-f]{40}$' && [ "$#" -eq 2 ]; then
+      C="${P##*/commits/}"
+      [ "$STUB_COMMIT_GET_EXIT" = 0 ] || exit "$STUB_COMMIT_GET_EXIT"
+      PARENT="$(jq -r --arg c "$C" '.[$c] // empty' <<<"$STUB_PARENT_BY_COMMIT")"
+      [ -n "$PARENT" ] || PARENT="$STUB_PARENT_SHA"
+      FILES="$(jq -c --arg c "$C" '.[$c] // empty' <<<"$STUB_COMMIT_FILES_BY_SHA")"
+      if [ -z "$FILES" ]; then
+        [ "$STUB_PR_FILES_EXIT" = 0 ] || exit "$STUB_PR_FILES_EXIT"
+        FILES="$STUB_PR_FILES"
+      fi
+      # The real endpoint always carries a per-file `status`; a fixture that
+      # names files only means "added" (a freeze's own shape).
+      # A comma-separated parent value serves a merge commit (several parents).
+      jq -cn --arg c "$C" --arg p "$PARENT" --argjson files "$FILES" \
+        '{sha:$c, parents:(if $p == "" then [] else ($p | split(",") | map({sha:.})) end), files:($files | map({status:"added"} + .))}'; exit 0
+    fi
+    if printf '%s' "$*" | grep -qF '.head.sha'; then
+      [ "$STUB_BINDING_EXIT" = 0 ] || exit "$STUB_BINDING_EXIT"
+      jq -r --arg n "${P##*/pulls/}" '.[$n] // empty' <<<"$STUB_PULL_HEADS"; exit 0
+    fi
+    if printf '%s' "$P" | grep -qF '/pulls/' && printf '%s' "$P" | grep -qF '/files'; then
+      printf '%s' "$STUB_PR_FILES"; exit "$STUB_PR_FILES_EXIT"
+    fi
+    # Freeze-PR target-tree diff (base branch vs. the marker's parent) — the
+    # MG-1 fix: evaluate_pr no longer trusts a freeze PR's own two-marker
+    # diff for migrations/frontend, it compares against this instead.
+    if printf '%s' "$P" | grep -qF '/compare/'; then
+      # Which range was asked for is the contract under test, so record it.
+      [ -z "${STUB_COMPARE_LOG:-}" ] || printf '%s\n' "${P##*/compare/}" >> "$STUB_COMPARE_LOG"
+      printf '%s' "$STUB_COMPARE_FILES"; exit "$STUB_COMPARE_EXIT"
+    fi
+    if printf '%s' "$P" | grep -qF '/git/ref/heads/'; then
+      if [ "$STUB_BRANCH_EXISTS" = true ]; then echo '{"ref":"exists"}'; exit 0; else exit 1; fi
+    fi
+    if printf '%s' "$P" | grep -qF '/git/commits/'; then
+      if printf '%s' "$*" | grep -qF '.parents[0].sha'; then
+        printf '%s' "$STUB_PARENT_SHA"; exit 0
+      else
+        printf '%s' "$STUB_COMMIT_TREE"; exit 0
+      fi
+    fi
+    if printf '%s' "$P" | grep -qF '/git/blobs'; then
+      cat >/dev/null; printf '%s' "$STUB_BLOB_RESPONSE"; exit 0
+    fi
+    if printf '%s' "$P" | grep -qF '/git/trees/' && printf '%s' "$P" | grep -qF 'recursive=1'; then
+      TREE_SHA="${P##*/git/trees/}"; TREE_SHA="${TREE_SHA%%\?*}"
+      [ -z "${STUB_TREE_GET_LOG:-}" ] || printf '%s\n' "$TREE_SHA" >> "$STUB_TREE_GET_LOG"
+      [ "$STUB_TREE_GET_EXIT" = 0 ] || exit "$STUB_TREE_GET_EXIT"
+      if [ -n "$STUB_TREES_FILE" ]; then
+        jq -c --arg s "$TREE_SHA" '.[$s] // {}' "$STUB_TREES_FILE"; exit 0
+      fi
+      jq -c --arg s "$TREE_SHA" '.[$s] // {}' <<<"$STUB_TREES_BY_SHA"; exit 0
+    fi
+    if printf '%s' "$P" | grep -qF '/git/trees'; then
+      cat >/dev/null; printf '%s' "$STUB_TREE_RESPONSE"; exit 0
+    fi
+    if printf '%s' "$P" | grep -qF '/git/refs'; then
+      cat >/dev/null; printf '%s' "$STUB_REF_RESPONSE"; exit "${STUB_REF_EXIT:-0}"
+    fi
+    if printf '%s' "$P" | grep -qF '/git/commits'; then
+      cat >/dev/null; printf '%s' "$STUB_COMMIT_RESPONSE"; exit 0
+    fi
+    echo '{}'; exit 0 ;;
+  *) echo '{}'; exit 0 ;;
+esac
+STUB
+cat > "$STUB_BIN/curl" <<'STUB'
+#!/usr/bin/env bash
+set -u
+[ -n "${STUB_SUSPEND_CODE+x}" ] || STUB_SUSPEND_CODE=202
+[ -n "${STUB_HEALTHZ_CODE+x}" ] || STUB_HEALTHZ_CODE=200
+[ -n "${STUB_SERVICES+x}" ] || STUB_SERVICES='[]'
+[ -n "${STUB_BACKEND_DEPLOYS+x}" ] || STUB_BACKEND_DEPLOYS='[]'
+[ -n "${STUB_FRONTEND_DEPLOYS+x}" ] || STUB_FRONTEND_DEPLOYS='[]'
+[ -n "${STUB_DEPLOYS_BY_SERVICE_JSON+x}" ] || STUB_DEPLOYS_BY_SERVICE_JSON=''
+# #1536 bundle-disambiguation oracle fixtures. Only exercised when the gate
+# actually has 2+ backend candidates to disambiguate — every pre-existing
+# scenario has 0 or 1, so these never fire outside the new tests below.
+[ -n "${STUB_FRONTEND_HTML_EXIT+x}" ] || STUB_FRONTEND_HTML_EXIT=0
+[ -n "${STUB_FRONTEND_HTML+x}" ] || STUB_FRONTEND_HTML='<html><body><script type="module" src="/assets/index-ABC123.js"></script></body></html>'
+[ -n "${STUB_BUNDLE_EXIT+x}" ] || STUB_BUNDLE_EXIT=0
+[ -n "${STUB_BUNDLE_JS+x}" ] || STUB_BUNDLE_JS=''
+ARGS="$*"
+[ -z "${STUB_CURL_LOG:-}" ] || printf '%s\n' "$ARGS" >> "$STUB_CURL_LOG"
+if printf '%s' "$ARGS" | grep -qF '/suspend'; then
+  # Receipt of every suspend POST that actually went out, so a test can
+  # assert a refusal issued NONE rather than inferring it from a status field.
+  if [ -n "${STUB_SUSPEND_LOG:-}" ]; then
+    printf '%s\n' "$ARGS" >> "$STUB_SUSPEND_LOG"
+  fi
+  # Lock probe: `finish` must have RELEASED the PR state lock before it got
+  # here, so a concurrent process can take it. Recorded free/held for the
+  # caller to assert on.
+  if [ -n "${STUB_LOCK_PROBE:-}" ] && [ -n "${STUB_LOCK_PROBE_FILE:-}" ]; then
+    ( flock -n 6 && printf 'free' || printf 'held' ) \
+      6>"$STUB_LOCK_PROBE_FILE" > "$STUB_LOCK_PROBE"
+  fi
+  # State probe: snapshot the PR state file at the moment the artifact work
+  # begins, so the caller can assert the slot is still HELD here (crash-safety
+  # order) rather than already cleared.
+  if [ -n "${STUB_STATE_PROBE:-}" ] && [ -n "${STUB_STATE_PROBE_FILE:-}" ]; then
+    cat "$STUB_STATE_PROBE_FILE" > "$STUB_STATE_PROBE" 2>/dev/null || true
+  fi
+  # Stall long enough for an outer `timeout` to kill the gate here — a real
+  # mid-flight container death, not a simulated one.
+  [ -n "${STUB_SUSPEND_SLEEP:-}" ] && sleep "$STUB_SUSPEND_SLEEP"
+  printf '%s' "$STUB_SUSPEND_CODE"; exit 0
+fi
+if printf '%s' "$ARGS" | grep -qF '/healthz'; then
+  if [ "$STUB_HEALTHZ_CODE" = "200" ]; then printf '200'; exit 0; else exit 22; fi
+fi
+if printf '%s' "$ARGS" | grep -qF '/deploys'; then
+  SERVICE_ID="$(sed -n 's#.*https://api.render.com/v1/services/\([^/]*\)/deploys.*#\1#p' <<<"$ARGS")"
+  if [ -n "$STUB_DEPLOYS_BY_SERVICE_JSON" ]; then
+    jq -c --arg id "$SERVICE_ID" '.[$id] // []' <<<"$STUB_DEPLOYS_BY_SERVICE_JSON"
+    exit 0
+  fi
+  if printf '%s' "$ARGS" | grep -qF 'backend-pr'; then
+    printf '%s' "$STUB_BACKEND_DEPLOYS"
+  else
+    printf '%s' "$STUB_FRONTEND_DEPLOYS"
+  fi
+  exit 0
+fi
+if printf '%s' "$ARGS" | grep -qF '/version'; then
+  [ -n "${STUB_VERSION_JSON:-}" ] || exit 22
+  printf '%s' "$STUB_VERSION_JSON"; exit 0
+fi
+if printf '%s' "$ARGS" | grep -qF '/services?limit'; then
+  printf '%s' "$STUB_SERVICES"; exit 0
+fi
+# #1536: the bundle-disambiguation oracle's two fetches. Bundle path checked
+# first (it also lives under the same onrender.com host as the frontend root).
+if printf '%s' "$ARGS" | grep -qE '\.js($| )'; then
+  [ "$STUB_BUNDLE_EXIT" = 0 ] || exit "$STUB_BUNDLE_EXIT"
+  printf '%s' "$STUB_BUNDLE_JS"; exit 0
+fi
+if printf '%s' "$ARGS" | grep -qE 'onrender\.com/?( |$)'; then
+  [ "$STUB_FRONTEND_HTML_EXIT" = 0 ] || exit "$STUB_FRONTEND_HTML_EXIT"
+  printf '%s' "$STUB_FRONTEND_HTML"; exit 0
+fi
+echo '{}'; exit 0
+STUB
+chmod +x "$STUB_BIN/gh" "$STUB_BIN/curl"
+cat > "$STUB_BIN/date" <<'STUB'
+#!/usr/bin/env bash
+# The preview-waiter checks elapsed time from `date -u +%s`. Keep the normal
+# system date for every legacy fixture, but let its new bounded-loop cases use
+# an explicit sequence so success, terminal exits and deadline behaviour are
+# hermetic rather than timing-sensitive.
+if [ "$#" -eq 2 ] && [ "$1" = "-u" ] && [ "$2" = "+%s" ] && [ -n "${STUB_WAIT_CLOCK_FILE:-}" ]; then
+  count_file="${STUB_WAIT_CLOCK_COUNT:-${STUB_WAIT_CLOCK_FILE}.count}"
+  n=1
+  if [ -s "$count_file" ]; then n="$(cat "$count_file")"; fi
+  printf '%s\n' "$(( n + 1 ))" > "$count_file"
+  value="$(sed -n "${n}p" "$STUB_WAIT_CLOCK_FILE")"
+  [ -n "$value" ] || value="$(tail -n 1 "$STUB_WAIT_CLOCK_FILE")"
+  printf '%s\n' "$value"
+  exit 0
+fi
+exec /usr/bin/date "$@"
+STUB
+chmod +x "$STUB_BIN/date"
+cat > "$STUB_BIN/sleep" <<'STUB'
+#!/usr/bin/env bash
+if [ -n "${STUB_WAIT_SLEEP_LOG:-}" ]; then
+  printf '%s\n' "$1" >> "$STUB_WAIT_SLEEP_LOG"
+  exit 0
+fi
+exec /usr/bin/sleep "$@"
+STUB
+chmod +x "$STUB_BIN/sleep"
+cat > "$STUB_BIN/mountpoint" <<'STUB'
+#!/usr/bin/env bash
+[ "${1:-}" = "-q" ] && [ "${2:-}" = "${SMOKE_GATE_SHARED_ROOT:-}" ]
+STUB
+chmod +x "$STUB_BIN/mountpoint"
+LEGACY_GATE="$STUB_BIN/legacy-smoke-pr-gate.sh"
+git -C "$REPO_ROOT" show "$LEGACY_GATE_BASE:container/skills/smoke-test/scripts/smoke-pr-gate.sh" >"$LEGACY_GATE"
+chmod +x "$LEGACY_GATE"
+REAL_JQ="$(command -v jq)"
+export REAL_JQ
+cat > "$STUB_BIN/jq" <<'STUB'
+#!/usr/bin/env bash
+# Narrowly model the jq 1.6 behavior behind the live failure: the ledger
+# producer yields no bytes, then jq -e accepts the empty readback pipeline.
+# Host jq 1.7 exits 4 on empty input, so both halves are needed for this
+# regression to kill the old source outside the live container image.
+if [ -n "${STUB_LEDGER_JQ_EMPTY_FILE:-}" ] &&
+   printf '%s' "$*" | grep -qF 'targetSha:$target,freezeSha:$freeze,freezePr:$pr'; then
+  printf 'attempt\n' >> "$STUB_LEDGER_JQ_EMPTY_FILE"
+  exit 0
+fi
+if [ -n "${STUB_LEDGER_JQ_EMPTY_FILE:-}" ] &&
+   printf '%s' "$*" | grep -qF '.runId == $run and .finishedAt == $now'; then
+  STUB_JQ_INPUT="$(cat)"
+  if [ -z "$STUB_JQ_INPUT" ]; then exit 0; fi
+  printf '%s' "$STUB_JQ_INPUT" | "$REAL_JQ" "$@"
+  exit $?
+fi
+exec "$REAL_JQ" "$@"
+STUB
+chmod +x "$STUB_BIN/jq"
+export PATH="$STUB_BIN:$PATH"
+
+reset_stubs() {
+  unset STUB_PR_LIST STUB_PR_VIEW STUB_PR_VIEW_EXIT STUB_PR_FILES STUB_RUN_LIST STUB_RUN_LIST_EXIT \
+        STUB_RUN_LIST_SEQUENCE_FILE STUB_RUN_LIST_SEQUENCE_COUNT STUB_PARENT_SHA \
+        STUB_COMMIT_TREE STUB_BLOB_RESPONSE STUB_TREE_RESPONSE STUB_COMMIT_RESPONSE \
+        STUB_REF_RESPONSE STUB_REF_EXIT STUB_BRANCH_EXISTS STUB_PR_LIST_EXIT \
+        STUB_PR_FILES_EXIT STUB_COMMIT_FILES_BY_SHA STUB_COMMIT_GET_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
+        STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS STUB_DEPLOYS_BY_SERVICE_JSON \
+        STUB_COMPARE_FILES STUB_COMPARE_EXIT STUB_LOCK_PROBE STUB_LOCK_PROBE_FILE \
+        STUB_PARENT_BY_COMMIT STUB_PULL_HEADS STUB_BINDING_EXIT STUB_COMPARE_LOG \
+        STUB_TREES_BY_SHA STUB_TREE_GET_EXIT STUB_TREE_GET_LOG STUB_TREES_FILE \
+        STUB_STATE_PROBE STUB_STATE_PROBE_FILE STUB_SUSPEND_SLEEP STUB_REPO_VIEW_EXIT \
+        STUB_LEDGER_JQ_EMPTY_FILE STUB_SUSPEND_LOG \
+        STUB_FRONTEND_HTML_EXIT STUB_FRONTEND_HTML STUB_BUNDLE_EXIT STUB_BUNDLE_JS \
+        STUB_WAIT_CLOCK_FILE STUB_WAIT_CLOCK_COUNT STUB_WAIT_SLEEP_LOG \
+        SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER \
+        SMOKE_GATE_OWNER SMOKE_GATE_LEASE_TTL_SECONDS SMOKE_JOURNEYS_CATALOGUE SMOKE_GATE_FACTS_STUCK_SECONDS 2>/dev/null || true
+}
+
+fresh_state() {
+  STATE_DIR="$(mktemp -d)"
+  export SMOKE_GATE_STATE_DIR="$STATE_DIR"
+  export SMOKE_GATE_SHARED_ROOT="$TEST_SHARED_ROOT"
+  export SMOKE_GATE_LEASE_DIR="$TEST_SHARED_ROOT/$(basename "$STATE_DIR")/leases"
+  reset_stubs
+}
+sha() { printf "$1%.0s" $(seq 40); }
+# Seeds one handoff-ledger line plus the run-level verdict.json it is a receipt
+# of, in exactly the shapes `finish` writes (5c below proves that against the
+# real `finish`), and registers the GitHub-side target/PR binding for it.
+seed_ledger_receipt() { # <ledger> <run-id> <verdict> <target-sha> <freeze-sha> <freeze-pr>
+  local ledger="$1" run="$2" verdict="$3" target="$4" freeze="$5" pr="$6" now payload digest
+  now="2026-09-01T00:00:00Z"
+  payload="$(jq -cn --arg sha "$freeze" --arg run "$run" --arg verdict "$verdict" --arg now "$now" \
+    '{schemaVersion:1,sha:$sha,runId:$run,verdict:$verdict,finishedAt:$now}')"
+  digest="$(printf '%s' "$payload" | sha256sum | cut -d' ' -f1)"
+  mkdir -p "$STATE_DIR/runs/$run" "$(dirname "$ledger")"
+  printf '%s\n' "$payload" > "$STATE_DIR/runs/$run/verdict.json"
+  jq -cn --arg target "$target" --arg freeze "$freeze" --argjson pr "$pr" --arg run "$run" \
+    --arg verdict "$verdict" --arg now "$now" --arg digest "$digest" \
+    '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,
+      runId:$run,verdict:$verdict,finishedAt:$now,verdictDigest:$digest}' >> "$ledger"
+  [ -n "${STUB_PARENT_BY_COMMIT:-}" ] || STUB_PARENT_BY_COMMIT='{}'
+  [ -n "${STUB_PULL_HEADS:-}" ] || STUB_PULL_HEADS='{}'
+  STUB_PARENT_BY_COMMIT="$(jq -c --arg c "$freeze" --arg t "$target" '.[$c]=$t' <<<"$STUB_PARENT_BY_COMMIT")"
+  STUB_PULL_HEADS="$(jq -c --arg n "$pr" --arg f "$freeze" '.[$n]=$f' <<<"$STUB_PULL_HEADS")"
+  export STUB_PARENT_BY_COMMIT STUB_PULL_HEADS
+}
+# A freeze PR that is ready in every respect a campaign needs: target identity,
+# green CI on the target, both previews live on the marker SHA, healthz 200.
+freeze_ready_fixture() { # <pr> <freeze-sha> <target-sha>
+  export STUB_PR_VIEW="{\"number\":$1,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$2\",\"headRefName\":\"smoke-freeze/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+  export STUB_PR_LIST="[{\"number\":$1,\"headRefOid\":\"$2\",\"headRefName\":\"smoke-freeze/x\"}]"
+  export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
+  export STUB_PARENT_SHA="$3"
+  export STUB_RUN_LIST="[{\"headSha\":\"$3\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+  export STUB_SERVICES="[\
+{\"id\":\"srv-backend-pr-$1\",\"name\":\"WIDGET-API PR #$1\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-$1.onrender.com\"}},\
+{\"id\":\"srv-frontend-pr-$1\",\"name\":\"WIDGET-WEB PR #$1\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://widget-web-pr-$1.onrender.com\"}}]"
+  export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$2\"}}]"
+  export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$2\"}}]"
+  export STUB_HEALTHZ_CODE=200
+}
+expire_lease() { # <lease-file>; no writer is live in these test fixtures
+  local lease_file="$1" tmp="${1}.expired"
+  jq -c '.expiresAt="2000-01-01T00:00:00Z"' "$lease_file" > "$tmp"
+  mv "$tmp" "$lease_file"
+}
+
+if smoke_case 1-misconfig; then
+# --- 1. Misconfig: fail-closed wake, throttled on the immediate next poll --
+fresh_state
+unset SMOKE_GATE_REPO SMOKE_GATE_BACKEND_SERVICE SMOKE_GATE_FRONTEND_SERVICE \
+  SMOKE_GATE_FRONTEND_PREFIX SMOKE_GATE_BACKEND_PREFIX SMOKE_GATE_MIGRATIONS_PREFIX 2>/dev/null || true
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "gate_misconfigured" and
+  (.data.missing | length == 6) and
+  (.data.missing | index("SMOKE_GATE_FRONTEND_PREFIX") != null) and
+  (.data.missing | index("SMOKE_GATE_BACKEND_PREFIX") != null) and
+  (.data.missing | index("SMOKE_GATE_MIGRATIONS_PREFIX") != null)
+' >/dev/null
+# An empty prefix is refused too: `startswith("")` would match every file.
+EMPTY_PREFIX="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base \
+  SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX="" \
+  bash "$GATE" check 7 2>/dev/null || true)"
+jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$EMPTY_PREFIX" >/dev/null
+# ...and so is one without its trailing "/": "api/migrations" also matches "api/migrations-archive/".
+NO_SLASH="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base \
+  SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations \
+  bash "$GATE" check 7 2>/dev/null || true)"
+jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$NO_SLASH" >/dev/null ||
+  { echo "a prefix without its trailing / was accepted: $NO_SLASH" >&2; exit 1; }
+# ...and so is one that is not repository-relative: GitHub file names never start "/", "./" or "../".
+for bad in /api/migrations/ ../api/migrations/ ./api/migrations/ api//migrations/ api/../migrations/; do
+  NOT_REL="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base \
+    SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX="$bad" \
+    bash "$GATE" check 7 2>/dev/null || true)"
+  jq -e '.ok == false and .missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$NOT_REL" >/dev/null ||
+    { echo "a non-relative prefix $bad was accepted: $NOT_REL" >&2; exit 1; }
+done
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_misconfigured" and .observation.kind == "blocked"' >/dev/null
+# W2: a quiet poll's observation is one the task-observation helper accepts,
+# and the gate's own keys are all still there for the controller to read.
+bash "$GATE" poll | python3 -c 'import json,sys; sys.path.insert(0, sys.argv[1]); from task_observation import observation_problem
+d = json.loads(sys.stdin.read().splitlines()[-1])
+assert d["wakeAgent"] is False and d["ok"] is False and d["data"]["trigger"] == "gate_misconfigured", d
+p = observation_problem(d["observation"]); sys.exit("invalid observation: " + p if p else 0)' \
+  "$(dirname "$GATE")/../../task-observation"
+
+# The layout validator runs before mode dispatch, so a verb that never reads
+# the prefixes refuses too: no mode can run with a bad layout.
+for verb in progress release task-claim lease-status challenger-timeout; do
+  T1V="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=/api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/ \
+    bash "$GATE" "$verb" 2>/dev/null || true)"
+  jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_BACKEND_PREFIX"]' <<<"$T1V" >/dev/null ||
+    { echo "1: $verb ran with a bad layout prefix: $T1V" >&2; exit 1; }
+done
+# Equal service prefixes would collapse the two freeze markers into one path.
+T1E="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base \
+  SMOKE_GATE_FRONTEND_PREFIX=src/ SMOKE_GATE_BACKEND_PREFIX=src/ SMOKE_GATE_MIGRATIONS_PREFIX=src/migrations/ \
+  bash "$GATE" check 7 2>/dev/null || true)"
+jq -e '.error == "gate misconfigured" and .missing == ["SMOKE_GATE_FRONTEND_PREFIX","SMOKE_GATE_BACKEND_PREFIX"]' <<<"$T1E" >/dev/null ||
+  { echo "1: equal frontend and backend prefixes were accepted: $T1E" >&2; exit 1; }
+# The freeze helper validates the same way, before it touches GitHub, and names
+# exactly the key at fault: backend, frontend, or both when they are equal.
+while read -r fe be want; do
+  T1F="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_FRONTEND_PREFIX="$fe" SMOKE_GATE_BACKEND_PREFIX="$be" \
+    bash "$(dirname "$GATE")/smoke-freeze-pr.sh" "$(printf 'a%.0s' $(seq 40))" 2>/dev/null)" && T1F_RC=0 || T1F_RC=$?
+  [ "$T1F_RC" -eq 2 ] && jq -e --argjson want "$want" '.ok == false and .missing == $want' <<<"$T1F" >/dev/null ||
+    { echo "1: the freeze helper accepted $fe $be: rc=$T1F_RC $T1F" >&2; exit 1; }
+done <<'CASES'
+web/ ../api/ ["SMOKE_GATE_BACKEND_PREFIX"]
+../web/ api/ ["SMOKE_GATE_FRONTEND_PREFIX"]
+src/ src/ ["SMOKE_GATE_FRONTEND_PREFIX","SMOKE_GATE_BACKEND_PREFIX"]
+CASES
+
+fi
+# --- Common config for every scenario below ---------------------------------
+export SMOKE_GATE_REPO=org/repo
+export SMOKE_GATE_BACKEND_SERVICE=srv-backend-base
+export SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/
+PARENT_SHA="$(sha e)"
+FREEZE_SHA="$(sha f)"
+BASE_SHA="$(sha a)"
+
+if smoke_case 2-4a-settle; then
+# --- 2. No labeled open PRs: quiet idle, no wake ----------------------------
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export STUB_PR_LIST='[]'
+bash "$GATE" poll | jq -e '
+  .wakeAgent == false and .data.trigger == "waiting_for_candidates" and .data.labeledPrCount == 0
+  and .observation.kind == "empty" and .observation.bound == "30m"
+' >/dev/null
+
+# --- 3. Settle happy path: poll claims the run and stamps state ------------
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha b)"
+export STUB_PR_LIST="[{\"number\":42,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-42\",\"name\":\"WIDGET-API PR #42\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-42.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+POLL_OUT="$(bash "$GATE" poll)"
+jq -e --arg sha "$HEAD_SHA" '
+  .wakeAgent == true and .data.trigger == "pr_build_settled" and
+  .data.pr == 42 and .data.sourceSha == $sha and
+  .data.previewUrl == "https://widget-api-pr-42.onrender.com" and
+  .data.isFreezePr == false and .data.ciSha == $sha and
+  .data.recovery == false and .data.abandonedActiveSha == null and
+  .data.campaignSize == "standard" and .data.sizeReason == "no sizing rules" and
+  (.data.runId | test("^smoke-pr42-")) and
+  (.data.coordinatorOwnerToken | test("^owner-[0-9a-f]{64}$"))
+' <<<"$POLL_OUT" >/dev/null
+POLL_RUN="$(jq -r '.data.runId' <<<"$POLL_OUT")"
+POLL_OWNER="$(jq -r '.data.coordinatorOwnerToken' <<<"$POLL_OUT")"
+jq -e --arg sha "$HEAD_SHA" '
+  .activeSha == $sha and .activeRunId != null and .activeLeaseOwner != null and .completedSha == null
+' "$STATE_DIR/pr-42-state.json" >/dev/null
+jq -e --arg owner "$POLL_OWNER" '.owner == $owner' "$SMOKE_GATE_LEASE_DIR/lease-$POLL_RUN.json" >/dev/null
+# Same head, immediately after claiming: already active, no re-wake.
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates" and .observation.kind == "empty"' >/dev/null
+
+# Automatic poll is also a claim producer. Pre-bind every run id it can mint
+# during this short hermetic call; it must refuse before PR lease/authority or
+# private state is written.
+fresh_state
+AUTO_SHA="$(sha d)"
+AUTO_LEGACY_SHA="$(sha e)"
+export SMOKE_GATE_RUN_PREFIX=bound
+export STUB_PR_LIST="[{\"number\":142,\"headRefOid\":\"$AUTO_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$AUTO_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES='[{"id":"srv-backend-pr-142","name":"WIDGET-API PR #142","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://widget-api-pr-142.onrender.com"}}]'
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$AUTO_SHA\"}}]"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"
+AUTO_LEGACY_STATE="$STATE_DIR/legacy-private"
+mkdir -p "$AUTO_LEGACY_STATE"
+AUTO_EPOCH="$(/usr/bin/date -u +%s)"
+AUTO_ISO="$(/usr/bin/date -u -d "@$AUTO_EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
+AUTO_STAMP="$(/usr/bin/date -u -d "@$AUTO_EPOCH" +%Y%m%dT%H%M%SZ)"
+AUTO_RUN="bound-pr142-${AUTO_SHA:0:12}-$AUTO_STAMP"
+AUTO_DATE_BIN="$STUB_BIN/fixed-date-pr"
+mkdir -p "$AUTO_DATE_BIN"
+cat >"$AUTO_DATE_BIN/date" <<STUB
+#!/usr/bin/env bash
+if [ "\$*" = '-u +%s' ]; then printf '%s\n' '$AUTO_EPOCH'
+elif [ "\$*" = '-u +%Y-%m-%dT%H:%M:%SZ' ]; then printf '%s\n' '$AUTO_ISO'
+else exec /usr/bin/date "\$@"
+fi
+STUB
+chmod +x "$AUTO_DATE_BIN/date"
+TEST_PATH="$PATH"
+export PATH="$AUTO_DATE_BIN:$PATH"
+SMOKE_GATE_STATE_DIR="$AUTO_LEGACY_STATE" bash "$LEGACY_GATE" task-claim "$AUTO_RUN" "$AUTO_LEGACY_SHA" owner-legacy >/dev/null
+AUTO_POLL_OUT="$(bash "$GATE" poll)"
+export PATH="$TEST_PATH"
+jq -e '.ok == false and .wakeAgent == true and .data.trigger == "coordinator_lease_unavailable" and
+       (.data.detail.error | test("task-scoped"))' <<<"$AUTO_POLL_OUT" >/dev/null || {
+  echo "automatic PR poll ignored shared task binding: $AUTO_POLL_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/pr-142-state.json" ] && [ ! -e "$SMOKE_GATE_LEASE_DIR/pr-142-authority.json" ]
+jq -e --arg sha "$AUTO_LEGACY_SHA" '.deploySha == $sha and .terminal == null' \
+  "$SMOKE_GATE_LEASE_DIR/task-binding-$AUTO_RUN.json" >/dev/null
+unset SMOKE_GATE_RUN_PREFIX
+
+# --- 3a. Target-aware preflight: the gate exports SMOKE_GATE_PREFLIGHT_TARGET_URL
+# for THIS settle candidate's own preview before invoking PREFLIGHT_CMD — the
+# whole point of routing the check to the right host instead of skipping it
+# or checking a fixed default host, which would prove nothing about this PR's
+# build.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha c)"
+export STUB_PR_LIST="[{\"number\":43,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-43\",\"name\":\"WIDGET-API PR #43\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-43.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+SEEN_URL_FILE="$STATE_DIR/seen-preflight-url.txt"
+export SMOKE_GATE_PREFLIGHT_CMD="printf '%s' \"\$SMOKE_GATE_PREFLIGHT_TARGET_URL\" > $SEEN_URL_FILE"
+bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled"' >/dev/null
+[ "$(cat "$SEEN_URL_FILE")" = "https://widget-api-pr-43.onrender.com" ] \
+  || { echo "expected the preflight command to see this candidate's own preview URL" >&2; cat "$SEEN_URL_FILE" >&2; exit 1; }
+unset SMOKE_GATE_PREFLIGHT_CMD
+
+# --- 3b. A real preflight failure refuses the candidate and reports the
+# command's own last line as the reason, WITHOUT claiming the PR.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha d)"
+export STUB_PR_LIST="[{\"number\":44,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-44\",\"name\":\"WIDGET-API PR #44\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-44.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+export SMOKE_GATE_PREFLIGHT_CMD='echo "seat qa-a@example.com could not be verified"; exit 1'
+# `pr_preflight_failed`, not `preflight_failed`: dispositions are keyed by
+# trigger name and the develop gate owns the only `ack` verb, so a shared name
+# let an ack from here destroy a live develop-gate silence. The fingerprint is
+# gate-scoped for the same reason and must never be the bare reason.
+PF_WAKE="$(bash "$GATE" poll)"
+jq -e '
+  .wakeAgent == true and .data.trigger == "pr_preflight_failed" and
+  (.data.reason | test("could not be verified")) and
+  (.data.fingerprint | startswith("pr|")) and
+  (.data.fingerprint != .data.reason)
+' <<<"$PF_WAKE" >/dev/null
+[ ! -e "$STATE_DIR/pr-44-state.json" ] || jq -e '.activeRunId == null' "$STATE_DIR/pr-44-state.json" >/dev/null
+unset SMOKE_GATE_PREFLIGHT_CMD
+
+# --- 3c. INVARIANT 2, the PR-gate half: the re-arm throttle keys on the
+# gate-computed FINGERPRINT, not the reason string.
+#
+# This suite had NO flap sequence at all — only single-failure and URL-routing
+# preflight cases — so the develop gate's I2c latch mutant was killed on that
+# side and SURVIVED here, in code carrying the identical latch. The sequence
+# that separates the two keyings: alarm on reason A, throttle a CHANGED reason
+# B inside the re-arm floor (the throttled branch persists `.preflightReason`
+# but deliberately NOT `.preflightFingerprint`, so "last seen" and "last
+# alarmed" diverge exactly here), age past the floor, then flap back to A.
+# Keyed on the fingerprint, A is still the last thing we alarmed on and must
+# stay silent. Keyed on the reason, A reads as news and wakes for an incident
+# the operator was already told about, every time the text flaps back.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha e)"
+export STUB_PR_LIST="[{\"number\":45,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-45\",\"name\":\"WIDGET-API PR #45\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-45.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+FLAP_CTL="$STATE_DIR/control.json"
+flap_poll() { SMOKE_GATE_PREFLIGHT_CMD="echo \"$1\"; exit 1" bash "$GATE" poll; }
+# Push the last preflight wake back past the re-arm FLOOR (900s) but nowhere
+# near the ALERT ceiling (21600s), which re-arms unconditionally and would make
+# a fingerprint latch and a reason latch behave identically — i.e. would make
+# this case unable to fail for the reason it claims.
+flap_age() {
+  local t; t="$(date -u -d '@'$(( $(date -u +%s) - 1000 )) +'%Y-%m-%dT%H:%M:%SZ')"
+  jq --arg t "$t" '.preflightWakeAt=$t' "$FLAP_CTL" > "$FLAP_CTL.t" && mv "$FLAP_CTL.t" "$FLAP_CTL"
+}
+flap_poll "3 of 8 QA seats could not be verified" | jq -e '
+  .wakeAgent == true and .data.trigger == "pr_preflight_failed"
+' >/dev/null
+# Changed reason inside the floor: throttled, but the new text IS recorded.
+flap_poll "8 of 8 QA seats could not be verified" | jq -e '.wakeAgent == false and .observation.kind == "blocked"' >/dev/null
+jq -e '.preflightReason == "8 of 8 QA seats could not be verified"' "$FLAP_CTL" >/dev/null
+# Past the floor, flapped BACK to the reason we last alarmed on: still silent.
+flap_age
+flap_poll "3 of 8 QA seats could not be verified" | jq -e '.wakeAgent == false' >/dev/null \
+  || { echo "the pr-gate preflight throttle re-alarmed on a reason it had already alarmed on" >&2; exit 1; }
+# ...and past the floor a genuinely NEW reason still re-arms — the floor delays
+# news, it never suppresses it.
+flap_age
+flap_poll "6 of 8 QA seats could not be verified" | jq -e '
+  .wakeAgent == true and (.data.reason | test("6 of 8"))
+' >/dev/null
+unset SMOKE_GATE_PREFLIGHT_CMD
+
+# --- 3d. Settle payload carries campaignSize/sizeReason through for a LIGHT
+# PR — the coordinator's run record for pr1792 read no campaignSize at all
+# because this field never rode the pr_build_settled wake, even though the
+# gate computed it into $facts; regression for that gap.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+SIZE_RULES="$STATE_DIR/sizing-3d.json"
+cat > "$SIZE_RULES" <<'JSON'
+{"full":["backend/migrations/**"],"lightAllowed":["frontend/**"],"lightDeny":["frontend/auth/**"]}
+JSON
+export SMOKE_SIZING_RULES="$SIZE_RULES"
+HEAD_SHA="$(sha f)"
+export STUB_PR_LIST="[{\"number\":46,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_VIEW="{\"number\":46,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"frontend/a.css"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-46\",\"name\":\"WIDGET-API PR #46\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-46.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+CHECK_OUT="$(bash "$GATE" check 46)"
+CHECK_SIZE="$(jq -r '.campaignSize' <<<"$CHECK_OUT")"
+CHECK_REASON="$(jq -r '.sizeReason' <<<"$CHECK_OUT")"
+[ "$CHECK_SIZE" = "light" ] || { echo "3d setup: expected the fixture itself to classify light, got $CHECK_SIZE" >&2; exit 1; }
+POLL_OUT="$(bash "$GATE" poll)"
+jq -e --arg size "$CHECK_SIZE" --arg reason "$CHECK_REASON" '
+  .wakeAgent == true and .data.trigger == "pr_build_settled" and
+  .data.campaignSize == $size and .data.sizeReason == $reason and
+  .data.campaignSize == "light" and (.data.sizeReason | startswith("light:"))
+' <<<"$POLL_OUT" >/dev/null \
+  || { echo "3d: light campaignSize/sizeReason did not ride the settled wake: $POLL_OUT" >&2; exit 1; }
+unset SMOKE_SIZING_RULES
+
+# --- 3e. Same, for a FULL PR — the migrations-touching case, where campaign
+# size matters most (this is exactly the sizing signal a coordinator needs to
+# scale up review, not just the light-sizing happy path above).
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+SIZE_RULES="$STATE_DIR/sizing-3e.json"
+cat > "$SIZE_RULES" <<'JSON'
+{"full":["backend/migrations/**"],"lightAllowed":["frontend/**"],"lightDeny":["frontend/auth/**"]}
+JSON
+export SMOKE_SIZING_RULES="$SIZE_RULES"
+HEAD_SHA="$(sha 9)"
+export STUB_PR_LIST="[{\"number\":47,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_VIEW="{\"number\":47,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"backend/migrations/0100_add_col.sql"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-47\",\"name\":\"WIDGET-API PR #47\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-47.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+CHECK_OUT="$(bash "$GATE" check 47)"
+CHECK_SIZE="$(jq -r '.campaignSize' <<<"$CHECK_OUT")"
+CHECK_REASON="$(jq -r '.sizeReason' <<<"$CHECK_OUT")"
+[ "$CHECK_SIZE" = "full" ] || { echo "3e setup: expected the fixture itself to classify full, got $CHECK_SIZE" >&2; exit 1; }
+POLL_OUT="$(bash "$GATE" poll)"
+jq -e --arg size "$CHECK_SIZE" --arg reason "$CHECK_REASON" '
+  .wakeAgent == true and .data.trigger == "pr_build_settled" and
+  .data.campaignSize == $size and .data.sizeReason == $reason and
+  .data.campaignSize == "full" and
+  (.data.sizeReason | test("backend/migrations/0100_add_col.sql matched backend/migrations/\\*\\*"))
+' <<<"$POLL_OUT" >/dev/null \
+  || { echo "3e: full campaignSize/sizeReason did not ride the settled wake: $POLL_OUT" >&2; exit 1; }
+unset SMOKE_SIZING_RULES
+
+# --- 4. Deploy-SHA mismatch: check reports not settled, not ready ----------
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha c)"
+STALE_SHA="$(sha d)"
+export STUB_PR_VIEW="{\"number\":7,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-7\",\"name\":\"WIDGET-API PR #7\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-7.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$STALE_SHA\"}}]"
+bash "$GATE" check 7 | jq -e --arg head "$HEAD_SHA" --arg stale "$STALE_SHA" '
+  .eligible == true and .settled == false and .backendReady == false and
+  .backendDeploySha == $stale and .headSha == $head
+' >/dev/null
+
+# --- 4a. `static` preview provider: each preview's URL comes from its
+# *_SERVICE template, its deploy identity is the SHA it serves at /version, a
+# configured health path replaces /healthz, and Render's API is never called.
+fresh_state
+HEAD_SHA="$(sha 4)"
+export STUB_PR_VIEW="{\"number\":48,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_HEALTHZ_CODE=200 STUB_CURL_LOG="$STATE_DIR/curl-4a.log"
+# A static template with no placeholder cannot name a PR's preview: misconfigured.
+T4A="$(SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_BACKEND_SERVICE='https://api.example.test' \
+  SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-{pr}.example.test' bash "$GATE" check 48 2>/dev/null || true)"
+jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_BACKEND_SERVICE"]' <<<"$T4A" >/dev/null ||
+  { echo "4a: a placeholder-less static template was accepted: $T4A" >&2; exit 1; }
+T4A="$(SMOKE_PREVIEW_PROVIDER=heroku bash "$GATE" check 48 2>/dev/null || true)"
+jq -e '.ok == false and .missing == ["SMOKE_PREVIEW_PROVIDER"]' <<<"$T4A" >/dev/null ||
+  { echo "4a: an unknown provider was accepted: $T4A" >&2; exit 1; }
+static_check() {
+  SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_HEALTH_PATH=/healthz/ready \
+    SMOKE_GATE_BACKEND_SERVICE='https://api-pr-{pr}.example.test' \
+    SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-{pr}.example.test' bash "$GATE" check 48
+}
+T4A="$(STUB_VERSION_JSON="{\"sha\":\"$HEAD_SHA\"}" static_check)"
+jq -e --arg head "$HEAD_SHA" '
+  .settled == true and .backendReady == true and .backendDeploySha == $head and
+  .backendPreviewUrl == "https://api-pr-48.example.test" and
+  .frontendPreviewUrl == "https://web-pr-48.example.test"' <<<"$T4A" >/dev/null ||
+  { echo "4a: a static preview serving the head did not settle: $T4A" >&2; exit 1; }
+grep -qF 'https://api-pr-48.example.test/healthz/ready' "$STUB_CURL_LOG" ||
+  { echo "4a: the configured health path was not probed" >&2; exit 1; }
+! grep -qF 'api.render.com' "$STUB_CURL_LOG" || { echo "4a: the static provider called Render" >&2; exit 1; }
+# A preview serving another commit, or naming none, is not ready.
+T4A="$(STUB_VERSION_JSON="{\"sha\":\"$(sha 5)\"}" static_check)"
+jq -e '.settled == false and .backendReady == false' <<<"$T4A" >/dev/null ||
+  { echo "4a: a static preview serving a stale commit settled: $T4A" >&2; exit 1; }
+T4A="$(STUB_VERSION_JSON='{"sha":"short"}' static_check)"
+jq -e '.settled == false and .backendReady == false' <<<"$T4A" >/dev/null ||
+  { echo "4a: a malformed served sha settled: $T4A" >&2; exit 1; }
+# `{branch}` is the PR head as a host alias: lowercased, non-alphanumerics "-".
+T4A="$(STUB_VERSION_JSON="{\"sha\":\"$HEAD_SHA\"}" SMOKE_PREVIEW_PROVIDER=static \
+  SMOKE_GATE_BACKEND_SERVICE='https://{branch}.api.example.test' \
+  SMOKE_GATE_FRONTEND_SERVICE='https://{branch}.web.example.test' bash "$GATE" check 48)"
+jq -e '.settled == true and .backendPreviewUrl == "https://feature-x.api.example.test"' <<<"$T4A" >/dev/null ||
+  { echo "4a: a {branch} template did not resolve to the head alias: $T4A" >&2; exit 1; }
+# The alias comes from the head ref `check` already fetched. When no head ref
+# can be had, the fetch fails (fetchOk:false) instead of reading as a missing preview.
+T4A="$(STUB_PR_VIEW="$(jq -c 'del(.headRefName)' <<<"$STUB_PR_VIEW")" STUB_VERSION_JSON="{\"sha\":\"$HEAD_SHA\"}" \
+  SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_BACKEND_SERVICE='https://{branch}.api.example.test' \
+  SMOKE_GATE_FRONTEND_SERVICE='https://{branch}.web.example.test' bash "$GATE" check 48)"
+jq -e '.fetchOk == false and .settled == false' <<<"$T4A" >/dev/null ||
+  { echo "4a: an unresolvable {branch} alias read as an absent preview: $T4A" >&2; exit 1; }
+# A placeholder outside the host or path still yields no URL: refused.
+for bad in 'http{pr}://api.example.test' '{branch}https://api.example.test'; do
+  T4A="$(SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_BACKEND_SERVICE="$bad" \
+    SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-{pr}.example.test' bash "$GATE" check 48 2>/dev/null || true)"
+  jq -e '.missing == ["SMOKE_GATE_BACKEND_SERVICE"]' <<<"$T4A" >/dev/null ||
+    { echo "4a: a template with a misplaced placeholder was accepted ($bad): $T4A" >&2; exit 1; }
+done
+unset STUB_CURL_LOG
+
+fi
+if smoke_case 5-5b-freeze-range; then
+# --- 5. Freeze-PR: CI checked on the PARENT sha, not the marker head; range
+# facts come from campaignRange = validated-GO baseline ... target.
+# A freeze target sits ON the tracked branch, so the old `compare/develop...
+# target` was empty for every freeze (5d pins the API's real answer to that
+# call shape). The three fixtures that used to live here hand-set
+# `"status":"ahead"` on that call — a response GitHub cannot return for it —
+# which is how the oracle passed while production compared nothing. `ahead`
+# is only realistic for baseline...target, and STUB_COMPARE_LOG proves that
+# is the range actually requested.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+export STUB_PR_VIEW="{\"number\":9,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
+export STUB_PARENT_SHA="$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":3,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+export STUB_COMPARE_LOG="$STATE_DIR/compare.log"
+export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"pr-title-check\"}]"
+T5_OUT="$(bash "$GATE" check 9)"
+jq -e --arg parent "$PARENT_SHA" --arg head "$FREEZE_SHA" --arg base "$BASE_SHA" '
+  .isFreezePr == true and .ciSha == $parent and .ciReady == true and
+  .migrationsTouched == false and .frontendTouched == false and .headSha == $head and
+  .migrationsDeterminable == true and .migrationFiles == [] and .migrationsInRange == [] and
+  .campaignRange.baselineSha == $base and .campaignRange.targetSha == $parent and
+  .campaignRange.determinable == true and .campaignRange.reason == null and
+  .campaignRange.baselineRunId == "run-go-base"
+' <<<"$T5_OUT" >/dev/null || { echo "5: freeze range facts wrong: $T5_OUT" >&2; exit 1; }
+[ "$(cat "$STUB_COMPARE_LOG")" = "$BASE_SHA...$PARENT_SHA" ] ||
+  { echo "5: compared the wrong range: $(cat "$STUB_COMPARE_LOG")" >&2; exit 1; }
+# `check` is read-only: it never pins.
+[ ! -e "$STATE_DIR/pr-9-state.json" ]
+
+# --- 5a. INTENTIONAL POLICY CHANGE. A freeze whose range carries a migration
+# used to be refused outright (MG-1, migration 222, 2026-08-24). It now
+# SETTLES when it is otherwise ready: the migration is a fact about campaign
+# scope, reported by name, and the failure MG-1 was about — a backend that
+# cannot boot — is caught by backendReady/healthz (5a-ii), not by refusing
+# every migration-bearing range forever. No pr_migrations_refused alarm.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+PARENT_SHA="$(sha e)"
+FREEZE_SHA="$(sha f)"
+BASE_SHA="$(sha a)"
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 10 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":2,"behind_by":0,"files":[{"filename":"api/migrations/222_undo_edit_prior_actor.sql"},{"filename":"api/src/other.ts"}]}'
+T5A_OUT="$(bash "$GATE" check 10)"
+jq -e '
+  .isFreezePr == true and .migrationsTouched == true and .settled == true and .fetchOk == true and
+  .migrationsDeterminable == true and
+  .migrationFiles == ["api/migrations/222_undo_edit_prior_actor.sql"] and
+  .migrationsInRange == ["api/migrations/222_undo_edit_prior_actor.sql"] and
+  .campaignRange.determinable == true
+' <<<"$T5A_OUT" >/dev/null || { echo "5a: a ready migration-bearing freeze did not settle: $T5A_OUT" >&2; exit 1; }
+T5A_POLL="$(bash "$GATE" poll)"
+jq -e --arg base "$BASE_SHA" --arg parent "$PARENT_SHA" '
+  .wakeAgent == true and .data.trigger == "pr_build_settled" and .data.pr == 10 and
+  .data.isFreezePr == true and
+  .data.campaignRange.baselineSha == $base and .data.campaignRange.targetSha == $parent and
+  .data.campaignRange.determinable == true and
+  .data.migrationsInRange == ["api/migrations/222_undo_edit_prior_actor.sql"]
+' <<<"$T5A_POLL" >/dev/null || { echo "5a: poll did not settle the freeze with its range: $T5A_POLL" >&2; exit 1; }
+jq -e '.refusedAlertSha == null' "$STATE_DIR/pr-10-state.json" >/dev/null
+# 5a-list. SMOKE_GATE_MIGRATIONS_PREFIX may list several trees: a file under
+# ANY of them is a migration, and the single-tree result above is unchanged.
+fresh_state
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 10 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":3,"behind_by":0,"files":[{"filename":"api/migrations/222_undo_edit_prior_actor.sql"},{"filename":"data/migrations/043_sheet.sql"},{"filename":"data/seed.sql"}]}'
+T5L_OUT="$(SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/,data/migrations/ bash "$GATE" check 10)"
+jq -e '.migrationsTouched == true and .settled == true and
+  .migrationFiles == ["api/migrations/222_undo_edit_prior_actor.sql","data/migrations/043_sheet.sql"] and
+  .migrationsInRange == .migrationFiles' <<<"$T5L_OUT" >/dev/null ||
+  { echo "5a-list: a file under the second migrations tree was not a migration: $T5L_OUT" >&2; exit 1; }
+for bad in 'api/migrations/,' 'api/migrations/,,data/migrations/' 'api/migrations/,api/migrations/' 'api/migrations/,web/' 'api/migrations/,/data/'; do
+  T5L_BAD="$(SMOKE_GATE_MIGRATIONS_PREFIX="$bad" bash "$GATE" check 10 2>/dev/null || true)"
+  jq -e '.error == "gate misconfigured" and (.missing | index("SMOKE_GATE_MIGRATIONS_PREFIX") != null)' <<<"$T5L_BAD" >/dev/null ||
+    { echo "5a-list: a bad migrations list $bad was accepted: $T5L_BAD" >&2; exit 1; }
+done
+T5L_FE="$(SMOKE_GATE_FRONTEND_PREFIX=web/,site/ bash "$GATE" check 10 2>/dev/null || true)"
+jq -e '.missing == ["SMOKE_GATE_FRONTEND_PREFIX"]' <<<"$T5L_FE" >/dev/null ||
+  { echo "5a-list: the frontend prefix, which names one freeze marker, accepted a list: $T5L_FE" >&2; exit 1; }
+# 5a-ii. What still blocks: the MG-1 failure itself. Same freeze, but the
+# backend never came healthy — not settled, whatever the range says.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 10 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":2,"behind_by":0,"files":[{"filename":"api/migrations/222_undo_edit_prior_actor.sql"}]}'
+export STUB_HEALTHZ_CODE=503
+bash "$GATE" check 10 | jq -e '.settled == false and .healthzReady == false' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null
+export STUB_HEALTHZ_CODE=200
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$(sha 0)\"}}]"
+bash "$GATE" check 10 | jq -e '.settled == false and .backendReady == false' >/dev/null
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$FREEZE_SHA\"}}]"
+export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$(sha 0)\"}}]"
+bash "$GATE" check 10 | jq -e '.settled == false and .frontendReady == false' >/dev/null
+export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$FREEZE_SHA\"}}]"
+export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"failure\",\"workflowName\":\"CI\"}]"
+bash "$GATE" check 10 | jq -e '.settled == false and .ciReady == false' >/dev/null
+# Missing target identity: still fetchOk:false, still never settles. The
+# head commit is the one record that says what a head is (freeze_head_probe:
+# its files AND its parent come from the same response), so "the target
+# cannot be determined" means that commit could not be read at all — nothing
+# is known, not even that this is a freeze — and a commit with no parent is a
+# root commit, not a freeze.
+export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_COMMIT_GET_EXIT=1
+bash "$GATE" check 10 | jq -e '
+  .settled == false and .fetchOk == false and .isFreezePr == false and (has("campaignRange") | not)
+' >/dev/null
+unset STUB_COMMIT_GET_EXIT
+export STUB_PARENT_SHA=''
+
+# --- 5b. An unreadable range is UNKNOWN, never "no migrations" — and it no
+# longer poisons readiness. Before, a failed compare cleared fetchOk, which
+# clamps `settled` in check and skips the candidate in poll: with a range that
+# can legitimately stay unknown (>=300 files) that is "never runs again".
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 12 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_EXIT=1
+T5B_OUT="$(bash "$GATE" check 12)"
+jq -e --arg base "$BASE_SHA" '
+  .isFreezePr == true and .migrationsTouched == true and .frontendTouched == true and
+  .migrationsDeterminable == false and .migrationFiles == [] and .migrationsInRange == null and
+  .campaignRange.baselineSha == $base and .campaignRange.determinable == false and
+  .campaignRange.reason == "the baseline...target comparison could not be fetched" and
+  .campaignSize == "full" and
+  .sizeReason == "full: the baseline...target comparison could not be fetched" and
+  .fetchOk == true and .settled == true
+' <<<"$T5B_OUT" >/dev/null || { echo "5b: compare fetch failure: $T5B_OUT" >&2; exit 1; }
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "pr_build_settled" and .data.campaignSize == "full" and
+  .data.campaignRange.determinable == false and .data.migrationsInRange == null
+' >/dev/null
+export STUB_COMPARE_EXIT=0
+
+fi
+# --- 5c..5j share one ready freeze and vary only the ledger / the compare ----
+range_case() { # <label> <jq-assertion over `check`>; expects fixture env already set
+  local out
+  out="$(bash "$GATE" check 13)"
+  jq -e --arg base "$BASE_SHA" --arg parent "$PARENT_SHA" "$2" <<<"$out" >/dev/null ||
+    { echo "$1: $out" >&2; exit 1; }
+}
+UNKNOWN_RANGE='.campaignRange.determinable == false and .migrationsInRange == null and
+  .migrationsDeterminable == false and .migrationsTouched == true and
+  .campaignSize == "full" and .fetchOk == true and .settled == true'
+
+if smoke_case 5c-5i-baseline; then
+# --- 5c. Producer -> reader: the receipt the REAL `finish` writes validates,
+# and a later BLOCKED on the very same target/PR does not unseat that GO
+# (BLOCKED asserts nothing about the build). NO_GO / BLOCKED on a NEWER target
+# never advance the baseline either.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_PUBLISH_FILE="$STATE_DIR/dev-gate/latest-verdict.json" \
+  SMOKE_GATE_HOLD_FILE="$STATE_DIR/dev-gate/develop-hold.json" \
+  SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+GO_FREEZE="$(sha b)"
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
+export STUB_PARENT_SHA="$BASE_SHA"
+bash "$GATE" claim run-real-go 5 "$GO_FREEZE" >/dev/null
+bash "$GATE" finish "$GO_FREEZE" run-real-go GO | jq -e '.ok == true and .handoff.written == true' >/dev/null
+bash "$GATE" claim run-real-blocked 5 "$GO_FREEZE" >/dev/null
+bash "$GATE" finish "$GO_FREEZE" run-real-blocked BLOCKED | jq -e '.ok == true' >/dev/null
+LATER_SHA="$(sha c)"
+export STUB_PARENT_SHA="$LATER_SHA"
+bash "$GATE" claim run-real-nogo 6 "$(sha d)" >/dev/null
+bash "$GATE" finish "$(sha d)" run-real-nogo NO_GO | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim run-real-blocked2 6 "$(sha d)" >/dev/null
+bash "$GATE" finish "$(sha d)" run-real-blocked2 BLOCKED | jq -e '.ok == true' >/dev/null
+[ "$(wc -l < "$SMOKE_GATE_HANDOFF_LEDGER")" -eq 4 ]
+tail -1 "$SMOKE_GATE_HANDOFF_LEDGER" | jq -e --arg t "$LATER_SHA" '.verdict == "BLOCKED" and .targetSha == $t' >/dev/null
+export STUB_PARENT_BY_COMMIT="{\"$GO_FREEZE\":\"$BASE_SHA\"}" STUB_PULL_HEADS="{\"5\":\"$GO_FREEZE\"}"
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+range_case 5c '.campaignRange.baselineSha == $base and .campaignRange.baselineRunId == "run-real-go" and
+  .campaignRange.determinable == true and .migrationsInRange == [] and .settled == true'
+
+# --- 5d. The call shape production used, answered the way the API really
+# answers it: an ancestor-or-equal head is `behind`, zero files. That must
+# never again read as migrationsTouched:false / determinable:true. Same for
+# diverged, and for `identical` when the SHAs are not in fact the same.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"behind","ahead_by":0,"behind_by":4,"files":[]}'
+range_case 5d-behind "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"not strictly ahead.*behind\"))"
+export STUB_COMPARE_FILES='{"status":"diverged","ahead_by":2,"behind_by":1,"files":[{"filename":"api/src/other.ts"}]}'
+range_case 5d-diverged "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"diverged\"))"
+export STUB_COMPARE_FILES='{"status":"identical","ahead_by":0,"behind_by":0,"files":[]}'
+range_case 5d-identical-but-different "$UNKNOWN_RANGE"
+# `ahead` with an EMPTY list is not a confirmed empty range either.
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":2,"behind_by":0,"files":[]}'
+range_case 5d-ahead-empty "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"empty although\"))"
+# Malformed: no status / files not an array / a non-object body.
+export STUB_COMPARE_FILES='{"files":[{"filename":"api/src/other.ts"}]}'
+range_case 5d-malformed-nostatus "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"malformed\"))"
+export STUB_COMPARE_FILES='{"status":"ahead","behind_by":0,"files":"nope"}'
+range_case 5d-malformed-files "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"malformed\"))"
+export STUB_COMPARE_FILES='[]'
+range_case 5d-malformed-body "$UNKNOWN_RANGE"
+# A renamed/removed migration still counts: previous_filename sizes, filename names it.
+export SMOKE_SIZING_RULES="$STATE_DIR/rules.json"
+printf '%s' '{"full":["api/migrations/**"],"lightAllowed":["web/**"]}' > "$SMOKE_SIZING_RULES"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"web/src/moved.sql","previous_filename":"api/migrations/9_x.sql","status":"renamed"}]}'
+range_case 5d-renamed '.campaignRange.determinable == true and .campaignSize == "full" and
+  (.sizeReason | test("api/migrations/9_x.sql")) and
+  .migrationsTouched == true and .migrationsDeterminable == true and
+  .migrationsInRange == ["api/migrations/9_x.sql"] and .migrationFiles == .migrationsInRange and
+  .frontendTouched == true'
+# ...and the mirror image: moved OUT of the frontend prefix still reads frontendTouched.
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"docs/moved.tsx","previous_filename":"web/src/moved.tsx","status":"renamed"}]}'
+range_case 5d-renamed-frontend '.frontendTouched == true and .migrationsTouched == false and .migrationsInRange == []'
+unset SMOKE_SIZING_RULES
+
+# --- 5e. Identical: target IS the certified baseline. The one legitimately
+# empty range — determinable, [] (not null), and no compare is even requested.
+export STUB_COMPARE_LOG="$STATE_DIR/compare-identical.log"
+export STUB_COMPARE_FILES='{"status":"behind","ahead_by":0,"behind_by":9,"files":[]}'
+freeze_ready_fixture 13 "$FREEZE_SHA" "$BASE_SHA"
+range_case 5e '.campaignRange.baselineSha == $base and .campaignRange.targetSha == $base and
+  .campaignRange.determinable == true and .campaignRange.reason == null and
+  .migrationsInRange == [] and .migrationsTouched == false and .migrationsDeterminable == true and
+  .settled == true'
+[ ! -e "$STUB_COMPARE_LOG" ] || { echo "5e: an identical range still hit the compare API" >&2; exit 1; }
+unset STUB_COMPARE_LOG
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+
+# --- 5f. >=300 files. The compare endpoint caps `.files` at 300 (its paging
+# pages commits, not files), so at the cap the list is incomplete — but that
+# is an artifact of the endpoint, not real uncertainty. The file list then
+# comes from the two recursive trees: determinable, COMPLETE, and it names
+# migrations the capped compare list never showed. Live case: the first freeze
+# after the pinned GO spans 613 files, and would otherwise be unknown forever.
+CAPPED_COMPARE="$(python3 -c 'import json; print(json.dumps({"status":"ahead","ahead_by":40,"behind_by":0,"files":[{"filename": f"api/src/f{i}.ts"} for i in range(300)]}))')"
+tree_fixture() { # <n-changed> <truncated> -> STUB_TREES_BY_SHA for BASE_SHA / PARENT_SHA
+  STUB_TREES_BY_SHA="$(python3 - "$BASE_SHA" "$PARENT_SHA" "$1" "$2" <<'PYF'
+import json, sys
+base, target, n, truncated = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == "true"
+blob = lambda p, s, mode="100644": {"path": p, "type": "blob", "mode": mode, "sha": s}
+same = [blob("README.md", "s0"), blob("api/src/same.ts", "s1"),
+        {"path": "api/src", "type": "tree", "mode": "040000", "sha": "t-will-differ"}]
+a = same + [blob(f"api/src/f{i}.ts", f"a{i}") for i in range(n)]
+b = [dict(e) for e in same] + [blob(f"api/src/f{i}.ts", f"b{i}") for i in range(n)]
+b[2]["sha"] = "t-differs"                       # a changed DIRECTORY entry is not a file
+a += [blob("api/migrations/9_old_name.sql", "m9"), blob("api/src/removed.ts", "r1")]
+a += [blob("scripts/run.sh", "x1"), {"path": "vendor/lib", "type": "commit", "mode": "160000", "sha": "c1"}]
+b += [blob("scripts/run.sh", "x1", "100755"),              # chmod only: SAME blob sha, new mode
+      {"path": "vendor/lib", "type": "commit", "mode": "160000", "sha": "c2"}]  # submodule bump
+b += [blob("web/src/9_new_name.sql", "m9"),       # rename: same blob, both paths change
+      blob("api/migrations/301_added.sql", "m301")]
+print(json.dumps({base: {"sha": base, "truncated": False, "tree": a},
+                  target: {"sha": target, "truncated": truncated, "tree": b}}))
+PYF
+)"
+  export STUB_TREES_BY_SHA
+}
+export STUB_COMPARE_FILES="$CAPPED_COMPARE"
+export STUB_TREE_GET_LOG="$STATE_DIR/tree-get.log"
+tree_fixture 400 false
+range_case 5f-tree '.campaignRange.determinable == true and .campaignRange.reason == null and
+  .campaignRange.fileListMethod == "tree" and .fetchOk == true and .settled == true and
+  .migrationsTouched == true and .migrationsDeterminable == true and .frontendTouched == true and
+  .migrationsInRange == ["api/migrations/301_added.sql","api/migrations/9_old_name.sql"] and
+  .migrationFiles == .migrationsInRange'
+[ "$(sort "$STUB_TREE_GET_LOG" | tr '\n' ' ')" = "$(printf '%s\n%s\n' "$BASE_SHA" "$PARENT_SHA" | sort | tr '\n' ' ')" ] ||
+  { echo "5f: tree diff did not fetch exactly baseline+target: $(cat "$STUB_TREE_GET_LOG")" >&2; exit 1; }
+# The rename shows BOTH sides, so sizing still sees the path it moved OUT of;
+# unchanged blobs and the changed directory entry are not files in the range.
+export SMOKE_SIZING_RULES="$STATE_DIR/rules-tree.json"
+printf '%s' '{"full":["api/migrations/9_old_name.sql"],"lightAllowed":["web/**"]}' > "$SMOKE_SIZING_RULES"
+range_case 5f-tree-rename '.campaignSize == "full" and (.sizeReason | test("9_old_name.sql"))'
+# Full entry identity, not path->blob-sha: a chmod-only change (same blob sha)
+# and a submodule bump (`commit` entry) are both in the list. Each is made the
+# ONLY `full` trigger in turn, so `full` can only come from that one path.
+printf '%s' '{"full":["scripts/run.sh"],"lightAllowed":["**"]}' > "$SMOKE_SIZING_RULES"
+range_case 5f-tree-chmod '.campaignSize == "full" and (.sizeReason | test("scripts/run.sh"))'
+printf '%s' '{"full":["vendor/lib"],"lightAllowed":["**"]}' > "$SMOKE_SIZING_RULES"
+range_case 5f-tree-submodule '.campaignSize == "full" and (.sizeReason | test("vendor/lib"))'
+# Control: an UNCHANGED blob and the changed directory entry never trigger.
+printf '%s' '{"full":["README.md","api/src"],"lightAllowed":["**"]}' > "$SMOKE_SIZING_RULES"
+range_case 5f-tree-unchanged '.campaignRange.determinable == true and .campaignSize != "full"'
+unset SMOKE_SIZING_RULES
+# Below the cap the compare list is used as-is and no tree is fetched.
+rm -f "$STUB_TREE_GET_LOG"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+range_case 5f-compare '.campaignRange.determinable == true and .campaignRange.fileListMethod == "compare"'
+[ ! -e "$STUB_TREE_GET_LOG" ] || { echo "5f: an uncapped compare still fetched trees" >&2; exit 1; }
+export STUB_COMPARE_FILES="$CAPPED_COMPARE"
+# Truncated tree / tree fetch failure / malformed tree: unknown, full, still settles.
+tree_fixture 400 true
+range_case 5f-tree-truncated "$UNKNOWN_RANGE and .campaignRange.fileListMethod == null and
+  (.campaignRange.reason | test(\"target tree is truncated\"))"
+tree_fixture 400 false
+export STUB_TREE_GET_EXIT=1
+range_case 5f-tree-fetch-failed "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"tree could not be fetched\"))"
+export STUB_TREE_GET_EXIT=0
+export STUB_TREES_BY_SHA='{}'
+range_case 5f-tree-malformed "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"tree is malformed\"))"
+# Incomplete or unknown entry identities fail CLOSED. A migration entry with no
+# sha on either side used to compare "" == "" and vanish as unchanged while
+# another changed file kept the range determinable; an unknown type was dropped.
+tree_fixture 400 false
+T5F_GOOD_TREES="$STUB_TREES_BY_SHA"
+export STUB_TREES_BY_SHA="$(jq -c 'map_values(.tree += [{"path":"api/migrations/777_nosha.sql","type":"blob","mode":"100644"}])' <<<"$T5F_GOOD_TREES")"
+range_case 5f-tree-entry-no-sha "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"tree is malformed\"))"
+export STUB_TREES_BY_SHA="$(jq -c 'map_values(.tree += [{"path":"api/x","type":"blob","sha":"s9"}])' <<<"$T5F_GOOD_TREES")"
+range_case 5f-tree-entry-no-mode "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"tree is malformed\"))"
+export STUB_TREES_BY_SHA="$(jq -c --arg t "$PARENT_SHA" '.[$t].tree += [{"path":"api/y","type":"symlinkish","mode":"120000","sha":"s8"}]' <<<"$T5F_GOOD_TREES")"
+range_case 5f-tree-entry-unknown-type "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"target tree is malformed\"))"
+export STUB_TREES_BY_SHA="$T5F_GOOD_TREES"
+range_case 5f-tree-entries-control '.campaignRange.determinable == true and .campaignRange.fileListMethod == "tree"'
+# The wake carries the tree-derived range too. Last in 5f on purpose: a settled
+# poll PINS the range for this head, after which `check` stops recomputing.
+tree_fixture 400 false
+# The wake carries the tree-derived range too.
+bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and
+  .data.campaignRange.fileListMethod == "tree" and (.data.migrationsInRange | length) == 2' >/dev/null
+unset STUB_TREES_BY_SHA STUB_TREE_GET_LOG
+unset -f tree_fixture
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+
+# --- 5g. No validated GO: no ledger configured, an empty one, and one that
+# holds only non-GO verdicts. Unknown range, full, still settles.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+range_case 5g-unconfigured "$UNKNOWN_RANGE and .campaignRange.baselineSha == null and
+  (.campaignRange.reason | test(\"no handoff ledger\"))"
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-nogo NO_GO "$BASE_SHA" "$(sha b)" 5
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-hd HUMAN_DECISION "$BASE_SHA" "$(sha b)" 5
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-bl BLOCKED "$BASE_SHA" "$(sha b)" 5
+range_case 5g-no-go "$UNKNOWN_RANGE and .campaignRange.baselineSha == null and
+  (.campaignRange.reason | test(\"no GO entry\"))"
+
+# --- 5h. Invalid receipts are skipped for the next-older GO, never trusted.
+# Oldest line is the one genuine GO; every newer GO line is bad in one way.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+FORGED_SHA="$(sha 9)"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+# (i) no verdict.json behind the digest at all
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-nofile GO "$FORGED_SHA" "$(sha 1)" 21
+rm -f "$STATE_DIR/runs/run-go-nofile/verdict.json"
+# (ii) digest does not match the verdict.json on disk
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-baddigest GO "$FORGED_SHA" "$(sha 2)" 22
+jq -c '.finishedAt="2026-09-02T00:00:00Z"' "$STATE_DIR/runs/run-go-baddigest/verdict.json" > "$STATE_DIR/runs/run-go-baddigest/v.tmp"
+mv "$STATE_DIR/runs/run-go-baddigest/v.tmp" "$STATE_DIR/runs/run-go-baddigest/verdict.json"
+# (iii) a genuine NO_GO receipt relabelled GO on the ledger line only
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-nogo-relabelled NO_GO "$FORGED_SHA" "$(sha 3)" 23
+sed -i '$ s/"verdict":"NO_GO"/"verdict":"GO"/' "$SMOKE_GATE_HANDOFF_LEDGER"
+# (iv) a genuine GO receipt whose line was RE-POINTED at another target: the
+# digest still validates (it never covered targetSha) — only the binding
+# (freeze commit's parent) catches it.
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-repointed GO "$(sha 8)" "$(sha 4)" 24
+sed -i "\$ s/\"targetSha\":\"$(sha 8)\"/\"targetSha\":\"$FORGED_SHA\"/" "$SMOKE_GATE_HANDOFF_LEDGER"
+# (v) a genuine GO receipt attributed to a PR whose head is a different commit
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-wrongpr GO "$FORGED_SHA" "$(sha 6)" 25
+export STUB_PULL_HEADS="$(jq -c --arg other "$(sha 7)" '.["25"]=$other' <<<"$STUB_PULL_HEADS")"
+# (vi) torn / malformed trailing lines never abort the scan
+printf '%s\n' '{"verdict":"GO","targetSha":"short","runId":"../../etc"}' '{"verdict":"GO"' >> "$SMOKE_GATE_HANDOFF_LEDGER"
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+range_case 5h '.campaignRange.baselineSha == $base and .campaignRange.baselineRunId == "run-go-base" and
+  .campaignRange.determinable == true'
+
+# --- 5i. The binding could not be FETCHED: not the same as invalid. Nothing
+# older is substituted and nothing is assumed — range unknown, full, and the
+# answer is not pinned by an unsettled look.
+export STUB_BINDING_EXIT=1
+range_case 5i "$UNKNOWN_RANGE and .campaignRange.baselineSha == null and
+  .campaignRange.baselineResolved == false and (.campaignRange.reason | test(\"could not be fetched\"))"
+export STUB_BINDING_EXIT=0
+
+fi
+if smoke_case 5j-range-pin; then
+# --- 5j. The WHOLE range result is pinned at the first settled poll of a
+# freeze head, and every later poll / check / recovery wake of that head reads
+# the pin instead of recomputing. RANGE_VIEW is every range-derived fact.
+RANGE_VIEW='{campaignRange,migrationsInRange,migrationsTouched,frontendTouched,migrationFiles,migrationsDeterminable,campaignSize,sizeReason}'
+# Pins live beside the leases on the SHARED root, repo-qualified — never under
+# a coordinator's private state dir.
+pin_file() { printf '%s/range-pin-org__repo-pr-%s-%s.json' "$SMOKE_GATE_LEASE_DIR" "$1" "$2"; }
+recover_run() { # <run-id> -> the recovery wake for that run
+  expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$1.json"
+  SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll
+}
+# 5j-i. Determinable at the first settled poll. Afterwards a newer validated GO
+# lands (this campaign's own GO would do the same), the API starts returning a
+# DIFFERENT list (now with a migration) and the sizing rules change. Nothing
+# range-derived moves, byte for byte.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export SMOKE_SIZING_RULES="$STATE_DIR/rules-pin.json"
+printf '%s' '{"full":["api/migrations/**"],"lightAllowed":["web/**"]}' > "$SMOKE_SIZING_RULES"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+# `check` before any poll computes and pins nothing.
+range_case 5j-check-before '.campaignRange.baselinePinned == false'
+[ ! -e "$STATE_DIR/pr-13-state.json" ] || { echo "5j: check wrote PR state" >&2; exit 1; }
+T5J_FIRST="$(bash "$GATE" poll)"
+jq -e --arg base "$BASE_SHA" '.data.trigger == "pr_build_settled" and .data.recovery == false and
+  .data.campaignRange.baselineSha == $base and .data.campaignRange.determinable == true and
+  .data.campaignSize == "standard" and .data.migrationsInRange == []' <<<"$T5J_FIRST" >/dev/null ||
+  { echo "5j: first poll: $T5J_FIRST" >&2; exit 1; }
+T5J_RUN="$(jq -r '.data.runId' <<<"$T5J_FIRST")"
+jq -e --arg base "$BASE_SHA" --arg head "$FREEZE_SHA" '
+  .headSha == $head and .campaignRange.baselineSha == $base and
+  .campaignRange.baselineRunId == "run-go-base" and
+  .rangePaths == ["api/src/other.ts"] and
+  .campaignSize == "standard" and (.pinnedAt | type == "string")' "$(pin_file 13 "$FREEZE_SHA")" >/dev/null ||
+  { echo "5j: pin record wrong: $(cat "$(pin_file 13 "$FREEZE_SHA")")" >&2; exit 1; }
+# The pin lives in its own per-head file on the shared root: not in a slot of
+# the mutable PR state, and nowhere under the private state dir.
+[ -z "$(find "$STATE_DIR" -name '*range-pin*' -print -quit)" ]
+jq -e '(has("campaignRangePin") or has("campaignBaseline")) | not' "$STATE_DIR/pr-13-state.json" >/dev/null
+T5J_VIEW="$(bash "$GATE" check 13 | jq -c "$RANGE_VIEW")"
+jq -e '.campaignRange.baselinePinned == true' <<<"$T5J_VIEW" >/dev/null
+# The wake and the pinned view agree on everything but the pinned flag itself.
+[ "$(jq -c '.data.campaignRange | del(.baselinePinned)' <<<"$T5J_FIRST")" = "$(jq -c '.campaignRange | del(.baselinePinned)' <<<"$T5J_VIEW")" ]
+NEWER_SHA="$(sha c)"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-newer GO "$NEWER_SHA" "$(sha d)" 6
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":9,"behind_by":0,"files":[{"filename":"api/migrations/400_later.sql"},{"filename":"web/src/a.tsx"}]}'
+printf '%s' '{"full":["**"]}' > "$SMOKE_SIZING_RULES"
+export STUB_COMPARE_LOG="$STATE_DIR/compare-after-pin.log"
+[ "$(bash "$GATE" check 13 | jq -c "$RANGE_VIEW")" = "$T5J_VIEW" ] ||
+  { echo "5j: a pinned determinable range moved on check" >&2; exit 1; }
+T5J_RECOVERY="$(recover_run "$T5J_RUN")"
+jq -e --arg run "$T5J_RUN" '.wakeAgent == true and .data.trigger == "pr_build_settled" and
+  .data.recovery == true and .data.runId == $run' <<<"$T5J_RECOVERY" >/dev/null ||
+  { echo "5j: no recovery wake: $T5J_RECOVERY" >&2; exit 1; }
+[ "$(jq -c '.data | {campaignRange,migrationsInRange,campaignSize,sizeReason}' <<<"$T5J_RECOVERY")" = \
+  "$(jq -c '{campaignRange,migrationsInRange,campaignSize,sizeReason}' <<<"$T5J_VIEW")" ] ||
+  { echo "5j: recovery wake moved the pinned range: $T5J_RECOVERY" >&2; exit 1; }
+[ ! -e "$STUB_COMPARE_LOG" ] || { echo "5j: a pinned head still hit the compare API" >&2; exit 1; }
+# New head => new campaign => new pin. It sees the newer GO, the new list and
+# the new rules, so the hold above was the pin and not a dead fixture.
+NEW_FREEZE="$(sha 5)"
+freeze_ready_fixture 13 "$NEW_FREEZE" "$PARENT_SHA"
+range_case 5j-new-head '.campaignRange.baselineSha != $base and .campaignRange.baselinePinned == false and
+  .migrationsInRange == ["api/migrations/400_later.sql"] and .campaignSize == "full"'
+bash "$GATE" poll >/dev/null
+jq -e --arg head "$NEW_FREEZE" --arg newer "$NEWER_SHA" '.headSha == $head and
+  .campaignRange.baselineSha == $newer and
+  .migrationsInRange == ["api/migrations/400_later.sql"]' \
+  "$(pin_file 13 "$NEW_FREEZE")" >/dev/null || { echo "5j: a new head did not get its own pin" >&2; exit 1; }
+# ...and the first head's pin is still there, untouched by the new head.
+[ "$(jq -c "$RANGE_VIEW"' | del(.campaignRange.baselinePinned, .campaignRange.pinState)' <<<"$T5J_VIEW")" = \
+  "$(jq -c "$RANGE_VIEW"' | del(.campaignRange.baselinePinned, .campaignRange.pinState)' "$(pin_file 13 "$FREEZE_SHA")")" ] ||
+  { echo "5j: pinning a new head disturbed the old head's pin" >&2; exit 1; }
+unset SMOKE_SIZING_RULES STUB_COMPARE_LOG
+
+# 5j-ii. The P1: a NON-null baseline and a TRANSIENT compare failure at the
+# first settled poll. The campaign opens unknown/full. The API then recovers —
+# and check, a later poll and the recovery wake of the same run must all still
+# say unknown/full: recomputing would shrink a campaign already opened as full
+# and change migrationsInRange under it.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+export STUB_COMPARE_EXIT=1
+T5J2_FIRST="$(bash "$GATE" poll)"
+jq -e --arg base "$BASE_SHA" '.data.trigger == "pr_build_settled" and .data.campaignSize == "full" and
+  .data.campaignRange.baselineSha == $base and .data.campaignRange.determinable == false and
+  .data.migrationsInRange == null' <<<"$T5J2_FIRST" >/dev/null ||
+  { echo "5j-ii: first poll: $T5J2_FIRST" >&2; exit 1; }
+T5J2_RUN="$(jq -r '.data.runId' <<<"$T5J2_FIRST")"
+export STUB_COMPARE_EXIT=0                                  # the API recovers
+range_case 5j-ii-check "$UNKNOWN_RANGE"' and .campaignRange.baselineSha == $base and
+  .campaignRange.baselinePinned == true and
+  .campaignRange.reason == "the baseline...target comparison could not be fetched"'
+T5J2_VIEW="$(bash "$GATE" check 13 | jq -c "$RANGE_VIEW")"
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null    # run is live: no second wake
+[ "$(bash "$GATE" check 13 | jq -c "$RANGE_VIEW")" = "$T5J2_VIEW" ]
+T5J2_RECOVERY="$(recover_run "$T5J2_RUN")"
+jq -e --arg run "$T5J2_RUN" '.data.trigger == "pr_build_settled" and .data.recovery == true and
+  .data.runId == $run and .data.campaignSize == "full" and
+  .data.campaignRange.determinable == false and .data.migrationsInRange == null' <<<"$T5J2_RECOVERY" >/dev/null ||
+  { echo "5j-ii: recovery wake shrank a campaign opened as full: $T5J2_RECOVERY" >&2; exit 1; }
+# Same for a transient TREE failure under a capped compare.
+# (An UNSETTLED look pins nothing: not-ready freeze, failing compare, then ready
+# with a working API => determinable.)
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+export STUB_COMPARE_EXIT=1 STUB_HEALTHZ_CODE=503
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null
+[ ! -e "$(pin_file 13 "$FREEZE_SHA")" ] ||
+  { echo "5j-ii: an unsettled poll pinned a range" >&2; exit 1; }
+export STUB_COMPARE_EXIT=0 STUB_HEALTHZ_CODE=200
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.campaignRange.determinable == true' >/dev/null
+# No validated GO at the first settled poll is pinned the same way.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.campaignSize == "full" and
+  .data.campaignRange.determinable == false' >/dev/null
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-late GO "$BASE_SHA" "$(sha b)" 5
+range_case 5j-unknown-pinned "$UNKNOWN_RANGE"' and .campaignRange.baselineSha == null and .campaignRange.baselinePinned == true'
+
+# 5j-iii. A range far past one argv string. Linux caps a single argument at
+# 128 KiB; a range-sized value passed to jq as --argjson would fail to EXEC,
+# the pin candidate would be dropped, and an otherwise-settled freeze would be
+# skipped forever. 5,200 changed paths (>200 KB as JSON, 600 of them
+# migrations) must pin, read back through check / poll / the recovery wake,
+# size and list migrations correctly, and still emit the wake.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES="$(python3 -c 'import json; print(json.dumps({"status":"ahead","ahead_by":900,"behind_by":0,"files":[{"filename": f"api/src/f{i}.ts"} for i in range(300)]}))')"
+export STUB_TREES_FILE="$STATE_DIR/big-trees.json"
+python3 - "$BASE_SHA" "$PARENT_SHA" > "$STUB_TREES_FILE" <<'PYF'
+import json, sys
+base, target = sys.argv[1], sys.argv[2]
+blob = lambda p, s: {"path": p, "type": "blob", "mode": "100644", "sha": s}
+paths = [f"api/src/modules/some/deeply/nested/feature/area/file_{i:05d}.ts" for i in range(4600)]
+paths += [f"api/migrations/{i:04d}_a_descriptively_named_migration_step.sql" for i in range(600)]
+print(json.dumps({base: {"truncated": False, "tree": [blob(p, "a") for p in paths]},
+                  target: {"truncated": False, "tree": [blob(p, "b") for p in paths]}}))
+PYF
+export SMOKE_SIZING_RULES="$STATE_DIR/rules-big.json"
+printf '%s' '{"full":["api/migrations/0599_*"],"lightAllowed":["web/**"]}' > "$SMOKE_SIZING_RULES"
+T5J3_FIRST="$(bash "$GATE" poll)"
+jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and
+  .data.campaignRange.determinable == true and .data.campaignRange.fileListMethod == "tree" and
+  (.data.migrationsInRange | length) == 600 and .data.campaignSize == "full" and
+  (.data.sizeReason | test("0599_"))' <<<"$T5J3_FIRST" >/dev/null ||
+  { echo "5j-iii: a >128KiB range did not settle+wake: ${T5J3_FIRST:0:400}" >&2; exit 1; }
+T5J3_RUN="$(jq -r '.data.runId' <<<"$T5J3_FIRST")"
+[ "$(jq -c '.rangePaths' "$(pin_file 13 "$FREEZE_SHA")" | wc -c)" -gt 204800 ] ||
+  { echo "5j-iii: fixture is not past the size it exists to test" >&2; exit 1; }
+jq -e '(.rangePaths | length) == 5200 and (.migrationsInRange | length) == 600' \
+  "$(pin_file 13 "$FREEZE_SHA")" >/dev/null
+rm -f "$STUB_TREES_FILE"; export STUB_COMPARE_EXIT=1       # nothing to recompute from: reads must come from the pin
+T5J3_VIEW="$(bash "$GATE" check 13 | jq -c "$RANGE_VIEW")"
+jq -e '.campaignRange.baselinePinned == true and .campaignRange.determinable == true and
+  (.migrationsInRange | length) == 600 and (.migrationFiles | length) == 600 and
+  .migrationsTouched == true and .campaignSize == "full"' <<<"$T5J3_VIEW" >/dev/null ||
+  { echo "5j-iii: check did not read the large pin back" >&2; exit 1; }
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null
+T5J3_RECOVERY="$(recover_run "$T5J3_RUN")"
+jq -e --arg run "$T5J3_RUN" '.data.trigger == "pr_build_settled" and .data.recovery == true and
+  .data.runId == $run and (.data.migrationsInRange | length) == 600 and .data.campaignSize == "full"' \
+  <<<"$T5J3_RECOVERY" >/dev/null || { echo "5j-iii: no recovery wake for the large pin" >&2; exit 1; }
+[ "$(jq -c '.data | {campaignRange,migrationsInRange,campaignSize,sizeReason}' <<<"$T5J3_RECOVERY")" = \
+  "$(jq -c '{campaignRange,migrationsInRange,campaignSize,sizeReason}' <<<"$T5J3_VIEW")" ]
+export STUB_COMPARE_EXIT=0
+unset SMOKE_SIZING_RULES STUB_TREES_FILE
+
+# 5j-iv. STORAGE INVARIANT: pins are immutable and keyed by head SHA. The
+# interleaving that broke the single-slot pin, driven through the gate's hold
+# seam: poll A has EVALUATED old head H1 and is paused before promotion; poll B
+# sees new head H2 during a compare outage, pins unknown/full and opens
+# campaign R; A resumes. A must not open a campaign, and must not disturb H2's
+# pin — so once the API recovers, check / poll / R's recovery wake still report
+# the pinned unknown/full instead of a recomputed determinable/standard.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+H1_SHA="$FREEZE_SHA"
+H2_SHA="$(sha 5)"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+freeze_ready_fixture 13 "$H1_SHA" "$PARENT_SHA"
+T5J4_HOLD="$STATE_DIR/hold-a"
+T5J4_A_OUT="$STATE_DIR/poll-a.out"
+SMOKE_GATE_TEST_HOLD_BEFORE_RANGE_PIN_FILE="$T5J4_HOLD" bash "$GATE" poll > "$T5J4_A_OUT" 2>/dev/null &
+T5J4_A_PID=$!
+for _ in $(seq 1 600); do [ -e "$T5J4_HOLD.ready" ] && break; /usr/bin/sleep 0.05; done
+[ -e "$T5J4_HOLD.ready" ] || { echo "5j-iv: poll A never reached the hold seam" >&2; exit 1; }
+[ ! -e "$(pin_file 13 "$H1_SHA")" ]                         # A has evaluated H1 but promoted nothing
+freeze_ready_fixture 13 "$H2_SHA" "$PARENT_SHA"
+export STUB_COMPARE_EXIT=1                                  # outage while B looks at H2
+T5J4_B="$(bash "$GATE" poll)"
+jq -e --arg h "$H2_SHA" '.data.trigger == "pr_build_settled" and .data.sourceSha == $h and
+  .data.campaignSize == "full" and .data.campaignRange.determinable == false' <<<"$T5J4_B" >/dev/null ||
+  { echo "5j-iv: poll B did not open R as unknown/full: $T5J4_B" >&2; exit 1; }
+T5J4_RUN="$(jq -r '.data.runId' <<<"$T5J4_B")"
+T5J4_PIN_BEFORE="$(cat "$(pin_file 13 "$H2_SHA")")"
+T5J4_INODE_BEFORE="$(stat -c '%i %Y' "$(pin_file 13 "$H2_SHA")")"
+: > "$T5J4_HOLD"                                            # A resumes with its stale H1 facts
+wait "$T5J4_A_PID"
+jq -e '.wakeAgent == false' "$T5J4_A_OUT" >/dev/null ||
+  { echo "5j-iv: the stale H1 poll opened a campaign: $(cat "$T5J4_A_OUT")" >&2; exit 1; }
+jq -e --arg h "$H2_SHA" --arg run "$T5J4_RUN" '.activeSha == $h and .activeRunId == $run' \
+  "$STATE_DIR/pr-13-state.json" >/dev/null
+[ "$(cat "$(pin_file 13 "$H2_SHA")")" = "$T5J4_PIN_BEFORE" ] ||
+  { echo "5j-iv: a stale evaluation of H1 disturbed H2's pin" >&2; exit 1; }
+export STUB_COMPARE_EXIT=0                                  # the API recovers
+range_case 5j-iv-check "$UNKNOWN_RANGE"' and .headSha == "'"$H2_SHA"'" and .campaignRange.baselinePinned == true and
+  .campaignRange.reason == "the baseline...target comparison could not be fetched"'
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null    # R is live; and this is a 2nd promotion attempt path
+# A second promotion for the same head is a byte-identical no-op (same inode,
+# same mtime, same bytes) — forced by handing poll freshly computed facts for a
+# head that is already pinned: check's view is the pin, the file is untouched.
+[ "$(cat "$(pin_file 13 "$H2_SHA")")" = "$T5J4_PIN_BEFORE" ]
+[ "$(stat -c '%i %Y' "$(pin_file 13 "$H2_SHA")")" = "$T5J4_INODE_BEFORE" ] ||
+  { echo "5j-iv: H2's pin file was rewritten" >&2; exit 1; }
+T5J4_RECOVERY="$(recover_run "$T5J4_RUN")"
+jq -e --arg run "$T5J4_RUN" '.data.trigger == "pr_build_settled" and .data.recovery == true and
+  .data.runId == $run and .data.campaignSize == "full" and
+  .data.campaignRange.determinable == false and .data.migrationsInRange == null' <<<"$T5J4_RECOVERY" >/dev/null ||
+  { echo "5j-iv: R recovered with a shrunk scope: $T5J4_RECOVERY" >&2; exit 1; }
+[ "$(cat "$(pin_file 13 "$H2_SHA")")" = "$T5J4_PIN_BEFORE" ]
+
+# 5j-v. Second promotion for the SAME head: poll A evaluates H fresh (API up,
+# determinable) and pauses; poll B pins H as unknown/full (API down) and opens
+# the campaign; A resumes holding a DIFFERENT, freshly computed result for the
+# very same head. First write wins: the pin is byte-identical, same inode, and
+# A — whose facts contradict the pin — wakes nobody.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+freeze_ready_fixture 13 "$H2_SHA" "$PARENT_SHA"
+T5J5_HOLD="$STATE_DIR/hold-a"
+SMOKE_GATE_TEST_HOLD_BEFORE_RANGE_PIN_FILE="$T5J5_HOLD" bash "$GATE" poll > "$STATE_DIR/poll-a.out" 2>/dev/null &
+T5J5_A_PID=$!
+for _ in $(seq 1 600); do [ -e "$T5J5_HOLD.ready" ] && break; /usr/bin/sleep 0.05; done
+[ -e "$T5J5_HOLD.ready" ] || { echo "5j-v: poll A never reached the hold seam" >&2; exit 1; }
+STUB_COMPARE_EXIT=1 bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and
+  .data.campaignRange.determinable == false' >/dev/null
+T5J5_PIN_BEFORE="$(cat "$(pin_file 13 "$H2_SHA")")"
+T5J5_INODE_BEFORE="$(stat -c '%i %Y' "$(pin_file 13 "$H2_SHA")")"
+: > "$T5J5_HOLD"
+wait "$T5J5_A_PID"
+jq -e '.wakeAgent == false' "$STATE_DIR/poll-a.out" >/dev/null ||
+  { echo "5j-v: the losing promotion still woke: $(cat "$STATE_DIR/poll-a.out")" >&2; exit 1; }
+[ "$(cat "$(pin_file 13 "$H2_SHA")")" = "$T5J5_PIN_BEFORE" ] &&
+  [ "$(stat -c '%i %Y' "$(pin_file 13 "$H2_SHA")")" = "$T5J5_INODE_BEFORE" ] ||
+  { echo "5j-v: a second promotion rewrote the pin" >&2; exit 1; }
+jq -e '.campaignRange.determinable == false' "$(pin_file 13 "$H2_SHA")" >/dev/null
+[ "$(find "$SMOKE_GATE_LEASE_DIR" -name '*range-pin*' | wc -l)" -eq 1 ]   # no temp or duplicate left behind
+
+# 5j-vi. Pins are never trimmed. Trimming raced admission: a pin could be
+# removed between its promotion and the claim that would have protected it,
+# and the next poll of that head then recomputed a smaller scope. Eleven other
+# heads are promoted after H's pin; H's pin is byte-identical and all 12 remain.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+freeze_ready_fixture 13 "$H2_SHA" "$PARENT_SHA"
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled"' >/dev/null
+T5J6_PIN="$(cat "$(pin_file 13 "$H2_SHA")")"
+for T5J6_C in 0 1 2 3 4 6 7 8 9 a c; do
+  freeze_ready_fixture 13 "$(sha "$T5J6_C")" "$PARENT_SHA"
+  bash "$GATE" poll >/dev/null
+done
+[ "$(find "$SMOKE_GATE_LEASE_DIR" -name 'range-pin-*' | wc -l)" -eq 12 ] &&
+  [ "$(cat "$(pin_file 13 "$H2_SHA")")" = "$T5J6_PIN" ] ||
+  { echo "5j-vi: pins were trimmed or disturbed" >&2; exit 1; }
+
+# 5j-vii. Pin reach == campaign reach. A run can be resumed through the SHARED
+# lease by a coordinator with a DIFFERENT private state dir; it must read the
+# same pin, not recompute. Second coordinator: fresh private state dir, same
+# shared lease dir, and an API that now answers differently.
+freeze_ready_fixture 13 "$H2_SHA" "$PARENT_SHA"
+T5J7_VIEW_A="$(bash "$GATE" check 13 | jq -c "$RANGE_VIEW")"
+jq -e '.campaignRange.pinState == "valid" and .campaignRange.determinable == true' <<<"$T5J7_VIEW_A" >/dev/null
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":9,"behind_by":0,"files":[{"filename":"api/migrations/400_later.sql"}]}'
+T5J7_OTHER_STATE="$(mktemp -d)"
+[ "$(SMOKE_GATE_STATE_DIR="$T5J7_OTHER_STATE" bash "$GATE" check 13 | jq -c "$RANGE_VIEW")" = "$T5J7_VIEW_A" ] ||
+  { echo "5j-vii: a second coordinator (different private state dir) recomputed the range" >&2; exit 1; }
+# No usable shared root: never a private pin. unknown/full with the reason, and
+# a settled freeze is NOT offered (and says so on stderr).
+T5J7_NOROOT="$(SMOKE_GATE_SHARED_ROOT="$T5J7_OTHER_STATE/missing" SMOKE_GATE_LEASE_DIR="$T5J7_OTHER_STATE/missing/leases" \
+  SMOKE_GATE_STATE_DIR="$T5J7_OTHER_STATE" bash "$GATE" check 13)"
+jq -e '.campaignRange.pinState == "unavailable" and .campaignRange.determinable == false and
+  .migrationsInRange == null and .campaignSize == "full" and
+  (.campaignRange.reason | test("cannot be kept on shared storage.*is missing"))' <<<"$T5J7_NOROOT" >/dev/null ||
+  { echo "5j-vii: no shared root: $T5J7_NOROOT" >&2; exit 1; }
+T5J7_ERR="$T5J7_OTHER_STATE/poll.err"
+SMOKE_GATE_SHARED_ROOT="$T5J7_OTHER_STATE/missing" SMOKE_GATE_LEASE_DIR="$T5J7_OTHER_STATE/missing/leases" \
+  SMOKE_GATE_STATE_DIR="$T5J7_OTHER_STATE" bash "$GATE" poll 2>"$T5J7_ERR" | jq -e '.wakeAgent == false' >/dev/null
+grep -q 'settled but not offered' "$T5J7_ERR" || { echo "5j-vii: the not-offered freeze was silent" >&2; exit 1; }
+[ -z "$(find "$T5J7_OTHER_STATE" -name '*range-pin*' -print -quit)" ] ||
+  { echo "5j-vii: a private pin was written" >&2; exit 1; }
+rm -rf "$T5J7_OTHER_STATE"
+
+# 5j-viii. INVALID IS NOT ABSENT. A pin that was determinable/standard is
+# truncated mid-campaign while the API would happily recompute: the head goes
+# unknown/full (never a recomputed scope), is still OFFERED — the recovery wake
+# fires, as full — and the damaged file is left exactly as found.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+freeze_ready_fixture 13 "$H2_SHA" "$PARENT_SHA"
+T5J8_FIRST="$(bash "$GATE" poll)"
+jq -e '.data.trigger == "pr_build_settled" and .data.campaignRange.determinable == true' <<<"$T5J8_FIRST" >/dev/null
+T5J8_RUN="$(jq -r '.data.runId' <<<"$T5J8_FIRST")"
+head -c 40 "$(pin_file 13 "$H2_SHA")" > "$STATE_DIR/trunc" && cat "$STATE_DIR/trunc" > "$(pin_file 13 "$H2_SHA")"
+range_case 5j-viii-truncated "$UNKNOWN_RANGE"' and .campaignRange.pinState == "invalid" and
+  .campaignRange.baselineSha == null and (.campaignRange.reason | test("truncated or malformed"))'
+T5J8_RECOVERY="$(recover_run "$T5J8_RUN")"
+jq -e --arg run "$T5J8_RUN" '.data.trigger == "pr_build_settled" and .data.recovery == true and
+  .data.runId == $run and .data.campaignSize == "full" and .data.campaignRange.pinState == "invalid" and
+  .data.migrationsInRange == null' <<<"$T5J8_RECOVERY" >/dev/null ||
+  { echo "5j-viii: a truncated pin was recomputed or made the head unofferable: $T5J8_RECOVERY" >&2; exit 1; }
+cmp -s "$STATE_DIR/trunc" "$(pin_file 13 "$H2_SHA")" || { echo "5j-viii: the invalid pin was replaced" >&2; exit 1; }
+: > "$(pin_file 13 "$H2_SHA")"                              # empty file: same answer
+range_case 5j-viii-empty "$UNKNOWN_RANGE"' and .campaignRange.pinState == "invalid"'
+# A dangling symlink, a live symlink and a directory at the pin path BEFORE any
+# poll: each is unknown/full and the freeze is still offered — never silently
+# unofferable, and the obstruction is neither followed nor removed.
+for T5J8_KIND in dangling livelink directory; do
+  fresh_state
+  export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+    SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+  export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
+  freeze_ready_fixture 13 "$H2_SHA" "$PARENT_SHA"
+  mkdir -p "$SMOKE_GATE_LEASE_DIR"
+  case "$T5J8_KIND" in
+    dangling)  ln -s "$STATE_DIR/nowhere" "$(pin_file 13 "$H2_SHA")" ;;
+    livelink)  printf '{}' > "$STATE_DIR/target.json"; ln -s "$STATE_DIR/target.json" "$(pin_file 13 "$H2_SHA")" ;;
+    directory) mkdir "$(pin_file 13 "$H2_SHA")" ;;
+  esac
+  range_case "5j-viii-$T5J8_KIND" "$UNKNOWN_RANGE"' and .campaignRange.pinState == "invalid"'
+  bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and
+    .data.campaignSize == "full" and .data.campaignRange.pinState == "invalid"' >/dev/null ||
+    { echo "5j-viii: $T5J8_KIND at the pin path made the freeze unofferable" >&2; exit 1; }
+  case "$T5J8_KIND" in
+    dangling|livelink) [ -L "$(pin_file 13 "$H2_SHA")" ] ;;
+    directory) [ -d "$(pin_file 13 "$H2_SHA")" ] ;;
+  esac
+  [ "$T5J8_KIND" != livelink ] || [ "$(cat "$STATE_DIR/target.json")" = '{}' ]   # never written through
+done
+unset -f recover_run pin_file
+
+fi
+# --- 5k. Journey selection rides campaignRange (smoke-journeys.py) ----------
+# The catalogue is the fictional example under references/. Selection consumes
+# ONLY the baseline...target file list, is absent when the install has no
+# catalogue, and is pinned by the first settled poll — in the SHARED lease dir,
+# beside the range pin, by the same immutable primitives.
+jpin_file() { printf '%s/journeys-pin-org__repo-pr-%s-%s.json' "$SMOKE_GATE_LEASE_DIR" "$1" "$2"; }
+JOURNEYS_EXAMPLE="$SCRIPT_DIR/../references/journeys.example.json"
+REAL_PYTHON3="$(command -v python3)"; export REAL_PYTHON3
+journeys_fixture() { # <compare-files-json>; one ready freeze (PR 13) with a validated baseline
+  fresh_state
+  export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+    SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+  export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+  seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+  freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+  export STUB_COMPARE_FILES="$1"
+  cp "$JOURNEYS_EXAMPLE" "$STATE_DIR/journeys.json"
+  export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/journeys.json"
+}
+BACKEND_ONLY='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/migrations/0042_loan_period_options.sql"},{"filename":"api/src/reports/export.ts"},{"filename":"docs/internal/changelog.md"}]}'
+if smoke_case 5k-journeys; then
+
+# No catalogue: byte-identical. Env unset (default path absent) and env naming
+# an absent file give the same bytes, with no `journeys` key; and adopting a
+# catalogue ADDS that one key and changes nothing else.
+journeys_fixture "$BACKEND_ONLY"
+unset SMOKE_JOURNEYS_CATALOGUE
+T5K_UNSET="$(bash "$GATE" check 13)"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/no-such-journeys.json"
+T5K_ABSENT="$(bash "$GATE" check 13)"
+[ "$T5K_UNSET" = "$T5K_ABSENT" ] || { echo "5k: an absent catalogue changed the facts" >&2; exit 1; }
+jq -e 'has("journeys") | not' <<<"$T5K_ABSENT" >/dev/null || { echo "5k: journeys key without a catalogue: $T5K_ABSENT" >&2; exit 1; }
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/journeys.json"
+T5K_WITH="$(bash "$GATE" check 13)"
+[ "$(jq -c 'del(.journeys)' <<<"$T5K_WITH")" = "$T5K_ABSENT" ] ||
+  { echo "5k: a catalogue changed facts other than .journeys" >&2; exit 1; }
+
+# ...and with no catalogue and nothing at either pin path, no checker even runs:
+# a pin-check that would crash changes nothing (byte-identical), whereas a stray
+# pin with no catalogue is still judged.
+cat > "$STUB_BIN/python3" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *"smoke-journeys.py pin-check "*) [ -z "${STUB_PINCHECK_FAIL:-}" ] || exit 70 ;; esac
+exec /usr/bin/env -u STUB_PINCHECK_FAIL "$REAL_PYTHON3" "$@"
+STUB
+chmod +x "$STUB_BIN/python3"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/no-such-journeys.json" STUB_PINCHECK_FAIL=1
+[ "$(bash "$GATE" check 13)" = "$T5K_ABSENT" ] || { echo "5k: a crashing pin checker changed the no-catalogue facts" >&2; exit 1; }
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and (.data | has("journeys") | not)' >/dev/null ||
+  { echo "5k: a crashing pin checker made a no-catalogue freeze unofferable" >&2; exit 1; }
+unset STUB_PINCHECK_FAIL; rm -f "$STUB_BIN/python3"
+journeys_fixture "$BACKEND_ONLY"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/no-such-journeys.json"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"; printf '{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}' > "$(jpin_file 13 "$FREEZE_SHA")"
+range_case 5k-stray-pin-no-catalogue '.journeys.pinState == "invalid" and (.journeys.reason | test("no journey catalogue is configured"))'
+journeys_fixture "$BACKEND_ONLY"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/journeys.json"
+T5K_WITH="$(bash "$GATE" check 13)"
+
+# A BACKEND-ONLY change selects its unchanged UI consumer up front; the path
+# nothing claims is listed; the infra exclusion is visible. `check` never pins.
+jq -e '.journeys.selection == "matched" and .journeys.route == "web" and .journeys.pinned == false and
+  [.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["loan-desk-checkout"] and
+  .journeys.matchedJourneys[0].evidence == "browser" and
+  .journeys.unmappedPaths == ["api/src/reports/export.ts"] and
+  (.journeys.excludedPaths | map({path,glob})) == [{"path":"docs/internal/changelog.md","glob":"docs/internal/**"}] and
+  (.journeys.excludedPaths[0].reason | length > 0)' <<<"$T5K_WITH" >/dev/null ||
+  { echo "5k: backend-only selection wrong: $T5K_WITH" >&2; exit 1; }
+jq -e '.journeys.pinState == "absent"' <<<"$T5K_WITH" >/dev/null
+[ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: check pinned a selection" >&2; exit 1; }
+
+# The settled poll pins it and the wake carries it, with the catalogue snapshot.
+T5K_POLL="$(bash "$GATE" poll)"
+jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true and
+  .data.journeys.unmappedPaths == ["api/src/reports/export.ts"] and
+  (.data.journeys.catalogueSha256 | test("^[0-9a-f]{64}$"))' <<<"$T5K_POLL" >/dev/null ||
+  { echo "5k: wake payload carries no pinned selection: $T5K_POLL" >&2; exit 1; }
+T5K_SNAPSHOT="$(jq -r '.data.journeys.catalogueSnapshot' <<<"$T5K_POLL")"
+[ "$(sha256sum < "$T5K_SNAPSHOT" | cut -d' ' -f1)" = "$(jq -r '.data.journeys.catalogueSha256' <<<"$T5K_POLL")" ]
+# The pin and its snapshot live in the shared lease dir, never the private
+# state dir, and the wake IS the pin, byte for byte.
+[ "$(jq -r '.data.journeys.pinFile' <<<"$T5K_POLL")" = "$(jpin_file 13 "$FREEZE_SHA")" ]
+case "$T5K_SNAPSHOT" in "$SMOKE_GATE_LEASE_DIR"/journeys-catalogue-*) ;; *) echo "5k: snapshot outside the shared lease dir: $T5K_SNAPSHOT" >&2; exit 1 ;; esac
+[ "$(jq -c '.data.journeys' <<<"$T5K_POLL")" = "$(jq -c . "$(jpin_file 13 "$FREEZE_SHA")")" ] ||
+  { echo "5k: the wake's selection is not the pin" >&2; exit 1; }
+[ -z "$(find "$STATE_DIR" -name '*journeys-pin*' -o -name 'journeys-catalogue-*' | head -1)" ] ||
+  { echo "5k: a journeys pin was written under the private state dir" >&2; exit 1; }
+# FROZEN: a glob added afterwards claims the path in the live catalogue, and
+# the campaign still owes the explanation it was opened with.
+jq '.journeys[0].consumes += ["api/src/reports/**"]' "$JOURNEYS_EXAMPLE" > "$STATE_DIR/journeys.json"
+range_case 5k-frozen '.journeys.pinned == true and .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
+[ "$(bash "$GATE" check 13 | jq -c '.journeys')" = "$(jq -c '.data.journeys' <<<"$T5K_POLL")" ] ||
+  { echo "5k: the pinned selection moved after a catalogue edit" >&2; exit 1; }
+# SHARED ownership: a second coordinator with a DIFFERENT private state dir
+# (no ledger, no catalogue of its own, the API down) reads the same selection.
+T5K_OTHER="$(mktemp -d)"
+[ "$(SMOKE_GATE_STATE_DIR="$T5K_OTHER" SMOKE_GATE_HANDOFF_LEDGER="$T5K_OTHER/none.jsonl" \
+     SMOKE_JOURNEYS_CATALOGUE="$T5K_OTHER/none.json" STUB_COMPARE_EXIT=1 bash "$GATE" check 13 | jq -c '.journeys')" = \
+  "$(jq -c '.data.journeys' <<<"$T5K_POLL")" ] ||
+  { echo "5k: a second coordinator did not read the shared journeys pin" >&2; exit 1; }
+rm -rf "$T5K_OTHER"
+# IMMUTABLE: a second promotion for the same head changes nothing on disk.
+T5K_PIN_SUM="$(sha256sum < "$(jpin_file 13 "$FREEZE_SHA")")"
+bash "$GATE" poll >/dev/null
+[ "$(sha256sum < "$(jpin_file 13 "$FREEZE_SHA")")" = "$T5K_PIN_SUM" ]
+
+# The matcher consumes the PINNED range paths, never a recomputed list: pin the
+# range with no catalogue installed, then adopt one while the API starts naming
+# different files. Selection is computed off what the range pin holds.
+journeys_fixture "$BACKEND_ONLY"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/not-yet.json"
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and (.data | has("journeys") | not)' >/dev/null ||
+  { echo "5k: setup: range did not pin without a catalogue" >&2; exit 1; }
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/journeys.json"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"mobile/src/scan.tsx"}]}'
+range_case 5k-pinned-paths '.campaignRange.baselinePinned == true and .journeys.route == "web" and
+  [.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["loan-desk-checkout"] and
+  .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
+
+# INVALID IS NOT ABSENT, and RECOVERY IS THE GATE'S. Anything at the primary
+# pin's path that the one predicate refuses — truncated, a symlink, a
+# directory, or well-formed-looking bytes with no identity or snapshot — means
+# its scope is unrecoverable. The gate then computes a recovery selection
+# (every catalogue journey owed, the pinned range's unclaimed paths kept) and
+# promotes it ONCE as a second immutable shared file; the bad primary is never
+# recomputed over, replaced or written through.
+rpin_file() { printf '%s' "$(jpin_file "$1" "$2" | sed 's/\.json$/-recovery.json/')"; }
+T5K_ALL_RECOVERED='[.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"pin-recovered"},{"id":"branch-scope-crossing","reason":"pin-recovered"},{"id":"mobile-scan-return","reason":"pin-recovered"}]'
+for T5K_KIND in truncated dangling directory shape-only; do
+  journeys_fixture "$BACKEND_ONLY"
+  mkdir -p "$SMOKE_GATE_LEASE_DIR"
+  case "$T5K_KIND" in
+    truncated)  printf '{"schemaVersion":1,"selec' > "$(jpin_file 13 "$FREEZE_SHA")" ;;
+    dangling)   ln -s "$STATE_DIR/nowhere.json" "$(jpin_file 13 "$FREEZE_SHA")" ;;
+    directory)  mkdir "$(jpin_file 13 "$FREEZE_SHA")" ;;
+    shape-only) printf '{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}' > "$(jpin_file 13 "$FREEZE_SHA")" ;;
+  esac
+  range_case "5k-invalid-$T5K_KIND" '.journeys.pinState == "recovery-absent" and .journeys.selection == "full" and
+    .journeys.recovery == true and .journeys.pinned == false and (.journeys | '"$T5K_ALL_RECOVERED"') and
+    .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
+  [ ! -e "$(rpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: check wrote a recovery pin" >&2; exit 1; }
+  T5K_REC="$(bash "$GATE" poll)"
+  jq -e --arg f "$(rpin_file 13 "$FREEZE_SHA")" '.wakeAgent == true and .data.trigger == "pr_build_settled" and
+    .data.journeys.pinState == "recovered" and .data.journeys.pinned == true and .data.journeys.pinFile == $f and
+    (.data.journeys | '"$T5K_ALL_RECOVERED"')' <<<"$T5K_REC" >/dev/null ||
+    { echo "5k: an invalid primary pin ($T5K_KIND) was not recovered by the gate: ${T5K_REC:0:600}" >&2; exit 1; }
+  [ "$(jq -c '.data.journeys' <<<"$T5K_REC")" = "$(jq -c . "$(rpin_file 13 "$FREEZE_SHA")")" ]
+  case "$T5K_KIND" in
+    truncated)  [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = '{"schemaVersion":1,"selec' ] ;;
+    dangling)   [ -L "$(jpin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$STATE_DIR/nowhere.json" ] ;;
+    directory)  [ -d "$(jpin_file 13 "$FREEZE_SHA")" ] ;;
+    shape-only) [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = '{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}' ] ;;
+  esac
+  # Promoted once, immutable, shared: a catalogue edit, a re-poll and a second
+  # coordinator with another state dir all read the same recovery pin.
+  T5K_REC_SUM="$(sha256sum < "$(rpin_file 13 "$FREEZE_SHA")")"
+  jq 'del(.journeys[2])' "$JOURNEYS_EXAMPLE" > "$STATE_DIR/journeys.json"
+  bash "$GATE" poll >/dev/null
+  [ "$(sha256sum < "$(rpin_file 13 "$FREEZE_SHA")")" = "$T5K_REC_SUM" ]
+  T5K_OTHER="$(mktemp -d)"
+  [ "$(SMOKE_GATE_STATE_DIR="$T5K_OTHER" SMOKE_GATE_HANDOFF_LEDGER="$T5K_OTHER/none.jsonl" \
+       SMOKE_JOURNEYS_CATALOGUE="$T5K_OTHER/none.json" bash "$GATE" check 13 | jq -c '.journeys')" = \
+    "$(jq -c '.data.journeys' <<<"$T5K_REC")" ] ||
+    { echo "5k: a second coordinator did not read the shared recovery pin" >&2; exit 1; }
+  rm -rf "$T5K_OTHER"
+done
+# STABLE OWNER: a recovery pin, once promoted, owns the campaign even if the
+# primary reads as valid again — the gate, the wake and a recovery wake all
+# keep reporting it (here: the invalid primary is swapped for a valid one).
+journeys_fixture "$BACKEND_ONLY"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"
+printf '{"pinned":tr' > "$(jpin_file 13 "$FREEZE_SHA")"
+T5K_SO="$(bash "$GATE" poll)"
+jq -e '.data.journeys.pinState == "recovered"' <<<"$T5K_SO" >/dev/null || { echo "5k: stable-owner setup" >&2; exit 1; }
+T5K_SO_RUN="$(jq -r '.data.runId' <<<"$T5K_SO")"
+T5K_VALID_PRIMARY="$STATE_DIR/valid-primary.json"
+jq -c --arg f "$(jpin_file 13 "$FREEZE_SHA")" '.recovery = false | .pinState = "valid" | .pinFile = $f | .reason = null |
+  .matchedJourneys = [.matchedJourneys[0]] | .matchedJourneys[0].reason = "changed"' "$(rpin_file 13 "$FREEZE_SHA")" > "$T5K_VALID_PRIMARY"
+cat "$T5K_VALID_PRIMARY" > "$(jpin_file 13 "$FREEZE_SHA")"
+[ "$(python3 "$SCRIPT_DIR/smoke-journeys.py" pin-check "$(jpin_file 13 "$FREEZE_SHA")" --pr 13 --head "$FREEZE_SHA" --repo-slug org__repo | jq -r .state)" = valid ] ||
+  { echo "5k: stable-owner fixture: the swapped primary is not valid on its own" >&2; exit 1; }
+range_case 5k-stable-owner-check '.journeys.pinState == "recovered" and (.journeys.pinFile | test("-recovery.json$"))'
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$T5K_SO_RUN.json"
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.recovery == true and
+  .data.journeys.pinState == "recovered"' >/dev/null || { echo "5k: the recovery wake flipped back to the primary" >&2; exit 1; }
+
+# CHECKER UNAVAILABLE IS NOT INVALID: a pin-check that fails to run (a timeout,
+# a crash) is no verdict — no recovery pin is promoted, the head is not offered
+# this cycle and says why, and once the checker runs the PRIMARY owns.
+journeys_fixture "$BACKEND_ONLY"
+bash "$GATE" poll | jq -e '.data.journeys.pinState == "valid"' >/dev/null || { echo "5k: unavailable setup" >&2; exit 1; }
+T5K_UA_RUN="$(jq -r '.activeRunId' "$STATE_DIR/pr-13-state.json")"
+cat > "$STUB_BIN/python3" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *"smoke-journeys.py pin-check "*) [ -z "${STUB_PINCHECK_FAIL:-}" ] || exit 70 ;; esac
+exec /usr/bin/env -u STUB_PINCHECK_FAIL "$REAL_PYTHON3" "$@"
+STUB
+chmod +x "$STUB_BIN/python3"
+export STUB_PINCHECK_FAIL=1
+range_case 5k-checker-unavailable '.journeys.pinState == "unavailable" and .journeys.selection == "full" and
+  (.journeys.reason | test("could not be checked")) and .journeys.matchedJourneys == []'
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$T5K_UA_RUN.json"
+T5K_UA_ERR="$STATE_DIR/ua.err"
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll 2>"$T5K_UA_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+  { echo "5k: a head whose pin checker was unavailable was offered" >&2; exit 1; }
+grep -q 'not offered: a journeys pin for this head could not be checked' "$T5K_UA_ERR" ||
+  { echo "5k: checker-unavailable was silent: $(cat "$T5K_UA_ERR")" >&2; exit 1; }
+[ ! -e "$(rpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: an unavailable checker promoted a recovery pin" >&2; exit 1; }
+unset STUB_PINCHECK_FAIL; rm -f "$STUB_BIN/python3"
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll | jq -e --arg f "$(jpin_file 13 "$FREEZE_SHA")" '.data.trigger == "pr_build_settled" and
+  .data.journeys.pinState == "valid" and .data.journeys.pinFile == $f' >/dev/null ||
+  { echo "5k: after the checker returned, the primary did not own" >&2; exit 1; }
+[ ! -e "$(rpin_file 13 "$FREEZE_SHA")" ]
+
+# BOTH pins invalid: nothing can say what the run owes, so the head is NOT
+# offered, and stderr names both files.
+journeys_fixture "$BACKEND_ONLY"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"
+printf '{"pinned":tr' > "$(jpin_file 13 "$FREEZE_SHA")"
+printf '{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}' > "$(rpin_file 13 "$FREEZE_SHA")"
+range_case 5k-both-invalid '.journeys.pinState == "invalid" and .journeys.selection == "full" and .journeys.matchedJourneys == [] and
+  (.journeys.reason | test("neither journeys pin for this head is valid"))'
+T5K_BOTH_ERR="$STATE_DIR/both.err"
+bash "$GATE" poll 2>"$T5K_BOTH_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+  { echo "5k: a head with no valid journeys pin was offered" >&2; exit 1; }
+grep -q "not offered: neither journeys pin for this head is valid: $(jpin_file 13 "$FREEZE_SHA") .*$(rpin_file 13 "$FREEZE_SHA")" "$T5K_BOTH_ERR" ||
+  { echo "5k: both-invalid was silent: $(cat "$T5K_BOTH_ERR")" >&2; exit 1; }
+unset -f rpin_file
+
+# Range-sized selections never travel in argv: 5,200 changed paths nobody
+# claims (>200 KB of unmappedPaths) still pin, wake and read back.
+journeys_fixture "$(python3 -c 'import json; print(json.dumps({"status":"ahead","ahead_by":900,"behind_by":0,"files":[{"filename": f"api/src/f{i}.ts"} for i in range(300)]}))')"
+export STUB_TREES_FILE="$STATE_DIR/big-trees.json"
+python3 - "$BASE_SHA" "$PARENT_SHA" > "$STUB_TREES_FILE" <<'PYF'
+import json, sys
+base, target = sys.argv[1], sys.argv[2]
+blob = lambda p, s: {"path": p, "type": "blob", "mode": "100644", "sha": s}
+paths = [f"api/src/reports/some/deeply/nested/feature/area/file_{i:05d}.ts" for i in range(5199)] + ["web/src/desk/a.tsx"]
+print(json.dumps({base: {"truncated": False, "tree": [blob(p, "a") for p in paths]},
+                  target: {"truncated": False, "tree": [blob(p, "b") for p in paths]}}))
+PYF
+T5K_BIG="$(bash "$GATE" poll)"
+jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true and
+  (.data.journeys.unmappedPaths | length) == 5199 and
+  [.data.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["loan-desk-checkout"]' <<<"$T5K_BIG" >/dev/null ||
+  { echo "5k: a >128KiB selection did not pin+wake: ${T5K_BIG:0:300}" >&2; exit 1; }
+[ "$(jq -c '.unmappedPaths' "$(jpin_file 13 "$FREEZE_SHA")" | wc -c)" -gt 204800 ]
+range_case 5k-big-readback '(.journeys.unmappedPaths | length) == 5199 and .journeys.pinState == "valid"'
+unset STUB_TREES_FILE
+
+# NATIVE-ONLY: a non-empty scope claimed entirely by native-manual journeys
+# routes to the manual packet. One stray path keeps it a web campaign.
+journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"mobile/src/scan.tsx"},{"filename":"docs/internal/mobile.md"}]}'
+range_case 5k-native '.journeys.route == "native-manual" and .journeys.unmappedPaths == [] and
+  [.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["mobile-scan-return"]'
+journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"mobile/src/scan.tsx"},{"filename":"api/src/reports/export.ts"}]}'
+range_case 5k-native-mixed '.journeys.route == "web" and .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
+# A RENAME counts on both sides: a file moved out of a consumed area still selects it.
+journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/shared/period.ts","previous_filename":"api/src/loans/period.ts","status":"renamed"}]}'
+range_case 5k-rename '[.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["loan-desk-checkout"] and
+  .journeys.unmappedPaths == ["api/src/shared/period.ts"]'
+
+# UNKNOWN floor history is not fresh history: with SMOKE_GATE_RUN_ROOT unset,
+# or pointing at a mount that is not there, every floor journey is due — a
+# config failure must never delete the floor — and a readable root computes it.
+journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"web/src/desk/a.tsx"}]}'
+FLOOR_ALL_DUE='.journeys.floor.computed == false and .journeys.floor.due == ["branch-scope-crossing"] and
+  [.journeys.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"changed"},{"id":"branch-scope-crossing","reason":"floor"}]'
+unset SMOKE_GATE_RUN_ROOT
+range_case 5k-floor-root-unset "$FLOOR_ALL_DUE and (.journeys.floor.reason | test(\"SMOKE_GATE_RUN_ROOT unset\"))"
+export SMOKE_GATE_RUN_ROOT="$STATE_DIR/no-such-mount"
+range_case 5k-floor-root-missing "$FLOOR_ALL_DUE"
+mkdir -p "$STATE_DIR/runs-root"; export SMOKE_GATE_RUN_ROOT="$STATE_DIR/runs-root"
+range_case 5k-floor-root-readable '.journeys.floor.computed == true and .journeys.floor.due == ["branch-scope-crossing"]'
+unset SMOKE_GATE_RUN_ROOT
+
+# A matcher that crashes selects nothing, and nothing is never pinned: the
+# facts say `full`, the head is not offered that cycle (and says why), no pin is
+# written, and the next poll — matcher working again — pins the real selection.
+journeys_fixture "$BACKEND_ONLY"
+cat > "$STUB_BIN/python3" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *"smoke-journeys.py match "*)
+    if [ -n "${STUB_JOURNEYS_OUT:-}" ]; then cat >/dev/null; printf '%s' "$STUB_JOURNEYS_OUT"; exit 0; fi
+    [ -z "${STUB_JOURNEYS_FAIL:-}" ] || exit 70 ;;
+  *"smoke-journeys.py pin-check "*)
+    [ -z "${STUB_PINCHECK_FAIL:-}" ] || exit 70 ;;
+esac
+exec /usr/bin/env -u STUB_JOURNEYS_FAIL "$REAL_PYTHON3" "$@"
+STUB
+chmod +x "$STUB_BIN/python3"
+export STUB_JOURNEYS_FAIL=1
+range_case 5k-matcher-failed '.journeys.selection == "full" and (.journeys.reason | test("^journey matcher failed")) and .journeys.pinState == "absent"'
+T5K_FAIL_ERR="$STATE_DIR/poll.err"
+bash "$GATE" poll 2>"$T5K_FAIL_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+  { echo "5k: a failed matcher's empty selection was offered" >&2; exit 1; }
+grep -q 'journey selection could not be pinned (journey matcher failed' "$T5K_FAIL_ERR" ||
+  { echo "5k: the unoffered head was silent: $(cat "$T5K_FAIL_ERR")" >&2; exit 1; }
+[ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: a failed matcher result was pinned" >&2; exit 1; }
+unset STUB_JOURNEYS_FAIL
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true and
+  .data.journeys.selection == "matched"' >/dev/null || { echo "5k: the retry after a matcher failure did not pin" >&2; exit 1; }
+# AN EMPTY `full` IS NEVER PINNABLE, whoever produces it. Hand the gate one
+# directly — a matcher that exits 0 with a well-shaped `full` naming nothing —
+# and it is refused at the same seam: no pin, not offered, says why.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_JOURNEYS_FAIL=1 STUB_JOURNEYS_OUT='{"schemaVersion":1,"selection":"full","reason":"hand-fed","route":"web","recovery":false,"catalogueValid":true,"catalogueSha256":"0000000000000000000000000000000000000000000000000000000000000000","matchedJourneys":[],"unmappedPaths":[],"excludedPaths":[],"unassessedNativeJourneys":[]}'
+range_case 5k-empty-full-refused '.journeys.selection == "full" and .journeys.pinState == "absent" and
+  (.journeys.reason | test("not pinnable: it is `full` but names no journey \\(hand-fed\\)"))'
+bash "$GATE" poll 2>"$T5K_FAIL_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+  { echo "5k: a hand-fed empty full selection was offered" >&2; exit 1; }
+grep -q 'could not be pinned (the computed selection is not pinnable: it is `full` but names no journey' "$T5K_FAIL_ERR"
+[ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: an empty full selection was pinned" >&2; exit 1; }
+unset STUB_JOURNEYS_FAIL STUB_JOURNEYS_OUT
+rm -f "$STUB_BIN/python3"
+
+# The real producers of that state: a catalogue that is truncated, or
+# unreadable, at the first settled poll. No pin, not offered, reason on stderr;
+# once the catalogue is repaired the next poll pins the real selection.
+# ONE rule: a catalogue that parses but fails validation (one empty title) is
+# refused the same way — named journeys with no unmapped paths would let an
+# unclaimed change through.
+for T5K_KIND in truncated unreadable invalid; do
+  journeys_fixture "$BACKEND_ONLY"
+  case "$T5K_KIND" in
+    invalid)    jq '.journeys[0].title = ""' "$JOURNEYS_EXAMPLE" > "$STATE_DIR/journeys.json" ;;
+    truncated)  head -c 200 "$JOURNEYS_EXAMPLE" > "$STATE_DIR/journeys.json" ;;
+    unreadable) chmod 000 "$STATE_DIR/journeys.json"; [ "$(id -u)" != 0 ] || continue ;;
+  esac
+  range_case "5k-$T5K_KIND-catalogue" '.journeys.selection == "full" and .journeys.pinState == "absent" and
+    (.journeys.reason | test("journey matcher failed: journey catalogue is unusable")) and .journeys.matchedJourneys == []'
+  bash "$GATE" poll 2>"$T5K_FAIL_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+    { echo "5k: a $T5K_KIND catalogue's empty selection was offered" >&2; exit 1; }
+  grep -q 'journey selection could not be pinned (journey matcher failed: journey catalogue is unusable' "$T5K_FAIL_ERR" ||
+    { echo "5k: $T5K_KIND catalogue: the unoffered head was silent: $(cat "$T5K_FAIL_ERR")" >&2; exit 1; }
+  [ "$T5K_KIND" != invalid ] || grep -q 'title must be' "$T5K_FAIL_ERR" ||
+    { echo "5k: the validation error was not named: $(cat "$T5K_FAIL_ERR")" >&2; exit 1; }
+  [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: a $T5K_KIND catalogue was pinned" >&2; exit 1; }
+  chmod 644 "$STATE_DIR/journeys.json"; cp "$JOURNEYS_EXAMPLE" "$STATE_DIR/journeys.json"
+  bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true and
+    .data.journeys.selection == "matched" and .data.journeys.unmappedPaths == ["api/src/reports/export.ts"]' >/dev/null ||
+    { echo "5k: repairing a $T5K_KIND catalogue did not pin the real selection" >&2; exit 1; }
+done
+
+# UNKNOWN range is "full", never an empty match.
+journeys_fixture "$BACKEND_ONLY"
+rm -f "$SMOKE_GATE_HANDOFF_LEDGER"
+range_case 5k-unknown '.campaignRange.determinable == false and .journeys.selection == "full" and
+  (.journeys.reason | test("range not determinable")) and .journeys.route == "web" and
+  [.journeys.matchedJourneys[] | select(.reason == "range-unknown") | .id] == ["loan-desk-checkout","branch-scope-crossing"] and
+  .journeys.unassessedNativeJourneys == ["mobile-scan-return"]'
+# A catalogue that is present but broken is `full` with the reason, not silence.
+journeys_fixture "$BACKEND_ONLY"
+printf '{"schemaVersion":1,"journeys":"nope"}' > "$STATE_DIR/journeys.json"
+range_case 5k-broken '.journeys.selection == "full" and .journeys.catalogueValid == false and
+  (.journeys.reason | test("journey matcher failed: journey catalogue is unusable")) and .journeys.pinState == "absent"'
+# An ordinary PR has no campaignRange, so it gets no selection either.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_PR_FILES='[{"filename":"api/src/loans/period.ts"}]'
+bash "$GATE" check 13 | jq -e '.isFreezePr == false and (has("journeys") | not)' >/dev/null ||
+  { echo "5k: an ordinary PR grew a journeys key" >&2; exit 1; }
+fi
+if smoke_case 5l-admission; then
+# --- 5l. ADMISSION: a manual `claim` of a freeze head pins exactly as `poll`
+# does (pin_freeze_head), BEFORE it takes ownership. `check` never pins, so
+# check-then-claim used to admit a freeze with both pin paths absent — and the
+# barrier read that as legacy "no pin". Ordinary PRs and no-catalogue installs
+# are untouched.
+pin_file() { printf '%s/range-pin-org__repo-pr-%s-%s.json' "$SMOKE_GATE_LEASE_DIR" "$1" "$2"; }
+journeys_fixture "$BACKEND_ONLY"
+bash "$GATE" check 13 | jq -e '.settled == true and .campaignRange.pinState == "absent" and .journeys.pinState == "absent"' >/dev/null
+[ ! -e "$(pin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ]
+# claim reaches detect_freeze without check/poll's config guard, so an unset or
+# malformed marker prefix must refuse there too, never admit the freeze as ordinary.
+for bad in "SMOKE_GATE_FRONTEND_PREFIX=" "SMOKE_GATE_BACKEND_PREFIX=api" "SMOKE_GATE_MIGRATIONS_PREFIX="; do
+  T5L_BAD="$(env "$bad" bash "$GATE" claim run-manual-13x 13 "$FREEZE_SHA" 2>/dev/null || true)"
+  jq -e '.ok == false and (.error | startswith("gate misconfigured"))' <<<"$T5L_BAD" >/dev/null ||
+    { echo "5l: claim with $bad did not refuse: $T5L_BAD" >&2; exit 1; }
+done
+[ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-manual-13x.json" ] || { echo "5l: a refused claim left a lease" >&2; exit 1; }
+T5L_CLAIM="$(bash "$GATE" claim run-manual-13 13 "$FREEZE_SHA")"
+jq -e '.ok == true and .runId == "run-manual-13" and .campaignRange.pinState == "valid" and
+  .campaignRange.baselinePinned == true and .journeys.pinned == true and .journeys.pinState == "valid" and
+  .journeys.selection == "matched" and .journeys.unmappedPaths == ["api/src/reports/export.ts"]' <<<"$T5L_CLAIM" >/dev/null ||
+  { echo "5l: a manual freeze claim did not pin: $T5L_CLAIM" >&2; exit 1; }
+[ -s "$(pin_file 13 "$FREEZE_SHA")" ] && [ -s "$(jpin_file 13 "$FREEZE_SHA")" ] ||
+  { echo "5l: the claim reported pins that are not on shared storage" >&2; exit 1; }
+[ "$(jq -c '.journeys' <<<"$T5L_CLAIM")" = "$(jq -c '.' "$(jpin_file 13 "$FREEZE_SHA")")" ] ||
+  { echo "5l: the claim's journeys are not the pinned bytes" >&2; exit 1; }
+jq -e '.repoSlug == "org__repo" and .pr == 13' "$SMOKE_GATE_LEASE_DIR/lease-run-manual-13.json" >/dev/null
+bash "$GATE" check 13 | jq -e '.campaignRange.pinState == "valid" and .journeys.pinState == "valid"' >/dev/null
+# A later claim of the same head READS the pins — no second promote, bytes unchanged.
+T5L_RPIN="$(cat "$(pin_file 13 "$FREEZE_SHA")")"; T5L_JPIN="$(cat "$(jpin_file 13 "$FREEZE_SHA")")"
+bash "$GATE" release run-manual-13 | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim run-manual-13b 13 "$FREEZE_SHA" | jq -e '.ok == true and .journeys.pinned == true and .campaignRange.pinState == "valid"' >/dev/null
+[ "$(cat "$(pin_file 13 "$FREEZE_SHA")")" = "$T5L_RPIN" ] && [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = "$T5L_JPIN" ] ||
+  { echo "5l: a second claim re-promoted a pin" >&2; exit 1; }
+bash "$GATE" release run-manual-13b >/dev/null
+# ...and a claim after `poll` already pinned reads poll's bytes (poll's own
+# settled wake owns the slot, so its run is released first — a manual claim of
+# a pinned head is the recovery shape, not a second pinning).
+journeys_fixture "$BACKEND_ONLY"
+T5L_POLL="$(bash "$GATE" poll)"
+jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true' <<<"$T5L_POLL" >/dev/null
+T5L_RPIN="$(cat "$(pin_file 13 "$FREEZE_SHA")")"; T5L_JPIN="$(cat "$(jpin_file 13 "$FREEZE_SHA")")"
+bash "$GATE" release "$(jq -r '.data.runId' <<<"$T5L_POLL")" "$(jq -r '.data.coordinatorOwnerToken' <<<"$T5L_POLL")" | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim run-after-poll 13 "$FREEZE_SHA" | jq -e '.ok == true and .journeys.pinned == true' >/dev/null
+[ "$(cat "$(pin_file 13 "$FREEZE_SHA")")" = "$T5L_RPIN" ] && [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = "$T5L_JPIN" ] ||
+  { echo "5l: a claim after poll re-promoted a pin" >&2; exit 1; }
+# No shared pin storage: refused, and NOTHING is owned — no lease, no slot.
+# Pins and leases share one store (range_pin_store_readable is the read-only
+# twin of lease_dir_prepare), so a missing shared root is refused by claim's
+# lease preflight before admission even runs; admission's own refusal is the
+# same outcome, and either way no ownership is written.
+journeys_fixture "$BACKEND_ONLY"
+T5L_UNAVAIL="$(SMOKE_GATE_SHARED_ROOT="$STATE_DIR/missing" SMOKE_GATE_LEASE_DIR="$STATE_DIR/missing/leases" \
+  bash "$GATE" claim run-unavail 13 "$FREEZE_SHA" 2>/dev/null)"
+jq -e '.ok == false and .runId == "run-unavail" and (.error |
+  test("^freeze campaign not admitted: .*cannot be kept on shared storage") or test("^shared coordinator lease unavailable"))' <<<"$T5L_UNAVAIL" >/dev/null ||
+  { echo "5l: unavailable pin storage did not refuse the claim: $T5L_UNAVAIL" >&2; exit 1; }
+[ ! -e "$STATE_DIR/missing/leases/lease-run-unavail.json" ] &&
+  { [ ! -e "$STATE_DIR/pr-13-state.json" ] || jq -e '.activeRunId == null' "$STATE_DIR/pr-13-state.json" >/dev/null; } ||
+  { echo "5l: a refused claim still took ownership" >&2; exit 1; }
+# A matcher failure: the range pins, the journeys cannot — refused, nothing owned.
+journeys_fixture "$BACKEND_ONLY"
+cat > "$STUB_BIN/python3" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *"smoke-journeys.py match "*) [ -z "${STUB_JOURNEYS_FAIL:-}" ] || exit 70 ;; esac
+exec /usr/bin/env -u STUB_JOURNEYS_FAIL "$REAL_PYTHON3" "$@"
+STUB
+chmod +x "$STUB_BIN/python3"
+export STUB_JOURNEYS_FAIL=1
+T5L_MATCH="$(bash "$GATE" claim run-matchfail 13 "$FREEZE_SHA" 2>/dev/null)"
+jq -e '.ok == false and (.error | test("^freeze campaign not admitted: its journey selection could not be pinned \\(journey matcher failed"))' <<<"$T5L_MATCH" >/dev/null ||
+  { echo "5l: a failed matcher did not refuse the claim: $T5L_MATCH" >&2; exit 1; }
+[ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-matchfail.json" ] ||
+  { echo "5l: a refused claim left a journeys pin or a lease" >&2; exit 1; }
+unset STUB_JOURNEYS_FAIL; rm -f "$STUB_BIN/python3"
+bash "$GATE" claim run-matchok 13 "$FREEZE_SHA" | jq -e '.ok == true and .journeys.pinned == true' >/dev/null
+# No catalogue: a freeze claim pins the range only; no `journeys` key, no journeys pin.
+journeys_fixture "$BACKEND_ONLY"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/no-such-journeys.json"
+T5L_NOCAT="$(bash "$GATE" claim run-nocat 13 "$FREEZE_SHA")"
+jq -e '.ok == true and .campaignRange.pinState == "valid" and (has("journeys") | not)' <<<"$T5L_NOCAT" >/dev/null ||
+  { echo "5l: no-catalogue freeze claim: $T5L_NOCAT" >&2; exit 1; }
+[ -s "$(pin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ]
+# An ORDINARY PR, catalogue or not: the claim neither evaluates nor pins — its
+# output carries neither key and shared storage stays empty of pins.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'
+T5L_ORD="$(bash "$GATE" claim run-ordinary 13 "$FREEZE_SHA")"
+jq -e '.ok == true and .pr == 13 and (has("campaignRange") | not) and (has("journeys") | not)' <<<"$T5L_ORD" >/dev/null ||
+  { echo "5l: an ordinary claim changed shape: $T5L_ORD" >&2; exit 1; }
+[ -z "$(find "$SMOKE_GATE_LEASE_DIR" -name '*-pin-*' -print -quit)" ] || { echo "5l: an ordinary claim wrote a pin" >&2; exit 1; }
+# ...but a head whose commit cannot be read is not KNOWN to be ordinary: refused.
+export STUB_COMMIT_GET_EXIT=1
+T5L_UNKNOWN="$(bash "$GATE" claim run-unknown-kind 14 "$FREEZE_SHA" || true)"
+jq -e '.ok == false and (.error | test("whether this head is a freeze is unknown"))' <<<"$T5L_UNKNOWN" >/dev/null ||
+  { echo "5l: a PR of unknown kind was admitted: $T5L_UNKNOWN" >&2; exit 1; }
+[ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-unknown-kind.json" ]
+unset STUB_COMMIT_GET_EXIT
+# HEAD BINDING. The PR advanced from freeze head H to an ordinary head J, so
+# its file list now describes J. A claim of H is classified by H's own commit —
+# a freeze — and pinned; it is never admitted unpinned. And the converse: an
+# ordinary H on a PR whose current head J is a freeze is an ordinary claim.
+journeys_fixture "$BACKEND_ONLY"
+T5L_J="$(sha 9)"
+export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'   # the PR's CURRENT (J) diff
+export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" '{($h):[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]}')"
+T5L_DRIFT="$(bash "$GATE" claim run-drift 13 "$FREEZE_SHA")"
+jq -e '.ok == true and .campaignRange.pinState == "valid" and .journeys.pinned == true' <<<"$T5L_DRIFT" >/dev/null ||
+  { echo "5l: a freeze head on an advanced PR was not pinned at claim: $T5L_DRIFT" >&2; exit 1; }
+[ -s "$(pin_file 13 "$FREEZE_SHA")" ] && [ -s "$(jpin_file 13 "$FREEZE_SHA")" ]
+bash "$GATE" release run-drift >/dev/null
+# poll shares the classifier: the listed head H is a freeze by its own commit.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'
+export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" '{($h):[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]}')"
+bash "$GATE" check 13 | jq -e '.isFreezePr == true and .settled == true' >/dev/null ||
+  { echo "5l: check classified a freeze head by the PR's current files" >&2; exit 1; }
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.isFreezePr == true and .data.journeys.pinned == true' >/dev/null ||
+  { echo "5l: poll classified a freeze head by the PR's current files" >&2; exit 1; }
+# The converse: H is ordinary by its own commit even though the PR's current head is a freeze.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" '{($h):[{"filename":"api/src/reports/export.ts"}]}')"
+T5L_ORD_H="$(bash "$GATE" claim run-ordinary-head 13 "$FREEZE_SHA")"
+jq -e '.ok == true and (has("campaignRange") | not) and (has("journeys") | not)' <<<"$T5L_ORD_H" >/dev/null ||
+  { echo "5l: an ordinary head was classified by the PR's current freeze files: $T5L_ORD_H" >&2; exit 1; }
+[ -z "$(find "$SMOKE_GATE_LEASE_DIR" -name '*-pin-*' -print -quit)" ]
+# A FREEZE IS EXACTLY THE SHAPE smoke-freeze-pr.sh BUILDS: one parent, the two
+# marker paths, both ADDED. An ordinary multi-commit PR whose head commit
+# removes markers added earlier lists the same two filenames — and is
+# ordinary: no freeze keys, the head's own CI (not the parent's) consulted,
+# an ordinary claim, and `finish` writes no handoff. So are a rename, a
+# modification, and the two markers added beside a third file.
+MARKERS='{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}'
+head_files() { export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" --argjson f "$1" '{($h):$f}')"; }
+for shape in \
+  "removed|[{\"filename\":\"api/.render-freeze\",\"status\":\"removed\"},{\"filename\":\"web/.render-freeze\",\"status\":\"removed\"}]" \
+  "renamed|[{\"filename\":\"api/.render-freeze\",\"status\":\"renamed\",\"previous_filename\":\"api/.freeze\"},{\"filename\":\"web/.render-freeze\"}]" \
+  "modified|[{\"filename\":\"api/.render-freeze\",\"status\":\"modified\"},{\"filename\":\"web/.render-freeze\"}]" \
+  "extra-file|[$MARKERS,{\"filename\":\"api/src/x.ts\"}]" \
+  "two-parents|[$MARKERS]"; do
+  label="${shape%%|*}"; files="${shape#*|}"
+  journeys_fixture "$BACKEND_ONLY"
+  export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'
+  head_files "$files"
+  # A merge commit that happens to add both markers has two parents; the
+  # freeze commit has exactly one.
+  [ "$label" != two-parents ] ||
+    export STUB_PARENT_BY_COMMIT="$(jq -c --arg h "$FREEZE_SHA" --arg p "$PARENT_SHA,$BASE_SHA" '.[$h] = $p' <<<"$STUB_PARENT_BY_COMMIT")"
+  T5L_SHAPE="$(bash "$GATE" check 13)"
+  jq -e --arg head "$FREEZE_SHA" '.isFreezePr == false and (has("campaignRange") | not) and (has("journeys") | not) and .ciSha == $head' <<<"$T5L_SHAPE" >/dev/null ||
+    { echo "5l: a head whose markers are $label was classified as a freeze: $T5L_SHAPE" >&2; exit 1; }
+  T5L_SHAPE="$(bash "$GATE" claim "run-$label" 13 "$FREEZE_SHA")"
+  jq -e '.ok == true and (has("campaignRange") | not) and (has("journeys") | not)' <<<"$T5L_SHAPE" >/dev/null ||
+    { echo "5l: a claim of a head whose markers are $label took the freeze path: $T5L_SHAPE" >&2; exit 1; }
+  [ -z "$(find "$SMOKE_GATE_LEASE_DIR" -name '*-pin-*' -print -quit)" ] || { echo "5l: $label head was pinned" >&2; exit 1; }
+  T5L_SHAPE="$(SMOKE_GATE_PUBLISH_FILE="$STATE_DIR/dev-gate/latest-verdict.json" SMOKE_GATE_HOLD_FILE="$STATE_DIR/dev-gate/develop-hold.json" \
+    bash "$GATE" finish "$FREEZE_SHA" "run-$label" GO)"
+  jq -e '.ok == true and .handoff.written == false' <<<"$T5L_SHAPE" >/dev/null ||
+    { echo "5l: finish of a head whose markers are $label wrote a freeze handoff: $T5L_SHAPE" >&2; exit 1; }
+  [ ! -e "$STATE_DIR/dev-gate/latest-verdict.json" ] && [ ! -e "$STATE_DIR/dev-gate/develop-hold.json" ] ||
+    { echo "5l: finish of a $label head published a freeze verdict" >&2; exit 1; }
+done
+# ...and the real shape, both markers added onto one parent, is the freeze it always was.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'
+head_files "[$MARKERS]"
+bash "$GATE" check 13 | jq -e '.isFreezePr == true and .settled == true and .campaignRange.pinState == "absent"' >/dev/null ||
+  { echo "5l: the real freeze shape was not classified as a freeze" >&2; exit 1; }
+unset STUB_COMMIT_FILES_BY_SHA
+unset -f pin_file
+
+unset SMOKE_JOURNEYS_CATALOGUE
+unset -f range_case journeys_fixture jpin_file
+
+fi
+if smoke_case 6-7b-lifecycle; then
+# --- 6. Migrations refusal: never settles; one throttled alarm wake --------
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha 1)"
+export STUB_PR_VIEW="{\"number\":11,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"api/migrations/0099_add_col.sql"},{"filename":"api/src/foo.ts"}]'
+bash "$GATE" check 11 | jq -e '.migrationsTouched == true and .settled == false' >/dev/null
+# Same PR through poll: refuses with a throttled alarm, never a settle wake.
+export STUB_PR_LIST="[{\"number\":11,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+bash "$GATE" poll | jq -e --arg sha "$HEAD_SHA" '
+  .wakeAgent == true and .data.trigger == "pr_migrations_refused" and
+  .data.pr == 11 and .data.sourceSha == $sha
+' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates" and .observation.kind == "empty"' >/dev/null
+[ ! -e "$STATE_DIR/pr-11-verdict.json" ]
+
+# --- 7. claim/progress/release lifecycle ------------------------------------
+fresh_state
+CLAIM_SHA="$(sha 2)"
+bash "$GATE" claim run-x 5 "$CLAIM_SHA" | jq -e '.ok == true and .pr == 5 and .tookOverFrom == null' >/dev/null
+bash "$GATE" claim run-y 5 "$CLAIM_SHA" | jq -e '.ok == false' >/dev/null   # slot already owned
+bash "$GATE" progress run-wrong | jq -e '.ok == false and .pr == null' >/dev/null
+bash "$GATE" progress run-x | jq -e '.ok == true and .pr == 5' >/dev/null
+jq -e '.activeProgressAt != null' "$STATE_DIR/pr-5-state.json" >/dev/null
+bash "$GATE" release run-x | jq -e '.ok == true and .releasedRunId == "run-x"' >/dev/null
+jq -e '.activeSha == null and .activeRunId == null' "$STATE_DIR/pr-5-state.json" >/dev/null
+
+# --- 7b. P1 regression: a stamping run keeps its slot past the age ceiling.
+# ACTIVE_STALE_SECONDS used to be ANDed into liveness, so a coordinator that
+# had stamped `progress` four minutes earlier went "not live" the instant it
+# crossed 4h — and the next claim/poll started a SECOND coordinator on the
+# same PR and the same frozen SHA with nothing telling the first. That is
+# exactly how run …-20260822T023125Z was displaced at 4h00m03s, after which
+# two coordinators drove the same seat for hours and no verdict was ever
+# published. Simulated by setting the ceiling to 0, which makes every active
+# run instantly "overrun".
+fresh_state
+DUP_SHA="$(sha 9)"
+bash "$GATE" claim run-orig-live 55 "$DUP_SHA" | jq -e '.ok == true' >/dev/null
+bash "$GATE" progress run-orig-live | jq -e '.ok == true' >/dev/null
+export SMOKE_GATE_ACTIVE_STALE_SECONDS=0
+# Same PR, same SHA, new run id — the rival's exact shape. Refused, and the
+# refusal says how a human forces it rather than leaving them to guess.
+bash "$GATE" claim run-rival 55 "$DUP_SHA" | jq -e '
+  .ok == false and .pr == 55 and .activeRunId == "run-orig-live" and
+  (.error | test("--takeover")) and .activeAgeSeconds >= 0
+' >/dev/null
+jq -e '.activeRunId == "run-orig-live"' "$STATE_DIR/pr-55-state.json" >/dev/null
+# `poll` never takes over either: with the slot held, PR 55 is not a candidate.
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export STUB_PR_LIST="[{\"number\":55,\"headRefOid\":\"$DUP_SHA\",\"headRefName\":\"feature/dup\"}]"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$DUP_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-55\",\"name\":\"WIDGET-API PR #55\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-55.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$DUP_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+# ...but the ceiling still RINGS. It was demoted from executioner to alarm, not
+# deleted: a zombie stamper (heartbeat alive, work wedged in a retry loop or a
+# hung browser) must not hold the slot in silence just because no rival happens
+# to claim. One wake per overrun run, then latched.
+bash "$GATE" poll | jq -e --arg sha "$DUP_SHA" '
+  .wakeAgent == true and .data.trigger == "pr_run_overrun" and
+  .data.pr == 55 and .data.runId == "run-orig-live" and
+  .data.sourceSha == $sha and .data.activeAgeSeconds >= 0
+' >/dev/null
+jq -e '.overrunAlertRunId == "run-orig-live"' "$STATE_DIR/pr-55-state.json" >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates" and .observation.kind == "empty"' >/dev/null
+jq -e '.activeRunId == "run-orig-live"' "$STATE_DIR/pr-55-state.json" >/dev/null
+# Control, so the assertion above cannot pass vacuously: this fixture IS a real
+# settle candidate. Free the slot and the very same poll wakes and auto-claims.
+bash "$GATE" release run-orig-live | jq -e '.ok == true' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled"' >/dev/null
+POLL_RUN="$(jq -r '.activeRunId' "$STATE_DIR/pr-55-state.json")"
+# An explicit human --takeover past the ceiling still works, and says so.
+bash "$GATE" claim run-rival 55 "$DUP_SHA" --takeover | jq -e --arg prev "$POLL_RUN" '
+  .ok == true and .runId == "run-rival" and .tookOverFrom == $prev
+' >/dev/null
+# The displacement is LOUD. A shell gate cannot kill the incumbent's container,
+# so the displaced run's next gate verb is the only channel that reaches it —
+# it must carry a stop instruction, not just "not the active run".
+jq -e --arg prev "$POLL_RUN" '
+  .displacedRunId == $prev and .displacedAt != null
+' "$STATE_DIR/pr-55-state.json" >/dev/null
+for VERB in progress release; do
+  OUT="$(bash "$GATE" "$VERB" "$POLL_RUN")"
+  jq -e '
+    .ok == false and (.error | test("STOP THIS CAMPAIGN")) and
+    (.error | test("--takeover")) and .pr == 55 and .activeRunId == "run-rival"
+  ' <<<"$OUT" >/dev/null || { echo "expected $VERB to hand the displaced run a stop instruction, got: $OUT" >&2; exit 1; }
+done
+OUT="$(bash "$GATE" finish "$DUP_SHA" "$POLL_RUN" GO)"
+jq -e '.ok == false and (.error | test("STOP THIS CAMPAIGN"))' <<<"$OUT" >/dev/null
+[ ! -e "$STATE_DIR/pr-55-verdict.json" ]
+# An unrelated stale run id still gets the ordinary refusal, not a stop order.
+bash "$GATE" progress some-other-run | jq -e '
+  .ok == false and .pr == null and (.error | test("STOP") | not)
+' >/dev/null
+# An ordinary (non-takeover) claim clears the name so it can never mis-accuse.
+bash "$GATE" release run-rival >/dev/null
+bash "$GATE" claim run-clean 55 "$DUP_SHA" >/dev/null
+jq -e '.displacedRunId == null and .displacedAt == null' "$STATE_DIR/pr-55-state.json" >/dev/null
+bash "$GATE" release run-clean >/dev/null
+bash "$GATE" claim run-rival 55 "$DUP_SHA" >/dev/null
+# An explicit --takeover works BELOW the ceiling too. This assertion was the
+# reverse earlier in this same change; an adversarial review pointed out that
+# gating the flag on the ceiling removed the operator's only lever during the
+# first hours of a wedged campaign, while protecting against nothing a
+# deliberate human flag does not already imply. A bare claim is still refused.
+unset SMOKE_GATE_ACTIVE_STALE_SECONDS
+bash "$GATE" claim run-third 55 "$DUP_SHA" --takeover | jq -e '
+  .ok == true and .tookOverFrom == "run-rival"
+' >/dev/null
+bash "$GATE" release run-third >/dev/null
+bash "$GATE" claim run-rival 55 "$DUP_SHA" >/dev/null
+bash "$GATE" claim run-third 55 "$DUP_SHA" | jq -e '
+  .ok == false and (.error | test("wait for it or ask its coordinator"))
+' >/dev/null
+# A genuinely dead run (no stamp inside the liveness window) is still
+# reclaimable under its published run id — the recovery path this fix must not
+# break and the run-id continuity rule requires.
+export SMOKE_GATE_PROGRESS_STALE_SECONDS=0
+bash "$GATE" claim run-rival 55 "$DUP_SHA" | jq -e '
+  .ok == true and .tookOverFrom == null
+' >/dev/null
+unset SMOKE_GATE_PROGRESS_STALE_SECONDS
+
+fi
+# --- 7c. pr_run_stalled: a claimed run whose PR stopped settling is not
+# invisible. The traced hole: the challenger files its disposition, the
+# coordinator dies before synthesis, progress goes stale, and the preview is
+# then suspended / the PR unlabeled or closed. `challenger-timeout` refuses (a
+# disposition exists), same-run recovery needs a PR that settles, and
+# `pr_run_overrun` needs FRESH progress — so nothing ever fired.
+IDLE_ONE='{"wakeAgent":false,"data":{"schemaVersion":1,"trigger":"waiting_for_candidates","labeledPrCount":1}}'
+IDLE_NONE='{"wakeAgent":false,"data":{"schemaVersion":1,"trigger":"waiting_for_candidates","labeledPrCount":0}}'
+stalled_fixture() { # <pr> <sha>: a settling ordinary PR plus a readable run root
+  fresh_state
+  export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+    SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+  export SMOKE_GATE_RUN_ROOT="$STATE_DIR/qa-runs"
+  mkdir -p "$SMOKE_GATE_RUN_ROOT"
+  export STUB_PR_LIST="[{\"number\":$1,\"headRefOid\":\"$2\",\"headRefName\":\"feature/stall\"}]"
+  export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+  export STUB_RUN_LIST="[{\"headSha\":\"$2\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+  export STUB_SERVICES="[{\"id\":\"srv-backend-pr-$1\",\"name\":\"WIDGET-API PR #$1\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-$1.onrender.com\"}}]"
+  export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$2\"}}]"
+  export STUB_HEALTHZ_CODE=200
+}
+# The coordinator's death, as the gate sees it: no stamp inside the window.
+stall_now() { export SMOKE_GATE_PROGRESS_STALE_SECONDS=0 SMOKE_GATE_STALLED_GRACE_SECONDS=0; }
+stall_clear() { unset SMOKE_GATE_PROGRESS_STALE_SECONDS SMOKE_GATE_STALLED_GRACE_SECONDS; }
+ownership_digest() { # <pr> <run>: state owner + lease + authority, for "nothing was minted"
+  { jq -c '[.activeRunId,.activeLeaseOwner,.activeStartedAt,.challengerDeadline]' "$STATE_DIR/pr-$1-state.json"
+    cat "$SMOKE_GATE_LEASE_DIR/lease-$2.json" "$SMOKE_GATE_LEASE_DIR/pr-$1-authority.json"; } | sha256sum
+}
+if smoke_case 7c-stalled; then
+
+STALL_SHA="$(sha 6)"
+stalled_fixture 61 "$STALL_SHA"
+STALL_OPEN="$(bash "$GATE" poll)"
+jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled"' <<<"$STALL_OPEN" >/dev/null
+STALL_RUN="$(jq -r '.data.runId' <<<"$STALL_OPEN")"
+STALL_OWNER="$(jq -r '.data.coordinatorOwnerToken' <<<"$STALL_OPEN")"
+mkdir -p "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/challenger"
+echo "disposition: no blocking findings" > "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/challenger/disposition.md"
+# The contract as the scaffold writes it today (schemaVersion 2, campaign
+# identity beside the token, smoke-run-scaffold.sh:558-569); a legacy v1 one
+# is exercised on PR 64 below.
+jq -cn --arg o "$STALL_OWNER" --arg run "$STALL_RUN" --arg sha "$STALL_SHA" \
+  '{schemaVersion:2,runId:$run,sourceSha:$sha,coordinatorOwnerToken:$o,ownershipKind:"pr",pr:61,repoSlug:"org/repo"}' \
+  > "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/completion-contract.json"
+# ...and the preview is suspended: the PR is still listed, it just never settles.
+export STUB_HEALTHZ_CODE=503
+# Fresh progress => silent, byte-identical to a gate that has no such alarm.
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_ONE" ] || { echo "7c: a live claimed run changed poll output" >&2; exit 1; }
+# Stale, but inside the grace that gives same-run recovery first refusal => silent.
+[ "$(SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_ONE" ] ||
+  { echo "7c: stalled alarm rang inside its grace window" >&2; exit 1; }
+jq -e '.stalledAlertRunId == null' "$STATE_DIR/pr-61-state.json" >/dev/null
+# The precondition of the hole, asserted rather than assumed: the timeout verb
+# refuses because a disposition exists.
+jq -c '.challengerDeadline="2000-01-01T00:00:00Z"' "$STATE_DIR/pr-61-state.json" > "$STATE_DIR/pr-61-state.tmp"
+mv "$STATE_DIR/pr-61-state.tmp" "$STATE_DIR/pr-61-state.json"
+bash "$GATE" challenger-timeout "$STALL_RUN" "$STALL_OWNER" | jq -e '
+  .ok == false and (.error | test("DID file a disposition"))' >/dev/null
+# A dead coordinator stops renewing too: its lease (900s) lapses well inside
+# the liveness window (1800s), so a stalled run normally reports leaseLive:false.
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$STALL_RUN.json"
+stall_now
+STALL_BEFORE="$(ownership_digest 61 "$STALL_RUN")"
+STALL_OUT="$(bash "$GATE" poll)"
+jq -e --arg run "$STALL_RUN" --arg sha "$STALL_SHA" '
+  .wakeAgent == true and .data.trigger == "pr_run_stalled" and
+  .data.pr == 61 and .data.runId == $run and .data.sourceSha == $sha and
+  .data.challengerDispositionFiled == true and .data.synthesisPending == true and
+  .data.completionContractExists == true and .data.contractAdoptionRequired == true and
+  .data.finishIntentPending == false and .data.leaseLive == false and
+  (.data.activeStartedAt | type == "string") and .data.quietSeconds >= 0 and
+  .data.notSettling.reason == "not_settled" and .data.notSettling.headSha == $sha and
+  .data.notSettling.facts.healthzReady == false and .data.notSettling.facts.backendReady == true
+' <<<"$STALL_OUT" >/dev/null || { echo "7c: expected pr_run_stalled, got: $STALL_OUT" >&2; exit 1; }
+# It reports; it never recovers. No token in the wake, nothing minted or rotated.
+if grep -q 'owner-[0-9a-f]\{8\}' <<<"$STALL_OUT"; then echo "7c: stalled wake leaked an owner token" >&2; exit 1; fi
+[ "$(ownership_digest 61 "$STALL_RUN")" = "$STALL_BEFORE" ] ||
+  { echo "7c: stalled alarm changed ownership of a non-settling PR" >&2; exit 1; }
+jq -e --arg run "$STALL_RUN" '.stalledAlertRunId == $run' "$STATE_DIR/pr-61-state.json" >/dev/null
+# Next poll => silent. Latched per run id, no interval re-ring.
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_ONE" ] || { echo "7c: stalled alarm re-fired on the next poll" >&2; exit 1; }
+# The preview comes back: existing same-run recovery is untouched by the latch.
+export STUB_HEALTHZ_CODE=200
+bash "$GATE" poll | jq -e --arg run "$STALL_RUN" '
+  .data.trigger == "pr_build_settled" and .data.recovery == true and
+  .data.resumedRunId == true and .data.runId == $run' >/dev/null
+stall_clear
+
+# Same run shape, but the PR STILL settles: existing recovery wins, the stalled
+# alarm neither fires nor latches, and the poll after that is silent.
+STALL_SHA="$(sha 7)"
+stalled_fixture 62 "$STALL_SHA"
+STALL_RUN="$(bash "$GATE" poll | jq -r '.data.runId')"
+mkdir -p "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/challenger"
+echo "disposition" > "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/challenger/disposition.md"
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$STALL_RUN.json"
+stall_now
+bash "$GATE" poll | jq -e --arg run "$STALL_RUN" '
+  .wakeAgent == true and .data.trigger == "pr_build_settled" and
+  .data.recovery == true and .data.resumedRunId == true and .data.runId == $run' >/dev/null
+jq -e '.stalledAlertRunId == null' "$STATE_DIR/pr-62-state.json" >/dev/null
+stall_clear
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_ONE" ] || { echo "7c: recovery and the stalled alarm double-fired" >&2; exit 1; }
+
+# The PR left the labeled-open list altogether (closed) — the case `poll`'s own
+# loop can never see. No disposition, unreadable contract: reported as such.
+STALL_SHA="$(sha 8)"
+stalled_fixture 63 "$STALL_SHA"
+STALL_OPEN="$(bash "$GATE" poll)"
+STALL_RUN="$(jq -r '.data.runId' <<<"$STALL_OPEN")"
+STALL_OWNER="$(jq -r '.data.coordinatorOwnerToken' <<<"$STALL_OPEN")"
+export STUB_PR_LIST='[]'
+export STUB_PR_VIEW="{\"state\":\"CLOSED\",\"labels\":[{\"name\":\"render-preview\"}],\"baseRefName\":\"develop\",\"headRefOid\":\"$STALL_SHA\"}"
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: live run on an unlisted PR changed poll output" >&2; exit 1; }
+stall_now
+# leaseLive is reported, not acted on: this lease has not lapsed yet.
+bash "$GATE" poll | jq -e --arg run "$STALL_RUN" '
+  .wakeAgent == true and .data.trigger == "pr_run_stalled" and .data.pr == 63 and .data.runId == $run and
+  .data.leaseLive == true and
+  .data.challengerDispositionFiled == false and .data.synthesisPending == false and
+  .data.completionContractExists == false and .data.contractAdoptionRequired == false and
+  .data.notSettling.reason == "pr_closed" and .data.notSettling.prState == "CLOSED"' >/dev/null
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: unlisted stalled alarm re-fired" >&2; exit 1; }
+# A NEW run id re-arms it. The responder's own path: resume the published run
+# id with `claim` (allowed once progress is stale and the dead owner's lease has
+# lapsed), release it, and a later run on the same PR that stalls the same way
+# alarms again.
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$STALL_RUN.json"
+STALL_RECLAIM="$(bash "$GATE" claim "$STALL_RUN" 63 "$STALL_SHA" owner-responder)"
+jq -e '.ok == true' <<<"$STALL_RECLAIM" >/dev/null
+bash "$GATE" release "$STALL_RUN" owner-responder | jq -e '.ok == true' >/dev/null
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: a released run still alarmed" >&2; exit 1; }
+bash "$GATE" claim run-stall-second 63 "$STALL_SHA" owner-second | jq -e '.ok == true' >/dev/null
+export STUB_PR_VIEW="{\"state\":\"OPEN\",\"labels\":[],\"baseRefName\":\"develop\",\"headRefOid\":\"$STALL_SHA\"}"
+bash "$GATE" poll | jq -e '
+  .data.trigger == "pr_run_stalled" and .data.runId == "run-stall-second" and
+  .data.notSettling.reason == "label_removed" and .data.notSettling.labeled == false' >/dev/null
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: re-armed stalled alarm re-fired" >&2; exit 1; }
+# Unwired run root: null, never false — absence is only evidence when presence
+# was possible. And an unreadable `gh pr view` leaves the honest generic reason.
+bash "$GATE" release run-stall-second owner-second | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim run-stall-third 63 "$STALL_SHA" owner-third | jq -e '.ok == true' >/dev/null
+export STUB_PR_VIEW_EXIT=1
+SMOKE_GATE_RUN_ROOT= bash "$GATE" poll | jq -e '
+  .data.trigger == "pr_run_stalled" and .data.runId == "run-stall-third" and
+  .data.challengerDispositionFiled == null and .data.completionContractExists == null and
+  .data.contractAdoptionRequired == null and .data.synthesisPending == false and
+  .data.notSettling == {reason:"pr_not_listed"}' >/dev/null
+# A TERMINAL run is silent: finish it and the same poll says nothing.
+bash "$GATE" finish "$STALL_SHA" run-stall-third BLOCKED owner-third | jq -e '.ok == true' >/dev/null
+jq -e '.activeRunId == null and .completedRunId == "run-stall-third"' "$STATE_DIR/pr-63-state.json" >/dev/null
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: a terminal run alarmed as stalled" >&2; exit 1; }
+stall_clear
+
+# Precedence. (1) A settle candidate on ANOTHER PR outranks the stalled alarm —
+# it can never delay a campaign — and the alarm rings on the next idle poll.
+STALL_SHA="$(sha 5)"
+stalled_fixture 65 "$STALL_SHA"
+bash "$GATE" claim run-stall-dead 64 "$(sha 4)" owner-dead | jq -e '.ok == true' >/dev/null
+stall_now
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.pr == 65' >/dev/null
+jq -e '.stalledAlertRunId == null' "$STATE_DIR/pr-64-state.json" >/dev/null
+stall_clear
+# PR 65's new run is live under the default window; PR 64's is aged explicitly.
+jq -c '.activeStartedAt="2000-01-01T00:00:00Z" | .activeProgressAt=null' "$STATE_DIR/pr-64-state.json" > "$STATE_DIR/pr-64-state.tmp"
+mv "$STATE_DIR/pr-64-state.tmp" "$STATE_DIR/pr-64-state.json"
+# The scan keys on pr-<n>-state.json and nothing else: range/journeys pin files
+# (shared lease dir, here also dropped beside the state) and an unparseable
+# state file are ignored, and the claimed run is still found.
+for STALL_DECOY in "$STATE_DIR" "$SMOKE_GATE_LEASE_DIR"; do
+  echo '{"activeRunId":"decoy","pr":1}' > "$STALL_DECOY/range-pin-v1-pr-64-$(sha 4).json"
+  echo '{"activeRunId":"decoy","pr":1}' > "$STALL_DECOY/journeys-pin-v1-pr-64-$(sha 4).json"
+done
+echo 'not json' > "$STATE_DIR/pr-1-state.json"
+# A contract written before identity existed (schemaVersion 1) reads the same:
+# adoption is keyed on the token, and `adopt` backfills the identity itself.
+mkdir -p "$SMOKE_GATE_RUN_ROOT/run-stall-dead"
+jq -cn '{schemaVersion:1,coordinatorOwnerToken:"owner-dead"}' \
+  > "$SMOKE_GATE_RUN_ROOT/run-stall-dead/completion-contract.json"
+bash "$GATE" poll | jq -e '
+  .data.trigger == "pr_run_stalled" and .data.pr == 64 and .data.runId == "run-stall-dead" and
+  .data.completionContractExists == true and .data.contractAdoptionRequired == true' >/dev/null
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_ONE" ] || { echo "7c: aged stalled alarm re-fired" >&2; exit 1; }
+# (2) Overrun and stalled are disjoint by predicate: a run that is still
+# STAMPING past the ceiling is an overrun, never a stall, even at zero grace.
+STALL_SHA="$(sha 2)"
+stalled_fixture 66 "$STALL_SHA"
+bash "$GATE" claim run-stall-zombie 66 "$STALL_SHA" owner-zombie | jq -e '.ok == true' >/dev/null
+SMOKE_GATE_ACTIVE_STALE_SECONDS=0 SMOKE_GATE_STALLED_GRACE_SECONDS=0 bash "$GATE" poll | jq -e '
+  .data.trigger == "pr_run_overrun" and .data.runId == "run-stall-zombie"' >/dev/null
+jq -e '.stalledAlertRunId == null and .overrunAlertRunId == "run-stall-zombie"' "$STATE_DIR/pr-66-state.json" >/dev/null
+# No claimed run anywhere => byte-identical, even with the alarm at zero grace.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base STUB_PR_LIST='[]'
+stall_now
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: poll output changed with no claimed run" >&2; exit 1; }
+bash "$GATE" claim run-stall-done 67 "$(sha 1)" owner-done >/dev/null
+bash "$GATE" release run-stall-done owner-done >/dev/null
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: a released slot alarmed" >&2; exit 1; }
+stall_clear
+unset SMOKE_GATE_RUN_ROOT
+
+fi
+if smoke_case 7d-12-finish; then
+# --- 7d. challenger-timeout ends a run that never left intake ------
+# The controller now times a run out while it is still in intake -- no
+# completion contract, possibly no run directory at all (run pr2075). That
+# rests on the verb needing neither: it reads the claim, the deadline and the
+# ABSENCE of challenger/disposition.md under a readable run root, then runs the
+# ordinary finish BLOCKED. Asserted here against the real verb, not the fake.
+STALL_SHA="$(sha 3)"
+stalled_fixture 68 "$STALL_SHA"
+bash "$GATE" claim run-intake-dead 68 "$STALL_SHA" owner-intake | jq -e '.ok == true' >/dev/null
+[ ! -e "$SMOKE_GATE_RUN_ROOT/run-intake-dead" ] || { echo "7d: precondition - no run directory" >&2; exit 1; }
+# Before the deadline the verb refuses, so what follows is the deadline's doing.
+bash "$GATE" challenger-timeout run-intake-dead owner-intake | jq -e '
+  .ok == false and .refusal == "deadline-not-passed" and (.error | test("has not passed"))' >/dev/null \
+  || { echo "7d: challenger-timeout ended a run before its deadline" >&2; exit 1; }
+# Every precondition refusal carries its machine-readable code (the gate's code
+# table above the verb). The campaign controller keys on these codes, and the
+# controller tests' fake gate emits the same ones: asserted here against the
+# REAL verb so the two cannot drift apart unnoticed (PR #1066 rounds 1 and 3).
+set_pr68_deadline() {
+  jq -c --arg d "$1" '.challengerDeadline=$d' "$STATE_DIR/pr-68-state.json" > "$STATE_DIR/pr-68-state.tmp"
+  mv "$STATE_DIR/pr-68-state.tmp" "$STATE_DIR/pr-68-state.json"
+}
+timeout_refusal() { # <expected-code>: the verb refuses with exactly that code, slot untouched
+  local out
+  # Three of these refusals exit 2 (smoke-pr-gate.sh:4639,:4657,:4663): the
+  # code, not the exit status, is what is asserted.
+  out="$(bash "$GATE" challenger-timeout run-intake-dead owner-intake)" || true
+  jq -e --arg c "$1" '.ok == false and .refusal == $c' <<<"$out" >/dev/null \
+    || { echo "7d: expected refusal code $1, got: $out" >&2; exit 1; }
+  jq -e '.activeRunId == "run-intake-dead"' "$STATE_DIR/pr-68-state.json" >/dev/null \
+    || { echo "7d: a $1 refusal released the slot" >&2; exit 1; }
+}
+set_pr68_deadline ""
+timeout_refusal no-deadline
+set_pr68_deadline "2000-01-01T00:00:00Z"
+( unset SMOKE_GATE_RUN_ROOT; timeout_refusal run-root-unset )
+( export SMOKE_GATE_RUN_ROOT="$STATE_DIR/no-such-mount"; timeout_refusal run-root-unreadable )
+mkdir -p "$SMOKE_GATE_RUN_ROOT/run-intake-dead/challenger"
+echo "filed" > "$SMOKE_GATE_RUN_ROOT/run-intake-dead/challenger/disposition.md"
+timeout_refusal disposition-filed
+rm -rf "$SMOKE_GATE_RUN_ROOT/run-intake-dead"
+# An UNPARSABLE deadline has passed: epoch_or_zero reads a failed `date -d` as
+# epoch 0 (smoke-pr-gate.sh:166-173). The fake gate models exactly that (PR
+# #1066 closing review); a refusal from the run-root check, which comes after
+# the deadline check, proves the deadline did not stop it.
+set_pr68_deadline "not-a-date"
+( export SMOKE_GATE_RUN_ROOT="$STATE_DIR/no-such-mount"; timeout_refusal run-root-unreadable )
+set_pr68_deadline "2000-01-01T00:00:00Z"
+# `lease-unavailable`: the shared lease fence, which this verb and `finish`
+# both take, cannot read the lease (here: malformed). A "cannot look" the
+# controller retries and alarms on (GATE_REFUSALS), never a permanent refusal.
+LEASE68="$SMOKE_GATE_LEASE_DIR/lease-run-intake-dead.json"
+cp "$LEASE68" "$LEASE68.keep"
+printf '{' > "$LEASE68"
+timeout_refusal lease-unavailable
+mv "$LEASE68.keep" "$LEASE68"
+bash "$GATE" challenger-timeout run-intake-dead owner-intake | jq -e '
+  .ok == true and .verdict == "BLOCKED" and .challengerDisposition == "no-disposition"' >/dev/null \
+  || { echo "7d: challenger-timeout refused a contract-less run past its deadline" >&2; exit 1; }
+jq -e '.activeRunId == null and .completedRunId == "run-intake-dead" and .completedVerdict == "BLOCKED"' \
+  "$STATE_DIR/pr-68-state.json" >/dev/null || { echo "7d: the slot was not released BLOCKED" >&2; exit 1; }
+unset SMOKE_GATE_RUN_ROOT
+
+# --- 7e. challenger-start anchors the challenger's window to the root post ---
+# `claim` stamps a provisional deadline; the challenger only starts at the root
+# post. `challenger-start` arms the deadline before each attempt of the root,
+# to min(now + timeout, provisional + intake allowance), never moving it back.
+# A same-SHA recovery keeps it, an expired deadline is never revived, and a run
+# whose root never goes out still times out at the provisional deadline.
+START_SHA="$(sha 5)"
+stalled_fixture 69 "$START_SHA"
+pr69() { jq -c "$1" "$STATE_DIR/pr-69-state.json" > "$STATE_DIR/pr-69-state.tmp"; mv "$STATE_DIR/pr-69-state.tmp" "$STATE_DIR/pr-69-state.json"; }
+iso_at() { date -u -d "@$1" +'%Y-%m-%dT%H:%M:%SZ'; }
+bash "$GATE" claim run-start 69 "$START_SHA" owner-start | jq -e '.ok == true' >/dev/null
+jq -e '.challengerStartedAt == null and (.challengerDeadline | type == "string")' "$STATE_DIR/pr-69-state.json" >/dev/null
+# Intake took 40 minutes: the provisional deadline is that much closer.
+START_PROVISIONAL="$(iso_at $(( $(date -u +%s) + 5400 - 2400 )))"
+pr69 ".challengerDeadline=\"$START_PROVISIONAL\""
+# Only the run's own owner and claimant may start it; nothing moves otherwise.
+bash "$GATE" challenger-start run-start owner-other | jq -e '.ok == false and (.error | test("caller owner"))' >/dev/null
+bash "$GATE" challenger-start run-nope owner-start | jq -e '.ok == false and (.error | test("not the active run"))' >/dev/null
+SMOKE_GATE_CLAIMANT=controller bash "$GATE" challenger-start run-start owner-start |
+  jq -e '.ok == false and .claimantMismatch == true' >/dev/null
+jq -e --arg d "$START_PROVISIONAL" '.challengerDeadline == $d and .challengerStartedAt == null' "$STATE_DIR/pr-69-state.json" >/dev/null ||
+  { echo "7e: a refused challenger-start moved the deadline" >&2; exit 1; }
+START_BEFORE="$(date -u +%s)"
+START_OUT="$(bash "$GATE" challenger-start run-start owner-start)"
+START_AFTER="$(date -u +%s)"
+jq -e --arg p "$START_PROVISIONAL" '.ok == true and .started == true and .provisionalDeadline == $p' <<<"$START_OUT" >/dev/null ||
+  { echo "7e: challenger-start did not start: $START_OUT" >&2; exit 1; }
+START_DEADLINE="$(jq -r '.challengerDeadline' <<<"$START_OUT")"
+START_EPOCH="$(date -u -d "$START_DEADLINE" +%s)"
+[ "$START_EPOCH" -ge $(( START_BEFORE + 5400 )) ] && [ "$START_EPOCH" -le $(( START_AFTER + 5400 )) ] ||
+  { echo "7e: the challenger did not get its full window from the root post ($START_DEADLINE)" >&2; exit 1; }
+jq -e --arg d "$START_DEADLINE" --argjson o "$START_OUT" \
+  '.challengerDeadline == $d and .challengerStartedAt == $o.challengerStartedAt' "$STATE_DIR/pr-69-state.json" >/dev/null
+# The arm is kept provisional, measured from the claim-time deadline.
+jq -e --arg p "$START_PROVISIONAL" '.challengerProvisionalDeadline == $p' "$STATE_DIR/pr-69-state.json" >/dev/null ||
+  { echo "7e: an arm did not keep the claim-time deadline" >&2; exit 1; }
+# A re-arm (the root's next attempt) moves the start forward, never back.
+REARM_OUT="$(bash "$GATE" challenger-start run-start owner-start)"
+jq -e --arg p "$START_PROVISIONAL" --arg d "$START_DEADLINE" '
+  .ok == true and .started == true and .confirmed == false and .provisionalDeadline == $p and .challengerDeadline >= $d' \
+  <<<"$REARM_OUT" >/dev/null || { echo "7e: a re-arm did not move the start forward: $REARM_OUT" >&2; exit 1; }
+START_DEADLINE="$(jq -r '.challengerDeadline' <<<"$REARM_OUT")"
+START_OUT="$REARM_OUT"
+# challenger-timeout keys on the re-anchored deadline.
+bash "$GATE" challenger-timeout run-start owner-start | jq -e '.ok == false and .refusal == "deadline-not-passed"' >/dev/null
+# A same-SHA recovery keeps the anchor and its claim-time deadline.
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-run-start.json"
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" claim run-start 69 "$START_SHA" owner-start-2 | jq -e '.ok == true' >/dev/null
+jq -e --arg d "$START_DEADLINE" --argjson o "$START_OUT" --arg p "$START_PROVISIONAL" \
+  '.challengerDeadline == $d and .challengerStartedAt == $o.challengerStartedAt and .challengerProvisionalDeadline == $p' \
+  "$STATE_DIR/pr-69-state.json" >/dev/null ||
+  { echo "7e: recovery reset the challenger anchor" >&2; exit 1; }
+# --- 7f. the delivery receipt confirms the start at the delivery time -------
+# The root was armed 30 minutes ago and its delivery landed 10 minutes ago
+# (its first attempt failed and was retried): the window runs from the
+# delivery, not from the arm and not from this call.
+ARMED_EPOCH="$(( $(date -u +%s) - 1800 ))"
+pr69 ".challengerStartedAt=\"$(iso_at "$ARMED_EPOCH")\" | .challengerDeadline=\"$(iso_at $(( ARMED_EPOCH + 5400 )))\""
+DELIVERED_EPOCH="$(( $(date -u +%s) - 600 ))"
+confirm_unchanged() { # <label> <args...>: refused, nothing written
+  local label="$1" before out; shift
+  before="$(jq -c '[.challengerDeadline,.challengerStartedAt,.challengerProvisionalDeadline]' "$STATE_DIR/pr-69-state.json")"
+  out="$(bash "$GATE" challenger-start "$@")" && rc=0 || rc=$?
+  jq -e '.ok == false' <<<"$out" >/dev/null || { echo "7f: $label was not refused: $out" >&2; exit 1; }
+  [ "$(jq -c '[.challengerDeadline,.challengerStartedAt,.challengerProvisionalDeadline]' "$STATE_DIR/pr-69-state.json")" = "$before" ] ||
+    { echo "7f: $label wrote state" >&2; exit 1; }
+  printf '%s\n' "$out"
+}
+confirm_unchanged "a malformed delivery time" run-start owner-start-2 --delivered not-a-time | jq -e '.error | test("ISO-8601")' >/dev/null
+confirm_unchanged "an unknown flag" run-start owner-start-2 --at "$(iso_at "$DELIVERED_EPOCH")" | jq -e '.error | test("usage")' >/dev/null
+CONFIRM_OUT="$(bash "$GATE" challenger-start run-start owner-start-2 --delivered "$(iso_at "$DELIVERED_EPOCH")")"
+jq -e --arg at "$(iso_at "$DELIVERED_EPOCH")" --arg d "$(iso_at $(( DELIVERED_EPOCH + 5400 )))" '
+  .ok == true and .started == true and .confirmed == true and .challengerStartedAt == $at and .challengerDeadline == $d' \
+  <<<"$CONFIRM_OUT" >/dev/null || { echo "7f: the confirm did not anchor at the delivery time: $CONFIRM_OUT" >&2; exit 1; }
+jq -e --arg d "$(iso_at $(( DELIVERED_EPOCH + 5400 )))" \
+  '.challengerDeadline == $d and .challengerProvisionalDeadline == null' "$STATE_DIR/pr-69-state.json" >/dev/null ||
+  { echo "7f: the confirmed start was not written final" >&2; exit 1; }
+START_DEADLINE="$(jq -r '.challengerDeadline' <<<"$CONFIRM_OUT")"
+# Final: neither a repeat confirm nor an arm moves it again.
+for extra in "" "--delivered $(iso_at $(( DELIVERED_EPOCH + 300 )))"; do
+  # shellcheck disable=SC2086
+  bash "$GATE" challenger-start run-start owner-start-2 $extra | jq -e --arg d "$START_DEADLINE" '
+    .ok == true and .started == false and .alreadyStarted == true and .confirmed == true and .challengerDeadline == $d' >/dev/null ||
+    { echo "7f: a confirmed start moved (extra: $extra)" >&2; exit 1; }
+done
+bash "$GATE" release run-start owner-start-2 | jq -e '.ok == true' >/dev/null
+jq -e '.challengerStartedAt == null and .challengerDeadline == null and .challengerProvisionalDeadline == null' \
+  "$STATE_DIR/pr-69-state.json" >/dev/null
+# A root delivered before the armed deadline is confirmed even when that
+# deadline has passed by the time the receipt is read; one delivered after it
+# is not, and the window stays closed.
+bash "$GATE" claim run-edge 69 "$START_SHA" owner-edge | jq -e '.ok == true' >/dev/null
+EDGE_NOW="$(date -u +%s)"
+pr69 ".challengerStartedAt=\"$(iso_at $(( EDGE_NOW - 5460 )))\" | .challengerDeadline=\"$(iso_at $(( EDGE_NOW - 60 )))\" |
+  .challengerProvisionalDeadline=\"$(iso_at $(( EDGE_NOW - 1000 )))\""
+confirm_unchanged "a root delivered after the deadline" run-edge owner-edge --delivered "$(iso_at $(( EDGE_NOW - 30 )))" |
+  jq -e '.refusal == "deadline-passed"' >/dev/null
+confirm_unchanged "a re-arm past the deadline" run-edge owner-edge | jq -e '.refusal == "deadline-passed"' >/dev/null
+# Capped at the claim-time deadline plus the allowance.
+bash "$GATE" challenger-start run-edge owner-edge --delivered "$(iso_at $(( EDGE_NOW - 120 )))" |
+  jq -e --arg at "$(iso_at $(( EDGE_NOW - 120 )))" --arg d "$(iso_at $(( EDGE_NOW - 1000 + 3600 )))" '
+    .ok == true and .confirmed == true and .challengerStartedAt == $at and .challengerDeadline == $d' >/dev/null ||
+  { echo "7f: a root delivered before the armed deadline was not confirmed under the ceiling" >&2; exit 1; }
+bash "$GATE" release run-edge owner-edge >/dev/null
+# A future delivery time reads as now.
+bash "$GATE" claim run-future 69 "$START_SHA" owner-future | jq -e '.ok == true' >/dev/null
+FUTURE_OUT="$(bash "$GATE" challenger-start run-future owner-future --delivered "$(iso_at $(( $(date -u +%s) + 7200 )))")"
+FUTURE_AT="$(date -u -d "$(jq -r '.challengerStartedAt' <<<"$FUTURE_OUT")" +%s)"
+[ "$FUTURE_AT" -le "$(date -u +%s)" ] && jq -e '.ok == true and .confirmed == true' <<<"$FUTURE_OUT" >/dev/null ||
+  { echo "7f: a future delivery time was not read as now: $FUTURE_OUT" >&2; exit 1; }
+bash "$GATE" release run-future owner-future >/dev/null
+# Never moved back: a delivery time that would end the window before the
+# deadline already armed leaves that deadline in force.
+bash "$GATE" claim run-floor 69 "$START_SHA" owner-floor | jq -e '.ok == true' >/dev/null
+FLOOR_DL="$(bash "$GATE" challenger-start run-floor owner-floor | jq -r '.challengerDeadline')"
+bash "$GATE" challenger-start run-floor owner-floor --delivered "$(iso_at $(( $(date -u +%s) - 1800 )))" |
+  jq -e --arg d "$FLOOR_DL" '.ok == true and .confirmed == true and .challengerDeadline == $d' >/dev/null ||
+  { echo "7f: a confirm moved the armed deadline back" >&2; exit 1; }
+bash "$GATE" release run-floor owner-floor >/dev/null
+# The ceiling: an intake that ate most of the window gets the allowance, not a
+# full fresh window.
+bash "$GATE" claim run-slow 69 "$START_SHA" owner-slow | jq -e '.ok == true' >/dev/null
+jq -e '.challengerStartedAt == null' "$STATE_DIR/pr-69-state.json" >/dev/null ||
+  { echo "7e: a new campaign inherited the previous run's anchor" >&2; exit 1; }
+SLOW_PROVISIONAL_EPOCH="$(( $(date -u +%s) + 600 ))"
+pr69 ".challengerDeadline=\"$(iso_at "$SLOW_PROVISIONAL_EPOCH")\""
+bash "$GATE" challenger-start run-slow owner-slow | jq -e --arg d "$(iso_at $(( SLOW_PROVISIONAL_EPOCH + 3600 )))" '
+  .ok == true and .started == true and .challengerDeadline == $d' >/dev/null ||
+  { echo "7e: re-anchoring exceeded provisional + allowance" >&2; exit 1; }
+bash "$GATE" release run-slow owner-slow >/dev/null
+# Structural refusals, each with its code and nothing written.
+bash "$GATE" claim run-late 69 "$START_SHA" owner-late | jq -e '.ok == true' >/dev/null
+start_refusal() { # <code>
+  local before out
+  before="$(jq -c '[.challengerDeadline,.challengerStartedAt]' "$STATE_DIR/pr-69-state.json")"
+  out="$(bash "$GATE" challenger-start run-late owner-late)" || true
+  jq -e --arg c "$1" '.ok == false and .refusal == $c' <<<"$out" >/dev/null ||
+    { echo "7e: expected refusal $1, got: $out" >&2; exit 1; }
+  [ "$(jq -c '[.challengerDeadline,.challengerStartedAt]' "$STATE_DIR/pr-69-state.json")" = "$before" ] ||
+    { echo "7e: a $1 refusal wrote state" >&2; exit 1; }
+}
+pr69 '.challengerDeadline=""'
+start_refusal no-deadline
+pr69 '.challengerDeadline="2999-01-01T00:00:00Z" | .challengerDisposition="no-disposition"'
+start_refusal disposition-filed
+pr69 '.challengerDeadline="2000-01-01T00:00:00Z" | .challengerDisposition=null'
+start_refusal deadline-passed
+# A root that never went out: the provisional deadline still ends the run.
+bash "$GATE" challenger-timeout run-late owner-late | jq -e '.ok == true and .verdict == "BLOCKED"' >/dev/null ||
+  { echo "7e: a never-started challenger window did not time out at the provisional deadline" >&2; exit 1; }
+unset SMOKE_GATE_RUN_ROOT
+
+# --- 8. finish suspends the backend preview ---------------------------------
+fresh_state
+FINISH_SHA="$(sha 3)"
+bash "$GATE" claim run-finish-1 42 "$FINISH_SHA" >/dev/null
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-42\",\"name\":\"WIDGET-API PR #42\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-42.onrender.com\"}}]"
+export STUB_SUSPEND_CODE=202
+bash "$GATE" finish "$FINISH_SHA" run-finish-1 GO | jq -e --arg sha "$FINISH_SHA" '
+  .ok == true and .verdict == "GO" and .pr == 42 and .sha == $sha and
+  .suspend.attempted == true and .suspend.ok == true and .suspend.httpStatus == 202
+' >/dev/null
+jq -e --arg sha "$FINISH_SHA" '
+  .schemaVersion == 1 and .pr == 42 and .sha == $sha and .verdict == "GO" and
+  .suspend.ok == true
+' "$STATE_DIR/pr-42-verdict.json" >/dev/null
+jq -e --arg sha "$FINISH_SHA" '
+  .completedSha == $sha and .completedVerdict == "GO" and .activeSha == null
+' "$STATE_DIR/pr-42-state.json" >/dev/null
+
+# Suspend failure must not fail the finish — logged in the JSON, not thrown.
+fresh_state
+FINISH_SHA2="$(sha 4)"
+bash "$GATE" claim run-finish-2 43 "$FINISH_SHA2" >/dev/null
+export STUB_SERVICES='[]'   # preview already torn down
+bash "$GATE" finish "$FINISH_SHA2" run-finish-2 NO_GO | jq -e '
+  .ok == true and .verdict == "NO_GO" and
+  .suspend.attempted == false and .suspend.ok == false and
+  (.suspend.reason | test("not found"))
+' >/dev/null
+
+# --- 9. finish from a non-active run is refused, state untouched -----------
+fresh_state
+ORIG_SHA="$(sha 5)"
+bash "$GATE" claim run-orig 44 "$ORIG_SHA" >/dev/null
+# Simulate the run being superseded (reclaimed) without going through finish.
+jq '.activeRunId="run-new"' "$STATE_DIR/pr-44-state.json" > "$STATE_DIR/pr-44-state.json.tmp"
+mv "$STATE_DIR/pr-44-state.json.tmp" "$STATE_DIR/pr-44-state.json"
+bash "$GATE" finish "$ORIG_SHA" run-orig GO | jq -e '
+  .ok == false and (.error | test("not the active run")) and .pr == null
+' >/dev/null
+jq -e '.activeRunId == "run-new" and .completedSha == null' "$STATE_DIR/pr-44-state.json" >/dev/null
+[ ! -e "$STATE_DIR/pr-44-verdict.json" ]
+
+# finish also rejects malformed input the same way the develop gate does.
+fresh_state
+if bash "$GATE" finish abc123 run-1 GO | jq -e '.ok == true' >/dev/null 2>&1; then
+  echo "expected short SHA to be rejected" >&2; exit 1
+fi
+if bash "$GATE" finish "$(sha 6)" run-1 SHIP_IT | jq -e '.ok == true' >/dev/null 2>&1; then
+  echo "expected invalid verdict to be rejected" >&2; exit 1
+fi
+
+# --- 10. gh pr list fetch failure: throttled global alarm -------------------
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export STUB_PR_LIST_EXIT=1
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed" and .observation.kind == "unreadable"' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed" and .observation.kind == "unreadable"' >/dev/null
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "gate_fetch_failed" and .data.consecutiveFailures == 3
+' >/dev/null
+
+# --- 10a. An empty PR list from an UNREACHABLE repo must not read as "nothing
+# labeled". `gh pr list` goes through the search API, which answers a renamed
+# repo or a rescoped token with HTTP 200 / `[]` / exit 0 — byte-identical to
+# the healthy idle in scenario 2, which is why the reachability probe exists.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export STUB_PR_LIST='[]' STUB_PR_LIST_EXIT=0 STUB_REPO_VIEW_EXIT=1
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed" and .observation.kind == "unreadable"' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed" and .observation.kind == "unreadable"' >/dev/null
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "gate_fetch_failed" and .data.consecutiveFailures == 3
+' >/dev/null
+# And the probe must cost the healthy path nothing: a reachable repo with an
+# empty list is still a quiet idle, not a strike.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export STUB_PR_LIST='[]' STUB_REPO_VIEW_EXIT=0
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates" and .observation.kind == "empty"' >/dev/null
+
+# --- 11. P1 regression: run ids must be unique ACROSS PRs, not just within
+# one PR's own state file. Before the fix, `claim` only checked collision
+# against the TARGET pr's own state, so two different PRs could both claim
+# the same caller-chosen run id. `finish`/`progress`/`release` then resolve a
+# bare run id by scanning for the first matching state file
+# (find_pr_for_run) — with two matches, the wrong PR wins by glob order, and
+# `finish` could record one PR's verdict under a DIFFERENT PR's SHA while
+# leaving the true owner a zombie forever "active".
+fresh_state
+SHA_A="$(sha 7)"
+SHA_B="$(sha 8)"
+bash "$GATE" claim shared-run 100 "$SHA_A" | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim shared-run 200 "$SHA_B" | jq -e '
+  .ok == false and (.error | test("unique"))
+' >/dev/null
+# PR 100 still owns the run id untouched; PR 200 was never written at all.
+jq -e --arg sha "$SHA_A" '
+  .activeSha == $sha and .activeRunId == "shared-run"
+' "$STATE_DIR/pr-100-state.json" >/dev/null
+[ ! -e "$STATE_DIR/pr-200-state.json" ]
+# finish resolves unambiguously to PR 100, with PR 100's own SHA — never
+# PR 200's, and never both.
+bash "$GATE" finish "$SHA_A" shared-run GO | jq -e --arg sha "$SHA_A" '
+  .ok == true and .pr == 100 and .sha == $sha
+' >/dev/null
+
+# --- 12. P1 regression: `check` must never assert settled:true when a
+# required fetch failed, even though CI/deploy/healthz are all otherwise
+# green. Before the fix, the files-fetch failure branch left
+# migrations_touched/frontend_touched computed as FALSE (fail-OPEN) instead
+# of the promised fail-closed TRUE, so a human trusting `check` before a
+# manual claim could freeze a migrations-carrying PR without ever seeing the
+# refusal.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha 9)"
+export STUB_PR_VIEW="{\"number\":55,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES_EXIT=1
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-55\",\"name\":\"WIDGET-API PR #55\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-55.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+bash "$GATE" check 55 | jq -e '
+  .fetchOk == false and .settled == false and
+  .migrationsTouched == true and .frontendTouched == true
+' >/dev/null
+
+fi
+if smoke_case 12-19-handoff; then
+# --- 12. Develop-freeze-handoff: finish on a FREEZE pr writes hold/publish/
+# ledger keyed to the TARGET develop sha (the marker commit's parent), not
+# the freeze marker sha itself.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+TARGET_SHA="$(sha 7)"
+FREEZE_HEAD_SHA="$(sha 8)"
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
+export STUB_PARENT_SHA="$TARGET_SHA"
+bash "$GATE" claim run-freeze-1 60 "$FREEZE_HEAD_SHA" >/dev/null
+
+DEV_PUBLISH="$STATE_DIR/dev-gate/latest-verdict.json"
+DEV_HOLD="$STATE_DIR/dev-gate/develop-hold.json"
+DEV_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+export SMOKE_GATE_PUBLISH_FILE="$DEV_PUBLISH" SMOKE_GATE_HOLD_FILE="$DEV_HOLD" \
+  SMOKE_GATE_HANDOFF_LEDGER="$DEV_LEDGER"
+
+bash "$GATE" finish "$FREEZE_HEAD_SHA" run-freeze-1 NO_GO | jq -e --arg target "$TARGET_SHA" '
+  .ok == true and .handoff.written == true and .handoff.targetSha == $target
+' >/dev/null
+jq -e --arg sha "$TARGET_SHA" '.sha == $sha and .verdict == "NO_GO"' "$DEV_PUBLISH" >/dev/null
+jq -e --arg sha "$TARGET_SHA" '.sha == $sha and .verdict == "NO_GO" and .runId == "run-freeze-1"' "$DEV_HOLD" >/dev/null
+jq -e --arg target "$TARGET_SHA" --arg freeze "$FREEZE_HEAD_SHA" --argjson pr 60 --arg run "run-freeze-1" '
+  .targetSha == $target and .freezeSha == $freeze and .freezePr == $pr and
+  .verdict == "NO_GO" and .runId == $run
+' "$DEV_LEDGER" >/dev/null
+
+# --- 12b. HUMAN_DECISION RAISES the hold (owner decision 2026-08-25). It used
+# to leave the hold untouched — default-open — so a verdict whose literal
+# meaning is "the system does not know whether this is safe" behaved as GO on
+# precisely the cases flagged as needing judgment. `reason` distinguishes it
+# from a defects hold. BLOCKED is deliberately unchanged.
+bash "$GATE" claim run-freeze-hd 60 "$FREEZE_HEAD_SHA" >/dev/null
+bash "$GATE" finish "$FREEZE_HEAD_SHA" run-freeze-hd HUMAN_DECISION | jq -e '.ok == true' >/dev/null
+jq -e --arg sha "$TARGET_SHA" '
+  .sha == $sha and .verdict == "HUMAN_DECISION" and .runId == "run-freeze-hd" and
+  .reason == "needs_human_decision"
+' "$DEV_HOLD" >/dev/null
+# BLOCKED still leaves whatever hold is standing exactly as it was.
+bash "$GATE" claim run-freeze-bl 60 "$FREEZE_HEAD_SHA" >/dev/null
+bash "$GATE" finish "$FREEZE_HEAD_SHA" run-freeze-bl BLOCKED | jq -e '.ok == true' >/dev/null
+jq -e '.runId == "run-freeze-hd" and .verdict == "HUMAN_DECISION"' "$DEV_HOLD" >/dev/null
+
+# --- 13. GO clears the hold, keyed the same way.
+bash "$GATE" claim run-freeze-2 60 "$FREEZE_HEAD_SHA" >/dev/null
+bash "$GATE" finish "$FREEZE_HEAD_SHA" run-freeze-2 GO | jq -e --arg target "$TARGET_SHA" '
+  .ok == true and .handoff.written == true and .handoff.targetSha == $target
+' >/dev/null
+[ ! -e "$DEV_HOLD" ]
+# The ledger records BOTH outcomes (append-only) so the develop gate's dedup
+# advance always reads the most recent one.
+[ "$(wc -l < "$DEV_LEDGER")" -eq 4 ]
+
+# --- 14. Non-freeze PRs never touch publish/hold/ledger, even when the
+# wrapper has them configured — "never touch them" is unconditional, not
+# dependent on the wrapper only enabling them for freeze deployments.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+NORMAL_SHA="$(sha 9)"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+bash "$GATE" claim run-normal-1 61 "$NORMAL_SHA" >/dev/null
+DEV_HOLD2="$STATE_DIR/dev-gate2/develop-hold.json"
+DEV_PUBLISH2="$STATE_DIR/dev-gate2/latest-verdict.json"
+export SMOKE_GATE_PUBLISH_FILE="$DEV_PUBLISH2" SMOKE_GATE_HOLD_FILE="$DEV_HOLD2"
+bash "$GATE" finish "$NORMAL_SHA" run-normal-1 NO_GO | jq -e '
+  .ok == true and .handoff.written == false and .handoff.targetSha == null
+' >/dev/null
+[ ! -e "$DEV_HOLD2" ]
+[ ! -e "$DEV_PUBLISH2" ]
+
+# --- 15. P2 regression: a ledger append failure must be reported truthfully
+# — handoff.written must be false (not true) with a reason, even though the
+# hold/publish artifacts (written first, independently) succeeded. Forcing
+# the failure: the lock's directory is a path component that is actually a
+# regular file, so both bounded-retry attempts fail deterministically and
+# fast (flock refuses a bad fd instantly — no timeout wait needed to
+# reproduce this).
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+LOCKFAIL_TARGET="$(sha 1)"
+LOCKFAIL_HEAD="$(sha 2)"
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
+export STUB_PARENT_SHA="$LOCKFAIL_TARGET"
+bash "$GATE" claim run-lockfail 70 "$LOCKFAIL_HEAD" >/dev/null
+
+DEV_PUBLISH3="$STATE_DIR/dev-gate3/latest-verdict.json"
+DEV_HOLD3="$STATE_DIR/dev-gate3/develop-hold.json"
+BLOCKER="$STATE_DIR/dev-gate3-blocker"
+: > "$BLOCKER"
+BAD_LEDGER="$BLOCKER/subdir/handoff-ledger.jsonl"
+export SMOKE_GATE_PUBLISH_FILE="$DEV_PUBLISH3" SMOKE_GATE_HOLD_FILE="$DEV_HOLD3" \
+  SMOKE_GATE_HANDOFF_LEDGER="$BAD_LEDGER"
+
+LOCKFAIL_OUT="$(bash "$GATE" finish "$LOCKFAIL_HEAD" run-lockfail NO_GO 2>/dev/null || true)"
+jq -e '
+  .ok == false and .leaseReleased == false and
+  (.error | test("terminal artifact write failed"))
+' <<<"$LOCKFAIL_OUT" >/dev/null
+# The hold/publish artifacts were still written correctly — only the
+# ledger's own append failed.
+jq -e --arg sha "$LOCKFAIL_TARGET" '.sha == $sha and .verdict == "NO_GO"' "$DEV_PUBLISH3" >/dev/null
+jq -e --arg sha "$LOCKFAIL_TARGET" '.sha == $sha and .verdict == "NO_GO"' "$DEV_HOLD3" >/dev/null
+[ ! -e "$BAD_LEDGER" ]
+jq -e '.activeRunId == "run-lockfail" and .completedSha == null' "$STATE_DIR/pr-70-state.json" >/dev/null
+[ -s "$SMOKE_GATE_LEASE_DIR/lease-run-lockfail.json" ]
+# The held slot and lease make the failure retryable once storage is repaired.
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate3/handoff-ledger.jsonl"
+bash "$GATE" finish "$LOCKFAIL_HEAD" run-lockfail NO_GO | jq -e '.ok == true and .leaseReleased == true' >/dev/null
+
+# --- 16. CI facts are filtered to the target SHA -------------------------
+# `gh run list --branch` returns the branch's recent runs, not one commit's,
+# so the SHA filter is the whole correctness of the port away from the
+# check-runs endpoint. A branch whose recent runs are all for OTHER commits
+# must read as "no CI for our head" (fail closed), never as green.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha 1)"
+OTHER_SHA="$(sha 2)"
+export STUB_PR_VIEW="{\"number\":61,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$OTHER_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-61\",\"name\":\"WIDGET-API PR #61\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+bash "$GATE" check 61 | jq -e '
+  .ciTotal == 0 and .ciReady == false and .settled == false
+' >/dev/null
+# Same fixtures, but the branch listing now carries OUR sha: settles.
+export STUB_RUN_LIST="[{\"headSha\":\"$OTHER_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"},{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+bash "$GATE" check 61 | jq -e '
+  .ciTotal == 1 and .ciReady == true and .settled == true
+' >/dev/null
+# 16b. A run still in flight (the runs API reports conclusion null) is
+# pending, never failed; completed failure/cancelled/timed_out runs still
+# count as failed. Neither head settles.
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"in_progress\",\"conclusion\":null,\"workflowName\":\"Backend CI\"},{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+PR_INFLIGHT="$(bash "$GATE" check 61)"
+jq -e '.ciTotal == 2 and .ciPending == 1 and .ciFailed == 0 and .ciSucceeded == 1 and
+       .ciReady == false and .settled == false' <<<"$PR_INFLIGHT" >/dev/null || {
+  echo "16b: an in-progress run was not reported as pending only: $PR_INFLIGHT" >&2; exit 1; }
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"failure\",\"workflowName\":\"Backend CI\"},{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"cancelled\",\"workflowName\":\"Mobile CI\"},{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"timed_out\",\"workflowName\":\"E2E\"},{\"headSha\":\"$HEAD_SHA\",\"status\":\"queued\",\"conclusion\":null,\"workflowName\":\"Lint\"},{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+PR_MIXED="$(bash "$GATE" check 61)"
+jq -e '.ciTotal == 5 and .ciPending == 1 and .ciFailed == 3 and .ciSucceeded == 1 and
+       .ciReady == false and .settled == false' <<<"$PR_MIXED" >/dev/null || {
+  echo "16b: completed non-success runs were not all counted as failed: $PR_MIXED" >&2; exit 1; }
+
+# --- 17. A PR that can never settle alarms instead of failing silently ----
+# The 2026-08-12 outage in one test: freeze PR #786 was built, live and warm
+# for 6.5h while its CI fetch returned nothing, and every poll skipped it
+# without a word. Unfetchable facts must alarm once past the window.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha 3)"
+export STUB_PR_LIST="[{\"number\":77,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST_EXIT=1
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-77\",\"name\":\"WIDGET-API PR #77\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+
+# Inside the window: silent, but the stall is now RECORDED.
+export SMOKE_GATE_FACTS_STUCK_SECONDS=3600
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null
+jq -e --arg sha "$HEAD_SHA" '.factsStuckSha == $sha and .factsStuckSince != null' \
+  "$STATE_DIR/pr-77-state.json" >/dev/null
+
+# Past the window: one alarm, latched.
+export SMOKE_GATE_FACTS_STUCK_SECONDS=0
+bash "$GATE" poll | jq -e --arg sha "$HEAD_SHA" '
+  .wakeAgent == true and .data.trigger == "pr_facts_unavailable" and
+  .data.pr == 77 and .data.sourceSha == $sha
+' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null
+
+# Facts recover: the latch clears, so a later stall alarms again.
+unset STUB_RUN_LIST_EXIT
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+bash "$GATE" poll >/dev/null
+jq -e '.factsStuckSha == null and .factsStuckAlertSha == null' "$STATE_DIR/pr-77-state.json" >/dev/null
+
+# --- 18. finish holds its authority locks through terminal side effects ------
+# The state and shared lifecycle locks fence the network and artifact window,
+# so an expired predecessor cannot publish after a successor reclaims.
+fresh_state
+LOCKPROBE_SHA="$(sha 7)"
+bash "$GATE" claim run-lockprobe 88 "$LOCKPROBE_SHA" >/dev/null
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-88\",\"name\":\"backend-preview PR #88\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
+export STUB_SUSPEND_CODE=202
+export STUB_LOCK_PROBE="$STATE_DIR/lock-probe.txt"
+export STUB_LOCK_PROBE_FILE="$STATE_DIR/pr-88-state.lock"
+bash "$GATE" finish "$LOCKPROBE_SHA" run-lockprobe GO | jq -e '
+  .ok == true and .suspend.attempted == true and .suspend.ok == true
+' >/dev/null
+if [ "$(cat "$STUB_LOCK_PROBE" 2>/dev/null)" != "held" ]; then
+  echo "expected finish to hold the PR state lock through the suspend POST, probe said: $(cat "$STUB_LOCK_PROBE" 2>/dev/null)" >&2
+  exit 1
+fi
+jq -e --arg sha "$LOCKPROBE_SHA" '.completedSha == $sha and .activeRunId == null' \
+  "$STATE_DIR/pr-88-state.json" >/dev/null
+
+# --- 19. a lock-busy refusal is RETRYABLE, not "you lost the slot" ----------
+# Bare `ok:false` with no error field was indistinguishable from a reclaim, and
+# the skill tells a coordinator to stop the campaign on exactly that.
+fresh_state
+BUSY_SHA="$(sha 8)"
+bash "$GATE" claim run-busy 89 "$BUSY_SHA" >/dev/null
+( flock -x 6; sleep 3 ) 6>"$STATE_DIR/pr-89-state.lock" &
+BUSY_BLOCKER=$!
+sleep 0.3
+BUSY_OUT="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 bash "$GATE" progress run-busy)"
+wait "$BUSY_BLOCKER"
+jq -e '
+  .ok == false and .retryable == true and .pr == 89 and .wakeAgent == false and
+  (.error | startswith("gate_lock_busy:")) and
+  (.error | test("do not stop the campaign"))
+' <<<"$BUSY_OUT" >/dev/null || {
+  echo "expected a retryable gate_lock_busy refusal, got: $BUSY_OUT" >&2; exit 1; }
+# ...and the terminal refusal it must be told apart from carries neither field.
+jq -e '.ok == false and (.retryable | not) and (.error | startswith("gate_lock_busy:") | not)' \
+  <<<"$(bash "$GATE" progress run-nonexistent)" >/dev/null || {
+  echo "expected a not-active refusal to carry no retryable flag" >&2; exit 1; }
+# The slot survived the transient miss.
+jq -e '.activeRunId == "run-busy"' "$STATE_DIR/pr-89-state.json" >/dev/null
+
+fi
+if smoke_case 20-26-crash-safe; then
+# --- 20. finish is crash-safe: artifacts BEFORE the slot is cleared ---------
+# Clearing the slot first made finish fail OPEN and permanently: a container
+# death between the halves recorded NO_GO per-PR while the promotion hold was
+# never raised and the ledger line never landed, and the retry was refused with
+# "not the active run" because activeRunId was already null. The develop gate
+# survives its identical window via its hold-integrity reconciler; the PR gate
+# has none, so the ORDER is the whole contract.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+CRASH_TARGET="$(sha 9)"
+CRASH_HEAD="$(sha a)"
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
+export STUB_PARENT_SHA="$CRASH_TARGET"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-91\",\"name\":\"backend-preview PR #91\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
+export STUB_SUSPEND_CODE=202
+CRASH_PUBLISH="$STATE_DIR/crash/latest-verdict.json"
+CRASH_HOLD="$STATE_DIR/crash/develop-hold.json"
+CRASH_LEDGER="$STATE_DIR/crash/handoff-ledger.jsonl"
+export SMOKE_GATE_PUBLISH_FILE="$CRASH_PUBLISH" SMOKE_GATE_HOLD_FILE="$CRASH_HOLD" \
+  SMOKE_GATE_HANDOFF_LEDGER="$CRASH_LEDGER"
+bash "$GATE" claim run-crash 91 "$CRASH_HEAD" >/dev/null
+
+# The slot must still be held at the moment the artifact work starts.
+export STUB_STATE_PROBE="$STATE_DIR/state-probe.json"
+export STUB_STATE_PROBE_FILE="$STATE_DIR/pr-91-state.json"
+# ...and a real death right there: the stub stalls past the outer timeout.
+export STUB_SUSPEND_SLEEP=5
+timeout 2 bash "$GATE" finish "$CRASH_HEAD" run-crash NO_GO >/dev/null 2>&1 || true
+unset STUB_SUSPEND_SLEEP
+
+jq -e '.activeRunId == "run-crash" and .completedSha == null' "$STUB_STATE_PROBE" >/dev/null || {
+  echo "the slot was already cleared when the artifact work began: $(cat "$STUB_STATE_PROBE")" >&2
+  exit 1; }
+jq -e '.activeRunId == "run-crash" and .completedVerdict == null' "$STATE_DIR/pr-91-state.json" >/dev/null || {
+  echo "a crash mid-finish left the slot cleared, so the retry can never complete: $(cat "$STATE_DIR/pr-91-state.json")" >&2
+  exit 1; }
+[ ! -e "$CRASH_HOLD" ] || { echo "fixture: the hold should not exist yet after the crash" >&2; exit 1; }
+
+# The retry completes rather than being refused, and lands every artifact.
+bash "$GATE" finish "$CRASH_HEAD" run-crash NO_GO | jq -e --arg t "$CRASH_TARGET" '
+  .ok == true and .verdict == "NO_GO" and .handoff.written == true and .handoff.targetSha == $t
+' >/dev/null || { echo "the retry after a mid-finish crash was refused" >&2; exit 1; }
+jq -e --arg t "$CRASH_TARGET" '.sha == $t and .verdict == "NO_GO"' "$CRASH_HOLD" >/dev/null
+jq -e --arg t "$CRASH_TARGET" '.sha == $t' "$CRASH_PUBLISH" >/dev/null
+jq -e --arg t "$CRASH_TARGET" 'select(.targetSha == $t) | .runId == "run-crash"' "$CRASH_LEDGER" >/dev/null
+jq -e --arg sha "$CRASH_HEAD" '.completedSha == $sha and .activeRunId == null' \
+  "$STATE_DIR/pr-91-state.json" >/dev/null
+
+# --- 21. a takeover cannot enter DURING the terminal artifact window --------
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+TO_SHA="$(sha b)"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-92\",\"name\":\"backend-preview PR #92\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
+export STUB_SUSPEND_CODE=202
+bash "$GATE" claim run-old 92 "$TO_SHA" >/dev/null
+# Simulate the successor claiming while this finish is on the network.
+export STUB_SUSPEND_SLEEP=2
+bash "$GATE" finish "$TO_SHA" run-old GO > "$STATE_DIR/takeover-out.json" 2>/dev/null &
+FIN=$!
+sleep 0.5
+TO_CLAIM="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 bash "$GATE" claim run-new 92 "$TO_SHA" --takeover || true)"
+wait "$FIN" || true
+unset STUB_SUSPEND_SLEEP
+jq -e '.ok == false and .retryable == true and (.error | test("gate_lock_busy"))' <<<"$TO_CLAIM" >/dev/null || {
+  echo "expected the concurrent takeover to wait outside the terminal fence, got: $TO_CLAIM" >&2
+  exit 1; }
+jq -e '.ok == true and .runId == "run-old"' "$STATE_DIR/takeover-out.json" >/dev/null
+jq -e '.activeRunId == null and .completedRunId == "run-old"' "$STATE_DIR/pr-92-state.json" >/dev/null
+# Once the terminal transition is complete, a new claim may proceed normally.
+bash "$GATE" claim run-new 92 "$TO_SHA" --takeover | jq -e '.ok == true and .runId == "run-new"' >/dev/null
+
+# --- 22. P1 regression: `finish` must refuse a SHA that is not the one this
+# run claimed. Live on 2026-08-25 (freeze PR #1211): the coordinator passed
+# the TARGET develop sha instead of the freeze-marker sha it had claimed and
+# tested. detect_freeze walks the supplied sha's first parent, so the walk
+# landed one commit early and the hold, publish file and ledger line all went
+# out naming PR #1199's commit — a build the campaign never examined — while
+# `finish` exited ok:true. The gate already holds the claimed sha in
+# activeSha; the whole fix is to compare against it before any side effect.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+CLAIMED="$(sha c)"
+NOT_CLAIMED="$(sha d)"
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
+export STUB_PARENT_SHA="$(sha e)"
+DEV_PUBLISH4="$STATE_DIR/dev-gate4/latest-verdict.json"
+DEV_HOLD4="$STATE_DIR/dev-gate4/develop-hold.json"
+DEV_LEDGER4="$STATE_DIR/dev-gate4/handoff-ledger.jsonl"
+export SMOKE_GATE_PUBLISH_FILE="$DEV_PUBLISH4" SMOKE_GATE_HOLD_FILE="$DEV_HOLD4" \
+  SMOKE_GATE_HANDOFF_LEDGER="$DEV_LEDGER4"
+bash "$GATE" claim run-wrongsha 93 "$CLAIMED" >/dev/null
+# Exits 2, the same as the other malformed-invocation refusals, so capture
+# before piping — `set -o pipefail` would otherwise read the refusal itself
+# as the test failing.
+WRONGSHA_OUT="$(bash "$GATE" finish "$NOT_CLAIMED" run-wrongsha NO_GO || true)"
+jq -e --arg c "$CLAIMED" --arg w "$NOT_CLAIMED" '
+  .ok == false and .claimedSha == $c and .suppliedSha == $w and
+  (.error | test("does not match the sha this run claimed"))
+' <<<"$WRONGSHA_OUT" >/dev/null || {
+  echo "expected finish to refuse a sha this run never claimed, got: $WRONGSHA_OUT" >&2; exit 1; }
+# Nothing was written and the slot was NOT released — the refusal is fully
+# recoverable, unlike a verdict recorded against the wrong build.
+[ ! -e "$DEV_HOLD4" ] && [ ! -e "$DEV_PUBLISH4" ] && [ ! -e "$DEV_LEDGER4" ] || {
+  echo "a refused finish still wrote handoff artifacts" >&2; exit 1; }
+jq -e '.activeRunId == "run-wrongsha" and .completedSha == null' "$STATE_DIR/pr-93-state.json" >/dev/null
+[ ! -e "$STATE_DIR/pr-93-verdict.json" ]
+# The retry named in the error text actually works.
+bash "$GATE" finish "$CLAIMED" run-wrongsha NO_GO | jq -e '.ok == true and .handoff.written == true' >/dev/null
+
+# --- 23. P1 regression: an artifact write that FAILS must be reported, and the
+# resulting hold/ledger divergence must survive the next finish. Every
+# publish/hold write was previously unchecked (`set -e` is not in effect), so
+# an unwritable shared mount — the hold lives on the workgroup mount, the
+# ledger does not — left handoff.written:true / reason:null while the ledger
+# line landed anyway: a NO_GO whose promotion hold silently never went up.
+# The divergence was then erased by the NEXT run's finish, which is why the
+# 2026-08-18, -22 and -25 occurrences are all un-diagnosable.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+DIV_SHA="$(sha f)"
+DIV_TARGET="$(sha 0)"
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
+export STUB_PARENT_SHA="$DIV_TARGET"
+SHARED="$STATE_DIR/shared-mount"
+mkdir -p "$SHARED"
+export SMOKE_GATE_PUBLISH_FILE="$SHARED/latest-verdict.json" \
+  SMOKE_GATE_HOLD_FILE="$SHARED/develop-hold.json" \
+  SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/agent-mount/handoff-ledger.jsonl"
+bash "$GATE" claim run-div-a 94 "$DIV_SHA" >/dev/null
+bash "$GATE" finish "$DIV_SHA" run-div-a NO_GO | jq -e '.ok == true and .handoff.written == true' >/dev/null
+# Now the shared mount goes unwritable mid-campaign; the ledger's mount is fine.
+chmod 500 "$SHARED"
+bash "$GATE" claim run-div-b 94 "$DIV_SHA" >/dev/null
+DIV_OUT="$(bash "$GATE" finish "$DIV_SHA" run-div-b HUMAN_DECISION 2>/dev/null || true)"
+chmod 700 "$SHARED"   # restore before asserting, so a failure still cleans up
+jq -e '
+  .ok == false and .leaseReleased == false and
+  (.error | test("promotion is ungated"))
+' <<<"$DIV_OUT" >/dev/null || {
+  echo "a failed hold raise was reported as a successful handoff, got: $DIV_OUT" >&2; exit 1; }
+# The prior hold and newly appended ledger line are divergent, while the failed
+# owner keeps its slot and lease for an exact retry under the same fence.
+jq -e '.runId == "run-div-a"' "$SMOKE_GATE_HOLD_FILE" >/dev/null
+tail -1 "$SMOKE_GATE_HANDOFF_LEDGER" | jq -e '.runId == "run-div-b"' >/dev/null
+jq -e '.activeRunId == "run-div-b" and .completedRunId == "run-div-a"' "$STATE_DIR/pr-94-state.json" >/dev/null
+[ -s "$SMOKE_GATE_LEASE_DIR/lease-run-div-b.json" ]
+REPAIRED="$(bash "$GATE" finish "$DIV_SHA" run-div-b HUMAN_DECISION)"
+jq -e '.ok == true and .leaseReleased == true and .handoff.divergenceSnapshot != null' <<<"$REPAIRED" >/dev/null
+jq -e '.runId == "run-div-b" and .verdict == "HUMAN_DECISION"' "$SMOKE_GATE_HOLD_FILE" >/dev/null
+# A later successful finish observes the repaired, in-step records.
+bash "$GATE" claim run-div-c 94 "$DIV_SHA" >/dev/null
+bash "$GATE" finish "$DIV_SHA" run-div-c NO_GO | jq -e '.handoff.divergenceSnapshot == null' >/dev/null
+# A BLOCKED verdict is NOT hold-affecting (it deliberately leaves the hold
+# alone), so it must never be read as a divergence on the next finish.
+bash "$GATE" claim run-div-d 94 "$DIV_SHA" >/dev/null
+bash "$GATE" finish "$DIV_SHA" run-div-d BLOCKED >/dev/null
+bash "$GATE" claim run-div-e 94 "$DIV_SHA" >/dev/null
+bash "$GATE" finish "$DIV_SHA" run-div-e NO_GO | jq -e '.handoff.divergenceSnapshot == null' >/dev/null || {
+  echo "a BLOCKED ledger line was mistaken for a hold divergence" >&2; exit 1; }
+
+# --- 24. an unreadable PR diff during finish is not the same as "ordinary PR".
+# detect_freeze collapses a failed files fetch to isFreezePr:false, which the
+# handoff block treated identically to a non-freeze PR: nothing written, and
+# handoff.reason null on an ok:true finish. If the PR really was a freeze PR
+# its verdict was dropped silently. Reporting only — a genuine non-freeze PR
+# (test 14 above) still reports reason:null.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+BLIND_SHA="$(sha 1)"
+export SMOKE_GATE_PUBLISH_FILE="$STATE_DIR/blind/latest-verdict.json" \
+  SMOKE_GATE_HOLD_FILE="$STATE_DIR/blind/develop-hold.json"
+bash "$GATE" claim run-blind 95 "$BLIND_SHA" >/dev/null
+export STUB_PR_FILES_EXIT=1
+bash "$GATE" finish "$BLIND_SHA" run-blind NO_GO | jq -e '
+  .ok == true and .handoff.written == false and
+  (.handoff.reason | test("freeze-PR status is unknown"))
+' >/dev/null || { echo "an unreadable diff during finish was reported as an ordinary PR" >&2; exit 1; }
+unset STUB_PR_FILES_EXIT
+# ...but a misconfigured layout prefix is refused before finish runs at all, so
+# the slot and lease stay held for a retry instead of dropping a possible freeze verdict.
+bash "$GATE" claim run-blind-2 96 "$BLIND_SHA" >/dev/null
+T24="$(SMOKE_GATE_MIGRATIONS_PREFIX= bash "$GATE" finish "$BLIND_SHA" run-blind-2 NO_GO 2>/dev/null || true)"
+jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$T24" >/dev/null ||
+  { echo "24: finish with a misconfigured prefix did not refuse for retry: $T24" >&2; exit 1; }
+[ -e "$SMOKE_GATE_LEASE_DIR/lease-run-blind-2.json" ] || { echo "24: the refused finish released its lease" >&2; exit 1; }
+bash "$GATE" finish "$BLIND_SHA" run-blind-2 NO_GO | jq -e '.ok == true' >/dev/null ||
+  { echo "24: the retried finish with the prefix restored did not complete" >&2; exit 1; }
+
+
+# --- 25. Cross-target interleaving: the divergence check compares the hold
+# against the newest hold-affecting ledger line for ANY target, deliberately
+# NOT scoped to this run's targetSha. The hold file is a single mutable slot
+# meaning "is develop gated right now", so the last decision about that slot
+# is the right comparand no matter which freeze PR made it. Scoping the
+# comparison to the current target would read a stale same-target line and
+# report a divergence that does not exist — this pins the untargeted
+# semantics, so that change fails here.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
+ILV_SHARED="$STATE_DIR/interleave"
+mkdir -p "$ILV_SHARED"
+export SMOKE_GATE_PUBLISH_FILE="$ILV_SHARED/latest-verdict.json" \
+  SMOKE_GATE_HOLD_FILE="$ILV_SHARED/develop-hold.json" \
+  SMOKE_GATE_HANDOFF_LEDGER="$ILV_SHARED/handoff-ledger.jsonl"
+ILV_T1="$(sha a)"
+ILV_T2="$(sha b)"
+ILV_HEAD1="$(sha c)"
+ILV_HEAD2="$(sha d)"
+# Freeze PR #96 gates target T1.
+export STUB_PARENT_SHA="$ILV_T1"
+bash "$GATE" claim run-ilv-1 96 "$ILV_HEAD1" >/dev/null
+bash "$GATE" finish "$ILV_HEAD1" run-ilv-1 NO_GO | jq -e '.handoff.written == true' >/dev/null
+# A DIFFERENT freeze PR #97, on a different target T2, takes the slot next.
+export STUB_PARENT_SHA="$ILV_T2"
+bash "$GATE" claim run-ilv-2 97 "$ILV_HEAD2" >/dev/null
+bash "$GATE" finish "$ILV_HEAD2" run-ilv-2 NO_GO | jq -e '
+  .handoff.written == true and .handoff.divergenceSnapshot == null
+' >/dev/null || { echo "PR #97 read PR #96's in-step hold as a divergence" >&2; exit 1; }
+jq -e --arg sha "$ILV_T2" '.sha == $sha and .runId == "run-ilv-2"' "$SMOKE_GATE_HOLD_FILE" >/dev/null
+# Back to PR #96 / target T1. Hold and ledger are in step — both name
+# run-ilv-2 — so there is NO divergence. Scoped to T1, the newest matching
+# ledger line would be run-ilv-1 and this would falsely report "hold names a
+# different run than the ledger".
+export STUB_PARENT_SHA="$ILV_T1"
+bash "$GATE" claim run-ilv-3 96 "$ILV_HEAD1" >/dev/null
+bash "$GATE" finish "$ILV_HEAD1" run-ilv-3 NO_GO | jq -e '
+  .handoff.written == true and .handoff.divergenceSnapshot == null
+' >/dev/null || {
+  echo "a cross-target hold was misread as a divergence — the comparison must NOT be scoped to targetSha" >&2
+  exit 1; }
+[ "$(ls "$STATE_DIR"/hold-divergence-* 2>/dev/null | wc -l)" -eq 0 ] || {
+  echo "a divergence snapshot was written for an in-step cross-target hold" >&2; exit 1; }
+
+# --- 26. P2 regression: the ledger APPEND itself must be verified, not just
+# the lock. Test 15 covers a lock that cannot be taken; this is the other
+# half — the lock succeeds (its file lives in a writable directory) and the
+# `>>` fails at the FILE level (ENOSPC, chattr +i, a bad mode). That left
+# handoff.written:true / reason:null with no ledger line at all: the develop
+# gate blind to a NO_GO whose hold DID go up. A narrowly stubbed ledger-object
+# jq returns success with no bytes and models jq 1.6 accepting the subsequent
+# empty readback, which deterministically exercises the live bug on jq 1.7 too.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+APPFAIL_TARGET="$(sha 3)"
+APPFAIL_HEAD="$(sha 4)"
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
+export STUB_PARENT_SHA="$APPFAIL_TARGET"
+APPFAIL_DIR="$STATE_DIR/dev-gate4"
+mkdir -p "$APPFAIL_DIR"
+APPFAIL_LEDGER="$APPFAIL_DIR/handoff-ledger.jsonl"
+: > "$APPFAIL_LEDGER"
+export STUB_LEDGER_JQ_EMPTY_FILE="$APPFAIL_DIR/empty-jq-attempts"
+export SMOKE_GATE_PUBLISH_FILE="$APPFAIL_DIR/latest-verdict.json" \
+  SMOKE_GATE_HOLD_FILE="$APPFAIL_DIR/develop-hold.json" \
+  SMOKE_GATE_HANDOFF_LEDGER="$APPFAIL_LEDGER"
+bash "$GATE" claim run-appfail 98 "$APPFAIL_HEAD" >/dev/null
+APPFAIL_OUT="$(bash "$GATE" finish "$APPFAIL_HEAD" run-appfail NO_GO 2>/dev/null || true)"
+unset STUB_LEDGER_JQ_EMPTY_FILE
+jq -e --arg target "$APPFAIL_TARGET" '
+  .ok == false and .leaseReleased == false and
+  (.error | test("handoff-ledger.jsonl"))
+' <<<"$APPFAIL_OUT" >/dev/null || {
+  echo "an unwritten ledger line was reported as a successful handoff, got: $APPFAIL_OUT" >&2; exit 1; }
+[ "$(wc -c < "$APPFAIL_LEDGER")" -eq 0 ]
+[ "$(wc -l < "$APPFAIL_DIR/empty-jq-attempts")" -eq 2 ]
+# The hold still went up — a ledger failure must never skip or undo it.
+jq -e --arg sha "$APPFAIL_TARGET" '.sha == $sha and .runId == "run-appfail"' "$APPFAIL_DIR/develop-hold.json" >/dev/null
+jq -e '.activeRunId == "run-appfail" and .completedSha == null' "$STATE_DIR/pr-98-state.json" >/dev/null
+[ -s "$SMOKE_GATE_LEASE_DIR/lease-run-appfail.json" ]
+
+# Exercise the reproduced filesystem failure too when permissions are
+# enforceable. Root can append to mode 0400, so it runs the deterministic
+# empty-output case above and skips only this permission-specific repetition.
+if [ "$(id -u)" -ne 0 ]; then
+  chmod 400 "$APPFAIL_LEDGER"
+  APPFAIL_MODE_OUT="$(bash "$GATE" finish "$APPFAIL_HEAD" run-appfail NO_GO 2>/dev/null || true)"
+  chmod 600 "$APPFAIL_LEDGER"
+  jq -e '
+    .ok == false and .leaseReleased == false and
+    (.error | test("handoff-ledger.jsonl"))
+  ' <<<"$APPFAIL_MODE_OUT" >/dev/null || {
+    echo "mode-0400 ledger append failure was reported as success, got: $APPFAIL_MODE_OUT" >&2; exit 1; }
+  [ "$(wc -c < "$APPFAIL_LEDGER")" -eq 0 ]
+  jq -e '.activeRunId == "run-appfail" and .completedSha == null' "$STATE_DIR/pr-98-state.json" >/dev/null
+  [ -s "$SMOKE_GATE_LEASE_DIR/lease-run-appfail.json" ]
+fi
+
+# Once storage is repaired, the same-run retry writes one receipt and only
+# then completes the slot and releases shared ownership.
+bash "$GATE" finish "$APPFAIL_HEAD" run-appfail NO_GO | jq -e '.ok == true and .leaseReleased == true' >/dev/null
+tail -1 "$APPFAIL_LEDGER" | jq -e '.runId == "run-appfail"' >/dev/null
+[ "$(wc -l < "$APPFAIL_LEDGER")" -eq 1 ]
+
+fi
+if smoke_case 27-30-leases-recovery; then
+# --- 27. one shared PR cannot have two live run ids across private roots -----
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=30
+PR_BASE="$STATE_DIR" PR_STATE_A="$PR_BASE/state-a" PR_STATE_B="$PR_BASE/state-b"
+mkdir -p "$PR_STATE_A" "$PR_STATE_B"
+PR_COMMON_LEASE="$TEST_SHARED_ROOT/same-pr-different-run/leases"
+PR_BIND_SHA="$(sha a)"
+SMOKE_GATE_STATE_DIR="$PR_STATE_A" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" claim run-pr-a 119 "$PR_BIND_SHA" owner-a | jq -e '.ok == true' >/dev/null
+SECOND="$(SMOKE_GATE_STATE_DIR="$PR_STATE_B" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" claim run-pr-b 119 "$PR_BIND_SHA" owner-b || true)"
+jq -e '.ok == false and .activeRunId == "run-pr-a" and (.error | test("shared coordinator registry"))' <<<"$SECOND" >/dev/null
+jq -e '.runId == "run-pr-a" and .owner == "owner-a"' "$PR_COMMON_LEASE/pr-119-authority.json" >/dev/null
+[ ! -e "$PR_COMMON_LEASE/lease-run-pr-b.json" ] && [ ! -e "$PR_STATE_B/pr-119-state.json" ]
+# The existing explicit operator takeover remains the only live replacement.
+SMOKE_GATE_STATE_DIR="$PR_STATE_B" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" claim run-pr-b 119 "$PR_BIND_SHA" owner-b --takeover | jq -e '.ok == true' >/dev/null
+jq -e '.runId == "run-pr-b" and .owner == "owner-b"' "$PR_COMMON_LEASE/pr-119-authority.json" >/dev/null
+SMOKE_GATE_STATE_DIR="$PR_STATE_B" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" release run-pr-b owner-b | jq -e '.ok == true' >/dev/null
+
+# A run id is shared authority too: the same token cannot bind one live run id
+# to different PRs merely because their private state roots cannot see each other.
+RUN_STATE_A="$PR_BASE/run-state-a" RUN_STATE_B="$PR_BASE/run-state-b"
+mkdir -p "$RUN_STATE_A" "$RUN_STATE_B"
+SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" claim run-cross-pr 130 "$PR_BIND_SHA" shared-owner | jq -e '.ok == true' >/dev/null
+RUN_COLLISION="$(SMOKE_GATE_STATE_DIR="$RUN_STATE_B" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" claim run-cross-pr 131 "$PR_BIND_SHA" shared-owner || true)"
+jq -e '.ok == false and .leasePr == 130 and .requestedPr == 131 and (.error | test("permanently bound"))' <<<"$RUN_COLLISION" >/dev/null
+jq -e '.pr == 130 and .owner == "shared-owner"' "$PR_COMMON_LEASE/lease-run-cross-pr.json" >/dev/null
+[ ! -e "$PR_COMMON_LEASE/pr-131-authority.json" ] && [ ! -e "$RUN_STATE_B/pr-131-state.json" ]
+SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" release run-cross-pr shared-owner | jq -e '.ok == true' >/dev/null
+
+# Expiry permits a successor owner for the same PR, but never reassigns a run
+# id to another PR and strands the original PR's authority pointer.
+EXPIRED_PR_LEASE="$TEST_SHARED_ROOT/expired-cross-pr/leases"
+SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$EXPIRED_PR_LEASE" SMOKE_GATE_LEASE_TTL_SECONDS=30 \
+  bash "$GATE" claim run-expired-cross-pr 133 "$PR_BIND_SHA" owner-a | jq -e '.ok == true' >/dev/null
+expire_lease "$EXPIRED_PR_LEASE/lease-run-expired-cross-pr.json"
+RUN_COLLISION="$(SMOKE_GATE_STATE_DIR="$RUN_STATE_B" SMOKE_GATE_LEASE_DIR="$EXPIRED_PR_LEASE" SMOKE_GATE_LEASE_TTL_SECONDS=30 \
+  bash "$GATE" claim run-expired-cross-pr 134 "$PR_BIND_SHA" owner-b || true)"
+jq -e '.ok == false and .leasePr == 133 and .requestedPr == 134 and (.error | test("permanently bound"))' <<<"$RUN_COLLISION" >/dev/null
+jq -e '.pr == 133 and .runId == "run-expired-cross-pr" and .owner == "owner-a"' \
+  "$EXPIRED_PR_LEASE/pr-133-authority.json" >/dev/null
+[ ! -e "$EXPIRED_PR_LEASE/pr-134-authority.json" ] && [ ! -e "$RUN_STATE_B/pr-134-state.json" ]
+# Same-PR recovery under a successor is still allowed after expiry.
+SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$EXPIRED_PR_LEASE" SMOKE_GATE_LEASE_TTL_SECONDS=30 \
+  bash "$GATE" claim run-expired-cross-pr 133 "$PR_BIND_SHA" owner-b | jq -e '.ok == true and .lease.pr == 133 and .lease.owner == "owner-b"' >/dev/null
+SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$EXPIRED_PR_LEASE" \
+  bash "$GATE" release run-expired-cross-pr owner-b | jq -e '.ok == true' >/dev/null
+
+# --- 28. stale owner A cannot act after B reclaims through another state root
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=30
+STALE_BASE="$STATE_DIR"
+STATE_A="$STALE_BASE/private-a" STATE_B="$STALE_BASE/private-b"
+mkdir -p "$STATE_A" "$STATE_B"
+COMMON_LEASE="$TEST_SHARED_ROOT/stale-separate/leases"
+STALE_SHA="$(sha 5)"
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
+export STUB_PARENT_SHA="$(sha 4)"
+export SMOKE_GATE_PUBLISH_FILE="$STALE_BASE/latest-verdict.json" \
+  SMOKE_GATE_HOLD_FILE="$STALE_BASE/develop-hold.json" \
+  SMOKE_GATE_HANDOFF_LEDGER="$STALE_BASE/handoff-ledger.jsonl"
+SMOKE_GATE_STATE_DIR="$STATE_A" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
+  bash "$GATE" claim run-shared-owner 120 "$STALE_SHA" owner-a | jq -e '.ok == true' >/dev/null
+expire_lease "$COMMON_LEASE/lease-run-shared-owner.json"
+SMOKE_GATE_STATE_DIR="$STATE_B" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" SMOKE_GATE_LEASE_TTL_SECONDS=30 \
+  bash "$GATE" claim run-shared-owner 120 "$STALE_SHA" owner-b | jq -e '.ok == true' >/dev/null
+export SMOKE_GATE_LEASE_TTL_SECONDS=30
+STALE_PROGRESS="$(SMOKE_GATE_STATE_DIR="$STATE_A" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
+  bash "$GATE" progress run-shared-owner owner-a || true)"
+jq -e '.ok == false and (.error | test("lease"))' <<<"$STALE_PROGRESS" >/dev/null
+STALE_RELEASE="$(SMOKE_GATE_STATE_DIR="$STATE_A" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
+  bash "$GATE" release run-shared-owner owner-a || true)"
+jq -e '.ok == false and (.error | test("lease"))' <<<"$STALE_RELEASE" >/dev/null
+STALE_FINISH="$(SMOKE_GATE_STATE_DIR="$STATE_A" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
+  bash "$GATE" finish "$STALE_SHA" run-shared-owner NO_GO owner-a || true)"
+jq -e '.ok == false and (.error | test("lease"))' <<<"$STALE_FINISH" >/dev/null
+jq -e '.owner == "owner-b"' "$COMMON_LEASE/lease-run-shared-owner.json" >/dev/null
+[ ! -e "$STATE_A/pr-120-verdict.json" ] && [ ! -e "$STATE_A/runs/run-shared-owner/verdict.json" ]
+[ ! -e "$SMOKE_GATE_PUBLISH_FILE" ] && [ ! -e "$SMOKE_GATE_HOLD_FILE" ] && [ ! -e "$SMOKE_GATE_HANDOFF_LEDGER" ]
+SMOKE_GATE_STATE_DIR="$STATE_B" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
+  bash "$GATE" release run-shared-owner owner-b | jq -e '.ok == true and .leaseReleased == true' >/dev/null
+
+# --- 29. stale owner cannot adopt B's token from the same mutable state ------
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=30
+SAME_SHA="$(sha 6)"
+SAME_CLAIM="$(bash "$GATE" claim run-same-state 121 "$SAME_SHA" owner-a || true)"
+jq -e '.ok == true' <<<"$SAME_CLAIM" >/dev/null || { echo "initial same-state claim failed: $SAME_CLAIM" >&2; exit 1; }
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-run-same-state.json"
+SMOKE_GATE_LEASE_TTL_SECONDS=30 bash "$GATE" claim run-same-state 121 "$SAME_SHA" owner-b | jq -e '.ok == true' >/dev/null
+export SMOKE_GATE_LEASE_TTL_SECONDS=30
+for verb in progress release; do
+  OUT="$(SMOKE_GATE_OWNER=owner-a bash "$GATE" "$verb" run-same-state || true)"
+  jq -e '.ok == false and (.error | test("caller owner"))' <<<"$OUT" >/dev/null
+done
+OUT="$(SMOKE_GATE_OWNER=owner-a bash "$GATE" finish "$SAME_SHA" run-same-state NO_GO || true)"
+jq -e '.ok == false and (.error | test("caller owner"))' <<<"$OUT" >/dev/null
+jq -e '.owner == "owner-b"' "$SMOKE_GATE_LEASE_DIR/lease-run-same-state.json" >/dev/null
+[ ! -e "$STATE_DIR/pr-121-verdict.json" ] && [ ! -e "$STATE_DIR/runs/run-same-state/verdict.json" ]
+# The forwarded token works from a different execution identity and progress
+# renews the live lease instead of guessing authority from mutable PR state.
+BEFORE_EXP="$(jq -r '.expiresAt' "$SMOKE_GATE_LEASE_DIR/lease-run-same-state.json")"
+SMOKE_GATE_OWNER=unrelated bash "$GATE" progress run-same-state owner-b | jq -e '.ok == true and .leaseRenewed == true' >/dev/null
+AFTER_EXP="$(jq -r '.expiresAt' "$SMOKE_GATE_LEASE_DIR/lease-run-same-state.json")"
+[ "$(date -u -d "$AFTER_EXP" +%s)" -ge "$(date -u -d "$BEFORE_EXP" +%s)" ]
+bash "$GATE" release run-same-state owner-b | jq -e '.ok == true and .leaseReleased == true' >/dev/null
+
+# --- 29b. claimant: the controller and the legacy coordinator never both act -
+# A claim made with SMOKE_GATE_CLAIMANT=controller (the live controller's poll)
+# is recorded as activeClaimant; progress/finish/release/challenger-timeout
+# refuse a caller whose claimant differs, with the right owner token or not.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=30
+CTL_SHA="$(sha 7)"
+SMOKE_GATE_CLAIMANT=controller bash "$GATE" claim run-ctl 122 "$CTL_SHA" owner-ctl | jq -e '.ok == true' >/dev/null
+jq -e '.activeClaimant == "controller"' "$STATE_DIR/pr-122-state.json" >/dev/null
+for verb in progress release challenger-timeout; do
+  OUT="$(bash "$GATE" "$verb" run-ctl owner-ctl || true)"
+  jq -e '.ok == false and .claimantMismatch == true and .runClaimant == "controller"' <<<"$OUT" >/dev/null || {
+    echo "legacy caller $verb on a controller run must be refused: $OUT" >&2; exit 1; }
+done
+OUT="$(bash "$GATE" finish "$CTL_SHA" run-ctl GO owner-ctl || true)"
+jq -e '.ok == false and .claimantMismatch == true' <<<"$OUT" >/dev/null || { echo "legacy finish: $OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/runs/run-ctl/verdict.json" ]
+SMOKE_GATE_CLAIMANT=controller bash "$GATE" progress run-ctl owner-ctl | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim run-leg 123 "$CTL_SHA" owner-leg | jq -e '.ok == true' >/dev/null
+jq -e '.activeClaimant == null' "$STATE_DIR/pr-123-state.json" >/dev/null
+OUT="$(SMOKE_GATE_CLAIMANT=controller bash "$GATE" finish "$CTL_SHA" run-leg NO_GO owner-leg || true)"
+jq -e '.ok == false and .claimantMismatch == true and .runClaimant == null' <<<"$OUT" >/dev/null || {
+  echo "the controller must not finish a legacy run: $OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/runs/run-leg/verdict.json" ]
+bash "$GATE" progress run-leg owner-leg | jq -e '.ok == true' >/dev/null
+OUT="$(SMOKE_GATE_CLAIMANT=bogus bash "$GATE" progress run-leg owner-leg || true)"
+jq -e '.ok == false and (.error | test("SMOKE_GATE_CLAIMANT"))' <<<"$OUT" >/dev/null
+SMOKE_GATE_CLAIMANT=controller bash "$GATE" release run-ctl owner-ctl | jq -e '.ok == true' >/dev/null
+jq -e '.activeClaimant == null and .activeRunId == null' "$STATE_DIR/pr-122-state.json" >/dev/null
+bash "$GATE" release run-leg owner-leg | jq -e '.ok == true' >/dev/null
+
+# Expiry ends standalone renew/release authority. Recovery is the serialized
+# same-run claim using the original token, never reviving an expired lease.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=30
+EXPIRED_SHA="$(sha b)"
+bash "$GATE" claim run-expired-owner 127 "$EXPIRED_SHA" owner-a | jq -e '.ok == true' >/dev/null
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-run-expired-owner.json"
+for lease_verb in lease-renew lease-release; do
+  OUT="$(bash "$GATE" "$lease_verb" run-expired-owner owner-a || true)"
+  jq -e '.ok == false and (.error | test("expired")) and (.error | test("recover with claim"))' <<<"$OUT" >/dev/null
+  [ -s "$SMOKE_GATE_LEASE_DIR/lease-run-expired-owner.json" ]
+done
+SMOKE_GATE_LEASE_TTL_SECONDS=30 bash "$GATE" claim run-expired-owner 127 "$EXPIRED_SHA" owner-a | jq -e '.ok == true' >/dev/null
+jq -e '.pr == 127 and .runId == "run-expired-owner" and .owner == "owner-a"' "$SMOKE_GATE_LEASE_DIR/pr-127-authority.json" >/dev/null
+bash "$GATE" release run-expired-owner owner-a | jq -e '.ok == true' >/dev/null
+
+# Standalone lease-claim requires a PR for a new run id, while a same-owner
+# renewal may infer and preserve the PR already bound into a valid live lease.
+OUT="$(bash "$GATE" lease-claim run-standalone-new owner-a || true)"
+jq -e '.ok == false and (.error | test("requires the PR number"))' <<<"$OUT" >/dev/null
+for bad_pr in 0 007; do
+  OUT="$(bash "$GATE" claim "run-bad-pr-$bad_pr" "$bad_pr" "$EXPIRED_SHA" owner-a || true)"
+  jq -e '.ok == false and (.error | test("requires a PR number"))' <<<"$OUT" >/dev/null
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-bad-pr-$bad_pr.json" ]
+done
+bash "$GATE" claim run-standalone-bound 132 "$EXPIRED_SHA" owner-a | jq -e '.ok == true' >/dev/null
+STANDALONE_AUTH="$(cat "$SMOKE_GATE_LEASE_DIR/pr-132-authority.json")"
+bash "$GATE" lease-claim run-standalone-bound owner-a | jq -e '.ok == true and .lease.pr == 132' >/dev/null
+[ "$(cat "$SMOKE_GATE_LEASE_DIR/pr-132-authority.json")" = "$STANDALONE_AUTH" ]
+# The lease records the campaign's repo (repoSlug, slugged as journeys_pin_file
+# slugs it) — with the PR and the head, the identity smoke-evidence-barrier.sh
+# looks the campaign's journeys pin up by, by exact name. A re-acquire with no
+# REPO in its environment preserves it; a conflicting repo is refused, and the
+# lease is untouched.
+jq -e '.repoSlug == "org__repo"' "$SMOKE_GATE_LEASE_DIR/lease-run-standalone-bound.json" >/dev/null
+SMOKE_GATE_REPO= bash "$GATE" lease-claim run-standalone-bound owner-a | jq -e '.ok == true and .lease.repoSlug == "org__repo"' >/dev/null
+OUT="$(SMOKE_GATE_REPO=other/fork bash "$GATE" lease-claim run-standalone-bound owner-a 132 || true)"
+jq -e '.ok == false and (.error | test("bound to repo org__repo and cannot be re-acquired for repo other__fork"))' <<<"$OUT" >/dev/null
+jq -e '.repoSlug == "org__repo" and .pr == 132 and .owner == "owner-a"' "$SMOKE_GATE_LEASE_DIR/lease-run-standalone-bound.json" >/dev/null
+bash "$GATE" release run-standalone-bound owner-a | jq -e '.ok == true' >/dev/null
+
+# --- 30. malformed and non-shared lease storage fail closed -----------------
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+BAD_SHA="$(sha 7)"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"
+printf '{broken\n' > "$SMOKE_GATE_LEASE_DIR/lease-run-malformed.json"
+BAD="$(bash "$GATE" lease-status run-malformed 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("malformed"))' <<<"$BAD" >/dev/null
+BAD="$(bash "$GATE" claim run-malformed 122 "$BAD_SHA" owner-a 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("malformed"))' <<<"$BAD" >/dev/null
+grep -q '^{' "$SMOKE_GATE_LEASE_DIR/lease-run-malformed.json"
+# Syntactically valid JSON with an unparsable UTC timestamp is malformed too;
+# it may not be treated as an expired lease available for overwrite.
+printf '{"schemaVersion":1,"pr":122,"owner":"owner-a","claimedAt":"2026-09-07T00:00:00Z","renewedAt":"2026-09-07T00:00:00Z","expiresAt":"not-a-timestamp"}\n' \
+  > "$SMOKE_GATE_LEASE_DIR/lease-run-bad-time.json"
+BAD_TIME_BEFORE="$(cat "$SMOKE_GATE_LEASE_DIR/lease-run-bad-time.json")"
+BAD="$(bash "$GATE" lease-status run-bad-time 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("malformed"))' <<<"$BAD" >/dev/null
+BAD="$(bash "$GATE" claim run-bad-time 122 "$BAD_SHA" owner-b 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("malformed"))' <<<"$BAD" >/dev/null
+[ "$(cat "$SMOKE_GATE_LEASE_DIR/lease-run-bad-time.json")" = "$BAD_TIME_BEFORE" ]
+MISSING_ROOT="$STATE_DIR/no-such-shared-root"
+BAD="$(SMOKE_GATE_SHARED_ROOT="$MISSING_ROOT" SMOKE_GATE_LEASE_DIR="$MISSING_ROOT/leases" \
+  bash "$GATE" claim run-missing 123 "$BAD_SHA" owner-a 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("missing"))' <<<"$BAD" >/dev/null
+BAD_TASK="$(SMOKE_GATE_SHARED_ROOT="$MISSING_ROOT" SMOKE_GATE_LEASE_DIR="$MISSING_ROOT/leases" \
+  bash "$GATE" task-claim run-missing-task "$BAD_SHA" owner-a 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("missing"))' <<<"$BAD_TASK" >/dev/null
+BAD_DEV="$(SMOKE_GATE_SHARED_ROOT="$MISSING_ROOT" SMOKE_GATE_LEASE_DIR="$MISSING_ROOT/leases" \
+  bash "$SCRIPT_DIR/smoke-develop-gate.sh" claim run-missing-develop "$BAD_SHA" 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("missing"))' <<<"$BAD_DEV" >/dev/null
+ln -s "$STATE_DIR" "$TEST_SHARED_ROOT/private-alias"
+BAD="$(SMOKE_GATE_LEASE_DIR="$TEST_SHARED_ROOT/private-alias/leases" \
+  bash "$GATE" claim run-private-alias 124 "$BAD_SHA" owner-a 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("non-shared|outside shared"))' <<<"$BAD" >/dev/null
+[ ! -e "$STATE_DIR/pr-123-state.json" ] && [ ! -e "$STATE_DIR/pr-124-state.json" ] &&
+  [ ! -e "$STATE_DIR/task-run-missing-task-state.json" ]
+
+# A present binding whose referenced lease is corrupt or owner-inconsistent is
+# unknown authority, never an expired slot available for replacement.
+CORRUPT_A="$STATE_DIR/corrupt-a" CORRUPT_B="$STATE_DIR/corrupt-b"
+mkdir -p "$CORRUPT_A" "$CORRUPT_B"
+CORRUPT_LEASE="$TEST_SHARED_ROOT/corrupt-binding/leases"
+SMOKE_GATE_STATE_DIR="$CORRUPT_A" SMOKE_GATE_LEASE_DIR="$CORRUPT_LEASE" \
+  bash "$GATE" claim run-corrupt-a 128 "$BAD_SHA" owner-a | jq -e '.ok == true' >/dev/null
+printf '{broken\n' > "$CORRUPT_LEASE/lease-run-corrupt-a.json"
+BAD="$(SMOKE_GATE_STATE_DIR="$CORRUPT_B" SMOKE_GATE_LEASE_DIR="$CORRUPT_LEASE" \
+  bash "$GATE" claim run-corrupt-b 128 "$BAD_SHA" owner-b --takeover 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("malformed"))' <<<"$BAD" >/dev/null
+jq -e '.runId == "run-corrupt-a" and .owner == "owner-a"' "$CORRUPT_LEASE/pr-128-authority.json" >/dev/null
+[ ! -e "$CORRUPT_LEASE/lease-run-corrupt-b.json" ]
+
+# A failed same-owner re-claim restores the preexisting live lease rather than
+# deleting authority that another invocation still relies on.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+ROLL_SHA="$(sha 8)"
+bash "$GATE" claim run-rollback 125 "$ROLL_SHA" owner-a | jq -e '.ok == true' >/dev/null
+ROLL_BEFORE="$(cat "$SMOKE_GATE_LEASE_DIR/lease-run-rollback.json")"
+ROLL_AUTH_BEFORE="$(cat "$SMOKE_GATE_LEASE_DIR/pr-125-authority.json")"
+chmod 500 "$STATE_DIR"
+ROLL_OUT="$(bash "$GATE" claim run-rollback 125 "$ROLL_SHA" owner-a 2>/dev/null || true)"
+chmod 700 "$STATE_DIR"
+jq -e '.ok == false and (.error | test("private PR slot"))' <<<"$ROLL_OUT" >/dev/null
+[ "$(cat "$SMOKE_GATE_LEASE_DIR/lease-run-rollback.json")" = "$ROLL_BEFORE" ]
+[ "$(cat "$SMOKE_GATE_LEASE_DIR/pr-125-authority.json")" = "$ROLL_AUTH_BEFORE" ]
+bash "$GATE" release run-rollback owner-a | jq -e '.ok == true' >/dev/null
+
+# Poll lease I/O failures retain the poll envelope and use the existing
+# immediate-then-throttled alarm shape.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+POLL_FAIL_SHA="$(sha 9)"
+export STUB_PR_LIST="[{\"number\":126,\"headRefOid\":\"$POLL_FAIL_SHA\",\"headRefName\":\"feature/y\"}]"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$POLL_FAIL_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES='[{"id":"backend-pr-126","name":"backend PR #126","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://preview.invalid"}}]'
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$POLL_FAIL_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+POLL_MISSING="$STATE_DIR/missing-shared"
+for expected in true false; do
+  OUT="$(SMOKE_GATE_SHARED_ROOT="$POLL_MISSING" SMOKE_GATE_LEASE_DIR="$POLL_MISSING/leases" bash "$GATE" poll)"
+  jq -e --argjson expected "$expected" \
+    '.ok == false and .wakeAgent == $expected and .data.trigger == "coordinator_lease_unavailable"
+     and (if $expected then has("observation") | not else .observation.kind == "blocked" end)' <<<"$OUT" >/dev/null
+done
+# Force the post-bind fence to miss once. Poll must restore the pre-claim
+# absence instead of leaving a live owner token that no wake ever delivered.
+ROLLBACK_POLL="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 \
+  SMOKE_GATE_TEST_HOLD_RUN_LOCK_AFTER_BIND_SECONDS=1.5 bash "$GATE" poll)"
+jq -e '.wakeAgent == false and .data.trigger == "coordinator_lease_unavailable" and (.observation.kind | IN("empty","blocked"))' <<<"$ROLLBACK_POLL" >/dev/null
+[ ! -e "$SMOKE_GATE_LEASE_DIR/pr-126-authority.json" ]
+[ "$(find "$SMOKE_GATE_LEASE_DIR" -maxdepth 1 -name 'lease-smoke-pr126-*.json' -type f | wc -l)" -eq 0 ]
+# Readiness/debounce history may already exist, but no coordinator slot may.
+jq -e '.activeRunId == null and .activeLeaseOwner == null' "$STATE_DIR/pr-126-state.json" >/dev/null
+# With the transient lock gone, the next poll claims and delivers its token.
+NEXT_POLL="$(bash "$GATE" poll || true)"
+jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and (.data.coordinatorOwnerToken | length > 0)' <<<"$NEXT_POLL" >/dev/null || {
+  echo "poll after ownership rollback did not reacquire: $NEXT_POLL" >&2
+  exit 1
+}
+
+# --- Same-run recovery adopts the predecessor's contract itself ------------
+# End to end through the real poll: claim -> contract -> marker -> container
+# dies (lease expires, progress goes stale) -> poll recovers the SAME run id
+# under a freshly minted token AND rebinds the contract to it -> the successor
+# writes straight away, finishes the missing lane and finishes the run, with
+# the predecessor's marker still counting. A `claim` that resumes the run id
+# adopts the same way; an adoption that dies midway leaves the contract as it
+# was and the wake says the successor must adopt; a terminal run or a new SHA
+# adopts nothing.
+# Owner tokens are never echoed: every failure message below names the step.
+SCAFFOLD="$SCRIPT_DIR/smoke-run-scaffold.sh"
+BARRIER="$SCRIPT_DIR/smoke-evidence-barrier.sh"
+export SMOKE_GATE_RUN_ROOT="$STATE_DIR/run-root"
+mkdir -p "$SMOKE_GATE_RUN_ROOT"
+jq -e '.data.resumedRunId == false and .data.contractAdoptionRequired == false and
+  .data.contractAdoption == null' <<<"$NEXT_POLL" >/dev/null
+ADOPT_RUN="$(jq -r '.data.runId' <<<"$NEXT_POLL")"
+ADOPT_T1="$(jq -r '.data.coordinatorOwnerToken' <<<"$NEXT_POLL")"
+ADOPT_DIR="$SMOKE_GATE_RUN_ROOT/$ADOPT_RUN"
+mkdir -p "$ADOPT_DIR"
+ADOPT_DEADLINE="$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")"
+[ -n "$ADOPT_DEADLINE" ] && [ "$ADOPT_DEADLINE" != null ]
+scaffold_as() { local owner="$1"; shift; SMOKE_LANE_ROLE=coordinator SMOKE_GATE_OWNER="$owner" bash "$SCAFFOLD" "$@"; }
+scaffold_as "$ADOPT_T1" contract "$ADOPT_DIR" "$POLL_FAIL_SHA" B1:browser S1:source | jq -e '.ok == true' >/dev/null
+scaffold_as "$ADOPT_T1" marker "$ADOPT_DIR" B1 fail 'by the original owner' | jq -e '.ok == true' >/dev/null
+ADOPT_B1_HASH="$(sha256sum "$ADOPT_DIR/markers/B1.json" | cut -d' ' -f1)"
+# A live run is not recoverable: no second token is minted.
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates" and .observation.kind == "empty"' >/dev/null
+# The predecessor's container dies. A later deadline would be observable.
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$ADOPT_RUN.json"
+sleep 1
+# Two competing recoveries, each from a container with no owner identity of
+# its own: exactly one poll wins the lease, is handed a token, and rebinds the
+# contract to it; the other is refused by the shared authority and adopts
+# nothing.
+( unset SMOKE_GATE_OWNER; HOSTNAME=recovery-container-a SMOKE_GATE_PROGRESS_STALE_SECONDS=0 \
+    bash "$GATE" poll > "$STATE_DIR/recover-1.json" 2>/dev/null ) &
+RECOVER_PID_1=$!
+( unset SMOKE_GATE_OWNER; HOSTNAME=recovery-container-b SMOKE_GATE_PROGRESS_STALE_SECONDS=0 \
+    bash "$GATE" poll > "$STATE_DIR/recover-2.json" 2>/dev/null ) &
+RECOVER_PID_2=$!
+wait "$RECOVER_PID_1" || true
+wait "$RECOVER_PID_2" || true
+[ "$(jq -s '[.[] | select(.data.trigger == "pr_build_settled")] | length' \
+  "$STATE_DIR/recover-1.json" "$STATE_DIR/recover-2.json")" -eq 1 ] || {
+  echo "expected exactly one competing recovery poll to win the run" >&2; exit 1; }
+RECOVERED="$(jq -sc '[.[] | select(.data.trigger == "pr_build_settled")][0]' \
+  "$STATE_DIR/recover-1.json" "$STATE_DIR/recover-2.json")"
+jq -e --arg run "$ADOPT_RUN" '.wakeAgent == true and .data.runId == $run and .data.resumedRunId == true and
+  .data.recovery == true and .data.contractAdoptionRequired == false and
+  .data.contractAdoption.ok == true and .data.contractAdoption.adopted == true and
+  .data.contractAdoption.adoptionCount == 1 and (.data.contractAdoption | has("contract") | not)' <<<"$RECOVERED" >/dev/null || {
+  echo "recovery wake did not resume the run id and report its own contract adoption" >&2; exit 1; }
+ADOPT_T2="$(jq -r '.data.coordinatorOwnerToken' <<<"$RECOVERED")"
+[ -n "$ADOPT_T2" ] && [ "$ADOPT_T2" != "$ADOPT_T1" ]
+jq -e --arg owner "$ADOPT_T2" '.activeLeaseOwner == $owner' "$STATE_DIR/pr-126-state.json" >/dev/null
+jq -e --arg owner "$ADOPT_T2" '.coordinatorOwnerToken == $owner and (.ownerAdoptions | length) == 1' \
+  "$ADOPT_DIR/completion-contract.json" >/dev/null || {
+  echo "the winning recovery did not rebind the contract to the token it minted (exactly once)" >&2; exit 1; }
+# No fresh time budget: the original challenger deadline survives recovery.
+[ "$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")" = "$ADOPT_DEADLINE" ] || {
+  echo "recovery replaced the original challenger deadline" >&2; exit 1; }
+# The predecessor is fenced and a caller that lost the recovery race cannot
+# adopt; the successor needs no adopt of its own.
+OUT="$(scaffold_as "$ADOPT_T1" marker "$ADOPT_DIR" S1 fail stale 2>&1 || true)"
+jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
+OUT="$(scaffold_as owner-lost-the-race adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
+[ ! -e "$ADOPT_DIR/markers/S1.json" ]
+# Exact retry: the successor's own `adopt` is a byte-identical no-op.
+ADOPT_CONTRACT_HASH="$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)"
+scaffold_as "$ADOPT_T2" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" |
+  jq -e '.ok == true and .adopted == false and .alreadyOwner == true and .adoptionCount == 1' >/dev/null
+[ "$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_CONTRACT_HASH" ] || {
+  echo "an exact adopt retry rewrote the contract" >&2; exit 1; }
+# After adoption the predecessor is still fenced on every scaffold verb and on
+# the gate's own terminal verb; its token is nowhere in the contract.
+for stale_verb in marker redispatch adopt; do
+  case "$stale_verb" in
+    marker) OUT="$(scaffold_as "$ADOPT_T1" marker "$ADOPT_DIR" S1 fail stale 2>&1 || true)" ;;
+    redispatch) OUT="$(scaffold_as "$ADOPT_T1" redispatch "$ADOPT_DIR" B1 2>&1 || true)" ;;
+    adopt) OUT="$(scaffold_as "$ADOPT_T1" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" 2>&1 || true)" ;;
+  esac
+  jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null || {
+    echo "post-adoption predecessor $stale_verb was not fenced" >&2; exit 1; }
+done
+OUT="$(bash "$GATE" finish "$POLL_FAIL_SHA" "$ADOPT_RUN" NO_GO "$ADOPT_T1" || true)"
+jq -e '.ok == false and (.error | test("caller owner"))' <<<"$OUT" >/dev/null
+for leaked in "$ADOPT_T1" "$(printf '%s' "$ADOPT_T1" | sha256sum | cut -d' ' -f1)" \
+              "$(printf '%s' "$ADOPT_T2" | sha256sum | cut -d' ' -f1)"; do
+  if grep -qF "$leaked" "$ADOPT_DIR/completion-contract.json"; then
+    echo "adoption left a predecessor token or an owner-derived digest in the contract" >&2; exit 1
+  fi
+done
+jq -e '.ownerAdoptions == [.ownerAdoptions[0]] and (.ownerAdoptions[0] | keys == ["adoptedAt","index"])' \
+  "$ADOPT_DIR/completion-contract.json" >/dev/null
+# The successor finishes the missing lane with no adopt of its own; the
+# predecessor's marker is the same bytes at the same generation.
+scaffold_as "$ADOPT_T2" marker "$ADOPT_DIR" S1 completed 'by the recovery owner' | jq -e '.ok == true and .generation == 1' >/dev/null
+[ "$(sha256sum "$ADOPT_DIR/markers/B1.json" | cut -d' ' -f1)" = "$ADOPT_B1_HASH" ]
+# A coordinator-side `claim` that resumes the published run id adopts too.
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$ADOPT_RUN.json"
+ADOPT_T3=claim-resume-owner
+OUT="$(SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" claim "$ADOPT_RUN" 126 "$POLL_FAIL_SHA" "$ADOPT_T3")"
+jq -e --arg run "$ADOPT_RUN" '.ok == true and .runId == $run and .contractAdoptionRequired == false and
+  .contractAdoption.adopted == true and .contractAdoption.adoptionCount == 2' <<<"$OUT" >/dev/null || {
+  echo "a resuming claim did not adopt the contract: $(jq -c 'del(.lease)' <<<"$OUT")" >&2; exit 1; }
+jq -e --arg owner "$ADOPT_T3" '.coordinatorOwnerToken == $owner' "$ADOPT_DIR/completion-contract.json" >/dev/null
+[ "$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")" = "$ADOPT_DEADLINE" ]
+# A crash between the adoption's validation and its write: the recovery still
+# owns the run, the contract is exactly what it was, and the wake says the
+# successor must adopt. Its own adopt then completes the move.
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$ADOPT_RUN.json"
+ADOPT_CONTRACT_HASH="$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)"
+CRASHED="$(SMOKE_SCAFFOLD_TEST_CRASH_BEFORE_ADOPT_COMMIT=1 SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll || true)"
+jq -e --arg run "$ADOPT_RUN" '.data.trigger == "pr_build_settled" and .data.runId == $run and
+  .data.resumedRunId == true and .data.contractAdoptionRequired == true and
+  .data.contractAdoption.ok == false' <<<"$CRASHED" >/dev/null || {
+  echo "a recovery whose adoption died did not say the successor must adopt" >&2; exit 1; }
+[ "$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_CONTRACT_HASH" ] || {
+  echo "a crashed adoption changed the contract" >&2; exit 1; }
+ADOPT_T4="$(jq -r '.data.coordinatorOwnerToken' <<<"$CRASHED")"
+[ -n "$ADOPT_T4" ] && [ "$ADOPT_T4" != "$ADOPT_T3" ]
+OUT="$(scaffold_as "$ADOPT_T3" marker "$ADOPT_DIR" S1 completed stale 2>&1 || true)"
+jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
+OUT="$(scaffold_as "$ADOPT_T4" redispatch "$ADOPT_DIR" S1 2>&1 || true)"
+jq -e '.ok == false and (.error | test("different coordinator owner"))' <<<"$OUT" >/dev/null
+scaffold_as "$ADOPT_T4" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" |
+  jq -e '.ok == true and .adopted == true and .adoptionCount == 3' >/dev/null
+# The scaffold's pr contract also owes a pair-identity record before a barrier
+# phase passes (covered by smoke-evidence-barrier.test.sh); seed a
+# clean one so this still asserts only what adoption leaves behind.
+jq -e '.pairIdentity == "required"' "$ADOPT_DIR/completion-contract.json" >/dev/null
+mkdir -p "$ADOPT_DIR/coordinator"
+# Shaped exactly as `start` writes it on a PR contract: the barrier validates
+# the frozen record before reading any receipt.
+jq -c '.sourceSha as $s | {ok:true,freezeGeneration:1,history:[],expectedSourceSha:$s,
+    frontend:{service:"srv-seed00000001",deploy:"dep-seed00000001",commit:$s},
+    backend:{service:"srv-seed00000002",deploy:"dep-seed00000002",commit:$s}}' \
+  "$ADOPT_DIR/completion-contract.json" > "$ADOPT_DIR/coordinator/identity.json"
+printf '{"label":"seed","verdict":"ok","freezeGeneration":1}\n' > "$ADOPT_DIR/coordinator/identity-checks.ndjson"
+bash "$BARRIER" "$ADOPT_DIR" lanes | jq -e '.ready == true' >/dev/null
+[ "$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")" = "$ADOPT_DEADLINE" ]
+OUT="$(bash "$GATE" finish "$POLL_FAIL_SHA" "$ADOPT_RUN" NO_GO "$ADOPT_T4" || true)"
+jq -e '.ok == true' <<<"$OUT" >/dev/null || { echo "recovery owner could not finish the adopted run" >&2; exit 1; }
+# Already terminal: nothing holds the slot, so nothing can adopt into it, and
+# a later poll on the same build resumes nothing and adopts nothing.
+OUT="$(scaffold_as "$ADOPT_T4" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("does not hold the gate"))' <<<"$OUT" >/dev/null
+ADOPT_CONTRACT_HASH="$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)"
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll | jq -e '.data.trigger != "pr_build_settled"' >/dev/null
+[ "$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_CONTRACT_HASH" ]
+# A different SHA is a different campaign: a new run id, and the old run's
+# contract is left alone.
+ADOPT_NEXT_SHA="$(sha a)"
+export STUB_PR_LIST="[{\"number\":126,\"headRefOid\":\"$ADOPT_NEXT_SHA\",\"headRefName\":\"feature/y\"}]"
+export STUB_RUN_LIST="[{\"headSha\":\"$ADOPT_NEXT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$ADOPT_NEXT_SHA\"}}]"
+NEW_SHA_POLL="$(SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll || true)"
+jq -e --arg run "$ADOPT_RUN" '.data.trigger == "pr_build_settled" and .data.runId != $run and
+  .data.resumedRunId == false and .data.contractAdoption == null and
+  .data.contractAdoptionRequired == false' <<<"$NEW_SHA_POLL" >/dev/null || {
+  echo "a new SHA resumed or adopted the old run" >&2; exit 1; }
+[ "$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_CONTRACT_HASH" ]
+unset SMOKE_GATE_RUN_ROOT
+
+fi
+if smoke_case invariant3; then
+# --- INVARIANT 3: num_env rejects the classes it was built to stop --------
+# Mirror of the develop suite's case-53 extension. "All digits" admitted three
+# shapes, each a distinct silent failure: a leading zero is octal (or fatal) in
+# `$(( ))` but DECIMAL in `[ -ge ]`, so the reported window and the effective
+# window diverge; anything wider than int64 makes every `[ x -ge KNOB ]` an
+# error, which in an `if` is false — a threshold that never fires; and
+# set-but-empty took the default without being named.
+fresh_state
+unset SMOKE_GATE_REPO 2>/dev/null || true
+for bad in 0900 0100 05900 99999999999999999999 "" abc; do
+  SMOKE_GATE_WARMUP_TIMEOUT="$bad" bash "$GATE" poll | jq -e '
+    .data.trigger == "gate_misconfigured" and
+    (.data.missing | index("SMOKE_GATE_WARMUP_TIMEOUT") != null)
+  ' >/dev/null || { echo "pr gate num_env admitted WARMUP_TIMEOUT='$bad'" >&2; exit 1; }
+done
+for ok in 0 1 600 999999999999999999; do
+  SMOKE_GATE_WARMUP_TIMEOUT="$ok" bash "$GATE" poll | jq -e '
+    .data.missing | index("SMOKE_GATE_WARMUP_TIMEOUT") == null
+  ' >/dev/null || { echo "pr gate num_env rejected the legitimate WARMUP_TIMEOUT='$ok'" >&2; exit 1; }
+done
+bash "$GATE" poll | jq -e '.data.missing | index("SMOKE_GATE_WARMUP_TIMEOUT") == null' >/dev/null
+export SMOKE_GATE_REPO=org/repo
+
+# =============================================================================
+# Campaign-size classification (mechanical, install-rules-driven, fail-closed)
+# =============================================================================
+
+fi
+if smoke_case sizing-globs-policy; then
+# --- 23. No rules file at all: standard, backward compatible ---------------
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_SIZING_RULES="$STATE_DIR/does-not-exist.json"
+HEAD_SHA="$(sha 3)"
+export STUB_PR_VIEW="{\"number\":300,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"frontend/a.css"}]'
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "standard" and .sizeReason == "no sizing rules"
+' >/dev/null
+
+RULES="$STATE_DIR/sizing.json"
+cat > "$RULES" <<'JSON'
+{"full":["backend/migrations/**"],"lightAllowed":["frontend/**"],"lightDeny":["frontend/auth/**"]}
+JSON
+export SMOKE_SIZING_RULES="$RULES"
+
+# --- 24. UI-only PR: light --------------------------------------------------
+export STUB_PR_FILES='[{"filename":"frontend/a.css"},{"filename":"frontend/sub/b.tsx"}]'
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "light" and (.sizeReason | startswith("light:"))
+' >/dev/null
+
+# --- 25. A UI file under lightDeny forces standard --------------------------
+export STUB_PR_FILES='[{"filename":"frontend/auth/login.tsx"}]'
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "standard" and
+  .sizeReason == "standard: frontend/auth/login.tsx matched frontend/auth/**"
+' >/dev/null
+
+# --- 26. One backend file under a `full` glob: full -------------------------
+export STUB_PR_FILES='[{"filename":"backend/migrations/0099_add_col.sql"}]'
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/migrations/0099_add_col.sql matched backend/migrations/**"
+' >/dev/null
+
+# --- 27. Mixed UI + ordinary backend file (matches neither lightAllowed nor
+# lightDeny): standard, never light just because most files were UI ---------
+export STUB_PR_FILES='[{"filename":"frontend/a.css"},{"filename":"backend/service/handler.ts"}]'
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "standard" and
+  .sizeReason == "standard: backend/service/handler.ts not matched by lightAllowed"
+' >/dev/null
+
+# --- 27a. A rename out of a `full` path is sized off BOTH paths: previous
+# path matches `full`, new path matches `lightAllowed` -- must still be full.
+export STUB_PR_FILES='[{"filename":"frontend/moved.tsx","previous_filename":"backend/migrations/1_x.sql","status":"renamed"}]'
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/migrations/1_x.sql matched backend/migrations/**"
+' >/dev/null
+
+# --- 28. Own-diff fetch failure: fails closed to full, independent of rules -
+export STUB_PR_FILES_EXIT=1
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "full" and .sizeReason == "full: the PR file list could not be fetched"
+' >/dev/null
+export STUB_PR_FILES_EXIT=0
+
+# --- 29. >=100 changed files: truncated listing fails closed to full -------
+export STUB_PR_FILES="$(python3 -c 'import json; print(json.dumps([{"filename": f"backend/f{i}.ts"} for i in range(100)]))')"
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "full" and .sizeReason == "full: the PR file list is truncated (>=100 files)"
+' >/dev/null
+
+# --- 30. Freeze PR: sized from campaignRange (validated-GO baseline...target),
+# never the freeze PR's own two-marker diff.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_SIZING_RULES="$RULES"
+PARENT_SHA="$(sha e)"
+FREEZE_SHA="$(sha f)"
+export STUB_PR_VIEW="{\"number\":301,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
+export STUB_PARENT_SHA="$PARENT_SHA"
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$(sha a)" "$(sha b)" 5
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"backend/migrations/1_x.sql"}]}'
+export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"pr-title-check\"}]"
+bash "$GATE" check 301 | jq -e '
+  .isFreezePr == true and .campaignSize == "full" and
+  .sizeReason == "full: backend/migrations/1_x.sql matched backend/migrations/**"
+' >/dev/null
+# Same range, nothing `full` in it: the rules are genuinely consulted, so the
+# `full` above came from the migration and not from an unknown range.
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"docs/readme.md"}]}'
+bash "$GATE" check 301 | jq -e '.campaignRange.determinable == true and .campaignSize != "full"' >/dev/null
+unset STUB_PARENT_SHA STUB_COMPARE_FILES SMOKE_SIZING_RULES SMOKE_GATE_HANDOFF_LEDGER
+
+# =============================================================================
+# Campaign-size classifier: present-but-broken sizing rules must fail closed,
+# never collapse into "no sizing rules" (shadow-review #721). The caller's
+# guard (smoke-pr-gate.sh:1221-1226) treats a non-zero classifier exit, or a
+# stdout reply that isn't {campaignSize: string, sizeReason: string}, as
+# "the classifier failed" and forces campaignSize=full -- so the fix is a
+# non-zero exit with nothing meaningful on stdout, not a specific JSON shape.
+# =============================================================================
+fresh_state
+CLASSIFY="$SCRIPT_DIR/campaign-size-classify.py"
+
+# A directory in place of a file is unreadable regardless of container uid --
+# deterministic across environments, unlike chmod 000 under root.
+# NOTE: each check below uses `if OUT=$(...); then FAIL; fi` rather than a
+# bare `OUT=$(...); CODE=$?` -- under this file's `set -e -o pipefail`, a bare
+# assignment from a failing command substitution would abort the whole test
+# script before the next line could inspect $?; putting it in the `if`
+# condition is the standard exemption from errexit.
+DIR_AS_RULES="$STATE_DIR/rules-is-a-dir.json"
+mkdir -p "$DIR_AS_RULES"
+if OUT="$(echo '[]' | python3 "$CLASSIFY" "$DIR_AS_RULES" 2>/dev/null)"; then
+  echo "721: unreadable (directory) rules file exited 0 (stdout: $OUT)" >&2
+  exit 1
+fi
+[ -z "$OUT" ] || { echo "721: unreadable rules file printed stdout instead of failing closed" >&2; exit 1; }
+
+# Invalid JSON must fail closed, not read as "no sizing rules".
+BAD_JSON_RULES="$STATE_DIR/bad-json-rules.json"
+printf '{ not valid json' > "$BAD_JSON_RULES"
+if OUT="$(echo '[]' | python3 "$CLASSIFY" "$BAD_JSON_RULES" 2>/dev/null)"; then
+  echo "721: invalid-JSON rules file exited 0 (stdout: $OUT)" >&2
+  exit 1
+fi
+[ -z "$OUT" ] || { echo "721: invalid-JSON rules file printed stdout instead of failing closed" >&2; exit 1; }
+
+# A YAML document is not valid JSON -- same malformed-file direction, a
+# different concrete shape of "the file parses as something, just not JSON".
+YAML_RULES="$STATE_DIR/yaml-rules.yaml"
+cat > "$YAML_RULES" <<'YAML'
+full:
+  - backend/migrations/**
+YAML
+if OUT="$(echo '[]' | python3 "$CLASSIFY" "$YAML_RULES" 2>/dev/null)"; then
+  echo "721: YAML rules file exited 0 (stdout: $OUT)" >&2
+  exit 1
+fi
+[ -z "$OUT" ] || { echo "721: YAML rules file printed stdout instead of failing closed" >&2; exit 1; }
+
+# Valid JSON that isn't an object (a bare array) must fail closed too.
+ARRAY_RULES="$STATE_DIR/array-rules.json"
+echo '["full"]' > "$ARRAY_RULES"
+if OUT="$(echo '[]' | python3 "$CLASSIFY" "$ARRAY_RULES" 2>/dev/null)"; then
+  echo "721: non-dict rules document exited 0 (stdout: $OUT)" >&2
+  exit 1
+fi
+[ -z "$OUT" ] || { echo "721: non-dict rules document printed stdout instead of failing closed" >&2; exit 1; }
+
+# An ABSENT file is still the backward-compatible "no sizing rules" case,
+# exit 0 -- must not regress alongside the above.
+ABSENT_RULES="$STATE_DIR/absent-rules.json"
+echo '[]' | python3 "$CLASSIFY" "$ABSENT_RULES" | jq -e '
+  .campaignSize == "standard" and .sizeReason == "no sizing rules"
+' >/dev/null
+
+# End-to-end: the gate's own fail-closed guard (smoke-pr-gate.sh:1221-1226)
+# fires off the classifier's non-zero exit for a present-but-malformed file,
+# the same way it already does for a classifier crash.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_SIZING_RULES="$STATE_DIR/bad-json-rules.json"
+printf '{ not valid json' > "$SMOKE_SIZING_RULES"
+HEAD_SHA="$(sha 9)"
+export STUB_PR_VIEW="{\"number\":302,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"frontend/a.css"}]'
+bash "$GATE" check 302 | jq -e '
+  .campaignSize == "full" and .sizeReason == "full: campaign size classifier failed"
+' >/dev/null
+unset SMOKE_SIZING_RULES
+
+# =============================================================================
+# #1536 / #1603 — preview-identity disambiguation and the post-finish warm-up
+# false alarm. Render has twice provisioned two services sharing one display
+# name under the same parent (PR #1533, PR #1637); the gate used to take
+# whichever the API listed first. These fixtures pin: candidate enumeration,
+# bundle-based backend disambiguation, unconditional refusal (never a guess)
+# when disambiguation cannot resolve to exactly one candidate, the frontend
+# evidence-gap field, the SAME resolution at the mutating `finish`/suspend
+# site, and that a preview this gate itself suspended after finishing never
+# re-alarms as a stuck warm-up.
+
+# --- 33. Backend disambiguated via the served frontend bundle: exactly one
+# candidate's host is referenced, so it is preferred over the other and
+# settling proceeds normally — no ambiguity recorded.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+D_SHA="$(sha 2)"
+export STUB_PR_VIEW="{\"number\":80,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$D_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$D_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[\
+{\"id\":\"srv-frontend-pr-80\",\"name\":\"WIDGET-WEB PR #80\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://widget-web-pr-80.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-80-a\",\"name\":\"WIDGET-API PR #80\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-80-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-80-b\",\"name\":\"WIDGET-API PR #80\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-80-b.onrender.com\"}}]"
+export STUB_FRONTEND_HTML='<html><body><script type="module" src="/assets/index-Cg8w-v89.js"></script></body></html>'
+export STUB_BUNDLE_JS='fetch("https://widget-api-pr-80-b.onrender.com/api")'
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$D_SHA\"}}]"
+export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$D_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+D_CHECK="$(bash "$GATE" check 80)"
+jq -e '
+  .previewAmbiguous == false and .previewAmbiguityReason == null and
+  .backendSelectionMethod == "bundle-disambiguated" and
+  .backendPreviewId == "srv-backend-pr-80-b" and
+  .backendPreviewUrl == "https://widget-api-pr-80-b.onrender.com" and
+  (.backendCandidates | length) == 2 and
+  .frontendEvidenceGap == false and .settled == true
+' <<<"$D_CHECK" >/dev/null || { echo "33: bundle disambiguation did not prefer the referenced host: $D_CHECK" >&2; exit 1; }
+
+# --- 34. Backend still ambiguous: the served bundle references NEITHER
+# candidate host. Refused, not guessed — no id/url selected, fetchOk false so
+# the stall is loud (routes through the existing facts-stuck alarm) rather
+# than silently retried forever, and the reason names both candidates.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+N_SHA="$(sha 3)"
+export STUB_PR_VIEW="{\"number\":81,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$N_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$N_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[\
+{\"id\":\"srv-frontend-pr-81\",\"name\":\"WIDGET-WEB PR #81\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://widget-web-pr-81.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-81-a\",\"name\":\"WIDGET-API PR #81\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-81-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-81-b\",\"name\":\"WIDGET-API PR #81\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-81-b.onrender.com\"}}]"
+export STUB_FRONTEND_HTML='<html><body><script type="module" src="/assets/index-Cg8w-v89.js"></script></body></html>'
+export STUB_BUNDLE_JS='fetch("/api/local")'
+N_ERR="$STATE_DIR/n-check-stderr.txt"
+N_CHECK="$(bash "$GATE" check 81 2>"$N_ERR")"
+jq -e '
+  .previewAmbiguous == true and .backendSelectionMethod == "ambiguous" and
+  (.previewAmbiguityReason | test("PR #81")) and
+  (.previewAmbiguityReason | test("srv-backend-pr-81-a")) and
+  (.previewAmbiguityReason | test("srv-backend-pr-81-b")) and
+  (.previewAmbiguityReason | test("none of the candidate backend hosts")) and
+  .backendPreviewId == null and .backendPreviewUrl == null and
+  .backendReady == false and .settled == false and .fetchOk == false
+' <<<"$N_CHECK" >/dev/null || { echo "34: bundle-referencing-neither did not refuse: $N_CHECK" >&2; exit 1; }
+grep -qF 'srv-backend-pr-81-a' "$N_ERR" || { echo "34: refusal was not reported on stderr" >&2; cat "$N_ERR" >&2; exit 1; }
+# ...and this stall is LOUD: with the facts-stall window at zero, it alarms as
+# pr_facts_unavailable rather than silently retrying forever. Two calls, same
+# shape as test 17 above: the first records factsStuckSince (no alarm — the
+# window has not elapsed by wall-clock yet), the second's elapsed-time check
+# (NOW_EPOCH - factsStuckSince >= 0) is then measured strictly after that
+# timestamp was written, never racing it within one invocation.
+export STUB_PR_LIST="[{\"number\":81,\"headRefOid\":\"$N_SHA\",\"headRefName\":\"feature/x\"}]"
+SMOKE_GATE_FACTS_STUCK_SECONDS=3600 bash "$GATE" poll 2>/dev/null | jq -e '.wakeAgent == false' >/dev/null \
+  || { echo "34-poll: expected the first stall to be silent (inside the window)" >&2; exit 1; }
+SMOKE_GATE_FACTS_STUCK_SECONDS=0 bash "$GATE" poll 2>/dev/null | jq -e '
+  .wakeAgent == true and .data.trigger == "pr_facts_unavailable" and .data.pr == 81
+' >/dev/null || { echo "34-poll: ambiguity did not surface as an alarm" >&2; exit 1; }
+
+# --- 35. Backend ambiguous with NO frontend preview to disambiguate against —
+# the frontend evidence gap and the backend ambiguity are BOTH recorded, and
+# the reason names the missing oracle rather than silently doing nothing.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+G_SHA="$(sha 4)"
+export STUB_PR_VIEW="{\"number\":82,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$G_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$G_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[\
+{\"id\":\"srv-backend-pr-82-a\",\"name\":\"WIDGET-API PR #82\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-82-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-82-b\",\"name\":\"WIDGET-API PR #82\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-82-b.onrender.com\"}}]"
+G_CHECK="$(bash "$GATE" check 82 2>/dev/null)"
+jq -e '
+  .previewAmbiguous == true and
+  (.previewAmbiguityReason | test("no healthy frontend preview URL")) and
+  .frontendEvidenceGap == true and .frontendPreviewUrl == null and
+  .backendPreviewId == null and .settled == false
+' <<<"$G_CHECK" >/dev/null || { echo "35: missing-oracle case did not record both gaps: $G_CHECK" >&2; exit 1; }
+
+# --- 36. Frontend evidence gap on an ordinary backend-only PR: a single,
+# unambiguous backend still settles normally, but the ABSENCE of any frontend
+# preview for this PR is now stated explicitly rather than left to be
+# inferred from "not required".
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+E_SHA="$(sha 5)"
+export STUB_PR_VIEW="{\"number\":83,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$E_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$E_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-83\",\"name\":\"WIDGET-API PR #83\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-83.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$E_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+E_CHECK="$(bash "$GATE" check 83 2>/dev/null)"
+jq -e '
+  .frontendRequired == false and .frontendEvidenceGap == true and
+  .frontendPreviewUrl == null and .previewAmbiguous == false and
+  .backendSelectionMethod == "single" and .settled == true and .fetchOk == true
+' <<<"$E_CHECK" >/dev/null || { echo "36: backend-only PR did not record the frontend evidence gap: $E_CHECK" >&2; exit 1; }
+
+# --- 36b. #725: frontend ambiguity is RECORDED whether or not the frontend is
+# required. A backend-only PR with two same-named frontend twins used to report
+# previewAmbiguous:false and a null reason — the same facts as "the frontend
+# preview is not created yet". It still settles on its backend (a frontend
+# duplicate it never needed resolved does not hold it), but the refusal is
+# stated and names both twins. The same twins on a PR that DOES require the
+# frontend still block it, with fetchOk false.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+F_SHA="$(sha 6)"
+# The one fixture path that must match the frontend prefix is built from the
+# same env the gate reads rather than restated here.
+F_FRONTEND_PREFIX="$SMOKE_GATE_FRONTEND_PREFIX"
+[ -n "$F_FRONTEND_PREFIX" ] || { echo "36b: SMOKE_GATE_FRONTEND_PREFIX is not exported" >&2; exit 1; }
+export STUB_PR_VIEW="{\"number\":84,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$F_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"backend/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$F_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[\
+{\"id\":\"srv-frontend-pr-84-a\",\"name\":\"preview-frontend PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://preview-frontend-pr-84-a.onrender.com\"}},\
+{\"id\":\"srv-frontend-pr-84-b\",\"name\":\"preview-frontend PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://preview-frontend-pr-84-b.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-84\",\"name\":\"preview-backend PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://preview-backend-pr-84.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$F_SHA\"}}]"
+export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$F_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+F_ERR="$STATE_DIR/f-check-stderr.txt"
+F_CHECK="$(bash "$GATE" check 84 2>"$F_ERR")"
+jq -e '
+  .frontendRequired == false and .frontendSelectionMethod == "ambiguous" and
+  .previewAmbiguous == true and
+  (.previewAmbiguityReason | test("frontend preview for PR #84")) and
+  (.previewAmbiguityReason | test("srv-frontend-pr-84-a")) and
+  (.previewAmbiguityReason | test("srv-frontend-pr-84-b")) and
+  .frontendPreviewId == null and .frontendPreviewUrl == null and .frontendEvidenceGap == true and
+  .backendSelectionMethod == "single" and .backendReady == true and
+  .settled == true and .fetchOk == true
+' <<<"$F_CHECK" >/dev/null || { echo "36b: backend-only PR did not record its frontend twins as ambiguous: $F_CHECK" >&2; exit 1; }
+grep -qF 'srv-frontend-pr-84-b' "$F_ERR" || { echo "36b: frontend ambiguity was not reported on stderr" >&2; cat "$F_ERR" >&2; exit 1; }
+export STUB_PR_FILES="[{\"filename\":\"backend/src/foo.ts\"},{\"filename\":\"${F_FRONTEND_PREFIX}src/app.tsx\"}]"
+F_REQ_CHECK="$(bash "$GATE" check 84 2>/dev/null)"
+jq -e '
+  .frontendRequired == true and .previewAmbiguous == true and
+  (.previewAmbiguityReason | test("srv-frontend-pr-84-a")) and
+  .frontendReady == false and .settled == false and .fetchOk == false
+' <<<"$F_REQ_CHECK" >/dev/null || { echo "36b: a frontend-required PR with frontend twins was not held: $F_REQ_CHECK" >&2; exit 1; }
+
+# --- 36c. A failed duplicate must not freeze a frontend-required PR. Render's
+# deployment state selects the one live, commit-bound candidate, which still
+# has to match the immutable PR head before the gate settles.
+fresh_state
+export STUB_PR_VIEW="{\"number\":85,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$F_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES="[{\"filename\":\"${F_FRONTEND_PREFIX}src/app.tsx\"}]"
+export STUB_RUN_LIST="[{\"headSha\":\"$F_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[\
+{\"id\":\"srv-frontend-pr-85-failed\",\"name\":\"preview-frontend PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://preview-frontend-pr-85-failed.onrender.com\"}},\
+{\"id\":\"srv-frontend-pr-85-live\",\"name\":\"preview-frontend PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://preview-frontend-pr-85-live.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-85\",\"name\":\"preview-backend PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://preview-backend-pr-85.onrender.com\"}}]"
+export STUB_DEPLOYS_BY_SERVICE_JSON="{\
+\"srv-frontend-pr-85-failed\":[{\"status\":\"build_failed\",\"commit\":{\"id\":\"$F_SHA\"}}],\
+\"srv-frontend-pr-85-live\":[{\"status\":\"live\",\"commit\":{\"id\":\"$F_SHA\"}}],\
+\"srv-backend-pr-85\":[{\"status\":\"live\",\"commit\":{\"id\":\"$F_SHA\"}}]}"
+export STUB_HEALTHZ_CODE=200
+F_LIVE_CHECK="$(bash "$GATE" check 85 2>/dev/null)"
+jq -e '
+  .frontendRequired == true and .frontendSelectionMethod == "live-deploy-filtered" and
+  .previewAmbiguous == false and .frontendPreviewId == "srv-frontend-pr-85-live" and
+  .frontendReady == true and .backendReady == true and .settled == true and .fetchOk == true
+' <<<"$F_LIVE_CHECK" >/dev/null || { echo "36c: failed frontend duplicate did not resolve to the live candidate: $F_LIVE_CHECK" >&2; exit 1; }
+
+# --- 37. THE mutating site: `finish` refuses to suspend an ambiguous backend
+# (same bundle-oracle resolution as evaluate_pr, applied at the suspend call
+# site). No suspend POST is issued at all, the reason is written into the
+# durable verdict receipt, and finish still completes rather than stranding
+# the run.
+fresh_state
+F_SHA="$(sha 6)"
+export STUB_SUSPEND_LOG="$STATE_DIR/suspend-posts-37.log"
+: > "$STUB_SUSPEND_LOG"
+bash "$GATE" claim run-amb-finish 84 "$F_SHA" >/dev/null
+export STUB_SERVICES="[\
+{\"id\":\"srv-frontend-pr-84\",\"name\":\"WIDGET-WEB PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://widget-web-pr-84.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-84-a\",\"name\":\"WIDGET-API PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-84-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-84-b\",\"name\":\"WIDGET-API PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-84-b.onrender.com\"}}]"
+export STUB_FRONTEND_HTML='<html><body>no module script here</body></html>'
+export STUB_SUSPEND_CODE=202
+F_ERR="$STATE_DIR/f-finish-stderr.txt"
+bash "$GATE" finish "$F_SHA" run-amb-finish GO 2>"$F_ERR" | jq -e --arg sha "$F_SHA" '
+  .ok == true and .verdict == "GO" and .pr == 84 and .sha == $sha and
+  .suspend.attempted == false and .suspend.ok == false and
+  .suspend.httpStatus == null and
+  (.suspend.reason | test("PR #84")) and
+  (.suspend.reason | test("srv-backend-pr-84-a")) and
+  (.suspend.reason | test("srv-backend-pr-84-b")) and
+  (.suspend.reason | test("could not extract a JS bundle path"))
+' >/dev/null || { echo "37: finish did not refuse the ambiguous suspend" >&2; exit 1; }
+[ ! -s "$STUB_SUSPEND_LOG" ] || { echo "37: a suspend POST was issued against an ambiguous preview:" >&2; cat "$STUB_SUSPEND_LOG" >&2; exit 1; }
+jq -e '.suspend.attempted == false and (.suspend.reason | test("srv-backend-pr-84-a"))' \
+  "$STATE_DIR/pr-84-verdict.json" >/dev/null \
+  || { echo "37: the durable verdict receipt did not record the refusal" >&2; exit 1; }
+jq -e --arg sha "$F_SHA" '.completedSha == $sha and .activeSha == null' "$STATE_DIR/pr-84-state.json" >/dev/null \
+  || { echo "37: the refusal stranded the run instead of completing it" >&2; exit 1; }
+grep -qF 'srv-backend-pr-84-a' "$F_ERR" || { echo "37: suspend refusal was not reported on stderr" >&2; cat "$F_ERR" >&2; exit 1; }
+
+# --- 38. THE mutating site, positive case: `finish` disambiguates via the
+# bundle and suspends the CORRECT twin — a real POST hits the wire, targeting
+# the candidate the served frontend actually calls, not whichever the API
+# happened to list first.
+fresh_state
+S_SHA="$(sha 7)"
+export STUB_SUSPEND_LOG="$STATE_DIR/suspend-posts-38.log"
+: > "$STUB_SUSPEND_LOG"
+bash "$GATE" claim run-disambig-finish 85 "$S_SHA" >/dev/null
+export STUB_SERVICES="[\
+{\"id\":\"srv-frontend-pr-85\",\"name\":\"WIDGET-WEB PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://widget-web-pr-85.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-85-a\",\"name\":\"WIDGET-API PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-85-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-85-b\",\"name\":\"WIDGET-API PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-85-b.onrender.com\"}}]"
+export STUB_FRONTEND_HTML='<html><body><script type="module" src="/assets/index-Dw8AA3y4.js"></script></body></html>'
+export STUB_BUNDLE_JS='fetch("https://widget-api-pr-85-a.onrender.com/api")'
+export STUB_SUSPEND_CODE=202
+bash "$GATE" finish "$S_SHA" run-disambig-finish GO | jq -e '
+  .ok == true and .suspend.attempted == true and .suspend.ok == true and
+  .suspend.httpStatus == 202 and .suspend.reason == null
+' >/dev/null || { echo "38: bundle-disambiguated finish did not suspend" >&2; exit 1; }
+[ "$(wc -l < "$STUB_SUSPEND_LOG")" -eq 1 ] || { echo "38: expected exactly one suspend POST, got $(wc -l < "$STUB_SUSPEND_LOG")" >&2; exit 1; }
+grep -qF 'srv-backend-pr-85-a/suspend' "$STUB_SUSPEND_LOG" \
+  || { echo "38: the suspend POST did not target the bundle-referenced twin:" >&2; cat "$STUB_SUSPEND_LOG" >&2; exit 1; }
+
+# --- 39. #1603: a preview THIS GATE ITSELF SUSPENDED after finishing never
+# re-alarms as pr_warmup_stuck. Real completedSha==headSha state, produced by
+# an actual finish call (not hand-crafted), then a poll cycle whose facts show
+# backendReady:true (deploy sha still matches) and healthzReady:false (503
+# Service Suspended — by design). Four consecutive campaigns (#1560, #1600,
+# #1617, #1644) burned a wake and a container spawn each on exactly this.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+W_SHA="$(sha 8)"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-86\",\"name\":\"WIDGET-API PR #86\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-86.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$W_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+bash "$GATE" claim run-warmup-finish 86 "$W_SHA" >/dev/null
+export STUB_SUSPEND_CODE=202
+bash "$GATE" finish "$W_SHA" run-warmup-finish GO | jq -e '.ok == true and .suspend.ok == true' >/dev/null \
+  || { echo "39: setup finish call failed" >&2; exit 1; }
+jq -e --arg sha "$W_SHA" '.completedSha == $sha and .activeRunId == null' "$STATE_DIR/pr-86-state.json" >/dev/null \
+  || { echo "39: setup did not leave the expected completed state" >&2; exit 1; }
+# The suspended preview now 503s. Same headSha, same STUB_PR_FILES/RUN_LIST
+# (evaluate_pr re-fetches them fresh every poll) as a plain settled PR would
+# use, but healthz now reports the suspension.
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$W_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_HEALTHZ_CODE=503
+export STUB_PR_LIST="[{\"number\":86,\"headRefOid\":\"$W_SHA\",\"headRefName\":\"feature/x\"}]"
+# First poll: records deployLiveSince (freshly, as "now") — same reason test
+# 34-poll above needs two calls, so the warm-up window has actually elapsed
+# by wall-clock before the second poll checks it, rather than racing within
+# one invocation.
+bash "$GATE" poll >/dev/null
+SMOKE_GATE_WARMUP_TIMEOUT=0 bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger != "pr_warmup_stuck"' >/dev/null \
+  || { echo "39: a gate-suspended preview re-alarmed as pr_warmup_stuck" >&2; exit 1; }
+
+# --- 31. Glob-translation unit cases: **, {a,b}, and a single * that does not
+# cross `/`. Exercised directly against campaign-size-classify.py so a glob
+# regression is caught even if no gate-level scenario happens to hit it.
+CLASSIFY="$SCRIPT_DIR/campaign-size-classify.py"
+GLOB_RULES="$STATE_DIR/glob-rules.json"
+cat > "$GLOB_RULES" <<'JSON'
+{"full":["backend/migrations/**"],"lightAllowed":["frontend/**/*.{css,tsx}"],"lightDeny":[]}
+JSON
+# `**` crosses directories: a nested migration file still matches `backend/migrations/**`.
+echo '["backend/migrations/nested/deep/2_y.sql"]' | python3 "$CLASSIFY" "$GLOB_RULES" | jq -e '
+  .campaignSize == "full"
+' >/dev/null
+# `{a,b}` alternation: both extensions in the brace group are individually allowed.
+echo '["frontend/a.css","frontend/sub/b.tsx"]' | python3 "$CLASSIFY" "$GLOB_RULES" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+# a bare `*` does not cross `/`: `frontend/*.css` must not match a file one
+# directory deeper.
+STAR_RULES="$STATE_DIR/star-rules.json"
+cat > "$STAR_RULES" <<'JSON'
+{"full":[],"lightAllowed":["frontend/*.css"],"lightDeny":[]}
+JSON
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$STAR_RULES" | jq -e '.campaignSize == "light"' >/dev/null
+echo '["frontend/sub/a.css"]' | python3 "$CLASSIFY" "$STAR_RULES" | jq -e '
+  .campaignSize == "standard" and .sizeReason == "standard: frontend/sub/a.css not matched by lightAllowed"
+' >/dev/null
+
+# --- 32. `fullGlobsFrom`: read the named constant out of the install's own
+# release-policy file via ast.literal_eval, instead of keeping a second copy
+# of its sensitive-path list in the rules file -- and instead of importing
+# the file as a module, which would execute it. Every failure mode here
+# (unreadable file, unparseable file, absent variable, a non-literal value,
+# or a mistyped value) fails closed to `full` -- exercised directly against
+# campaign-size-classify.py, same as the glob unit cases above.
+POLICY_MOD="$STATE_DIR/policy.py"
+cat > "$POLICY_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+PY
+
+FGF_RULES="$STATE_DIR/fgf-rules.json"
+cat > "$FGF_RULES" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],"lightDeny":[],
+ "fullGlobsFrom":{"path":"$POLICY_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+# A file matching the imported policy's own glob: full.
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_RULES" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+# No match against the imported globs: falls through to the ordinary
+# light/standard rules exactly as if fullGlobsFrom were absent.
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_RULES" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+
+# A policy file whose first line imports a module that doesn't exist still
+# classifies correctly off its globs -- proof the file is read as data (ast),
+# never executed as code.
+NOEXEC_MOD="$STATE_DIR/policy-noexec.py"
+cat > "$NOEXEC_MOD" <<'PY'
+import module_that_does_not_exist_anywhere
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+PY
+FGF_NOEXEC="$STATE_DIR/fgf-noexec.json"
+cat > "$FGF_NOEXEC" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$NOEXEC_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_NOEXEC" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+
+# A computed value (not a literal): fails closed to full, reason says so.
+COMPUTED_MOD="$STATE_DIR/policy-computed.py"
+cat > "$COMPUTED_MOD" <<'PY'
+BASE = ["backend/permissions/**"]
+EXTRA = ["backend/billing/**"]
+SENSITIVE_GLOBS = BASE + EXTRA
+PY
+FGF_COMPUTED="$STATE_DIR/fgf-computed.json"
+cat > "$FGF_COMPUTED" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$COMPUTED_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_COMPUTED" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("is not a literal"))
+' >/dev/null
+
+# An unparseable file: fails closed to full.
+UNPARSEABLE_MOD="$STATE_DIR/policy-unparseable.py"
+cat > "$UNPARSEABLE_MOD" <<'PY'
+SENSITIVE_GLOBS = [
+PY
+FGF_UNPARSEABLE="$STATE_DIR/fgf-unparseable.json"
+cat > "$FGF_UNPARSEABLE" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$UNPARSEABLE_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_UNPARSEABLE" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("could not be parsed"))
+' >/dev/null
+
+# Unreadable file (does not exist): fails closed to full, names the path.
+FGF_MISSING="$STATE_DIR/fgf-missing.json"
+cat > "$FGF_MISSING" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$STATE_DIR/does-not-exist.py","name":"X"}}
+JSON
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_MISSING" | jq -e '
+  .campaignSize == "full" and (.sizeReason | startswith("full: fullGlobsFrom.path"))
+' >/dev/null
+
+# Wrong type (a string instead of a list): fails closed to full.
+BAD_TYPE_MOD="$STATE_DIR/policy-bad-type.py"
+cat > "$BAD_TYPE_MOD" <<'PY'
+SENSITIVE_GLOBS = "backend/permissions/**"
+PY
+FGF_BADTYPE="$STATE_DIR/fgf-badtype.json"
+cat > "$FGF_BADTYPE" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$BAD_TYPE_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_BADTYPE" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("is not a list of strings"))
+' >/dev/null
+
+# Absent variable: fails closed to full.
+FGF_MISSINGVAR="$STATE_DIR/fgf-missingvar.json"
+cat > "$FGF_MISSINGVAR" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$POLICY_MOD","name":"NOT_THERE"}}
+JSON
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_MISSINGVAR" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("not found at top level in"))
+' >/dev/null
+
+# Local `full` globs and imported globs are unioned, not one replacing the
+# other -- a file matching either must classify full.
+FGF_UNION="$STATE_DIR/fgf-union.json"
+cat > "$FGF_UNION" <<JSON
+{"full":["frontend/auth/**"],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$POLICY_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["frontend/auth/login.tsx"]' | python3 "$CLASSIFY" "$FGF_UNION" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("matched frontend/auth"))
+' >/dev/null
+echo '["backend/permissions/roles.ts"]' | python3 "$CLASSIFY" "$FGF_UNION" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("matched backend/permissions"))
+' >/dev/null
+
+# --- Any top-level statement that mutates or rebinds the imported name,
+# other than the single trusted literal assignment, must fail closed too
+# (shadow-review #723) -- AugAssign, `.extend`/`.append`, a second
+# (re)assignment, and `del` all silently kept only the first literal before
+# this fix, so a partial policy classified `light` instead of `full`.
+
+# `+=` after the initial assignment.
+AUGASSIGN_MOD="$STATE_DIR/policy-augassign.py"
+cat > "$AUGASSIGN_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+SENSITIVE_GLOBS += ["backend/billing/**"]
+PY
+FGF_AUGASSIGN="$STATE_DIR/fgf-augassign.json"
+cat > "$FGF_AUGASSIGN" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$AUGASSIGN_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_AUGASSIGN" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("AugAssign"))
+' >/dev/null
+
+# `.extend(...)` after the initial assignment.
+EXTEND_MOD="$STATE_DIR/policy-extend.py"
+cat > "$EXTEND_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+SENSITIVE_GLOBS.extend(["backend/billing/**"])
+PY
+FGF_EXTEND="$STATE_DIR/fgf-extend.json"
+cat > "$FGF_EXTEND" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$EXTEND_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_EXTEND" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("Expr"))
+' >/dev/null
+
+# `.append(...)` after the initial assignment.
+APPEND_MOD="$STATE_DIR/policy-append.py"
+cat > "$APPEND_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+SENSITIVE_GLOBS.append("backend/billing/**")
+PY
+FGF_APPEND="$STATE_DIR/fgf-append.json"
+cat > "$FGF_APPEND" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$APPEND_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_APPEND" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("Expr"))
+' >/dev/null
+
+# A second top-level (re)assignment -- even a plain literal one -- is no
+# longer trustworthy either: nothing left in the file distinguishes intended
+# shadowing from an accidental leftover first draft, so this must fail
+# closed rather than silently keep only the last value.
+REASSIGN_MOD="$STATE_DIR/policy-reassign.py"
+cat > "$REASSIGN_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+PY
+FGF_REASSIGN="$STATE_DIR/fgf-reassign.json"
+cat > "$FGF_REASSIGN" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$REASSIGN_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_REASSIGN" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("reassigned"))
+' >/dev/null
+
+# `del` after the initial assignment.
+DEL_MOD="$STATE_DIR/policy-del.py"
+cat > "$DEL_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+del SENSITIVE_GLOBS
+PY
+FGF_DEL="$STATE_DIR/fgf-del.json"
+cat > "$FGF_DEL" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$DEL_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_DEL" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("Delete"))
+' >/dev/null
+
+# --- A REALISTIC policy file must classify exactly as the minimal one does
+# (#736 round-1 P1). The first cut of the guard above refused any top-level
+# statement that so much as READ the imported name, and a real policy file is
+# one constant plus every line derived from it -- a compiled regex, a count, a
+# wider list -- so the guard refused the only shape it would ever meet in
+# production and sized every PR on that install `full`. A plain read leaves
+# the assigned literal exactly as written; only a BINDING or MUTATING use may
+# refuse. This fixture is the structural fix for that class: every derived
+# read below is one the live policy file actually contains.
+REALISTIC_MOD="$STATE_DIR/policy-realistic.py"
+cat > "$REALISTIC_MOD" <<'PY'
+"""A policy file shaped like a real one: a constant, then lines derived from it."""
+import re
+
+DEFAULT_SIZE = "standard"
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+SENSITIVE_RE = re.compile("|".join(g.replace("**", ".*") for g in SENSITIVE_GLOBS))
+GLOB_COUNT = len(SENSITIVE_GLOBS)
+ALL_GLOBS = SENSITIVE_GLOBS + ["backend/legacy/**"]
+PY
+FGF_REALISTIC="$STATE_DIR/fgf-realistic.json"
+cat > "$FGF_REALISTIC" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],"lightDeny":[],
+ "fullGlobsFrom":{"path":"$REALISTIC_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+# Identical sizes to the minimal-policy rules file (FGF_RULES, same globs),
+# input for input -- the derived reads change nothing.
+for SIZE_INPUT in '["backend/billing/charge.ts"]' '["backend/permissions/roles.ts"]' '["frontend/a.css"]' '["frontend/a.css","docs/x.md"]'; do
+  MIN_OUT="$(echo "$SIZE_INPUT" | python3 "$CLASSIFY" "$FGF_RULES" | jq -r '.campaignSize')"
+  REAL_OUT="$(echo "$SIZE_INPUT" | python3 "$CLASSIFY" "$FGF_REALISTIC" | jq -r '.campaignSize')"
+  [ "$MIN_OUT" = "$REAL_OUT" ] ||
+    { echo "736: derived reads changed the size for $SIZE_INPUT (minimal=$MIN_OUT realistic=$REAL_OUT)" >&2; exit 1; }
+done
+# ...and those sizes are the real ones, not `full` for everything: the
+# equality above would also hold if BOTH files were refused.
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_REALISTIC" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_REALISTIC" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+
+# A bare annotation before the assignment binds nothing and must not refuse.
+ANNOTATED_MOD="$STATE_DIR/policy-annotated.py"
+cat > "$ANNOTATED_MOD" <<'PY'
+SENSITIVE_GLOBS: list[str]
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+PY
+FGF_ANNOTATED="$STATE_DIR/fgf-annotated.json"
+cat > "$FGF_ANNOTATED" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$ANNOTATED_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_ANNOTATED" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_ANNOTATED" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+
+# --- Binding shapes that no ast.Name check can see (#736 round-1 P2-1).
+# Every fixture below assigns ONLY the permissions glob at top level and then
+# rebinds or mutates the name through some other route, so a guard that misses
+# the route reads a PARTIAL policy and sizes a billing PR `light` -- exactly
+# the #723 class. Each must fail closed to `full` instead.
+assert_policy_refused() {
+  # $1 = fixture basename, $2 = python source, $3 = expected reason regex
+  local mod="$STATE_DIR/policy-$1.py" rules="$STATE_DIR/fgf-$1.json"
+  printf '%s' "$2" > "$mod"
+  cat > "$rules" <<JSON
+{"full":[],"lightAllowed":["backend/**"],
+ "fullGlobsFrom":{"path":"$mod","name":"SENSITIVE_GLOBS"}}
+JSON
+  echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$rules" | jq -e --arg rx "$3" '
+    .campaignSize == "full" and (.sizeReason | test($rx))
+  ' >/dev/null || { echo "736: policy fixture $1 did not fail closed (expected reason ~ $3)" >&2; exit 1; }
+}
+
+assert_runtime_widening_policy_refused() {
+  # Prove both halves of the stale-literal failure: the reviewer-authored
+  # fixture really widens the imported list at runtime, while the classifier
+  # refuses that binding instead of reading the one-entry literal and calling
+  # the billing change `light` under the backend/** light rule.
+  local mod="$STATE_DIR/policy-$1.py" rules="$STATE_DIR/fgf-$1.json"
+  printf '%s' "$2" > "$mod"
+  python3 - "$mod" <<'PY'
+import runpy
+import sys
+
+globs = runpy.run_path(sys.argv[1])["SENSITIVE_GLOBS"]
+expected = ["backend/permissions/**", "backend/billing/**"]
+if globs != expected:
+    raise SystemExit("fixture did not widen the runtime policy: {!r}".format(globs))
+PY
+  cat > "$rules" <<JSON
+{"full":[],"lightAllowed":["backend/**"],
+ "fullGlobsFrom":{"path":"$mod","name":"SENSITIVE_GLOBS"}}
+JSON
+  echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$rules" | jq -e --arg rx "$3" '
+    .campaignSize == "full" and (.sizeReason | test($rx))
+  ' >/dev/null || { echo "769: runtime-widening fixture $1 did not fail closed (expected reason ~ $3)" >&2; exit 1; }
+}
+
+# `from x import NAME` rebinds the name to whatever that module holds.
+assert_policy_refused from-import 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+from policy_extra import SENSITIVE_GLOBS
+' 'ImportFrom'
+
+# `import x as NAME`.
+assert_policy_refused import-as 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+import policy_extra as SENSITIVE_GLOBS
+' 'Import'
+
+# A star import binds names this classifier cannot enumerate, so ANY star
+# import in the policy file is refused, whatever the imported module is.
+assert_policy_refused star-import 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+from policy_extra import *
+' 'ImportFrom'
+
+# `def NAME` / `class NAME` rebind the name to a function or a class.
+assert_policy_refused def-over 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+
+
+def SENSITIVE_GLOBS():
+    return ["backend/permissions/**", "backend/billing/**"]
+' 'FunctionDef'
+
+assert_policy_refused class-over 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+
+
+class SENSITIVE_GLOBS:
+    pass
+' 'ClassDef'
+
+# `except ... as NAME` binds (and then deletes) the name.
+assert_policy_refused except-as 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+try:
+    pass
+except ValueError as SENSITIVE_GLOBS:
+    pass
+' 'Try'
+
+# `match` captures bind through a string field: MatchAs, MatchStar, and
+# MatchMapping.rest. The reason alternative covers a pre-3.10 interpreter,
+# where the statement does not parse at all -- still fail-closed, different
+# reason.
+assert_policy_refused match-as 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+match DEFAULT_SIZE:
+    case SENSITIVE_GLOBS:
+        pass
+' 'Match|could not be parsed'
+
+assert_policy_refused match-star 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+match DEFAULT_SIZE:
+    case [*SENSITIVE_GLOBS]:
+        pass
+' 'Match|could not be parsed'
+
+assert_policy_refused match-rest 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+match DEFAULT_SIZE:
+    case {"a": 1, **SENSITIVE_GLOBS}:
+        pass
+' 'Match|could not be parsed'
+
+# An alias shares the one list object, so a mutation through the OTHER name
+# changes the policy while the literal above still reads complete.
+assert_runtime_widening_policy_refused alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+ALIAS = SENSITIVE_GLOBS
+ALIAS.append("backend/billing/**")
+' 'Assign'
+
+# #769: a trusted literal may have exactly one target.  Chained assignment
+# makes the other target an alias of that literal, so it can widen the policy
+# while the classifier would otherwise read only the original permissions
+# glob and size this billing change `light`.
+assert_runtime_widening_policy_refused chained-alias-append 'LEGACY = SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY.append("backend/billing/**")
+' 'Assign'
+
+# An alias can also hide in a destructuring RHS; the direct-name-only check
+# above must not treat this as the ordinary derived-list read below.
+assert_runtime_widening_policy_refused tuple-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY, UNUSED = (SENSITIVE_GLOBS, [])
+LEGACY.append("backend/billing/**")
+' 'aliases'
+
+# Likewise, a conditional can bind the trusted list itself on one branch.
+# The condition is true here so this also describes a real import-time
+# widening, but the classifier must refuse any branch that can alias it.
+assert_runtime_widening_policy_refused conditional-alias-append 'USE_LEGACY = True
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = SENSITIVE_GLOBS if USE_LEGACY else []
+LEGACY.append("backend/billing/**")
+' 'aliases'
+
+# A pure callee is only non-mutating; it does not promise a deep copy.  These
+# wrappers retain the trusted list as an element, so either later mutation
+# widens the imported policy even though direct `tuple(SENSITIVE_GLOBS)` and
+# `list(SENSITIVE_GLOBS)` remain valid copies of the literal strings.
+assert_runtime_widening_policy_refused tuple-wrapped-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY, = tuple([SENSITIVE_GLOBS])
+LEGACY.append("backend/billing/**")
+' 'aliases'
+
+assert_runtime_widening_policy_refused list-wrapped-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = list([SENSITIVE_GLOBS])
+LEGACY[0].append("backend/billing/**")
+' 'aliases'
+
+# The wrapper's reference can also be extracted immediately, without a
+# named intermediate container.  The binding guard must cover the expression
+# that receives the alias, not only the wrapper assignment shape.
+assert_runtime_widening_policy_refused subscript-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = (SENSITIVE_GLOBS,)[0]
+LEGACY.append("backend/billing/**")
+' 'aliases'
+
+# A walrus binds at top level too.  It is not an Assign node, but it can make
+# the same direct alias before a later mutation widens the imported policy.
+assert_runtime_widening_policy_refused walrus-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+(LEGACY := SENSITIVE_GLOBS)
+LEGACY.append("backend/billing/**")
+' 'aliases'
+
+# New outer containers do not prove a deep copy. Both bindings retain the
+# policy list as element zero, then mutate that exact object at import time.
+assert_runtime_widening_policy_refused list-plus-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = [SENSITIVE_GLOBS] + []
+LEGACY[0].append("backend/billing/**")
+' 'aliases'
+
+assert_runtime_widening_policy_refused comprehension-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = [glob for glob in [SENSITIVE_GLOBS]]
+LEGACY[0].append("backend/billing/**")
+' 'aliases'
+
+# The reference proof must cover BOTH operands of its one permitted derived
+# list form.  The outer concatenation is new, but its right operand keeps the
+# original list as an element and therefore still exposes it for mutation.
+assert_runtime_widening_policy_refused derived-list-nested-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = SENSITIVE_GLOBS + [SENSITIVE_GLOBS]
+LEGACY[-1].append("backend/billing/**")
+' 'aliases'
+
+# A call can retain a reference through its CALLEE, even when it has no
+# arguments.  Looking only at call arguments accepts this immediately-invoked
+# closure and leaves the classifier reading the stale literal.
+assert_runtime_widening_policy_refused lambda-callee-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = (lambda: SENSITIVE_GLOBS)()
+LEGACY.append("backend/billing/**")
+' 'aliases'
+
+# Module-level binders other than assignment must pass through the same
+# reference-retention proof.  Each of these five reviewer-authored fixtures
+# executes successfully and widens the real policy while leaving its literal
+# assignment unchanged, so the real classifier CLI must fail closed.
+assert_runtime_widening_policy_refused for-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+for LEGACY in [SENSITIVE_GLOBS]:
+    LEGACY.append("backend/billing/**")
+' 'aliases through an iterable binding'
+
+assert_runtime_widening_policy_refused augassign-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = []
+LEGACY += [SENSITIVE_GLOBS]
+LEGACY[0].append("backend/billing/**")
+' 'aliases through augmented assignment'
+
+assert_runtime_widening_policy_refused match-capture-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+match SENSITIVE_GLOBS:
+    case LEGACY:
+        LEGACY.append("backend/billing/**")
+' 'aliases through a match capture'
+
+assert_runtime_widening_policy_refused for-destructured-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+for LEGACY, in [(SENSITIVE_GLOBS,)]:
+    LEGACY.append("backend/billing/**")
+' 'aliases through an iterable binding'
+
+assert_runtime_widening_policy_refused match-nested-capture-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+match [SENSITIVE_GLOBS]:
+    case [LEGACY]:
+        LEGACY.append("backend/billing/**")
+' 'aliases through a match capture'
+
+# A read is not an alias: `ALL = NAME + OTHER` builds a NEW list and leaves
+# the constant alone, so the same file with a derived read still classifies.
+# (Covered by the realistic fixture above; this is the one-line contrast.)
+
+# --- Namespace reached by string (#736 round-1 P3-1): a constants file has
+# no need for `globals`/`vars`/`setattr`/`exec`/`eval`/`__import__`/
+# `sys.modules` at top level, and each of them can rebind the name in a way
+# no name-level check can see.
+assert_policy_refused globals-write 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+globals()["SENSITIVE_GLOBS"] = ["backend/billing/**"]
+' 'globals'
+
+assert_policy_refused sys-modules 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+import sys
+
+sys.modules[__name__].SENSITIVE_GLOBS = ["backend/billing/**"]
+' 'sys.modules'
+
+# --- A top-level CALL runs at import time and can mutate the constant in
+# place, leaving the literal this classifier reads a partial policy -- #723's
+# class by a route no name-level check sees (#736 round-2). Three shapes, one
+# cause: the constant handed to something that can mutate it.
+
+# 1. A helper that mutates its parameter. The call site reads like a plain
+#    use; only the callee knows.
+assert_policy_refused widen-call 'def _widen(globs):
+    globs.append("backend/billing/**")
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+_widen(SENSITIVE_GLOBS)
+' 'Expr'
+
+# 2. The same cause with the constant as an argument to an unbound method --
+#    `SENSITIVE_GLOBS.append(...)` is already refused, so this is the way
+#    round it.
+assert_policy_refused list-append-call 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+list.append(SENSITIVE_GLOBS, "backend/billing/**")
+' 'Expr'
+
+# 3. A helper whose BODY reaches the namespace by string, invoked at top
+#    level: nothing at top level names either `setattr` or the constant, and
+#    `_namespace_escape` does not scan function bodies, so only resolving the
+#    callee finds it.
+assert_policy_refused setattr-helper 'import sys
+
+
+def _install(value):
+    setattr(sys.modules[__name__], "SENSITIVE_GLOBS", value)
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+_install(["backend/billing/**"])
+' 'setattr|sys.modules'
+
+# Read-only control: the constant passed to callees that CANNOT mutate it
+# still classifies exactly as the minimal policy does. Refusing every call
+# that takes the constant, or every top-level call to a module-level helper,
+# would size every PR on a real install `full` -- round 1's regression.
+CALLREAD_MOD="$STATE_DIR/policy-callread.py"
+cat > "$CALLREAD_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+GLOB_COUNT = len(SENSITIVE_GLOBS)
+SORTED_GLOBS = sorted(SENSITIVE_GLOBS)
+FROZEN_GLOBS = tuple(SENSITIVE_GLOBS)
+COPIED_GLOBS = list(SENSITIVE_GLOBS)
+UNIQUE_GLOBS = set(SENSITIVE_GLOBS)
+HAS_ANY = any(SENSITIVE_GLOBS)
+HAS_ALL = all(SENSITIVE_GLOBS)
+EMPTY_COPY = list([])
+GLOB_RE = "|".join(SENSITIVE_GLOBS)
+ALL_GLOBS = SENSITIVE_GLOBS + ["backend/legacy/**"]
+PY
+CALLREAD_RULES="$STATE_DIR/fgf-callread.json"
+cat > "$CALLREAD_RULES" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$CALLREAD_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$CALLREAD_RULES" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$CALLREAD_RULES" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+
+# Safe reference controls: direct list/tuple copies contain only the trusted
+# list's immutable strings, `NAME + OTHER` creates a new outer list, and an
+# unrelated `list([])` does not mention the policy at all.  Mutating the list
+# copy at runtime must leave the source list unchanged, and the classifier
+# must therefore keep a billing-only change `light` rather than over-sizing
+# every policy file that uses these ordinary forms.
+SAFE_COPY_MOD="$STATE_DIR/policy-safe-copy.py"
+cat > "$SAFE_COPY_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+LIST_COPY = list(SENSITIVE_GLOBS)
+TUPLE_COPY = tuple(SENSITIVE_GLOBS)
+LIST_COPY.append("backend/billing/**")
+UNRELATED = list([])
+ALL_GLOBS = SENSITIVE_GLOBS + ["backend/legacy/**"]
+DIRECT_ITERATION = []
+for GLOB in SENSITIVE_GLOBS:
+    DIRECT_ITERATION.append(GLOB)
+COPY_ITERATION = []
+for GLOB in list(SENSITIVE_GLOBS):
+    COPY_ITERATION.append(GLOB)
+PY
+python3 - "$SAFE_COPY_MOD" <<'PY'
+import runpy
+import sys
+
+policy = runpy.run_path(sys.argv[1])
+if policy["SENSITIVE_GLOBS"] != ["backend/permissions/**"]:
+    raise SystemExit("safe copy mutated the runtime policy")
+if policy["LIST_COPY"] != ["backend/permissions/**", "backend/billing/**"]:
+    raise SystemExit("safe copy control did not execute")
+if policy["DIRECT_ITERATION"] != ["backend/permissions/**"]:
+    raise SystemExit("safe scalar iteration did not execute")
+if policy["COPY_ITERATION"] != ["backend/permissions/**"]:
+    raise SystemExit("safe flat-copy iteration did not execute")
+PY
+SAFE_COPY_RULES="$STATE_DIR/fgf-safe-copy.json"
+cat > "$SAFE_COPY_RULES" <<JSON
+{"full":[],"lightAllowed":["backend/**"],
+ "fullGlobsFrom":{"path":"$SAFE_COPY_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$SAFE_COPY_RULES" | jq -e '
+  .campaignSize == "light" and
+  .sizeReason == "light: all 1 changed file(s) matched lightAllowed"
+' >/dev/null
+
+# More ordinary derived reads: eager comprehensions, reverse-order list
+# concatenation, list spreading and slicing all allocate new containers (or
+# scalar compiled values) from the trusted flat string list. They must not
+# make every unrelated backend PR run the full campaign.
+DERIVED_READS_MOD="$STATE_DIR/policy-derived-reads.py"
+cat >"$DERIVED_READS_MOD" <<'PY'
+import re
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+# A policy commonly turns its glob syntax into regex syntax during import.
+COMPILED = [re.compile(re.escape(glob).replace(r"\\*\\*", ".*")) for glob in SENSITIVE_GLOBS]
+REVERSED = ["backend/legacy/**"] + SENSITIVE_GLOBS
+SPREAD = [*SENSITIVE_GLOBS]
+SLICE = SENSITIVE_GLOBS[:]
+PY
+python3 - "$DERIVED_READS_MOD" <<'PY'
+import runpy
+import sys
+
+policy = runpy.run_path(sys.argv[1])
+if policy["SENSITIVE_GLOBS"] != ["backend/permissions/**"]:
+    raise SystemExit("derived reads mutated the runtime policy")
+if policy["REVERSED"] != ["backend/legacy/**", "backend/permissions/**"]:
+    raise SystemExit("reverse concatenation control did not execute")
+policy["SPREAD"].append("backend/billing/**")
+policy["SLICE"].append("backend/billing/**")
+if policy["SENSITIVE_GLOBS"] != ["backend/permissions/**"]:
+    raise SystemExit("derived list copy retained the source policy list")
+PY
+DERIVED_READS_RULES="$STATE_DIR/fgf-derived-reads.json"
+cat >"$DERIVED_READS_RULES" <<JSON
+{"full":[],"lightAllowed":["backend/**"],
+ "fullGlobsFrom":{"path":"$DERIVED_READS_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$DERIVED_READS_RULES" | jq -e '
+  .campaignSize == "light" and
+  .sizeReason == "light: all 1 changed file(s) matched lightAllowed"
+' >/dev/null
+
+# The reverse-concatenation allowance has to prove the left operand really is
+# a built-in list. A custom __add__ can hand NAME straight back, so mutating
+# the apparently derived binding widens the runtime policy instead.
+assert_runtime_widening_policy_refused custom-add-reverse 'class Combine:
+    def __add__(self, other):
+        return other
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = Combine() + SENSITIVE_GLOBS
+LEGACY.append("backend/billing/**")
+' 'aliases'
+
+# `ast.Match` does not exist on Python 3.9. Simulate that interpreter's AST
+# surface to prove the classifier still reads an ordinary policy instead of
+# raising before it can fail closed at the caller.
+PY39_MOD="$STATE_DIR/policy-python39-ast.py"
+cat >"$PY39_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+PY
+python3 - "$CLASSIFY" "$PY39_MOD" <<'PY'
+import ast
+import runpy
+import sys
+
+had_match = hasattr(ast, "Match")
+saved_match = getattr(ast, "Match", None)
+if had_match:
+    delattr(ast, "Match")
+try:
+    classifier = runpy.run_path(sys.argv[1])
+    globs, reason = classifier["load_full_globs_from"]({"path": sys.argv[2], "name": "SENSITIVE_GLOBS"})
+finally:
+    if had_match:
+        setattr(ast, "Match", saved_match)
+if globs != ["backend/permissions/**"] or reason is not None:
+    raise SystemExit("pre-3.10 AST surface did not classify a simple policy: {!r} {!r}".format(globs, reason))
+PY
+
+# Read-only control 2: a policy file that CALLS its own helpers at top level
+# classifies normally, as long as no reachable body escapes the namespace.
+# The live policy does this 46 times; refusing it is the round-1 regression.
+HELPERS_MOD="$STATE_DIR/policy-helpers.py"
+cat > "$HELPERS_MOD" <<'PY'
+import re
+
+
+def _glob_re(glob):
+    return glob.replace("**", ".*")
+
+
+def _describe(count):
+    return "{} sensitive globs".format(count)
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+SENSITIVE_RE = re.compile("|".join(_glob_re(g) for g in SENSITIVE_GLOBS))
+SUMMARY = _describe(len(SENSITIVE_GLOBS))
+PY
+HELPERS_RULES="$STATE_DIR/fgf-helpers.json"
+cat > "$HELPERS_RULES" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$HELPERS_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$HELPERS_RULES" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$HELPERS_RULES" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+
+# --- A pure-callee name the POLICY FILE ITSELF binds is not the builtin it
+# spells (#736 round-3). The call-argument rule above matched its callee by
+# NAME, so a module-level `def len(globs): globs.append(...)` scored its own
+# `len(NAME)` a pure read: the classifier trusted the literal while the real
+# import widened it -- #723's class, through the round-2 guard's own door.
+#
+# The rule is "this name is bound at module level", not a list of the forms
+# that bind it, so there is one case per binder. Each fixture's literal holds
+# ONLY the permissions glob, so a missed shadowing classifies a billing PR
+# `light` instead of `full`. The two read-only controls directly above
+# (policy-callread, policy-helpers) are the other half of this check: they
+# must stay unmoved, or the rule has regressed into refusing every call --
+# round 1 again.
+assert_policy_refused shadow-def 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+
+
+def len(globs):
+    globs.append("backend/billing/**")
+    return 0
+
+
+len(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-class 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+
+
+class sorted:
+    pass
+
+
+sorted(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-from-import 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+from policy_extra import tuple
+
+tuple(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-import-as 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+import policy_extra as list
+
+list(SENSITIVE_GLOBS)
+' 'could mutate'
+
+# The two import spellings that bind through a DIFFERENT alias field than the
+# two above: a bare `import len` binds the first dotted segment of the module
+# name, and `from x import foo as len` binds the asname. Neither names the
+# constant, so the pre-existing import check walks straight past both and only
+# the shadowing rule refuses them.
+assert_policy_refused shadow-import-bare 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+import len
+
+len(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-from-import-as 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+from policy_extra import widen as sorted
+
+sorted(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-assign 'def _widen(globs):
+    globs.append("backend/billing/**")
+    return globs
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+set = _widen
+set(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-annassign 'def _widen(globs):
+    globs.append("backend/billing/**")
+    return globs
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+any: object = _widen
+any(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-for 'def _widen(globs):
+    globs.append("backend/billing/**")
+    return globs
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+for all in (_widen,):
+    pass
+
+all(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-with 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+with open("policy_extra.py") as len:
+    pass
+
+len(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-except-as 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+try:
+    pass
+except ValueError as sorted:
+    pass
+
+sorted(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-walrus 'def _widen(globs):
+    globs.append("backend/billing/**")
+    return globs
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+(tuple := _widen)
+tuple(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-del 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+del len
+len(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-global 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+global len
+len(SENSITIVE_GLOBS)
+' 'could mutate'
+
+# A walrus in a DEFAULT ARGUMENT is evaluated at import and binds a module
+# name, even though the function body around it is not top-level code.
+assert_policy_refused shadow-default-walrus 'def _widen(globs):
+    globs.append("backend/billing/**")
+    return globs
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+
+
+def _factory(widen=(len := _widen)):
+    return widen
+
+
+len(SENSITIVE_GLOBS)
+' 'could mutate'
+
+# A `match` capture binds through a string field. The reason alternative
+# covers a pre-3.10 interpreter, where the statement does not parse at all --
+# still fail-closed, different reason.
+assert_policy_refused shadow-match 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+DEFAULT_SIZE = "light"
+match DEFAULT_SIZE:
+    case len:
+        pass
+
+len(SENSITIVE_GLOBS)
+' 'could mutate|could not be parsed'
+
+# A star import binds names that cannot be enumerated, so no callee is
+# provably the builtin. The star import itself already refuses the whole file
+# (the `may rebind` reason above), which is why this asserts that reason and
+# not the call-argument one: belt and braces, the same answer twice.
+assert_policy_refused shadow-star-import 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+from policy_extra import *
+
+len(SENSITIVE_GLOBS)
+' 'may rebind'
+
+# Control for the shadowing rule specifically: binding names that are NOT on
+# the pure allowlist must not poison the genuine builtins beside them. This
+# file defines two helpers, calls one, and still reads the constant with the
+# real `len` and `"|".join` -- it must classify exactly as the minimal policy.
+NEARMISS_MOD="$STATE_DIR/policy-nearmiss.py"
+cat > "$NEARMISS_MOD" <<'PY'
+def _describe(count):
+    return "{} sensitive globs".format(count)
+
+
+def _lengths(globs):
+    return [len(g) for g in globs]
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+GLOB_COUNT = len(SENSITIVE_GLOBS)
+SUMMARY = _describe(GLOB_COUNT)
+GLOB_RE = "|".join(SENSITIVE_GLOBS)
+PY
+NEARMISS_RULES="$STATE_DIR/fgf-nearmiss.json"
+cat > "$NEARMISS_RULES" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$NEARMISS_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$NEARMISS_RULES" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$NEARMISS_RULES" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+
+# --- A DANGLING SYMLINK is present, not absent (#736 round-1 P2-2). open()
+# raises FileNotFoundError for it exactly as it does for a path that was
+# never created, so it used to collapse into "no sizing rules" -- #721's
+# class. os.path.lexists() tells the two apart; the broken link fails closed.
+DANGLING_RULES="$STATE_DIR/dangling-rules.json"
+ln -s "$STATE_DIR/no-such-sizing-target.json" "$DANGLING_RULES"
+if OUT="$(echo '[]' | python3 "$CLASSIFY" "$DANGLING_RULES" 2>/dev/null)"; then
+  echo "736: dangling-symlink rules file exited 0 (stdout: $OUT)" >&2
+  exit 1
+fi
+[ -z "$OUT" ] || { echo "736: dangling-symlink rules file printed stdout instead of failing closed" >&2; exit 1; }
+# A symlink to a REAL rules file is still an ordinary readable file.
+LINK_TARGET="$STATE_DIR/link-target-rules.json"
+echo '{"full":["backend/**"],"lightAllowed":["frontend/**"]}' > "$LINK_TARGET"
+LIVE_LINK="$STATE_DIR/live-link-rules.json"
+ln -s "$LINK_TARGET" "$LIVE_LINK"
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$LIVE_LINK" | jq -e '
+  .campaignSize == "full"
+' >/dev/null
+
+# --- RULE SHAPES (#736 round-1 P2-3). `list(rules.get(k) or [])` accepts any
+# iterable, so a rule list written as a bare string became one glob per
+# CHARACTER, none of which matches a path: `"full": "backend/**"` sized a
+# sensitive PR `light`. Every wrong shape -- a string, a number, a list with a
+# non-string in it, an explicit null, a non-object fullGlobsFrom -- exits
+# non-zero with nothing meaningful on stdout, into the caller's guard.
+SHAPE_N=0
+for SHAPE_DOC in \
+  '{"full":"backend/**","lightAllowed":["frontend/**"]}' \
+  '{"full":7,"lightAllowed":["frontend/**"]}' \
+  '{"full":null,"lightAllowed":["frontend/**"]}' \
+  '{"full":["backend/**",7],"lightAllowed":["frontend/**"]}' \
+  '{"full":[],"lightAllowed":"frontend/**"}' \
+  '{"full":[],"lightAllowed":["frontend/**"],"lightDeny":"frontend/legacy/**"}' \
+  '{"full":[],"lightAllowed":["frontend/**"],"lightDeny":null}' \
+  '{"full":[],"lightAllowed":{"glob":"frontend/**"}}' \
+  '{"full":[],"lightAllowed":["frontend/**"],"fullGlobsFrom":"policy.py"}' \
+  '{"full":[],"lightAllowed":["frontend/**"],"fullGlobsFrom":null}' \
+  ; do
+  SHAPE_N=$((SHAPE_N + 1))
+  SHAPE_RULES="$STATE_DIR/shape-$SHAPE_N-rules.json"
+  printf '%s' "$SHAPE_DOC" > "$SHAPE_RULES"
+  if OUT="$(echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$SHAPE_RULES" 2>/dev/null)"; then
+    echo "736: malformed rule shape exited 0: $SHAPE_DOC (stdout: $OUT)" >&2
+    exit 1
+  fi
+  [ -z "$OUT" ] || { echo "736: malformed rule shape printed stdout: $SHAPE_DOC" >&2; exit 1; }
+done
+# The well-shaped equivalents still classify normally -- the shape check must
+# not refuse a legitimate rules file (an absent key is not a malformed one).
+SHAPE_OK="$STATE_DIR/shape-ok-rules.json"
+echo '{"lightAllowed":["frontend/**"]}' > "$SHAPE_OK"
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$SHAPE_OK" | jq -e '.campaignSize == "light"' >/dev/null
+echo '{"full":["backend/**"],"lightAllowed":["frontend/**"],"lightDeny":[]}' > "$SHAPE_OK"
+echo '["backend/x.ts"]' | python3 "$CLASSIFY" "$SHAPE_OK" | jq -e '.campaignSize == "full"' >/dev/null
+
+fi
+if smoke_case task-scoped-retained-binding; then
+# --- Task-scoped certification lease: claim/progress/release --------------
+# A certification, re-verification or evidence-recovery run has no PR — this
+# is the lifecycle smoke-run-scaffold.sh's begin_active_run_fence now accepts
+# as a third active-slot shape.
+fresh_state
+TASK_SHA="$(sha 7)"
+OTHER_TASK_SHA="$(sha 8)"
+
+OUT="$(bash "$GATE" task-claim $'run-t1\n..' "$TASK_SHA" || true)"
+jq -e '.ok == false and (.error | test("1-200 chars"))' <<<"$OUT" >/dev/null || {
+  echo "expected a multi-line run id to be refused, got: $OUT" >&2; exit 1; }
+[ -z "$(find "$STATE_DIR" "$SMOKE_GATE_LEASE_DIR" -name $'*\n*' 2>/dev/null)" ] || { echo "a multi-line run id named a file" >&2; exit 1; }
+bash "$GATE" task-claim run-t1 "$TASK_SHA" | jq -e '.ok == true and .runId == "run-t1"' >/dev/null
+jq -e --arg sha "$TASK_SHA" '.activeRunId == "run-t1" and .activeSha == $sha and .activeLeaseOwner != null' \
+  "$STATE_DIR/task-run-t1-state.json" >/dev/null
+jq -e --arg sha "$TASK_SHA" '.schemaVersion == 1 and .kind == "task" and .runId == "run-t1" and .deploySha == $sha' \
+  "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json" >/dev/null
+
+# A different owner cannot claim a live task run without --takeover.
+SMOKE_GATE_OWNER=owner-b bash "$GATE" task-claim run-t1 "$TASK_SHA" | jq -e '.ok == false' >/dev/null
+
+# The same owner reclaiming keeps its original claimedAt.
+ORIG_CLAIMED="$(jq -r '.claimedAt' "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json")"
+sleep 1
+bash "$GATE" task-claim run-t1 "$TASK_SHA" | jq -e '.ok == true' >/dev/null
+[ "$(jq -r '.claimedAt' "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json")" = "$ORIG_CLAIMED" ] ||
+  { echo "expected same-owner task reclaim to preserve claimedAt" >&2; exit 1; }
+
+# A run id is permanently bound to its deploy SHA — no --takeover escape,
+# unlike a PR's owner binding. A different build needs a different run id.
+bash "$GATE" task-claim run-t1 "$OTHER_TASK_SHA" | jq -e '.ok == false and (.error | test("permanently bound"))' >/dev/null
+bash "$GATE" task-claim run-t1 "$OTHER_TASK_SHA" --takeover | jq -e '.ok == false and (.error | test("permanently bound"))' >/dev/null
+
+# Run ids are unique across the WHOLE gate: one already claimed by a PR
+# campaign, or by the develop campaign, cannot also become a task run.
+bash "$GATE" claim run-shared-pr 5 "$TASK_SHA" >/dev/null
+bash "$GATE" task-claim run-shared-pr "$TASK_SHA" | jq -e '
+  .ok == false and (.error | test("PR campaign"))
+' >/dev/null
+printf '{"schemaVersion":1,"activeRunId":"run-shared-dev","activeSha":"%s"}\n' "$TASK_SHA" \
+  > "$STATE_DIR/develop-state.json"
+bash "$GATE" task-claim run-shared-dev "$TASK_SHA" | jq -e '
+  .ok == false and (.error | test("develop campaign"))
+' >/dev/null
+rm -f "$STATE_DIR/develop-state.json"
+
+# The reciprocal task-claim check also reads a completed develop identity: the
+# develop slot is no longer active, but its run-level verdict key is terminal.
+printf '{"schemaVersion":1,"activeRunId":null,"activeSha":null,"completedRunId":"run-shared-dev-finished","completedSha":"%s"}\n' "$TASK_SHA" \
+  > "$STATE_DIR/develop-state.json"
+F2_DEVELOP_FINISHED_OUT="$(bash "$GATE" task-claim run-shared-dev-finished "$TASK_SHA")"
+jq -e '.ok == false and .developBinding == "completed" and (.error | test("finished"))' \
+  <<<"$F2_DEVELOP_FINISHED_OUT" >/dev/null || {
+  echo "task-claim took a completed develop run id: $F2_DEVELOP_FINISHED_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/task-run-shared-dev-finished-state.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-shared-dev-finished.json" ] ||
+  { echo "a refused completed-develop task claim wrote a task slot or lease" >&2; exit 1; }
+rm -f "$STATE_DIR/develop-state.json"
+
+# task-progress renews the lease and stamps activeProgressAt; wrong owner and
+# an unclaimed run are both refused.
+BEFORE_EXPIRES="$(jq -r '.expiresAt' "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json")"
+sleep 1
+bash "$GATE" task-progress run-t1 | jq -e '.ok == true and .leaseRenewed == true' >/dev/null
+[ "$(jq -r '.expiresAt' "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json")" != "$BEFORE_EXPIRES" ] ||
+  { echo "expected task-progress to renew the lease expiry" >&2; exit 1; }
+bash "$GATE" task-progress run-t1 owner-wrong | jq -e '.ok == false' >/dev/null
+bash "$GATE" task-progress run-never-claimed | jq -e '.ok == false' >/dev/null
+
+# task-release drops the active slot and the shared lease, but retains the
+# original activeSha as the run's durable binding. Progress/release then refuse
+# as not-active; a different SHA cannot steal the released run id, while the
+# original SHA can recover it.
+bash "$GATE" task-release run-t1 | jq -e '.ok == true and .leaseReleased == true' >/dev/null
+[ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json" ] ||
+  { echo "expected task-release to remove the shared task lease" >&2; exit 1; }
+jq -e --arg sha "$TASK_SHA" '.activeRunId == null and .activeSha == $sha' "$STATE_DIR/task-run-t1-state.json" >/dev/null
+bash "$GATE" task-progress run-t1 | jq -e '.ok == false' >/dev/null
+bash "$GATE" task-release run-t1 | jq -e '.ok == false' >/dev/null
+T1_RELEASED_STATE="$STATE_DIR/run-t1-released-before-rebind.json"
+cp "$STATE_DIR/task-run-t1-state.json" "$T1_RELEASED_STATE"
+T1_REBOUND_OUT="$(bash "$GATE" task-claim run-t1 "$OTHER_TASK_SHA")"
+jq -e --arg sha "$TASK_SHA" '
+  .ok == false and .boundSha == $sha and .binding == "released" and (.error | test("permanently bound"))
+' <<<"$T1_REBOUND_OUT" >/dev/null || {
+  echo "task-release allowed this run id to rebind to another SHA: $T1_REBOUND_OUT" >&2; exit 1; }
+cmp -s "$T1_RELEASED_STATE" "$STATE_DIR/task-run-t1-state.json" &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json" ] ||
+  { echo "a refused released-run rebind rewrote state or revived a lease" >&2; exit 1; }
+bash "$GATE" task-claim run-t1 "$TASK_SHA" | jq -e --arg sha "$TASK_SHA" '.ok == true and .sha == $sha' >/dev/null
+bash "$GATE" task-release run-t1 | jq -e '.ok == true and .leaseReleased == true' >/dev/null
+
+# After expiry (no takeover needed), a different owner may claim the same
+# run id on the SAME deploy SHA.
+bash "$GATE" task-claim run-t2 "$TASK_SHA" >/dev/null
+expire_lease "$SMOKE_GATE_LEASE_DIR/task-lease-run-t2.json"
+SMOKE_GATE_OWNER=owner-recovers bash "$GATE" task-claim run-t2 "$TASK_SHA" | jq -e '.ok == true' >/dev/null
+jq -e '.owner == "owner-recovers"' "$SMOKE_GATE_LEASE_DIR/task-lease-run-t2.json" >/dev/null
+
+# A live lease held by another owner IS overridable with --takeover (the
+# owner binding, unlike the deploy-SHA binding, is not permanent).
+bash "$GATE" task-claim run-t3 "$TASK_SHA" >/dev/null
+SMOKE_GATE_OWNER=owner-force bash "$GATE" task-claim run-t3 "$TASK_SHA" --takeover | jq -e '.ok == true' >/dev/null
+jq -e '.owner == "owner-force" and .deploySha == "'"$TASK_SHA"'"' "$SMOKE_GATE_LEASE_DIR/task-lease-run-t3.json" >/dev/null
+
+# A malformed shared task lease fails every verb closed, never open.
+bash "$GATE" task-claim run-t4 "$TASK_SHA" >/dev/null
+printf 'not json' > "$SMOKE_GATE_LEASE_DIR/task-lease-run-t4.json"
+bash "$GATE" task-claim run-t4 "$TASK_SHA" | jq -e '.ok == false and (.error | test("malformed"))' >/dev/null
+bash "$GATE" task-progress run-t4 | jq -e '.ok == false' >/dev/null
+
+# --- task-finish: the terminal step for a task-scoped run -------------------
+# The run scaffold and barrier alone can never PUBLISH a certification's
+# verdict — only this does, and only for the run's own lease owner on its own
+# claimed deploy SHA.
+fresh_state
+FIN_SHA="$(sha 9)"
+
+# No claim at all — refused, no verdict recorded.
+bash "$GATE" task-finish run-fin-1 "$FIN_SHA" GO | jq -e '.ok == false' >/dev/null
+[ ! -e "$STATE_DIR/runs/run-fin-1/verdict.json" ]
+
+bash "$GATE" task-claim run-fin-1 "$FIN_SHA" >/dev/null
+
+# Wrong owner is refused, no terminal effect.
+bash "$GATE" task-finish run-fin-1 "$FIN_SHA" GO owner-wrong | jq -e '.ok == false and (.error | test("caller owner"))' >/dev/null
+[ ! -e "$STATE_DIR/runs/run-fin-1/verdict.json" ]
+
+# Wrong deploy SHA is refused. Exits 2, same as the argument refusals above
+# it and `finish`'s own sha-mismatch check (smoke-pr-gate.sh's comment there:
+# "bare ok:false, exit 2 — the invocation is wrong, not the world") — capture
+# before piping, or `set -o pipefail` reads this refusal as the test failing.
+WRONGSHA_OUT="$(bash "$GATE" task-finish run-fin-1 "$OTHER_TASK_SHA" GO || true)"
+jq -e '.ok == false and (.error | test("does not match"))' <<<"$WRONGSHA_OUT" >/dev/null || {
+  echo "expected task-finish to refuse a sha this run never claimed, got: $WRONGSHA_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/runs/run-fin-1/verdict.json" ]
+
+# Success records the verdict and releases the lease.
+bash "$GATE" task-finish run-fin-1 "$FIN_SHA" GO | jq -e '.ok == true and .leaseReleased == true and .verdict == "GO"' >/dev/null
+jq -e --arg sha "$FIN_SHA" '.sha == $sha and .runId == "run-fin-1" and .verdict == "GO"' \
+  "$STATE_DIR/runs/run-fin-1/verdict.json" >/dev/null
+[ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-fin-1.json" ] ||
+  { echo "expected task-finish to remove the shared task lease" >&2; exit 1; }
+jq -e '.activeRunId == null and .completedRunId == "run-fin-1" and .completedVerdict == "GO"' \
+  "$STATE_DIR/task-run-fin-1-state.json" >/dev/null
+
+# Repeating the SAME terminal facts is idempotent — nothing re-recorded.
+bash "$GATE" task-finish run-fin-1 "$FIN_SHA" GO | jq -e '.ok == true and .idempotent == true' >/dev/null
+
+# A second, DIFFERENT verdict for the same run is a reconciliation case, same
+# shape as `finish`'s own refusal — the recorded verdict is never overwritten.
+RECON_OUT="$(bash "$GATE" task-finish run-fin-1 "$FIN_SHA" NO_GO || true)"
+jq -e '.ok == false and .gateStatus == "reconciliation_required"' <<<"$RECON_OUT" >/dev/null || {
+  echo "expected a second, different task-finish to be refused as a reconciliation case, got: $RECON_OUT" >&2; exit 1; }
+jq -e --arg sha "$FIN_SHA" '.sha == $sha and .verdict == "GO"' "$STATE_DIR/runs/run-fin-1/verdict.json" >/dev/null
+
+# A run that was never claimed (or already finished and released) is refused
+# as not-active, not silently treated as a fresh success.
+bash "$GATE" task-finish run-fin-never "$FIN_SHA" GO | jq -e '.ok == false' >/dev/null
+
+# --- #726 F1: a failed task-claim slot write puts back the lease it found ----
+# The cleanup used to delete the shared task lease unconditionally — on a
+# same-owner re-claim of a LIVE lease that destroyed a running coordinator's
+# ownership record, and task-progress then refused it. `claim` and
+# `task-release` both restore the prior lease; task-claim now does too.
+fresh_state
+F1_SHA="$(sha 7)"
+bash "$GATE" task-claim run-f1 "$F1_SHA" owner-a | jq -e '.ok == true' >/dev/null
+F1_BEFORE="$(cat "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1.json")"
+chmod 555 "$STATE_DIR"
+F1_OUT="$(bash "$GATE" task-claim run-f1 "$F1_SHA" owner-a 2>/dev/null || true)"
+chmod 700 "$STATE_DIR"   # restore before asserting, so a failure still cleans up
+jq -e '.ok == false and (.error | test("private task slot")) and (.error | test("could not be") | not)' \
+  <<<"$F1_OUT" >/dev/null || { echo "F1: expected a clean slot-write refusal, got: $F1_OUT" >&2; exit 1; }
+[ "$(cat "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1.json" 2>/dev/null)" = "$F1_BEFORE" ] ||
+  { echo "F1: a failed same-owner re-claim did not leave the live lease exactly as it was" >&2; exit 1; }
+jq -e '.owner == "owner-a"' "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1.json" >/dev/null
+bash "$GATE" task-progress run-f1 owner-a | jq -e '.ok == true' >/dev/null ||
+  { echo "F1: the surviving owner could not progress after the failed re-claim" >&2; exit 1; }
+# A failed --takeover gives the lease back to the owner it tried to displace.
+F1_BEFORE="$(cat "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1.json")"
+chmod 555 "$STATE_DIR"
+F1_TK_OUT="$(bash "$GATE" task-claim run-f1 "$F1_SHA" owner-b --takeover 2>/dev/null || true)"
+chmod 700 "$STATE_DIR"
+jq -e '.ok == false and (.error | test("private task slot"))' <<<"$F1_TK_OUT" >/dev/null ||
+  { echo "F1: expected the takeover's slot write to fail, got: $F1_TK_OUT" >&2; exit 1; }
+[ "$(cat "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1.json" 2>/dev/null)" = "$F1_BEFORE" ] ||
+  { echo "F1: a failed takeover left the lease with the displacing owner" >&2; exit 1; }
+jq -e '.activeLeaseOwner == "owner-a"' "$STATE_DIR/task-run-f1-state.json" >/dev/null
+# Only a lease the failed claim created from nothing is removed.
+chmod 555 "$STATE_DIR"
+F1_NEW_OUT="$(bash "$GATE" task-claim run-f1-new "$F1_SHA" 2>/dev/null || true)"
+chmod 700 "$STATE_DIR"
+jq -e '.ok == false and (.error | test("private task slot"))' <<<"$F1_NEW_OUT" >/dev/null
+[ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1-new.json" ] ||
+  { echo "F1: a failed first claim left an orphan task lease behind" >&2; exit 1; }
+[ ! -e "$SMOKE_GATE_LEASE_DIR/task-binding-run-f1-new.json" ] ||
+  { echo "F1: a failed first claim left an orphan permanent binding behind" >&2; exit 1; }
+
+# Binding creation and live-lease creation are one claim transaction. Inject a
+# selective task-lease mv failure after the binding write and prove both shared
+# records and the private slot roll back to absence.
+F1_LEASE_BIN="$STUB_BIN/task-lease-write-fail"
+mkdir -p "$F1_LEASE_BIN"
+cat >"$F1_LEASE_BIN/mv" <<'STUB'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in */task-lease-run-f1-lease.json) exit 1 ;; esac
+done
+exec /usr/bin/mv "$@"
+STUB
+chmod +x "$F1_LEASE_BIN/mv"
+F1_LEASE_OUT="$(PATH="$F1_LEASE_BIN:$PATH" bash "$GATE" task-claim run-f1-lease "$F1_SHA" 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("could not write the task lease"))' <<<"$F1_LEASE_OUT" >/dev/null ||
+  { echo "F1: expected injected task lease write failure, got: $F1_LEASE_OUT" >&2; exit 1; }
+[ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1-lease.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/task-binding-run-f1-lease.json" ] &&
+  [ ! -e "$STATE_DIR/task-run-f1-lease-state.json" ] ||
+  { echo "F1: failed lease creation did not roll the whole claim back to absence" >&2; exit 1; }
+
+# --- #726 F1/F2: task-claim holds the shared task lease lock AND the gate
+# control lock from lease acquisition through its private slot write. A
+# PATH-local mktemp probe records, from a separate process, whether each lock
+# is held at the instant the slot's temp file is created; it then runs the real
+# mktemp. Releasing the lease lock before the slot write let two concurrent
+# --takeover claims leave the lease owned by B and the slot naming A.
+PROBE_BIN="$STUB_BIN/task-slot-probe"
+mkdir -p "$PROBE_BIN"
+cat > "$PROBE_BIN/mktemp" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  */.task-*-state.*)
+    t=held; c=held
+    ( flock -n 3 ) 3>"$PROBE_TASK_LOCK" && t=free
+    ( flock -n 3 ) 3>"$PROBE_CONTROL_LOCK" && c=free
+    printf 'task=%s control=%s\n' "$t" "$c" >> "$PROBE_OUT" ;;
+esac
+exec "$REAL_MKTEMP" "$@"
+STUB
+chmod +x "$PROBE_BIN/mktemp"
+PROBE_OUT="$STATE_DIR/slot-probe.txt" \
+PROBE_TASK_LOCK="$SMOKE_GATE_LEASE_DIR/task-lease-run-f1-probe.lock" \
+PROBE_CONTROL_LOCK="$STATE_DIR/control.lock" \
+REAL_MKTEMP="$(command -v mktemp)" PATH="$PROBE_BIN:$PATH" \
+  bash "$GATE" task-claim run-f1-probe "$F1_SHA" | jq -e '.ok == true' >/dev/null
+[ "$(cat "$STATE_DIR/slot-probe.txt" 2>/dev/null)" = "task=held control=held" ] || {
+  echo "F1/F2: task-claim did not hold both locks through its slot write: $(cat "$STATE_DIR/slot-probe.txt" 2>/dev/null)" >&2; exit 1; }
+
+# --- #726 F2/#755/#757: run-id uniqueness holds in BOTH directions ----------
+# `task-claim` refused a run id a PR campaign held, but `claim` never looked at
+# task-*-state.json: `task-claim run-b` then `claim run-b 5` returned ok:true,
+# leaving two active slots that wedge both runs in begin_active_run_fence.
+fresh_state
+F2_SHA="$(sha 8)"
+bash "$GATE" task-claim run-f2 "$F2_SHA" | jq -e '.ok == true' >/dev/null
+F2_OUT="$(bash "$GATE" claim run-f2 5 "$F2_SHA")"
+jq -e '.ok == false and .pr == 5 and (.error | test("task-scoped")) and (.error | test("unique"))' \
+  <<<"$F2_OUT" >/dev/null || { echo "F2: claim took a run id an active task run holds: $F2_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/pr-5-state.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-f2.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/pr-5-authority.json" ] ||
+  { echo "F2: the refused PR claim still wrote a slot, lease or authority" >&2; exit 1; }
+bash "$GATE" task-progress run-f2 | jq -e '.ok == true' >/dev/null
+# A terminal task run is still an owner of its run id. PR claim used to inspect
+# only activeRunId, then write PR state/lease/authority for this completed id;
+# its later finish collided with the write-once task verdict. Refuse before any
+# PR lifecycle write, and leave both task receipts byte-for-byte intact.
+bash "$GATE" task-claim run-f2-finished "$F2_SHA" | jq -e '.ok == true' >/dev/null
+bash "$GATE" task-finish run-f2-finished "$F2_SHA" GO | jq -e '.ok == true' >/dev/null
+F2_FINISHED_STATE="$STATE_DIR/task-run-f2-finished-state.before-pr-claim"
+F2_FINISHED_VERDICT="$STATE_DIR/runs/run-f2-finished/verdict.before-pr-claim"
+cp "$STATE_DIR/task-run-f2-finished-state.json" "$F2_FINISHED_STATE"
+cp "$STATE_DIR/runs/run-f2-finished/verdict.json" "$F2_FINISHED_VERDICT"
+F2_FINISHED_OUT="$(bash "$GATE" claim run-f2-finished 8 "$F2_SHA")"
+jq -e '.ok == false and .taskBinding == "completed" and (.error | test("finished"))' <<<"$F2_FINISHED_OUT" >/dev/null || {
+  echo "F2: claim took a finished task run id: $F2_FINISHED_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/pr-8-state.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-f2-finished.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/pr-8-authority.json" ] &&
+  cmp -s "$F2_FINISHED_STATE" "$STATE_DIR/task-run-f2-finished-state.json" &&
+  cmp -s "$F2_FINISHED_VERDICT" "$STATE_DIR/runs/run-f2-finished/verdict.json" ||
+  { echo "F2: a refused finished-task PR claim wrote PR authority/state/lease or changed task receipts" >&2; exit 1; }
+# A released task has no active slot, but still owns its retained deploy-SHA
+# binding; PR claim must not seize that recoverable identity either.
+bash "$GATE" task-claim run-f2-released "$F2_SHA" | jq -e '.ok == true' >/dev/null
+bash "$GATE" task-release run-f2-released | jq -e '.ok == true' >/dev/null
+F2_RELEASED_STATE="$STATE_DIR/task-run-f2-released-state.before-pr-claim"
+cp "$STATE_DIR/task-run-f2-released-state.json" "$F2_RELEASED_STATE"
+F2_RELEASED_OUT="$(bash "$GATE" claim run-f2-released 9 "$F2_SHA")"
+jq -e '.ok == false and .taskBinding == "released" and (.error | test("released"))' <<<"$F2_RELEASED_OUT" >/dev/null || {
+  echo "F2: claim took a released task run id: $F2_RELEASED_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/pr-9-state.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-f2-released.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/pr-9-authority.json" ] &&
+  cmp -s "$F2_RELEASED_STATE" "$STATE_DIR/task-run-f2-released-state.json" ||
+  { echo "F2: a refused released-task PR claim wrote PR authority/state/lease or changed its binding" >&2; exit 1; }
+# The other direction: a run id a PR campaign holds cannot become a task run.
+bash "$GATE" claim run-f2-pr 6 "$F2_SHA" | jq -e '.ok == true' >/dev/null
+bash "$GATE" task-claim run-f2-pr "$F2_SHA" | jq -e '.ok == false and (.error | test("PR campaign"))' >/dev/null ||
+  { echo "F2: task-claim took a run id a PR campaign holds" >&2; exit 1; }
+[ ! -e "$STATE_DIR/task-run-f2-pr-state.json" ] && [ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-f2-pr.json" ] ||
+  { echo "F2: the refused task-claim still wrote a slot or lease" >&2; exit 1; }
+bash "$GATE" progress run-f2-pr | jq -e '.ok == true and .pr == 6' >/dev/null
+# A task state that exists but cannot be read fails the PR claim closed.
+printf 'not json' > "$STATE_DIR/task-run-f2-bad-state.json"
+bash "$GATE" claim run-f2-bad 7 "$F2_SHA" | jq -e '.ok == false and (.error | test("cannot be read"))' >/dev/null ||
+  { echo "F2: claim read an unparseable task state as no task run" >&2; exit 1; }
+[ ! -e "$STATE_DIR/pr-7-state.json" ]
+# task-claim's scan runs under CONTROL_LOCK, the lock `claim` scans under, and
+# fails closed (retryable) when it cannot get it — never the best-effort form.
+F2_HELD="$STATE_DIR/control-held"
+( flock -x 7; : > "$F2_HELD"; sleep 3 ) 7>"$STATE_DIR/control.lock" &
+F2_BLOCKER=$!
+for _ in $(seq 100); do [ -e "$F2_HELD" ] && break; sleep 0.05; done
+[ -e "$F2_HELD" ] || { echo "F2: the control-lock holder never signalled that it held the lock" >&2; exit 1; }
+F2_BUSY_OUT="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 bash "$GATE" task-claim run-f2-busy "$F2_SHA")"
+wait "$F2_BLOCKER"
+jq -e '.ok == false and .retryable == true and (.error | startswith("gate_lock_busy:"))' <<<"$F2_BUSY_OUT" >/dev/null ||
+  { echo "F2: task-claim did not wait on the control lock: $F2_BUSY_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/task-run-f2-busy-state.json" ] && [ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-f2-busy.json" ] ||
+  { echo "F2: task-claim wrote a slot or lease without the control lock" >&2; exit 1; }
+
+# --- #726 F3: a finished task run id is terminal ------------------------------
+# task-finish removes the lease, the only record of the deploy-SHA binding, so
+# `task-claim run-c <sha7>`, `task-finish GO`, `task-claim run-c <sha8>` used to
+# return ok:true, null the completed fields, and leave task-finish <sha8>
+# permanently reconciliation_required.
+fresh_state
+F3_SHA7="$(sha 7)"
+F3_SHA8="$(sha 8)"
+bash "$GATE" task-claim run-c "$F3_SHA7" | jq -e '.ok == true' >/dev/null
+bash "$GATE" task-finish run-c "$F3_SHA7" GO | jq -e '.ok == true' >/dev/null
+F3_STATE_BEFORE="$(cat "$STATE_DIR/task-run-c-state.json")"
+F3_VERDICT_BEFORE="$(cat "$STATE_DIR/runs/run-c/verdict.json")"
+F3_OUT="$(bash "$GATE" task-claim run-c "$F3_SHA8" || true)"
+jq -e '.ok == false and .finished == true and (.error | test("already finished")) and
+       (.error | test("start a new run id")) and .recordedVerdict.verdict == "GO"' \
+  <<<"$F3_OUT" >/dev/null || { echo "F3: a finished task run was re-claimed on another build: $F3_OUT" >&2; exit 1; }
+# The same build, even with --takeover, is no different: the run is over.
+bash "$GATE" task-claim run-c "$F3_SHA7" --takeover | jq -e '.ok == false and .finished == true' >/dev/null ||
+  { echo "F3: a finished task run was re-claimed on its own build" >&2; exit 1; }
+[ "$(cat "$STATE_DIR/task-run-c-state.json")" = "$F3_STATE_BEFORE" ] &&
+  [ "$(cat "$STATE_DIR/runs/run-c/verdict.json")" = "$F3_VERDICT_BEFORE" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-c.json" ] ||
+  { echo "F3: a refused re-claim rewrote the terminal record or revived a lease" >&2; exit 1; }
+jq -e '.completedRunId == "run-c" and .completedVerdict == "GO" and .completedAt != null' \
+  "$STATE_DIR/task-run-c-state.json" >/dev/null
+bash "$GATE" task-finish run-c "$F3_SHA7" GO | jq -e '.ok == true and .idempotent == true' >/dev/null
+# A verdict-bearing run is never re-claimable. The shared terminal binding is
+# committed before lease removal, so an interrupted task-finish resumes itself
+# directly even after the lease vanished; task-claim remains terminal-refused.
+# The state commit is failed for real (read-only state dir, run dir already
+# present); the lease removal it rolled back is then redone by hand.
+bash "$GATE" task-claim run-r "$F3_SHA7" | jq -e '.ok == true' >/dev/null
+mkdir -p "$STATE_DIR/runs/run-r"
+chmod 555 "$STATE_DIR"
+F3_R_OUT="$(bash "$GATE" task-finish run-r "$F3_SHA7" GO 2>/dev/null || true)"
+chmod 700 "$STATE_DIR"
+jq -e '.ok == false and (.error | test("terminal task state"))' <<<"$F3_R_OUT" >/dev/null ||
+  { echo "F3: expected task-finish's state commit to fail, got: $F3_R_OUT" >&2; exit 1; }
+F3_R_VERDICT="$(cat "$STATE_DIR/runs/run-r/verdict.json")"
+jq -e '.activeRunId == "run-r" and .completedRunId == null' "$STATE_DIR/task-run-r-state.json" >/dev/null
+rm -f "$SMOKE_GATE_LEASE_DIR/task-lease-run-r.json"
+F3_R_OTHER="$(bash "$GATE" task-claim run-r "$F3_SHA8" || true)"
+jq -e '.ok == false and .finished == true and (.error | test("already finished"))' <<<"$F3_R_OTHER" >/dev/null ||
+  { echo "F3: a half-finished run was re-claimed on another build: $F3_R_OTHER" >&2; exit 1; }
+bash "$GATE" task-finish run-r "$F3_SHA7" GO | jq -e '.ok == true and .verdict == "GO"' >/dev/null ||
+  { echo "F3: task-finish did not reconcile after lease removal" >&2; exit 1; }
+[ "$(cat "$STATE_DIR/runs/run-r/verdict.json")" = "$F3_R_VERDICT" ]
+jq -e '.completedRunId == "run-r" and .activeRunId == null' "$STATE_DIR/task-run-r-state.json" >/dev/null
+
+# --- #755/#757: retained binding spans private state roots -----------------
+CROSS_BASE="$STATE_DIR/cross-private-task-binding"
+CROSS_A="$CROSS_BASE/a" CROSS_B="$CROSS_BASE/b" CROSS_C="$CROSS_BASE/c"
+CROSS_LEASE="$TEST_SHARED_ROOT/cross-private-task-binding/leases"
+mkdir -p "$CROSS_A" "$CROSS_B" "$CROSS_C"
+CROSS_SHA_A="$(sha a)" CROSS_SHA_B="$(sha b)"
+
+# Release removes the live lease, not the permanent SHA identity. Another
+# private root cannot rebind it, while same-SHA unfinished recovery remains.
+SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-claim run-cross-released "$CROSS_SHA_A" owner-a | jq -e '.ok == true' >/dev/null
+SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-release run-cross-released owner-a | jq -e '.ok == true' >/dev/null
+jq -e --arg sha "$CROSS_SHA_A" '.deploySha == $sha and .terminal == null' \
+  "$CROSS_LEASE/task-binding-run-cross-released.json" >/dev/null
+CROSS_REBIND="$(SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-claim run-cross-released "$CROSS_SHA_B" owner-b)"
+jq -e --arg sha "$CROSS_SHA_A" '.ok == false and .boundSha == $sha and (.error | test("permanently bound"))' \
+  <<<"$CROSS_REBIND" >/dev/null || { echo "cross-root released task rebound: $CROSS_REBIND" >&2; exit 1; }
+[ ! -e "$CROSS_B/task-run-cross-released-state.json" ] && [ ! -e "$CROSS_LEASE/task-lease-run-cross-released.json" ]
+SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-claim run-cross-released "$CROSS_SHA_A" owner-b | jq -e '.ok == true' >/dev/null
+SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-release run-cross-released owner-b | jq -e '.ok == true' >/dev/null
+# The standalone common lease-acquisition seam is a PR identity producer too.
+CROSS_LEASE_CLAIM="$(SMOKE_GATE_STATE_DIR="$CROSS_C" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" lease-claim run-cross-released owner-pr 176)"
+jq -e '.ok == false and (.error | test("task-scoped"))' <<<"$CROSS_LEASE_CLAIM" >/dev/null || {
+  echo "standalone lease-claim ignored shared task binding: $CROSS_LEASE_CLAIM" >&2; exit 1; }
+[ ! -e "$CROSS_LEASE/lease-run-cross-released.json" ]
+
+# A finished task is terminal to task, PR and develop claimants even when its
+# private verdict/state exist only in root A.
+SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-claim run-cross-terminal "$CROSS_SHA_A" owner-a | jq -e '.ok == true' >/dev/null
+SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-finish run-cross-terminal "$CROSS_SHA_A" GO owner-a | jq -e '.ok == true' >/dev/null
+jq -e '.terminal.verdict == "GO" and (.terminal.verdictDigest | test("^[0-9a-f]{64}$"))' \
+  "$CROSS_LEASE/task-binding-run-cross-terminal.json" >/dev/null
+[ ! -e "$CROSS_B/runs/run-cross-terminal/verdict.json" ]
+CROSS_TASK_OUT="$(SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-claim run-cross-terminal "$CROSS_SHA_B" owner-b)"
+CROSS_PR_OUT="$(SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" claim run-cross-terminal 177 "$CROSS_SHA_B" owner-b)"
+DEVELOP_GATE="$SCRIPT_DIR/smoke-develop-gate.sh"
+CROSS_DEV_OUT="$(SMOKE_GATE_STATE_DIR="$CROSS_C" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$DEVELOP_GATE" claim run-cross-terminal "$CROSS_SHA_B")"
+for OUT in "$CROSS_TASK_OUT" "$CROSS_PR_OUT" "$CROSS_DEV_OUT"; do
+  jq -e '.ok == false and (.error | test("finished|terminal"))' <<<"$OUT" >/dev/null || {
+    echo "cross-root claimant took terminal task identity: $OUT" >&2; exit 1; }
+done
+[ ! -e "$CROSS_B/task-run-cross-terminal-state.json" ] &&
+  [ ! -e "$CROSS_B/pr-177-state.json" ] && [ ! -e "$CROSS_C/develop-state.json" ]
+
+# Reverse active PR-to-task exclusion comes from the shared PR run lease, not
+# from a private PR state scan.
+SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" claim run-cross-pr-active 178 "$CROSS_SHA_A" owner-pr | jq -e '.ok == true' >/dev/null
+CROSS_PR_TASK="$(SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-claim run-cross-pr-active "$CROSS_SHA_A" owner-task)"
+jq -e '.ok == false and .activePr == 178 and (.error | test("PR campaign"))' <<<"$CROSS_PR_TASK" >/dev/null || {
+  echo "cross-root task claim took active PR identity: $CROSS_PR_TASK" >&2; exit 1; }
+[ ! -e "$CROSS_B/task-run-cross-pr-active-state.json" ] &&
+  [ ! -e "$CROSS_LEASE/task-binding-run-cross-pr-active.json" ]
+SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" release run-cross-pr-active owner-pr | jq -e '.ok == true' >/dev/null
+
+# Task-kind adoption validates the shared lifetime binding, not just the
+# private slot and lease. Recovery owner B adopts a live same-SHA run; on a
+# second run B's task-finish commits the shared terminal binding and dies
+# before clearing lease/slot — state and lease still look live, and adopt must
+# refuse because the run is already terminal.
+ADOPT_TASK_STATE="$CROSS_BASE/adopt-task" ADOPT_TASK_LEASE="$TEST_SHARED_ROOT/adopt-task/leases"
+ADOPT_TASK_ROOT="$CROSS_BASE/adopt-task-runs"
+mkdir -p "$ADOPT_TASK_STATE" "$ADOPT_TASK_ROOT"
+task_scaffold_as() { local owner="$1"; shift
+  SMOKE_LANE_ROLE=coordinator SMOKE_GATE_OWNER="$owner" SMOKE_GATE_STATE_DIR="$ADOPT_TASK_STATE" \
+    SMOKE_GATE_LEASE_DIR="$ADOPT_TASK_LEASE" bash "$SCRIPT_DIR/smoke-run-scaffold.sh" "$@"; }
+task_gate() { SMOKE_GATE_STATE_DIR="$ADOPT_TASK_STATE" SMOKE_GATE_LEASE_DIR="$ADOPT_TASK_LEASE" bash "$GATE" "$@"; }
+for ADOPT_TASK_RUN in run-adopt-task-live run-adopt-task-terminal; do
+  mkdir -p "$ADOPT_TASK_ROOT/$ADOPT_TASK_RUN"
+  task_gate task-claim "$ADOPT_TASK_RUN" "$CROSS_SHA_A" owner-a | jq -e '.ok == true' >/dev/null
+  task_scaffold_as owner-a contract "$ADOPT_TASK_ROOT/$ADOPT_TASK_RUN" "$CROSS_SHA_A" B1:browser | jq -e '.ok == true' >/dev/null
+  expire_lease "$ADOPT_TASK_LEASE/task-lease-$ADOPT_TASK_RUN.json"
+  task_gate task-claim "$ADOPT_TASK_RUN" "$CROSS_SHA_A" owner-b | jq -e '.ok == true' >/dev/null
+done
+task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-live" "$CROSS_SHA_A" |
+  jq -e '.ok == true and .adopted == true' >/dev/null
+OUT="$(task_scaffold_as owner-a adopt "$ADOPT_TASK_ROOT/run-adopt-task-live" "$CROSS_SHA_A" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
+# A binding for another build, or none at all, is not a verifiable identity.
+ADOPT_TASK_BINDING="$ADOPT_TASK_LEASE/task-binding-run-adopt-task-terminal.json"
+ADOPT_TASK_BINDING_BEFORE="$(cat "$ADOPT_TASK_BINDING")"
+ADOPT_TASK_CONTRACT_HASH="$(sha256sum "$ADOPT_TASK_ROOT/run-adopt-task-terminal/completion-contract.json" | cut -d' ' -f1)"
+jq -c --arg sha "$CROSS_SHA_B" '.deploySha=$sha' <<<"$ADOPT_TASK_BINDING_BEFORE" > "$ADOPT_TASK_BINDING"
+OUT="$(task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-terminal" "$CROSS_SHA_A" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("different deploy SHA"))' <<<"$OUT" >/dev/null
+rm -f "$ADOPT_TASK_BINDING"
+OUT="$(task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-terminal" "$CROSS_SHA_A" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("missing or malformed"))' <<<"$OUT" >/dev/null
+# Parseable but malformed by the gate's own validator (read_task_binding):
+# adopt must fail closed on exactly the records the lifecycle verbs refuse.
+for BAD_BINDING in 'del(.boundAt)' '.boundAt="2026-02-30T00:00:00Z"' '.boundAt="yesterday"' \
+    '.terminal={}' '.terminal={"verdict":"GO"}' \
+    '.terminal={"verdict":"MAYBE","completedAt":"2026-09-17T00:00:00Z","verdictDigest":"'"$(sha c)$(sha c | cut -c1-24)"'"}' \
+    '.terminal={"verdict":"GO","completedAt":"2026-13-01T00:00:00Z","verdictDigest":"'"$(sha c)$(sha c | cut -c1-24)"'"}' \
+    '.schemaVersion=2' 'del(.terminal) | .kind="task"'; do
+  jq -c "$BAD_BINDING" <<<"$ADOPT_TASK_BINDING_BEFORE" > "$ADOPT_TASK_BINDING"
+  task_gate task-progress run-adopt-task-terminal owner-b 2>/dev/null | jq -e '.ok == false' >/dev/null || {
+    echo "fixture is not malformed to the gate itself: $BAD_BINDING" >&2; exit 1; }
+  OUT="$(task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-terminal" "$CROSS_SHA_A" 2>&1 || true)"
+  jq -e '.ok == false and (.error | test("missing or malformed"))' <<<"$OUT" >/dev/null || {
+    echo "adopt accepted a malformed shared task binding: $BAD_BINDING" >&2; exit 1; }
+  [ "$(sha256sum "$ADOPT_TASK_ROOT/run-adopt-task-terminal/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_TASK_CONTRACT_HASH" ]
+done
+printf '%s\n' "$ADOPT_TASK_BINDING_BEFORE" > "$ADOPT_TASK_BINDING"
+# The crash cut: terminal binding committed, lease and private slot not cleared.
+if SMOKE_GATE_TEST_TASK_FINISH_EXIT_AFTER=binding \
+   task_gate task-finish run-adopt-task-terminal "$CROSS_SHA_A" NO_GO owner-b >/dev/null; then
+  echo "task-finish binding crash seam unexpectedly returned success" >&2; exit 1
+fi
+jq -e '.terminal.verdict == "NO_GO"' "$ADOPT_TASK_BINDING" >/dev/null
+[ -s "$ADOPT_TASK_LEASE/task-lease-run-adopt-task-terminal.json" ]
+jq -e '.activeRunId == "run-adopt-task-terminal" and .activeLeaseOwner == "owner-b"' \
+  "$ADOPT_TASK_STATE/task-run-adopt-task-terminal-state.json" >/dev/null
+OUT="$(task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-terminal" "$CROSS_SHA_A" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("already terminal"))' <<<"$OUT" >/dev/null || {
+  echo "adopt succeeded on a task run whose shared binding is already terminal" >&2; exit 1; }
+[ "$(sha256sum "$ADOPT_TASK_ROOT/run-adopt-task-terminal/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_TASK_CONTRACT_HASH" ]
+task_gate task-finish run-adopt-task-terminal "$CROSS_SHA_A" NO_GO owner-b | jq -e '.ok == true' >/dev/null
+
+# Exact retries recover after each finish cut. The final cut has no lease at
+# all and therefore proves task-finish no longer needs a task-claim detour.
+for CUT in before-binding binding verdict lease-removal; do
+  CUT_STATE="$CROSS_BASE/cut-$CUT" CUT_LEASE="$TEST_SHARED_ROOT/cut-$CUT/leases"
+  CUT_RUN="run-cut-${CUT//-/_}"
+  mkdir -p "$CUT_STATE"
+  SMOKE_GATE_STATE_DIR="$CUT_STATE" SMOKE_GATE_LEASE_DIR="$CUT_LEASE" \
+    bash "$GATE" task-claim "$CUT_RUN" "$CROSS_SHA_A" owner-cut | jq -e '.ok == true' >/dev/null
+  if SMOKE_GATE_STATE_DIR="$CUT_STATE" SMOKE_GATE_LEASE_DIR="$CUT_LEASE" \
+     SMOKE_GATE_TEST_TASK_FINISH_EXIT_AFTER="$CUT" \
+     bash "$GATE" task-finish "$CUT_RUN" "$CROSS_SHA_A" NO_GO owner-cut >/dev/null; then
+    echo "finish crash seam $CUT unexpectedly returned success" >&2; exit 1
+  fi
+  if [ "$CUT" = before-binding ]; then
+    jq -e '.terminal == null' "$CUT_LEASE/task-binding-$CUT_RUN.json" >/dev/null
+    [ -s "$CUT_LEASE/task-lease-$CUT_RUN.json" ]
+    TERMINAL_BEFORE=""
+  else
+    jq -e '.terminal.verdict == "NO_GO"' "$CUT_LEASE/task-binding-$CUT_RUN.json" >/dev/null
+    TERMINAL_BEFORE="$(jq -c '.terminal' "$CUT_LEASE/task-binding-$CUT_RUN.json")"
+    if [ "$CUT" = binding ]; then
+      [ ! -e "$CUT_STATE/runs/$CUT_RUN/verdict.json" ]
+      [ -s "$CUT_LEASE/task-lease-$CUT_RUN.json" ]
+    elif [ "$CUT" = verdict ]; then
+      [ -s "$CUT_STATE/runs/$CUT_RUN/verdict.json" ]
+      [ -s "$CUT_LEASE/task-lease-$CUT_RUN.json" ]
+    else [ ! -e "$CUT_LEASE/task-lease-$CUT_RUN.json" ]; fi
+    CUT_OTHER="$(SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CUT_LEASE" \
+      bash "$GATE" task-claim "$CUT_RUN" "$CROSS_SHA_A" owner-other)"
+    jq -e '.ok == false and .finished == true and (.error | test("already finished"))' <<<"$CUT_OTHER" >/dev/null || {
+      echo "$CUT terminal identity was not durable in another private root: $CUT_OTHER" >&2; exit 1; }
+  fi
+  SMOKE_GATE_STATE_DIR="$CUT_STATE" SMOKE_GATE_LEASE_DIR="$CUT_LEASE" \
+    bash "$GATE" task-finish "$CUT_RUN" "$CROSS_SHA_A" NO_GO owner-cut | jq -e '.ok == true' >/dev/null
+  [ -z "$TERMINAL_BEFORE" ] ||
+    [ "$(jq -c '.terminal' "$CUT_LEASE/task-binding-$CUT_RUN.json")" = "$TERMINAL_BEFORE" ] || {
+      echo "$CUT retry rewrote immutable terminal facts" >&2; exit 1; }
+  jq -e --arg run "$CUT_RUN" '.completedRunId == $run and .activeRunId == null' "$CUT_STATE/task-$CUT_RUN-state.json" >/dev/null
+  jq -e --arg sha "$CROSS_SHA_A" '.sha == $sha and .verdict == "NO_GO"' "$CUT_STATE/runs/$CUT_RUN/verdict.json" >/dev/null
+  [ ! -e "$CUT_LEASE/task-lease-$CUT_RUN.json" ]
+done
+
+# Shared malformed state fails all three claim paths closed. No private root
+# can reinterpret it as absence.
+MAL_LEASE="$TEST_SHARED_ROOT/malformed-task-binding/leases"
+mkdir -p "$MAL_LEASE" "$CROSS_BASE/malformed-task" "$CROSS_BASE/malformed-pr" "$CROSS_BASE/malformed-dev"
+printf 'not json' >"$MAL_LEASE/task-binding-run-malformed-shared.json"
+MAL_TASK="$(SMOKE_GATE_STATE_DIR="$CROSS_BASE/malformed-task" SMOKE_GATE_LEASE_DIR="$MAL_LEASE" \
+  bash "$GATE" task-claim run-malformed-shared "$CROSS_SHA_A")"
+MAL_PR="$(SMOKE_GATE_STATE_DIR="$CROSS_BASE/malformed-pr" SMOKE_GATE_LEASE_DIR="$MAL_LEASE" \
+  bash "$GATE" claim run-malformed-shared 179 "$CROSS_SHA_A")"
+MAL_DEV="$(SMOKE_GATE_STATE_DIR="$CROSS_BASE/malformed-dev" SMOKE_GATE_LEASE_DIR="$MAL_LEASE" \
+  bash "$DEVELOP_GATE" claim run-malformed-shared "$CROSS_SHA_A")"
+for OUT in "$MAL_TASK" "$MAL_PR" "$MAL_DEV"; do
+  jq -e '.ok == false and (.error | test("malformed"))' <<<"$OUT" >/dev/null || {
+    echo "malformed shared binding failed open: $OUT" >&2; exit 1; }
+done
+[ ! -e "$CROSS_BASE/malformed-task/task-run-malformed-shared-state.json" ] &&
+  [ ! -e "$CROSS_BASE/malformed-pr/pr-179-state.json" ] &&
+  [ ! -e "$CROSS_BASE/malformed-dev/develop-state.json" ]
+
+# A valid shared record does not license choosing it over contradictory local
+# evidence. Task claim fails closed rather than overwriting the private slot.
+CONFLICT_STATE="$CROSS_BASE/conflicting-local" CONFLICT_LEASE="$TEST_SHARED_ROOT/conflicting-local/leases"
+mkdir -p "$CONFLICT_STATE" "$CONFLICT_LEASE"
+jq -cn --arg run run-conflicting-local --arg sha "$CROSS_SHA_A" \
+  '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:"2026-09-13T00:00:00Z",terminal:null}' \
+  >"$CONFLICT_LEASE/task-binding-run-conflicting-local.json"
+jq -cn --arg run run-conflicting-local --arg sha "$CROSS_SHA_B" \
+  '{schemaVersion:1,activeRunId:$run,activeSha:$sha,activeStartedAt:"2026-09-13T00:00:00Z",activeProgressAt:"2026-09-13T00:00:00Z",activeLeaseOwner:"old-owner",completedAt:null,completedRunId:null,completedVerdict:null}' \
+  >"$CONFLICT_STATE/task-run-conflicting-local-state.json"
+CONFLICT_OUT="$(SMOKE_GATE_STATE_DIR="$CONFLICT_STATE" SMOKE_GATE_LEASE_DIR="$CONFLICT_LEASE" \
+  bash "$GATE" task-claim run-conflicting-local "$CROSS_SHA_A" owner-new)"
+jq -e '.ok == false and (.error | test("malformed|identity evidence"))' <<<"$CONFLICT_OUT" >/dev/null || {
+  echo "conflicting local/shared identity did not fail closed: $CONFLICT_OUT" >&2; exit 1; }
+jq -e --arg sha "$CROSS_SHA_B" '.activeSha == $sha and .activeLeaseOwner == "old-owner"' \
+  "$CONFLICT_STATE/task-run-conflicting-local-state.json" >/dev/null
+[ ! -e "$CONFLICT_LEASE/task-lease-run-conflicting-local.json" ]
+
+# A real task claim from the base version has no binding file, but its shared
+# task lease is surviving, SHA-bearing history. Every manual reciprocal claim
+# producer must backfill that lease before refusing the run id.
+for LEGACY_KIND in pr lease develop; do
+  LEGACY_RUN="run-legacy-$LEGACY_KIND"
+  LEGACY_PRODUCER_STATE="$CROSS_BASE/legacy-producer-$LEGACY_KIND"
+  LEGACY_CONSUMER_STATE="$CROSS_BASE/new-producer-$LEGACY_KIND"
+  LEGACY_PRODUCER_LEASE="$TEST_SHARED_ROOT/legacy-producer-$LEGACY_KIND/leases"
+  mkdir -p "$LEGACY_PRODUCER_STATE" "$LEGACY_CONSUMER_STATE"
+  SMOKE_GATE_STATE_DIR="$LEGACY_PRODUCER_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_PRODUCER_LEASE" \
+    bash "$LEGACY_GATE" task-claim "$LEGACY_RUN" "$CROSS_SHA_A" owner-legacy | jq -e '.ok == true' >/dev/null
+  LEGACY_LEASE_BEFORE="$(cat "$LEGACY_PRODUCER_LEASE/task-lease-$LEGACY_RUN.json")"
+  [ ! -e "$LEGACY_PRODUCER_LEASE/task-binding-$LEGACY_RUN.json" ]
+  case "$LEGACY_KIND" in
+    pr)
+      LEGACY_OUT="$(SMOKE_GATE_STATE_DIR="$LEGACY_CONSUMER_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_PRODUCER_LEASE" \
+        bash "$GATE" claim "$LEGACY_RUN" 180 "$CROSS_SHA_B" owner-new)" ;;
+    lease)
+      LEGACY_OUT="$(SMOKE_GATE_STATE_DIR="$LEGACY_CONSUMER_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_PRODUCER_LEASE" \
+        bash "$GATE" lease-claim "$LEGACY_RUN" owner-new 181)" ;;
+    develop)
+      LEGACY_OUT="$(SMOKE_GATE_STATE_DIR="$LEGACY_CONSUMER_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_PRODUCER_LEASE" \
+        bash "$DEVELOP_GATE" claim "$LEGACY_RUN" "$CROSS_SHA_B")" ;;
+  esac
+  jq -e '.ok == false and (.error | test("task-scoped|task identity|task run"))' <<<"$LEGACY_OUT" >/dev/null || {
+    echo "$LEGACY_KIND claim ignored a surviving base-version task lease: $LEGACY_OUT" >&2; exit 1; }
+  [ "$(cat "$LEGACY_PRODUCER_LEASE/task-lease-$LEGACY_RUN.json")" = "$LEGACY_LEASE_BEFORE" ]
+  jq -e --arg run "$LEGACY_RUN" --arg sha "$CROSS_SHA_A" \
+    '.runId == $run and .deploySha == $sha and .terminal == null' \
+    "$LEGACY_PRODUCER_LEASE/task-binding-$LEGACY_RUN.json" >/dev/null
+done
+
+# Surviving shared lease evidence is accepted only when its exact shape and SHA
+# agree with any binding. Reciprocal producers fail closed on malformed and
+# contradictory legacy storage rather than fabricating a migration choice.
+LEGACY_BAD_STATE="$CROSS_BASE/legacy-bad" LEGACY_BAD_LEASE="$TEST_SHARED_ROOT/legacy-bad/leases"
+mkdir -p "$LEGACY_BAD_STATE" "$LEGACY_BAD_LEASE"
+printf 'not json\n' >"$LEGACY_BAD_LEASE/task-lease-run-legacy-malformed.json"
+LEGACY_BAD_PR="$(SMOKE_GATE_STATE_DIR="$LEGACY_BAD_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_BAD_LEASE" \
+  bash "$GATE" claim run-legacy-malformed 184 "$CROSS_SHA_B" owner-new)"
+LEGACY_BAD_DEV="$(SMOKE_GATE_STATE_DIR="$LEGACY_BAD_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_BAD_LEASE" \
+  bash "$DEVELOP_GATE" claim run-legacy-malformed "$CROSS_SHA_B")"
+for OUT in "$LEGACY_BAD_PR" "$LEGACY_BAD_DEV"; do
+  jq -e '.ok == false and (.error | test("cannot be read|malformed"))' <<<"$OUT" >/dev/null || {
+    echo "malformed legacy task lease failed open: $OUT" >&2; exit 1; }
+done
+jq -cn --arg run run-legacy-conflict --arg sha "$CROSS_SHA_A" \
+  '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:"2026-09-13T00:00:00Z",terminal:null}' \
+  >"$LEGACY_BAD_LEASE/task-binding-run-legacy-conflict.json"
+jq -cn --arg run run-legacy-conflict --arg sha "$CROSS_SHA_B" \
+  '{schemaVersion:1,kind:"task",runId:$run,deploySha:$sha,owner:"legacy",claimedAt:"2026-09-13T00:00:00Z",renewedAt:"2026-09-13T00:00:00Z",expiresAt:"2099-09-13T00:00:00Z"}' \
+  >"$LEGACY_BAD_LEASE/task-lease-run-legacy-conflict.json"
+LEGACY_CONFLICT_PR="$(SMOKE_GATE_STATE_DIR="$LEGACY_BAD_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_BAD_LEASE" \
+  bash "$GATE" claim run-legacy-conflict 185 "$CROSS_SHA_B" owner-new)"
+LEGACY_CONFLICT_DEV="$(SMOKE_GATE_STATE_DIR="$LEGACY_BAD_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_BAD_LEASE" \
+  bash "$DEVELOP_GATE" claim run-legacy-conflict "$CROSS_SHA_B")"
+for OUT in "$LEGACY_CONFLICT_PR" "$LEGACY_CONFLICT_DEV"; do
+  jq -e '.ok == false and (.error | test("cannot be read|malformed"))' <<<"$OUT" >/dev/null || {
+    echo "conflicting shared task identity failed open: $OUT" >&2; exit 1; }
+done
+
+# PR release and finish remove the shared PR lease before their private state
+# commit, then restore it if that commit fails. A task claimant must wait on
+# the existing PR run lock through this controlled temporary-absence window;
+# after rollback it must see the restored PR owner, never create a task binding.
+ROLLBACK_MV_BIN="$STUB_BIN/pr-rollback-mv"
+mkdir -p "$ROLLBACK_MV_BIN"
+cat >"$ROLLBACK_MV_BIN/mv" <<'STUB'
+#!/usr/bin/env bash
+if [ -n "${PROBE_SLOT:-}" ] && [ "${!#}" = "$PROBE_SLOT" ] && [ ! -e "$PROBE_PR_LEASE" ]; then
+  : >"$PROBE_READY"
+  for _probe_wait in $(seq 1 1000); do
+    [ -e "$PROBE_CONTINUE" ] && exit 1
+    sleep 0.01
+  done
+  exit 92
+fi
+exec /usr/bin/mv "$@"
+STUB
+chmod +x "$ROLLBACK_MV_BIN/mv"
+for ROLLBACK_MODE in release finish; do
+  ROLLBACK_RUN="run-pr-rollback-$ROLLBACK_MODE"
+  ROLLBACK_PR_STATE="$CROSS_BASE/pr-rollback-$ROLLBACK_MODE-a"
+  ROLLBACK_TASK_STATE="$CROSS_BASE/pr-rollback-$ROLLBACK_MODE-b"
+  ROLLBACK_LEASE="$TEST_SHARED_ROOT/pr-rollback-$ROLLBACK_MODE/leases"
+  ROLLBACK_PR=$([ "$ROLLBACK_MODE" = release ] && printf 182 || printf 183)
+  mkdir -p "$ROLLBACK_PR_STATE" "$ROLLBACK_TASK_STATE"
+  SMOKE_GATE_STATE_DIR="$ROLLBACK_PR_STATE" SMOKE_GATE_LEASE_DIR="$ROLLBACK_LEASE" \
+    bash "$GATE" claim "$ROLLBACK_RUN" "$ROLLBACK_PR" "$CROSS_SHA_A" owner-pr | jq -e '.ok == true' >/dev/null
+  ROLLBACK_READY="$CROSS_BASE/$ROLLBACK_MODE-ready"
+  ROLLBACK_CONTINUE="$CROSS_BASE/$ROLLBACK_MODE-continue"
+  ROLLBACK_OUT="$CROSS_BASE/$ROLLBACK_MODE-out.json"
+  if [ "$ROLLBACK_MODE" = release ]; then ROLLBACK_ARGS=(release "$ROLLBACK_RUN" owner-pr)
+  else ROLLBACK_ARGS=(finish "$CROSS_SHA_A" "$ROLLBACK_RUN" NO_GO owner-pr); fi
+  PROBE_SLOT="$ROLLBACK_PR_STATE/pr-$ROLLBACK_PR-state.json" \
+  PROBE_PR_LEASE="$ROLLBACK_LEASE/lease-$ROLLBACK_RUN.json" \
+  PROBE_READY="$ROLLBACK_READY" PROBE_CONTINUE="$ROLLBACK_CONTINUE" \
+  SMOKE_GATE_STATE_DIR="$ROLLBACK_PR_STATE" SMOKE_GATE_LEASE_DIR="$ROLLBACK_LEASE" \
+  PATH="$ROLLBACK_MV_BIN:$PATH" bash "$GATE" "${ROLLBACK_ARGS[@]}" >"$ROLLBACK_OUT" &
+  ROLLBACK_PID=$!
+  for _wait in $(seq 1 200); do [ -e "$ROLLBACK_READY" ] && break; sleep 0.02; done
+  [ -e "$ROLLBACK_READY" ] && [ ! -e "$ROLLBACK_LEASE/lease-$ROLLBACK_RUN.json" ] || {
+    echo "$ROLLBACK_MODE rollback fixture never reached the lease-removed cut" >&2; exit 1; }
+  ROLLBACK_TASK_OUT="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 SMOKE_GATE_STATE_DIR="$ROLLBACK_TASK_STATE" \
+    SMOKE_GATE_LEASE_DIR="$ROLLBACK_LEASE" bash "$GATE" task-claim "$ROLLBACK_RUN" "$CROSS_SHA_B" owner-task)"
+  jq -e '.ok == false and .retryable == true and (.error | test("PR run identity lock"))' \
+    <<<"$ROLLBACK_TASK_OUT" >/dev/null || {
+    echo "task claim read through $ROLLBACK_MODE rollback: $ROLLBACK_TASK_OUT" >&2; exit 1; }
+  : >"$ROLLBACK_CONTINUE"
+  wait "$ROLLBACK_PID" || true
+  jq -e '.ok == false and .leaseRestored == true' "$ROLLBACK_OUT" >/dev/null
+  ROLLBACK_AFTER="$(SMOKE_GATE_STATE_DIR="$ROLLBACK_TASK_STATE" SMOKE_GATE_LEASE_DIR="$ROLLBACK_LEASE" \
+    bash "$GATE" task-claim "$ROLLBACK_RUN" "$CROSS_SHA_B" owner-task)"
+  jq -e --argjson pr "$ROLLBACK_PR" '.ok == false and .activePr == $pr and (.error | test("PR campaign"))' \
+    <<<"$ROLLBACK_AFTER" >/dev/null || {
+    echo "task claim ignored restored PR lease after $ROLLBACK_MODE rollback: $ROLLBACK_AFTER" >&2; exit 1; }
+  [ ! -e "$ROLLBACK_LEASE/task-binding-$ROLLBACK_RUN.json" ] &&
+    [ ! -e "$ROLLBACK_LEASE/task-lease-$ROLLBACK_RUN.json" ] &&
+    [ ! -e "$ROLLBACK_TASK_STATE/task-$ROLLBACK_RUN-state.json" ]
+  SMOKE_GATE_STATE_DIR="$ROLLBACK_PR_STATE" SMOKE_GATE_LEASE_DIR="$ROLLBACK_LEASE" \
+    bash "$GATE" progress "$ROLLBACK_RUN" owner-pr | jq -e '.ok == true' >/dev/null
+done
+
+# An old all-null release erased its SHA and cannot be reconstructed. The
+# upgrade invents no history; a later valid claim establishes the first
+# provable shared binding.
+LEGACY_STATE="$CROSS_BASE/legacy-all-null" LEGACY_LEASE="$TEST_SHARED_ROOT/legacy-all-null/leases"
+mkdir -p "$LEGACY_STATE"
+printf '{"schemaVersion":1,"activeRunId":null,"activeSha":null,"completedRunId":null,"completedSha":null}\n' \
+  >"$LEGACY_STATE/task-run-legacy-lost-state.json"
+SMOKE_GATE_STATE_DIR="$LEGACY_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_LEASE" \
+  bash "$GATE" task-claim run-legacy-lost "$CROSS_SHA_B" owner-legacy | jq -e '.ok == true' >/dev/null
+jq -e --arg sha "$CROSS_SHA_B" '.deploySha == $sha and .terminal == null' \
+  "$LEGACY_LEASE/task-binding-run-legacy-lost.json" >/dev/null
+
+fi
+if smoke_case 64-preview-waiter; then
+# --- 64. PR preview waiter: pinned, bounded, and strictly read-only --------
+# A preview waiter is deliberately NOT the develop wait-settled loop copied
+# over: a PR can close or move while a caller waits. It must return those
+# terminal states promptly, never turn them into a misleading timeout.
+fresh_state
+WAIT_SHA="$(sha a)"
+export STUB_PR_VIEW="{\"number\":301,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$WAIT_SHA\",\"headRefName\":\"feature/wait\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"api/src/wait.ts"}]'
+export STUB_SERVICES='[{"id":"srv-backend-pr-301","name":"WIDGET-API PR #301","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://widget-api-pr-301.onrender.com"}}]'
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$WAIT_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+WAIT_CLOCK="$STATE_DIR/wait-clock.txt"
+printf '100\n101\n102\n' > "$WAIT_CLOCK"
+export STUB_WAIT_CLOCK_FILE="$WAIT_CLOCK"
+WAIT_RUNS="$STATE_DIR/wait-runs.jsonl"
+printf '%s\n%s\n' \
+  "[{\"headSha\":\"$WAIT_SHA\",\"status\":\"in_progress\",\"conclusion\":null,\"workflowName\":\"CI\"}]" \
+  "[{\"headSha\":\"$WAIT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]" > "$WAIT_RUNS"
+export STUB_RUN_LIST_SEQUENCE_FILE="$WAIT_RUNS"
+WAIT_OUT="$(bash "$GATE" wait-settled 301 --head "$WAIT_SHA" --interval-seconds 0 --max-seconds 30)"
+jq -e --arg sha "$WAIT_SHA" '
+  .ok == true and .eligible == true and .settled == true and .timedOut == false and .incomplete == false and
+  .headSha == $sha and .ciSha == $sha and .campaignSize == "standard" and .sizeReason == "no sizing rules" and
+  .checkIdentity == {pr:301,requestedHeadSha:$sha,headSha:$sha,ciSha:$sha} and .attempts == 2 and .waitedSeconds == 2
+' <<<"$WAIT_OUT" >/dev/null
+[ ! -e "$STATE_DIR/pr-301-state.json" ] && [ ! -e "$STATE_DIR/control.json" ] && [ ! -d "$SMOKE_GATE_LEASE_DIR" ] || {
+  echo "wait-settled wrote claim, state, or lease evidence" >&2; exit 1; }
+
+# Closed and unlabeled are terminal ineligible facts, not a build that can
+# become ready. They return on the first check even with a long wait budget.
+for WAIT_LABEL in closed unlabeled; do
+  fresh_state
+  WAIT_SHA="$(sha b)"
+  if [ "$WAIT_LABEL" = closed ]; then
+    export STUB_PR_VIEW="{\"number\":302,\"state\":\"CLOSED\",\"headRefOid\":\"$WAIT_SHA\",\"headRefName\":\"feature/closed\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+  else
+    export STUB_PR_VIEW="{\"number\":302,\"state\":\"OPEN\",\"headRefOid\":\"$WAIT_SHA\",\"headRefName\":\"feature/unlabeled\",\"baseRefName\":\"develop\",\"labels\":[]}"
+  fi
+  WAIT_CLOCK="$STATE_DIR/$WAIT_LABEL-clock.txt"
+  printf '200\n201\n' > "$WAIT_CLOCK"
+  export STUB_WAIT_CLOCK_FILE="$WAIT_CLOCK"
+  if bash "$GATE" wait-settled 302 --head "$WAIT_SHA" --interval-seconds 0 --max-seconds 30 >"$STATE_DIR/ineligible.json"; then
+    echo "wait-settled accepted $WAIT_LABEL PR" >&2; exit 1
+  fi
+  jq -e --arg sha "$WAIT_SHA" '.terminal == "ineligible" and .timedOut == false and .incomplete == true and .attempts == 1 and .requestedHeadSha == $sha' \
+    "$STATE_DIR/ineligible.json" >/dev/null
+  [ ! -e "$STATE_DIR/pr-302-state.json" ]
+done
+
+# A new source head must never inherit the waiter's result for the requested
+# one. It exits distinctly instead of observing a later, possibly settled PR.
+fresh_state
+WAIT_SHA="$(sha c)"
+MOVED_SHA="$(sha d)"
+export STUB_PR_VIEW="{\"number\":303,\"state\":\"OPEN\",\"headRefOid\":\"$MOVED_SHA\",\"headRefName\":\"feature/moved\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+WAIT_CLOCK="$STATE_DIR/moved-clock.txt"
+printf '300\n301\n' > "$WAIT_CLOCK"
+export STUB_WAIT_CLOCK_FILE="$WAIT_CLOCK"
+if bash "$GATE" wait-settled 303 --head "$WAIT_SHA" --interval-seconds 0 --max-seconds 30 >"$STATE_DIR/moved.json"; then
+  echo "wait-settled accepted a moved PR head" >&2; exit 1
+fi
+jq -e --arg expected "$WAIT_SHA" --arg observed "$MOVED_SHA" '
+  .terminal == "head_moved" and .timedOut == false and .incomplete == true and .attempts == 1 and
+  .requestedHeadSha == $expected and .observedHeadSha == $observed
+' "$STATE_DIR/moved.json" >/dev/null
+
+# Pending and temporary fetch failures remain incomplete/BLOCKED at the
+# deadline. They retain their exact check diagnostic and never claim a slot.
+fresh_state
+WAIT_SHA="$(sha e)"
+export STUB_PR_VIEW="{\"number\":304,\"state\":\"OPEN\",\"headRefOid\":\"$WAIT_SHA\",\"headRefName\":\"feature/pending\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"api/src/pending.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$WAIT_SHA\",\"status\":\"in_progress\",\"conclusion\":null,\"workflowName\":\"CI\"}]"
+WAIT_CLOCK="$STATE_DIR/pending-clock.txt"
+printf '400\n400\n500\n500\n' > "$WAIT_CLOCK"
+export STUB_WAIT_CLOCK_FILE="$WAIT_CLOCK"
+if bash "$GATE" wait-settled 304 --head "$WAIT_SHA" --interval-seconds 0 --max-seconds 0 >"$STATE_DIR/pending.json"; then
+  echo "wait-settled passed a pending preview" >&2; exit 1
+fi
+jq -e '.timedOut == true and .incomplete == true and .ciPending == 1 and .attempts == 1' "$STATE_DIR/pending.json" >/dev/null
+export STUB_PR_VIEW_EXIT=1
+if bash "$GATE" wait-settled 304 --head "$WAIT_SHA" --interval-seconds 0 --max-seconds 0 >"$STATE_DIR/fetch.json"; then
+  echo "wait-settled passed a transient fetch failure" >&2; exit 1
+fi
+jq -e '.timedOut == true and .incomplete == true and .error == "failed to fetch PR" and .attempts == 1' "$STATE_DIR/fetch.json" >/dev/null
+unset STUB_PR_VIEW_EXIT
+[ ! -e "$STATE_DIR/pr-304-state.json" ] && [ ! -d "$SMOKE_GATE_LEASE_DIR" ]
+
+# Limits belong only to the waiter command. A bad option is a usage failure,
+# and the normal read-only check remains available immediately afterwards.
+if bash "$GATE" wait-settled 304 --head "$WAIT_SHA" --max-seconds 09 >"$STATE_DIR/bad-limit.json"; then
+  echo "wait-settled accepted a malformed limit" >&2; exit 1
+fi
+jq -e '.ok == false and (.error | test("non-negative integer"))' "$STATE_DIR/bad-limit.json" >/dev/null
+bash "$GATE" check 304 | jq -e '.ok == true and .eligible == true' >/dev/null
+
+# A wait interval is an upper bound, never permission to sleep past the
+# caller's deadline. The hermetic clock reaches the deadline immediately
+# after the clamped two-second sleep, before a second API request can start.
+WAIT_CLOCK="$STATE_DIR/clamped-clock.txt"
+printf '600\n600\n602\n' > "$WAIT_CLOCK"
+export STUB_WAIT_CLOCK_FILE="$WAIT_CLOCK"
+WAIT_SLEEP_LOG="$STATE_DIR/clamped-sleep.txt"
+export STUB_WAIT_SLEEP_LOG="$WAIT_SLEEP_LOG"
+if bash "$GATE" wait-settled 304 --head "$WAIT_SHA" --interval-seconds 300 --max-seconds 2 >"$STATE_DIR/clamped.json"; then
+  echo "wait-settled passed while CI was pending" >&2; exit 1
+fi
+jq -e '.timedOut == true and .incomplete == true and .attempts == 1 and .waitedSeconds == 2' "$STATE_DIR/clamped.json" >/dev/null
+[ "$(cat "$WAIT_SLEEP_LOG")" = 2 ] || { echo "wait-settled slept past its remaining deadline" >&2; exit 1; }
+unset STUB_WAIT_SLEEP_LOG
+
+# Whole shell arguments must validate, not merely their first newline-delimited
+# record. Every malformed input below was previously accepted by grep -E.
+for WAIT_BAD_FIELD in pr head interval max; do
+  WAIT_CLOCK="$STATE_DIR/$WAIT_BAD_FIELD-clock.txt"
+  printf '700\n700\n' > "$WAIT_CLOCK"
+  export STUB_WAIT_CLOCK_FILE="$WAIT_CLOCK"
+  WAIT_ARGS=(wait-settled 304 --head "$WAIT_SHA" --interval-seconds 0 --max-seconds 0)
+  case "$WAIT_BAD_FIELD" in
+    pr) WAIT_ARGS[1]=$'304\nx' ;;
+    head) WAIT_ARGS[3]="$WAIT_SHA"$'\nx' ;;
+    interval) WAIT_ARGS[5]=$'0\nx' ;;
+    max) WAIT_ARGS[7]=$'0\nx' ;;
+  esac
+  if bash "$GATE" "${WAIT_ARGS[@]}" >"$STATE_DIR/bad-$WAIT_BAD_FIELD.json"; then
+    echo "wait-settled accepted a multiline $WAIT_BAD_FIELD argument" >&2; exit 1
+  fi
+  jq -e '.ok == false' "$STATE_DIR/bad-$WAIT_BAD_FIELD.json" >/dev/null
+done
+
+fi
+smoke_cases_done
+echo "smoke pr gate tests passed"

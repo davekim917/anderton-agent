@@ -1,0 +1,568 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# Pinned by digest so a build never asks Docker Hub to resolve the `1.7` tag (that HEAD request is the one that
+# returns the occasional 5xx). Bump the tag and digest together: `docker buildx imagetools inspect docker/dockerfile:1.7`.
+# NanoClaw Agent Container
+# Runs Claude Agent SDK in isolated Linux VM with browser automation.
+#
+# Runtime split:
+#   - agent-runner (our TypeScript code): Bun, mounted RO at /app/src by host
+#   - globally-installed Node CLIs (claude-code, agent-browser, vercel): pnpm + Node
+#
+# Source is never baked in — /app/src is provided by a shared read-only
+# bind mount at runtime (see src/container-runner.ts). Source-only changes
+# never require an image rebuild.
+#
+# Example Labs additions on top of upstream/v2:
+#   - GitHub CLI (gh) — used by git-worktree MCP tools for `gh pr create`
+#   - PostgreSQL + Redis clients, Python + dbt + snowflake-cli — data-team tooling
+
+# ---- mcp-toolbox alias stage -------------------------------------------------
+# Google publishes the toolbox as a multi-arch distroless image but does NOT
+# publish a linux/arm64 prebuilt at storage.googleapis.com. The alias FROM
+# lets us pull the binary via COPY --from below while keeping the version
+# pinned via build-arg.
+ARG MCP_TOOLBOX_VERSION=1.13.1
+ARG PNPM_VERSION=10.34.5
+FROM us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:${MCP_TOOLBOX_VERSION} AS mcp-toolbox-src
+
+FROM node:22-slim
+
+# ---- Build-time arguments ----------------------------------------------------
+# CJK fonts add ~200MB. Opt in only if you render Chinese/Japanese/Korean text.
+ARG INSTALL_CJK_FONTS=false
+
+# Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
+# mean every rebuild silently picks up the latest and can break in lockstep
+# across all users.
+ARG CLAUDE_CODE_VERSION=2.1.290
+ARG AGENT_BROWSER_VERSION=0.38.2
+ARG VERCEL_VERSION=62.4.0
+ARG BUN_VERSION=1.4.2
+ARG MMDC_VERSION=12.0.0
+ARG GWS_VERSION=0.22.5
+ARG CODEX_VERSION=0.160.1
+ARG OPENCODE_VERSION=1.18.34
+ARG WIX_CLI_VERSION=1.1.256
+ARG DBT_MCP_VERSION=2.5.0
+ARG PIP_VERSION=26.2.1
+ARG SETUPTOOLS_VERSION=84.0.0
+ARG WHEEL_VERSION=0.48.0
+ARG SNOWFLAKE_CLI_VERSION=3.28.0
+ARG DBT_CORE_VERSION=1.12.5
+ARG DBT_SNOWFLAKE_VERSION=1.12.1
+ARG UV_VERSION=0.12.23
+ARG AWS_CLI_VERSION=2.37.9
+
+# ---- System dependencies -----------------------------------------------------
+# tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
+# SIGTERM instead of being orphaned by the shell entrypoint.
+# ffmpeg: `agent-browser record start/stop` shells out to it — without it the
+# recording starts and then fails at stop with "ffmpeg not found". ~141MB.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        chromium \
+        fonts-liberation \
+        fonts-noto-color-emoji \
+        libgbm1 \
+        libnss3 \
+        libnss3-tools \
+        libatk-bridge2.0-0 \
+        libgtk-3-0 \
+        libx11-xcb1 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxrandr2 \
+        libasound2 \
+        libpangocairo-1.0-0 \
+        libcups2 \
+        libdrm2 \
+        libxshmfence1 \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        git \
+        jq \
+        less \
+        tini \
+        unzip \
+        xz-utils \
+        postgresql-client \
+        redis-tools \
+        ripgrep \
+        python3 \
+        python3-pip \
+        python3-venv \
+    && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
+        apt-get install -y --no-install-recommends fonts-noto-cjk; \
+       fi
+
+# GitHub CLI (official apt repo). Kept in a separate layer so the dep cache
+# above still hits when only gh bumps.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Data tools via isolated venvs (PEP 668 — Debian disallows system-wide pip).
+# snow and dbt have conflicting transitive deps (notably on click + urllib3),
+# so they live in separate venvs with symlinks on PATH. Layout mirrors v1:
+#   /opt/snow-venv/bin/snow → /usr/local/bin/snow
+#   /opt/dbt-venv/bin/dbt → /usr/local/bin/dbt
+RUN python3 -m venv /opt/snow-venv \
+    && /opt/snow-venv/bin/pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" "setuptools==${SETUPTOOLS_VERSION}" "wheel==${WHEEL_VERSION}" \
+    && /opt/snow-venv/bin/pip install --no-cache-dir "snowflake-cli==${SNOWFLAKE_CLI_VERSION}" \
+    && ln -sf /opt/snow-venv/bin/snow /usr/local/bin/snow
+
+RUN python3 -m venv /opt/dbt-venv \
+    && /opt/dbt-venv/bin/pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" "setuptools==${SETUPTOOLS_VERSION}" "wheel==${WHEEL_VERSION}" \
+    && /opt/dbt-venv/bin/pip install --no-cache-dir "dbt-core==${DBT_CORE_VERSION}" "dbt-snowflake==${DBT_SNOWFLAKE_VERSION}" \
+    && ln -sf /opt/dbt-venv/bin/dbt /usr/local/bin/dbt
+
+# sooperset/mcp-atlassian — stdio MCP server for Jira + Confluence (72 tools).
+# Isolated venv to avoid clashing with snow/dbt transitive deps.
+ARG MCP_ATLASSIAN_VERSION=0.23.1
+RUN python3 -m venv /opt/atlassian-venv \
+    && /opt/atlassian-venv/bin/pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" "setuptools==${SETUPTOOLS_VERSION}" "wheel==${WHEEL_VERSION}" \
+    && /opt/atlassian-venv/bin/pip install --no-cache-dir "mcp-atlassian==${MCP_ATLASSIAN_VERSION}" \
+    && ln -sf /opt/atlassian-venv/bin/mcp-atlassian /usr/local/bin/mcp-atlassian
+
+# dbt-labs/dbt-mcp — stdio MCP server for dbt Cloud (Discovery + Semantic Layer
+# + Admin API + dbt CLI/LSP). Requires Python >=3.12; node:22-slim (bookworm)
+# only ships 3.11, so we use uv to install a managed Python 3.12 and isolate
+# dbt-mcp's deps. uv lives in its own venv to match the snow/dbt/atlassian
+# isolation pattern.
+RUN python3 -m venv /opt/uv-venv \
+    && /opt/uv-venv/bin/pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" "setuptools==${SETUPTOOLS_VERSION}" "wheel==${WHEEL_VERSION}" \
+    && /opt/uv-venv/bin/pip install --no-cache-dir "uv==${UV_VERSION}" \
+    && ln -sf /opt/uv-venv/bin/uv /usr/local/bin/uv \
+    && ln -sf /opt/uv-venv/bin/uvx /usr/local/bin/uvx \
+    && UV_TOOL_DIR=/opt/uv-tools \
+       UV_TOOL_BIN_DIR=/usr/local/bin \
+       UV_PYTHON_INSTALL_DIR=/opt/uv-python \
+       uv tool install --python 3.12 "dbt-mcp==${DBT_MCP_VERSION}" \
+    && chmod -R a+rX /opt/uv-tools /opt/uv-python
+
+# AWS CLI v2 (isolated from pip to avoid version churn)
+RUN ARCH=$(uname -m) \
+    && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH}-${AWS_CLI_VERSION}.zip" -o /tmp/awscli.zip \
+    && unzip -q /tmp/awscli.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/awscli.zip /tmp/aws
+
+# Google Cloud SDK (gcloud, gsutil) — needs gpg to verify apt repo signature
+RUN apt-get update && apt-get install -y --no-install-recommends gnupg \
+    && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+      | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+      > /etc/apt/sources.list.d/google-cloud-sdk.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-cloud-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+# Render / Railway / Supabase CLIs and yq (released as prebuilt binaries)
+ARG RENDER_VERSION=2.28.0
+ARG RAILWAY_VERSION=5.63.2
+ARG SUPABASE_VERSION=2.119.0
+ARG YQ_VERSION=4.54.1
+RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
+    && curl -fsSL "https://github.com/render-oss/cli/releases/download/v${RENDER_VERSION}/cli_${RENDER_VERSION}_linux_${DPKG_ARCH}.zip" \
+       -o /tmp/render.zip \
+    && unzip -q /tmp/render.zip -d /tmp/render \
+    && mv /tmp/render/cli_v${RENDER_VERSION} /usr/local/bin/render \
+    && chmod +x /usr/local/bin/render \
+    && curl -fsSL "https://github.com/railwayapp/cli/releases/download/v${RAILWAY_VERSION}/railway-v${RAILWAY_VERSION}-${UARCH}-unknown-linux-musl.tar.gz" \
+       | tar xz -C /usr/local/bin railway \
+    && chmod +x /usr/local/bin/railway \
+    && curl -fsSL "https://github.com/supabase/cli/releases/download/v${SUPABASE_VERSION}/supabase_${SUPABASE_VERSION}_linux_${DPKG_ARCH}.deb" \
+       -o /tmp/supabase.deb \
+    && dpkg -i /tmp/supabase.deb \
+    && curl -fsSL "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${DPKG_ARCH}" \
+       -o /usr/local/bin/yq \
+    && chmod +x /usr/local/bin/yq \
+    && rm -rf /tmp/render.zip /tmp/render /tmp/supabase.deb
+
+# Google MCP Toolbox for Databases — provides --prebuilt looker stdio MCP.
+# Binary copied from the alias stage declared at the top of this Dockerfile.
+COPY --from=mcp-toolbox-src /toolbox /usr/local/bin/toolbox
+
+# Hex CLI — closed-source Rust binary released as multi-arch tarballs at
+# https://github.com/hex-inc/hex-cli/releases. Auth is OAuth-only (no static
+# token env var); the real `hex` binary reads XDG_CONFIG_HOME, and the
+# wrapper at /usr/local/bin/hex points it at the mount staging path. SHA256s
+# pinned per-arch — read the canonical .sha256 sidecar files (NOT a direct
+# pipe-to-sha256sum, which has been observed to read partial bytes off a
+# stale CDN edge):
+#   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-aarch64-unknown-linux-gnu.tar.xz.sha256
+#   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-x86_64-unknown-linux-gnu.tar.xz.sha256
+ARG HEX_CLI_VERSION=1.2026.09.23
+ARG HEX_CLI_SHA256_arm64=a6083e034c9f43f370a90dc04146b11eb060483d5bba44c358e50a94ce113cc5
+ARG HEX_CLI_SHA256_amd64=3845656a02f992b6bc50a8467bc18e19f52ce38a29be6b43ed13de5b8a1e34f2
+
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         arm64) RARCH=aarch64; SHA="$HEX_CLI_SHA256_arm64" ;; \
+         amd64) RARCH=x86_64;  SHA="$HEX_CLI_SHA256_amd64" ;; \
+         *) echo "Unsupported arch for hex CLI: $ARCH" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://github.com/hex-inc/hex-cli/releases/download/v${HEX_CLI_VERSION}/hex-${RARCH}-unknown-linux-gnu.tar.xz" \
+       -o /tmp/hex.tar.xz \
+    && echo "$SHA  /tmp/hex.tar.xz" | sha256sum -c - \
+    && tar -xf /tmp/hex.tar.xz -C /tmp \
+    && install -m 0755 "/tmp/hex-${RARCH}-unknown-linux-gnu/hex" /usr/local/bin/hex-real \
+    && rm -rf /tmp/hex*
+
+COPY --chmod=0755 hex-wrapper.sh /usr/local/bin/hex-wrapper.sh
+RUN chmod 0755 /usr/local/bin/hex-wrapper.sh \
+    && ln -s /usr/local/bin/hex-wrapper.sh /usr/local/bin/hex \
+    && /usr/local/bin/hex-real --version
+
+# Estuary flowctl — upstream publishes a bare x86_64 Linux binary and no
+# .sha256 sidecar, so the pin is the digest GitHub records for the release
+# asset (`gh api repos/estuary/flow/releases/tags/v$V --jq '.assets[] | .name + " " + .digest'`).
+# No arm64 build exists; an arm64 image goes without flowctl rather than
+# failing the whole build.
+ARG FLOWCTL_VERSION=0.6.13
+ARG FLOWCTL_SHA256_amd64=edf66d27761e5688a05200f2935cb86f816b7e52582eaffd1f5aef2f002d27d2
+RUN ARCH=$(dpkg --print-architecture) \
+    && if [ "$ARCH" = amd64 ]; then \
+         curl -fsSL "https://github.com/estuary/flow/releases/download/v${FLOWCTL_VERSION}/flowctl-x86_64-linux" \
+           -o /tmp/flowctl \
+         && echo "$FLOWCTL_SHA256_amd64  /tmp/flowctl" | sha256sum -c - \
+         && install -m 0755 /tmp/flowctl /usr/local/bin/flowctl \
+         && rm -f /tmp/flowctl \
+         && /usr/local/bin/flowctl --version; \
+       else \
+         echo "flowctl: no upstream build for $ARCH, skipping" >&2; \
+       fi
+
+# Chromium path for agent-browser / Playwright / mmdc consumers
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+# Belt-and-braces: prevent Playwright's postinstall from downloading its own
+# ~300MB Chromium. We've already installed the system one above.
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# mmdc reuses the system Chromium instead of downloading its own.
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+ENV PUPPETEER_SKIP_DOWNLOAD=1
+
+# ---- Bun runtime -------------------------------------------------------------
+# Install via the official script (handles multi-arch detection), then move
+# the binary to /usr/local/bin so the non-root `node` user can execute it.
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" && \
+    install -m 0755 /root/.bun/bin/bun /usr/local/bin/bun && \
+    rm -rf /root/.bun
+
+# ---- agent-runner deps -------------------------------------------------------
+# Deps are cached independently of CLI versions. Source is NOT baked in —
+# it's provided by the shared RO mount at runtime.
+WORKDIR /app
+
+COPY --chmod=0644 agent-runner/package.json agent-runner/bun.lock ./
+
+RUN --mount=type=cache,target=/root/.bun/install/cache \
+    bun install --frozen-lockfile
+
+# ---- pnpm + global Node CLIs -------------------------------------------------
+# Most stable first, most frequently bumped last. Bumping claude-code
+# (the most common change) only invalidates one layer.
+#
+# allowBuilds gates pnpm's supply-chain policy:
+#   - agent-browser has a postinstall build step.
+#   - @anthropic-ai/claude-code's postinstall downloads the native Claude
+#     binary (linux-arm64 variant on our image). Without the allowlist
+#     the SDK fails at spawn time with "native binary not found".
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+# `corepack prepare --activate` below pins pnpm by writing a "Last Known
+# Good" record to $COREPACK_HOME (default: $HOME/.cache/node/corepack) —
+# i.e. scoped to whichever OS user runs it. This RUN executes as root
+# (HOME=/root), but the container runs the agent as the unprivileged `node`
+# user (HOME=/home/node): a different HOME, so `node` never sees root's LKG
+# record. Corepack then falls back to auto-downloading whatever is
+# currently "latest" on the npm registry on its first invocation — this is
+# exactly how the pin silently drifted before (PNPM_VERSION pinned 10.x,
+# the image actually ran 11.x). Pointing COREPACK_HOME at a fixed,
+# non-HOME path makes the LKG record and the already-downloaded pnpm
+# tarball visible to every UID that runs pnpm in this image, so the pin
+# holds regardless of which user resolves it.
+#
+# Ownership (not just readability) matters here: agents clone and work in
+# arbitrary repos, and a workspace whose own package.json pins a different
+# pnpm — or Yarn — version makes Corepack download that version into this
+# same $COREPACK_HOME at runtime (getInstallFolder()/installVersion()) to
+# honor the project's pin. `node` must be able to write here, not just
+# read the baked-in default, or that install fails EACCES. The HOST_UID
+# remap block further down chowns this dir (alongside /workspace and
+# /home/node) to the runtime user so both cases work: our own pin resolves
+# from the pre-downloaded, read-accessible LKG entry with no network call,
+# and an on-demand different pin can still download and write here.
+ENV COREPACK_HOME="/opt/corepack"
+# Pin pnpm to match the host (package.json packageManager). Build approvals are
+# deliberately written in both formats: pnpm 10 global installs still honor
+# the legacy .npmrc keys, while pnpm 11 removes those keys and reads the global
+# `allowBuilds` YAML setting. Keep this in lockstep with package.json.
+ARG PNPM_VERSION
+RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate && \
+    resolved="$(pnpm --version)" && \
+    [ "$resolved" = "${PNPM_VERSION}" ] || \
+      { echo "pnpm --version ($resolved) != PNPM_VERSION (${PNPM_VERSION}) as root right after activation" >&2; exit 1; }
+
+# The npm bundled with node:22-slim (10.9.8) vendors tar <7.5.19, which carries
+# a fixable critical (GHSA-23hp-3jrh-7fpw). Patch-level bump only. Drop this
+# once the base image ships npm >= 10.9.9.
+ARG NPM_VERSION=12.2.0
+RUN npm install -g npm@${NPM_VERSION}
+
+# Global Node CLIs the agent invokes at runtime are installed explicitly below,
+# each pinned via an ARG (see the version block above). This fork keeps the
+# Dockerfile-ARG pin convention rather than upstream's cli-tools.json manifest,
+# so a caret bump upstream surfaces as a merge conflict instead of a silent
+# re-resolution.
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    echo "only-built-dependencies[]=agent-browser" > /root/.npmrc && \
+    echo "only-built-dependencies[]=@anthropic-ai/claude-code" >> /root/.npmrc && \
+    echo "only-built-dependencies[]=@googleworkspace/cli" >> /root/.npmrc && \
+    echo "only-built-dependencies[]=opencode-ai" >> /root/.npmrc && \
+    pnpm config set --global --json allowBuilds \
+        '{"agent-browser":true,"@anthropic-ai/claude-code":true,"@googleworkspace/cli":true,"opencode-ai":true}' && \
+    pnpm install -g "vercel@${VERCEL_VERSION}"
+
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    pnpm install -g "agent-browser@${AGENT_BROWSER_VERSION}"
+
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+# Wix CLI — Velo local-dev + publish for Wix-hosted sites.
+# Auth is OAuth via a per-group mounted ~/.wix dir (operator runs `wix login`
+# on the host once), NOT the OneCLI REST key. The CLI binary is fleet-wide;
+# only groups with the ~/.wix mount + a Wix secret can actually use it.
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    pnpm install -g "@wix/cli@${WIX_CLI_VERSION}"
+
+# Example Labs additions: code-intelligence + diagram + Google Workspace CLIs.
+# Codex CLI (@openai/codex) is invoked by /team-qa Validator E for
+# cross-model adversarial review; authenticated via the host's ~/.codex
+# mount (see src/container-runner.ts:581).
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    pnpm install -g \
+        "@mermaid-js/mermaid-cli@${MMDC_VERSION}" \
+        "@googleworkspace/cli@${GWS_VERSION}" \
+        "@openai/codex@${CODEX_VERSION}" \
+        "opencode-ai@${OPENCODE_VERSION}"
+
+# gws ships one prebuilt release binary per target triple, and its postinstall
+# picks *-unknown-linux-gnu on any glibc host. Upstream links that artifact
+# against glibc 2.39, but this image is node:22-slim (Debian 12, glibc 2.36),
+# so the installed binary aborts at exec and every agent loses Google Workspace:
+#   gws: /lib/*/libc.so.6: version `GLIBC_2.39' not found
+# The musl artifact of the SAME pinned version is statically linked and runs
+# here unchanged. Swap it in, checked against a SHA256 pinned in this
+# Dockerfile (same convention as the hex CLI above) rather than a sidecar
+# fetched from the same release — a sidecar proves nothing if the release
+# asset itself was replaced. Regenerated automatically on a GWS_VERSION bump
+# by the container-updates flow (container/update-sources.json's
+# google-workspace-cli entry); to do it by hand, read the canonical .sha256
+# sidecar files at:
+#   curl -sL https://github.com/googleworkspace/cli/releases/download/v$V/google-workspace-cli-x86_64-unknown-linux-musl.tar.gz.sha256
+#   curl -sL https://github.com/googleworkspace/cli/releases/download/v$V/google-workspace-cli-aarch64-unknown-linux-musl.tar.gz.sha256
+# Drop this step once the base image ships glibc >= 2.39.
+ARG GWS_SHA256_amd64=4db473dde4b1ab872e4ff35d769b0d4af1f1a6441a605e79d5cf8ada9c87e920
+ARG GWS_SHA256_arm64=e700fe63524932b10ec2130b47ece90aa850e66005fe52ccfc4cf8767bf9919a
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) gws_triple=x86_64-unknown-linux-musl; gws_sha="$GWS_SHA256_amd64" ;; \
+      arm64) gws_triple=aarch64-unknown-linux-musl; gws_sha="$GWS_SHA256_arm64" ;; \
+      *) echo "gws: unsupported architecture" >&2; exit 1 ;; \
+    esac; \
+    gws_bin="$(find /pnpm -type f -path '*/@googleworkspace/cli/bin/gws' -print -quit)"; \
+    test -n "$gws_bin"; \
+    gws_url="https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/google-workspace-cli-${gws_triple}.tar.gz"; \
+    tmp="$(mktemp -d)"; \
+    curl -fsSL "$gws_url" -o "$tmp/gws.tar.gz"; \
+    echo "$gws_sha  $tmp/gws.tar.gz" | sha256sum -c -; \
+    tar xzf "$tmp/gws.tar.gz" -C "$tmp"; \
+    install -m 0755 "$tmp/gws" "$gws_bin"; \
+    rm -rf "$tmp"; \
+    "$gws_bin" --version
+
+# ---- Remotion video runtime --------------------------------------------------
+# Shared runtime for programmatic video, available to EVERY agent group at
+# /opt/remotion — deliberately not a per-group folder, because a video toolchain
+# that lives in one agent's workspace is invisible to its siblings.
+#
+# Installed as a real project (not `pnpm install -g`) because Remotion renders
+# from a project entry point: the CLI alone cannot resolve `remotion`/`react`
+# from an arbitrary cwd. Agents scaffold their own project with
+# `/opt/remotion/new-video.sh <dir>`, which SYMLINKS this node_modules rather
+# than copying ~300MB per video.
+#
+# --frozen-lockfile per the supply-chain policy; the lockfile is committed at
+# container/remotion/pnpm-lock.yaml and regenerated with
+# `pnpm install --lockfile-only --ignore-workspace` from that directory (the
+# repo root's pnpm-workspace.yaml otherwise suppresses a nested lockfile).
+#
+# No allowBuilds entry: esbuild's postinstall stays unapproved here and rendering
+# works regardless — verified by rendering a composition end to end in the built
+# image. Do not add one without human approval.
+#
+# remotion.config.ts points Remotion at the system Chromium installed above, so
+# no Chrome Headless Shell download (~150MB) and the first render works with no
+# network egress.
+COPY remotion/package.json remotion/pnpm-lock.yaml /opt/remotion/
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    cd /opt/remotion && pnpm install --frozen-lockfile --ignore-workspace
+COPY remotion/tsconfig.json remotion/remotion.config.ts /opt/remotion/
+COPY remotion/src /opt/remotion/src
+COPY remotion/new-video.sh /opt/remotion/new-video.sh
+# Placeholder shots so the DemoVideo composition renders out of the box, which
+# is what proves the demo engine (camera, cursor, captions) works before an
+# agent has captured anything. Generated with the ffmpeg installed above rather
+# than committed as binaries — the repo stays text-only and they cost ~20KB.
+RUN mkdir -p /opt/remotion/public/shots /opt/remotion/public/clips /opt/remotion/public/audio && \
+    ffmpeg -loglevel error -f lavfi -i color=c=0x14203c:s=1920x1080 -frames:v 1 \
+        /opt/remotion/public/shots/01-placeholder.png && \
+    ffmpeg -loglevel error -f lavfi -i color=c=0x1d2c4f:s=1920x1080 -frames:v 1 \
+        /opt/remotion/public/shots/02-placeholder.png && \
+    chmod -R a+rX /opt/remotion && \
+    chmod 0755 /opt/remotion/new-video.sh && \
+    ln -sf /opt/remotion/new-video.sh /usr/local/bin/new-video
+
+# Cloudflare CLI. Upstream publishes only betas so far, so update-sources.json
+# opts this pin into npm's `latest` tag even when it is a prerelease. workerd's
+# blocked postinstall only costs `cf dev` / `--local`; API commands and deploys
+# don't need it. Auth: CLOUDFLARE_API_TOKEN placeholder, swapped by OneCLI.
+# Telemetry is on by default and ships `cf cli search` query text to Cloudflare.
+ARG CF_CLI_VERSION=1.0.0-beta.12
+ENV CF_SEND_TELEMETRY=false
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    pnpm install -g "cf@${CF_CLI_VERSION}"
+
+# Login shells reset PATH on Debian and can drop Docker ENV-provided /pnpm,
+# which makes globally installed CLIs invisible to Codex/OpenCode shell tools.
+# Expose pnpm shims through /usr/local/bin as a belt-and-suspenders fallback.
+RUN printf "%s\n" \
+        "export PNPM_HOME=/pnpm" \
+        "case \":\$PATH:\" in *\":/pnpm:\"*) ;; *) export PATH=\"/pnpm:\$PATH\" ;; esac" \
+        > /etc/profile.d/nanoclaw-pnpm.sh && \
+    chmod 0644 /etc/profile.d/nanoclaw-pnpm.sh && \
+    find /pnpm -maxdepth 1 -type f -perm /111 -exec sh -c "ln -sf \"\$1\" \"/usr/local/bin/\$(basename \"\$1\")\"" _ {} \;
+
+# Puppeteer config used by mmdc — points at the system Chromium and passes
+# --no-sandbox, without which mmdc launches and silently exits 0 producing no
+# output on Debian containers that lack unprivileged user namespaces.
+COPY --chmod=0644 puppeteer-config.json /app/puppeteer-config.json
+
+# Keep pnpm's generated Claude shim beside its package: its basedir-relative
+# node/module lookup keeps working after the public `claude` command becomes
+# the constrained NanoClaw review launcher below.
+RUN mv /pnpm/claude /pnpm/claude-real && test -x /pnpm/claude-real
+COPY --chmod=0755 claude-review-wrapper.sh /pnpm/claude
+RUN test -x /pnpm/claude
+
+# ---- ncl CLI wrapper ----------------------------------------------------------
+# Actual script lives in the mounted source at /app/src/cli/ncl.ts.
+RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl && \
+    chmod +x /usr/local/bin/ncl
+
+# ---- Entrypoint --------------------------------------------------------------
+COPY --chmod=0755 entrypoint.sh /app/entrypoint.sh
+
+# ---- Workspace + permissions -------------------------------------------------
+# Remap the `node` user+group to UID/GID 1001 before any chowns so the
+# container's runtime UID matches the host's non-root user. Host-side
+# processes (setup scripts, group-init, systemd unit user) run as UID 1001,
+# and host-owned bind mounts — notably `.claude-shared/` at /home/node/.claude
+# — arrive in the container at UID 1001. Without this remap, the container's
+# `node` (UID 1000) can *read* those dirs under 755 perms but can't *write*
+# provider state. The canonical workgroup-memory mount also relies on the
+# runtime UID matching its host ownership. The base image's UID 1000 is
+# arbitrary; no baked dir hard-codes it.
+ARG HOST_UID=1001
+ARG HOST_GID=1001
+# /home/node/.config must exist in the image: cred mounts land nested under it
+# (/home/node/.config/gws/accounts, .../google-calendar-mcp), and Docker creates
+# missing bind-mount parents ROOT-owned — leaving `node` unable to write
+# ~/.config at all (chromium crashpad aborts with exit 133, gcloud can't create
+# its config dir). Pre-creating it node-owned means Docker only root-creates the
+# nested read-only cred paths, which nothing needs to write.
+RUN groupmod -g ${HOST_GID} node && usermod -u ${HOST_UID} -g ${HOST_GID} node && \
+    mkdir -p /workspace/agent /workspace/global /workspace/extra /home/node/.config && \
+    chown -R ${HOST_UID}:${HOST_GID} /workspace /home/node /opt/corepack && \
+    chmod 755 /home/node
+
+USER node
+# Re-assert the pnpm pin as the actual runtime user (not just as root right
+# after `corepack prepare --activate` above) — this is the check that would
+# have caught the COREPACK_HOME/HOME-scoping drift this image once shipped
+# with (PNPM_VERSION pinned 10.x, `node` resolving 11.x latest at runtime).
+RUN resolved="$(pnpm --version)" \
+    && [ "$resolved" = "${PNPM_VERSION}" ] \
+    || { echo "pnpm --version ($resolved) != PNPM_VERSION (${PNPM_VERSION}) as node — pin drifted" >&2; exit 1; }
+# Corepack must be able to WRITE into COREPACK_HOME as node, not just read the
+# baked-in pin: a cloned repo whose own packageManager field names a different
+# pnpm/Yarn version makes Corepack download it into this same dir at runtime.
+# Catches a regression to the old world-readable-only chmod (or a dropped
+# chown) at build time instead of as an EACCES the first time an agent works
+# a repo with a different pin.
+RUN probe="$COREPACK_HOME/.write-probe" \
+    && { touch "$probe" || { echo "COREPACK_HOME ($COREPACK_HOME) not writable by node — Corepack can't install an on-demand pnpm/Yarn pin" >&2; exit 1; }; } \
+    && rm -f "$probe"
+RUN unreadable="$(find /opt/remotion \( -type f ! -readable -o -type d ! -executable \) -print -quit)" \
+    && test -z "$unreadable" \
+    && test -r /app/package.json \
+    && test -r /app/bun.lock \
+    && test -r /app/puppeteer-config.json \
+    && test -x /app/entrypoint.sh \
+    && test -x /usr/local/bin/hex-wrapper.sh \
+    && test -x /opt/remotion/new-video.sh
+# The runtime cwd is /workspace/agent (agent-runner's CWD constant, passed to
+# every provider). This WORKDIR only sets the entrypoint process's cwd, but it
+# must still name a path that exists inside the session-dir bind at /workspace:
+# a WORKDIR that doesn't exist is auto-created by runc at container init as
+# ROOT (it ignores USER), materializing an undeletable dir in the session dir
+# that blocks host-side session reclaim. /workspace/agent is always mounted.
+WORKDIR /workspace/agent
+
+# tini is PID 1, reaps zombies, forwards signals cleanly. entrypoint.sh does
+# `exec bun ...` so bun runs as tini's direct child.
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
+
+# Stamp the source repo's HEAD commit as an image label so the rebuild
+# watcher (src/container-rebuild-watcher.ts) can tell whether the image
+# reflects the latest origin/main. Must be a LABEL instruction driven by
+# ARG — not a `docker build --label` flag — because `--label` is silently
+# dropped on fully-cached rebuilds, but a LABEL layer tied to a changing
+# ARG invalidates and re-stamps. Upstream layers stay cached (ARG not
+# referenced earlier), so the rebuild is near-instant.
+ARG NANOCLAW_COMMIT=unknown
+LABEL nanoclaw.commit=$NANOCLAW_COMMIT
+
+# Agent-runner deps hash — sha256(sha256(package.json) || sha256(bun.lock))
+# sliced to 16 hex chars. Computed by container/build.sh and compared at host
+# spawn time by src/agent-runner-image-check.ts. Catches the "added a dep,
+# forgot to rebuild" footgun: agent-runner src is bind-mounted live but
+# node_modules is baked here, so a missing dep crash-loops every spawn with
+# no surfaced error. Same ARG+LABEL pattern as nanoclaw.commit above —
+# `docker build --label` is silently dropped on fully-cached rebuilds.
+ARG AGENT_RUNNER_DEPS_HASH=unknown
+LABEL nanoclaw.agentRunnerDepsHash=$AGENT_RUNNER_DEPS_HASH
+
+# Pressure-aware storage cleanup reads these immutable labels before deleting
+# any managed image. Keeping them in an ARG-driven final layer renews a
+# candidate's lease even when all content layers are cache hits.
+ARG NANOCLAW_RETENTION_CREATED_AT=unknown
+ARG NANOCLAW_RETENTION_HOURS=0
+ARG NANOCLAW_RETENTION_OWNER
+ARG NANOCLAW_IMAGE_ROLE=canonical
+ARG NANOCLAW_IMAGE_INSTALL
+LABEL nanoclaw.retention.created_at=$NANOCLAW_RETENTION_CREATED_AT
+LABEL nanoclaw.retention.hours=$NANOCLAW_RETENTION_HOURS
+LABEL nanoclaw.retention.owner=$NANOCLAW_RETENTION_OWNER
+LABEL nanoclaw.image.role=$NANOCLAW_IMAGE_ROLE
+LABEL nanoclaw.image.install=$NANOCLAW_IMAGE_INSTALL

@@ -1,0 +1,1328 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
+
+import { parseMarkdown } from 'chat';
+
+import {
+  createChatSdkBridge,
+  parseRetryAfterMs,
+  reconstructInboundText,
+  resolveQuotedReply,
+  splitForLimit,
+} from './chat-sdk-bridge.js';
+import type { Message as ChatMessage } from 'chat';
+import { parseMessageFlags } from '../flag-parser.js';
+
+function stubAdapter(partial: Partial<Adapter>): Adapter {
+  return { name: 'stub', ...partial } as unknown as Adapter;
+}
+
+interface RecordedPost {
+  threadId: string;
+  body: { markdown?: string; raw?: string };
+}
+
+/**
+ * Build a bridge over a stub adapter that records every postMessage body so
+ * tests can assert which delivery shape (markdown vs raw) was used.
+ */
+function recordingBridge(opts: {
+  transformOutboundText?: (t: string) => string;
+  transformOutboundMarkdown?: (t: string) => string;
+}): { bridge: ReturnType<typeof createChatSdkBridge>; posts: RecordedPost[] } {
+  const posts: RecordedPost[] = [];
+  const adapter = stubAdapter({
+    name: 'stub',
+    channelIdFromThreadId: (t: string) => t,
+    postMessage: async (threadId: string, body: { markdown?: string; raw?: string }) => {
+      posts.push({ threadId, body });
+      return { id: 'msg-stub', threadId, raw: {} };
+    },
+  } as unknown as Partial<Adapter>);
+  const bridge = createChatSdkBridge({
+    adapter,
+    supportsThreads: true,
+    ...opts,
+  });
+  return { bridge, posts };
+}
+
+interface PostCall {
+  threadId: string;
+  message: AdapterPostableMessage;
+}
+
+function makePostCapture() {
+  const calls: PostCall[] = [];
+  const postMessage = async (threadId: string, message: AdapterPostableMessage): Promise<RawMessage<unknown>> => {
+    calls.push({ threadId, message });
+    return { id: 'msg-stub', threadId, raw: {} };
+  };
+  return { calls, postMessage };
+}
+
+function hasLoneSurrogate(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(i + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      i++;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+describe('splitForLimit', () => {
+  it('returns a single chunk when text fits', () => {
+    expect(splitForLimit('short text', 100)).toEqual(['short text']);
+  });
+
+  it('splits on paragraph boundaries when available', () => {
+    const text = 'para one line one\npara one line two\n\npara two line one\npara two line two';
+    const chunks = splitForLimit(text, 40);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(40);
+  });
+
+  it('falls back to line boundaries when no paragraph fits', () => {
+    const text = 'alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot';
+    const chunks = splitForLimit(text, 15);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(15);
+  });
+
+  it('hard-cuts when no whitespace is available', () => {
+    const text = 'a'.repeat(100);
+    const chunks = splitForLimit(text, 30);
+    expect(chunks.length).toBe(Math.ceil(100 / 30));
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(30);
+    expect(chunks.join('')).toBe(text);
+  });
+});
+
+describe('createChatSdkBridge', () => {
+  // The bridge is now transport-only: forward inbound events, relay outbound
+  // ops. All per-wiring engage / accumulate / drop / subscribe decisions live
+  // in the router (src/router.ts routeInbound / evaluateEngage) and are
+  // exercised by host-core.test.ts end-to-end. These tests only cover the
+  // bridge's narrow, platform-adjacent surface.
+
+  it('omits openDM when the underlying Chat SDK adapter has none', () => {
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({}),
+      supportsThreads: false,
+    });
+    expect(bridge.openDM).toBeUndefined();
+  });
+
+  it('exposes openDM when the underlying adapter has one, and delegates directly', async () => {
+    const openDMCalls: string[] = [];
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({
+        openDM: async (userId: string) => {
+          openDMCalls.push(userId);
+          return `thread::${userId}`;
+        },
+        channelIdFromThreadId: (threadId: string) => `stub:${threadId.replace(/^thread::/, '')}`,
+      }),
+      supportsThreads: false,
+    });
+    expect(bridge.openDM).toBeDefined();
+    const platformId = await bridge.openDM!('user-42');
+    // Delegation: adapter.openDM → adapter.channelIdFromThreadId, no chat.openDM in between.
+    expect(openDMCalls).toEqual(['user-42']);
+    expect(platformId).toBe('stub:user-42');
+  });
+
+  it('exposes subscribe (lets the router initiate thread subscription on mention-sticky engage)', () => {
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({}),
+      supportsThreads: true,
+    });
+    expect(typeof bridge.subscribe).toBe('function');
+  });
+});
+
+describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
+  // Discord auto-creates a thread when a user replies to a channel-root
+  // message; the parent message lives in the parent channel, outside what
+  // `fetchMessages(threadId)` returns. The fetchThreadAnchor hook prepends
+  // that anchor so the agent's first wake inside the thread sees what the
+  // user is replying to.
+
+  function adapterWithFetchMessages(
+    msgs: Array<{ id: string; text: string; sender: string; iso: string; userId?: string }>,
+  ) {
+    return stubAdapter({
+      fetchMessages: async () => ({
+        messages: msgs.map((m) => ({
+          id: m.id,
+          text: m.text,
+          author: { userId: m.userId, fullName: m.sender, userName: m.sender, isMe: false },
+          metadata: { dateSent: new Date(m.iso) },
+        })),
+      }),
+    } as unknown as Partial<Adapter>);
+  }
+
+  it('prepends the anchor messages returned by fetchThreadAnchor (M0 + M1, in chronological order)', async () => {
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        { id: 'in-1', text: 'reply inside thread', sender: 'Operator', iso: '2026-05-03T13:00:00Z' },
+      ]),
+      supportsThreads: true,
+      fetchThreadAnchor: async () => [
+        {
+          sender: 'Example Agent',
+          text: 'wiki lint findings — 3 categories',
+          timestamp: '2026-05-03T10:00:00Z',
+          isAnchor: true,
+        },
+        {
+          sender: 'Operator',
+          text: '@Example Agent fix stale claims',
+          timestamp: '2026-05-03T10:30:00Z',
+          isAnchor: true,
+        },
+      ],
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history).toHaveLength(3);
+    expect(history[0].text).toBe('wiki lint findings — 3 categories');
+    expect(history[0].isAnchor).toBe(true);
+    expect(history[1].text).toBe('@Example Agent fix stale claims');
+    expect(history[1].isAnchor).toBe(true);
+    expect(history[2].sender).toBe('Operator');
+    expect(history[2].isAnchor).toBeUndefined();
+  });
+
+  it('skips the anchor when fetchThreadAnchor returns null (forum threads, channel root, errors)', async () => {
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        { id: 'in-1', text: 'reply inside thread', sender: 'Operator', iso: '2026-05-03T12:00:00Z' },
+      ]),
+      supportsThreads: true,
+      fetchThreadAnchor: async () => null,
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history).toHaveLength(1);
+    expect(history[0].sender).toBe('Operator');
+  });
+
+  it('does not duplicate when the anchor is already in the in-thread results (forum threads)', async () => {
+    const sharedIso = '2026-05-03T10:00:00Z';
+    const sharedText = 'forum starter post';
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        { id: 'starter', text: sharedText, sender: 'Example Agent', iso: sharedIso },
+        { id: 'in-1', text: 'reply', sender: 'Operator', iso: '2026-05-03T12:00:00Z' },
+      ]),
+      supportsThreads: true,
+      fetchThreadAnchor: async () => [
+        { sender: 'Example Agent', text: sharedText, timestamp: sharedIso, isAnchor: true },
+      ],
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history.filter((m) => m.text === sharedText)).toHaveLength(1);
+  });
+
+  it('still returns in-thread history when fetchThreadAnchor throws', async () => {
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        { id: 'in-1', text: 'reply', sender: 'Operator', iso: '2026-05-03T12:00:00Z' },
+      ]),
+      supportsThreads: true,
+      fetchThreadAnchor: async () => {
+        throw new Error('network down');
+      },
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history).toHaveLength(1);
+    expect(history[0].sender).toBe('Operator');
+  });
+
+  it('forwards excludeMessageId to fetchThreadAnchor (so adapters can skip when anchor == trigger)', async () => {
+    let receivedExclude: string | undefined;
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([]),
+      supportsThreads: true,
+      fetchThreadAnchor: async (_t, opts) => {
+        receivedExclude = opts?.excludeMessageId;
+        return null;
+      },
+    });
+    await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50, excludeMessageId: 'mention-msg-id' });
+    expect(receivedExclude).toBe('mention-msg-id');
+  });
+
+  it('applies transformInboundText to in-thread message text', async () => {
+    // Codex review #97: live messages go through messageToInbound which
+    // applies transformInboundText. The thread-history path was bypassing
+    // it, so a resumed thread saw raw snowflakes in [Thread context] even
+    // after live messages stopped leaking them.
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        { id: 'in-1', text: 'hey <@123> can you check', sender: 'Operator', iso: '2026-05-03T12:00:00Z' },
+        { id: 'in-2', text: 'sure thing', sender: 'Example Agent', iso: '2026-05-03T12:01:00Z' },
+      ]),
+      supportsThreads: true,
+      transformInboundText: (t) => t.replace(/<@123>/g, '@Example Agent-Codex'),
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history.map((m) => m.text)).toEqual(['hey @Example Agent-Codex can you check', 'sure thing']);
+  });
+
+  it('applies transformInboundSender to stale sibling bylines in thread history', async () => {
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        {
+          id: 'in-1',
+          text: 'assignment',
+          sender: 'Beacon',
+          userId: 'U-JORDAN',
+          iso: '2026-05-03T12:00:00Z',
+        },
+        {
+          id: 'in-2',
+          text: 'question',
+          sender: 'Operator',
+          userId: 'U-HUMAN',
+          iso: '2026-05-03T12:01:00Z',
+        },
+      ]),
+      supportsThreads: true,
+      transformInboundSender: (author) => (author.userId === 'U-JORDAN' ? 'Jordan' : null),
+    });
+    const history = await bridge.fetchThreadHistory!('slack:C:T', { limit: 50 });
+    expect(history.map((m) => m.sender)).toEqual(['Jordan', 'Operator']);
+  });
+
+  it('applies transformInboundText to anchor messages too', async () => {
+    // The mention-trigger anchor on Discord auto-threads sits outside
+    // fetchMessages but is prepended into history. Without applying the
+    // transform there, the very first wake on a thread can still surface
+    // raw `<@id>` to the agent.
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        { id: 'in-1', text: 'on it', sender: 'Example Agent', iso: '2026-05-03T13:00:00Z' },
+      ]),
+      supportsThreads: true,
+      fetchThreadAnchor: async () => [
+        {
+          sender: 'Operator',
+          text: 'hey <@123> have <@456> handle this',
+          timestamp: '2026-05-03T10:00:00Z',
+          isAnchor: true,
+        },
+      ],
+      transformInboundText: (t) => t.replace(/<@123>/g, '@Example Agent').replace(/<@456>/g, '@Example Agent-Codex'),
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history[0].text).toBe('hey @Example Agent have @Example Agent-Codex handle this');
+    expect(history[0].isAnchor).toBe(true);
+  });
+
+  it('de-dupes anchors against in-thread results on transformed text, not raw', async () => {
+    // For forum threads the anchor IS the first in-thread message; if we
+    // de-duped on raw text against transformed text the same starter post
+    // would survive twice. Comparison must be on normalized text on both
+    // sides.
+    const rawText = 'starter <@123> hi';
+    const transformedText = 'starter @Example Agent hi';
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        { id: 'starter', text: rawText, sender: 'Example Agent', iso: '2026-05-03T10:00:00Z' },
+      ]),
+      supportsThreads: true,
+      fetchThreadAnchor: async () => [
+        { sender: 'Example Agent', text: rawText, timestamp: '2026-05-03T10:00:00Z', isAnchor: true },
+      ],
+      transformInboundText: (t) => t.replace(/<@123>/g, '@Example Agent'),
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history.filter((m) => m.text === transformedText)).toHaveLength(1);
+  });
+});
+
+describe('createChatSdkBridge — outbound transform path', () => {
+  // The transform mode determines whether the adapter sees `markdown` or `raw`.
+  // `markdown` is required for adapters that emit rich blocks (Slack Block Kit
+  // tables, Discord ASCII tables) — those code paths are gated on the message
+  // arriving as `markdown` or `ast`. `raw` is appropriate when the transform
+  // has already pre-rendered to platform-native syntax (Telegram mrkdwn).
+
+  it('transformOutboundText forces raw delivery (legacy behavior preserved)', async () => {
+    const { bridge, posts } = recordingBridge({
+      transformOutboundText: (t) => t.toUpperCase(),
+    });
+    await bridge.deliver('thread-1', null, {
+      kind: 'chat',
+      content: { text: 'hello *world*' },
+    } as never);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].body).toEqual({ raw: 'HELLO *WORLD*' });
+  });
+
+  it('transformOutboundMarkdown keeps markdown delivery (rich-block features still fire)', async () => {
+    const { bridge, posts } = recordingBridge({
+      transformOutboundMarkdown: (md) => md.replace(/^## (.+)$/gm, '**$1**'),
+    });
+    await bridge.deliver('thread-1', null, {
+      kind: 'chat',
+      content: { text: '## Heading\n\n| a | b |\n|---|---|\n| 1 | 2 |' },
+    } as never);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].body.markdown).toBeDefined();
+    expect(posts[0].body.raw).toBeUndefined();
+    expect(posts[0].body.markdown).toBe('**Heading**\n\n| a | b |\n|---|---|\n| 1 | 2 |');
+  });
+
+  it('no transform → markdown delivery, content unchanged', async () => {
+    const { bridge, posts } = recordingBridge({});
+    await bridge.deliver('thread-1', null, {
+      kind: 'chat',
+      content: { text: '**bold** text' },
+    } as never);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].body).toEqual({ markdown: '**bold** text' });
+  });
+
+  it('transformOutboundText wins when both are set (legacy precedence)', async () => {
+    const { bridge, posts } = recordingBridge({
+      transformOutboundText: () => 'TEXT-WINS',
+      transformOutboundMarkdown: () => 'MARKDOWN-LOSES',
+    });
+    await bridge.deliver('thread-1', null, {
+      kind: 'chat',
+      content: { text: 'whatever' },
+    } as never);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].body).toEqual({ raw: 'TEXT-WINS' });
+  });
+
+  it('status-kind narration does not resolve into a live mention (2026-08-18 incident)', async () => {
+    // Stand-in for resolveSlackMentions: rewrites @Barry -> <@UBARRY> the
+    // same way the real Slack/Discord rewriter would, so this test fails if
+    // the zero-width neutralization stops happening.
+    const mentionRewriter = (t: string): string => t.replace(/@Barry\b/g, '<@UBARRY>');
+    const { bridge, posts } = recordingBridge({ transformOutboundMarkdown: mentionRewriter });
+
+    await bridge.deliver('thread-1', null, {
+      kind: 'status',
+      content: { text: 'drafting the post... keeping it concise without mentioning @Barry' },
+    } as never);
+
+    expect(posts).toHaveLength(1);
+    const delivered = posts[0].body.markdown as string;
+    expect(delivered).not.toContain('<@UBARRY>');
+    // Zero-width space breaks the rewriter's match but reads identically —
+    // strip it and the original prose is untouched.
+    expect(delivered.replace(/\u200b/g, '')).toBe('drafting the post... keeping it concise without mentioning @Barry');
+  });
+
+  it('chat-kind mentions still resolve normally (real addressing keeps working)', async () => {
+    const mentionRewriter = (t: string): string => t.replace(/@robin\b/g, '<@UROBIN>');
+    const { bridge, posts } = recordingBridge({ transformOutboundMarkdown: mentionRewriter });
+
+    await bridge.deliver('thread-1', null, {
+      kind: 'chat',
+      content: { text: '@robin can you take this one?' },
+    } as never);
+
+    expect(posts).toHaveLength(1);
+    expect(posts[0].body.markdown).toBe('<@UROBIN> can you take this one?');
+  });
+});
+
+describe('createChatSdkBridge.deliver — ask_question cards', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('caps rendered ask_question titles before creating the Card header', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+
+    await bridge.deliver('slack:C123', 'slack:C123:1781317853.356239', {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'q-long-title',
+        title: 'Question '.repeat(30),
+        question: 'Pick one',
+        options: ['Approve', 'Reject'],
+      },
+    });
+
+    expect(calls).toHaveLength(1);
+    const msg = calls[0].message as { card?: { title?: string; subtitle?: string }; fallbackText?: string };
+    const renderedTitle = msg.card?.title ?? '';
+    expect(Array.from(renderedTitle)).toHaveLength(150);
+    expect(renderedTitle).toMatch(/…$/);
+    expect(hasLoneSurrogate(renderedTitle)).toBe(false);
+    expect(msg.card?.subtitle).toBe('Pick one');
+    expect(msg.fallbackText?.startsWith(renderedTitle)).toBe(true);
+  });
+
+  it('puts decision context in the native card description used by Discord and Slack', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+
+    await bridge.deliver('discord:GUILD:CHANNEL', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'approval-with-detail',
+        title: 'Install Packages Request',
+        question: 'Agent "example-group" wants to install WebKit libraries. Approve?',
+        options: ['Approve', 'Reject'],
+      },
+    });
+
+    const msg = calls[0].message as { card?: { subtitle?: string }; fallbackText?: string };
+    expect(msg.card?.subtitle).toBe('Agent "example-group" wants to install WebKit libraries. Approve?');
+    expect(msg.fallbackText).toContain('Agent "example-group" wants to install WebKit libraries. Approve?');
+  });
+
+  it('puts Discord decision context in ordinary message content with native buttons', async () => {
+    const postMessage = vi.fn(async () => {
+      throw new Error('Discord card delivery must not fall back to the embed-only adapter path');
+    });
+    const fetchMock = vi.fn(
+      async (_input: string | URL | Request, _init?: RequestInit) =>
+        new Response(JSON.stringify({ id: 'discord-message-1' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ name: 'discord', postMessage }),
+      channelType: 'discord-codex',
+      botToken: 'test-bot-token',
+      supportsThreads: true,
+      maxTextLength: 2000,
+    });
+
+    const id = await bridge.deliver('discord:GUILD:PARENT', 'discord:GUILD:PARENT:THREAD', {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'q-discord-content',
+        title: 'Install Packages Request',
+        question: 'Agent "example-group" wants to install WebKit libraries. Approve?',
+        options: [
+          { label: 'Approve', value: 'approve', style: 'primary' },
+          { label: 'Reject', value: 'reject', style: 'danger' },
+        ],
+      },
+    });
+
+    expect(id).toBe('discord-message-1');
+    expect(postMessage).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('https://discord.com/api/v10/channels/THREAD/messages');
+    expect((init?.headers as Record<string, string>).Authorization).toBe('Bot test-bot-token');
+    const body = JSON.parse(init?.body as string);
+    expect(body).toMatchObject({
+      content: '**Install Packages Request**\n\nAgent "example-group" wants to install WebKit libraries. Approve?',
+      allowed_mentions: { parse: [] },
+    });
+    expect(body.embeds).toBeUndefined();
+    expect(body.components).toEqual([
+      {
+        type: 1,
+        components: [
+          { type: 2, style: 1, label: 'Approve', custom_id: 'ncq:q-discord-content:0\n0' },
+          { type: 2, style: 4, label: 'Reject', custom_id: 'ncq:q-discord-content:1\n1' },
+        ],
+      },
+    ]);
+  });
+
+  it('splits Discord options into rows of at most five buttons', async () => {
+    const fetchMock = vi.fn(
+      async (_input: string | URL | Request, _init?: RequestInit) =>
+        new Response(JSON.stringify({ id: 'discord-message-rows' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ name: 'discord' }),
+      botToken: 'test-bot-token',
+      supportsThreads: false,
+    });
+
+    await bridge.deliver('discord:GUILD:CHANNEL', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'q-rows',
+        title: 'Choose',
+        question: 'Pick one',
+        options: ['One', 'Two', 'Three', 'Four', 'Five', 'Six'],
+      },
+    });
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+    expect(body.components.map((row: { components: unknown[] }) => row.components.length)).toEqual([5, 1]);
+  });
+});
+
+describe('createChatSdkBridge.deliver — ask_question cards (button styles)', () => {
+  // Approval cards color their buttons (Slack: primary→green, danger→red).
+  // The bridge must forward the normalized option style into Button() and
+  // omit it when unset — an invalid style surviving to Block Kit would fail
+  // the whole card with invalid_blocks (effective auto-deny).
+
+  interface CapturedButton {
+    type?: string;
+    id?: string;
+    label?: string;
+    value?: string;
+    style?: string;
+  }
+
+  function buttonsFrom(calls: PostCall[]): CapturedButton[] {
+    const msg = calls[0].message as {
+      card?: { children?: Array<{ type?: string; children?: CapturedButton[] }> };
+    };
+    const actionsRow = msg.card?.children?.find((c) => c.type === 'actions');
+    expect(actionsRow).toBeDefined();
+    return actionsRow?.children ?? [];
+  }
+
+  it('passes each option style through to the Button, and omits it when unset', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    await bridge.deliver('slack:C1', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'q-1',
+        title: 'Approval needed',
+        question: 'Allow the tool call?',
+        options: [
+          { label: 'Approve', style: 'primary' },
+          { label: 'Deny', style: 'danger' },
+          'Skip', // string shorthand — never styled
+        ],
+      },
+    });
+    expect(calls).toHaveLength(1);
+    const buttons = buttonsFrom(calls);
+    expect(buttons.map((b) => b.label)).toEqual(['Approve', 'Deny', 'Skip']);
+    expect(buttons.map((b) => b.style)).toEqual(['primary', 'danger', undefined]);
+  });
+
+  it('drops invalid styles before they reach the Button (delivery goes through normalizeOptions)', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    await bridge.deliver('slack:C1', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'q-2',
+        title: 'Approval needed',
+        question: 'Allow the tool call?',
+        options: [{ label: 'Approve', style: 'chartreuse' }],
+      },
+    });
+    const buttons = buttonsFrom(calls);
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].style).toBeUndefined();
+  });
+});
+
+describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
+  // The send_card MCP tool writes outbound rows with `{ type: 'card', card, fallbackText }`.
+  // Before this branch existed the bridge silently dropped them: cards have no
+  // `text` / `markdown`, so the trailing fallback `if (text)` was false and the
+  // function returned without calling the adapter. These tests pin the contract
+  // for the dedicated card branch.
+
+  it('renders title, description, and string children, then posts via the adapter', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    const id = await bridge.deliver('telegram:42', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        card: {
+          title: 'Daily',
+          description: 'Your plate today',
+          children: ['• item one', '• item two'],
+        },
+        fallbackText: 'Daily: your plate',
+      },
+    });
+    expect(id).toBe('msg-stub');
+    expect(calls).toHaveLength(1);
+    const msg = calls[0].message as { card?: unknown; fallbackText?: string };
+    expect(msg.fallbackText).toBe('Daily: your plate');
+    expect(msg.card).toBeDefined();
+  });
+
+  it('caps rendered send_card titles without splitting emoji code points', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    await bridge.deliver('slack:C123', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        card: {
+          title: `${'A'.repeat(148)}🚨 tail`,
+          description: 'body',
+        },
+      },
+    });
+
+    const msg = calls[0].message as { card?: { title?: string } };
+    const renderedTitle = msg.card?.title ?? '';
+    const renderedCodePoints = Array.from(renderedTitle);
+    expect(renderedCodePoints).toHaveLength(150);
+    expect(renderedCodePoints.at(-2)).toBe('🚨');
+    expect(renderedCodePoints.at(-1)).toBe('…');
+    expect(hasLoneSurrogate(renderedTitle)).toBe(false);
+  });
+
+  it('drops actions without url (send_card is fire-and-forget; non-URL buttons would have nowhere to land)', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    await bridge.deliver('discord:guild:chan', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        card: {
+          title: 'Card',
+          description: 'has only label-only actions',
+          actions: [{ label: 'Add' }, { label: 'Skip' }],
+        },
+      },
+    });
+    expect(calls).toHaveLength(1);
+    // Cast through the public Card shape to read the children we set
+    const msg = calls[0].message as { card?: { children?: Array<{ type?: string }> } };
+    const childTypes = (msg.card?.children ?? []).map((c) => c.type);
+    expect(childTypes).not.toContain('actions');
+  });
+
+  it('renders url actions as link buttons inside an Actions row', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    await bridge.deliver('discord:guild:chan', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        card: {
+          title: 'Docs',
+          actions: [{ label: 'Open', url: 'https://example.com' }, { label: 'No-link' }],
+        },
+      },
+    });
+    const msg = calls[0].message as {
+      card?: { children?: Array<{ type?: string; children?: Array<{ type?: string; url?: string }> }> };
+    };
+    const actionsRow = msg.card?.children?.find((c) => c.type === 'actions');
+    expect(actionsRow).toBeDefined();
+    const buttons = actionsRow?.children ?? [];
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].type).toBe('link-button');
+    expect(buttons[0].url).toBe('https://example.com');
+  });
+
+  it('skips delivery when the card has neither title nor body content', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    const id = await bridge.deliver('telegram:42', null, {
+      kind: 'chat-sdk',
+      content: { type: 'card', card: {} },
+    });
+    expect(id).toBeUndefined();
+    expect(calls).toHaveLength(0);
+  });
+
+  it('falls through to the text branch for non-card chat-sdk payloads (no regression)', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    await bridge.deliver('telegram:42', null, {
+      kind: 'chat-sdk',
+      content: { text: 'plain hello' },
+    });
+    expect(calls).toHaveLength(1);
+    const msg = calls[0].message as { markdown?: string };
+    expect(msg.markdown).toBe('plain hello');
+  });
+});
+
+describe('parseRetryAfterMs', () => {
+  it('extracts retry_after from Discord 429 JSON', () => {
+    const err = new Error(
+      'Discord API error: 429 {"message": "You are being rate limited.", "retry_after": 0.3, "global": false}',
+    );
+    expect(parseRetryAfterMs(err)).toBe(300);
+  });
+
+  it('rounds up sub-millisecond values', () => {
+    const err = new Error('Discord API error: 429 {"retry_after": 0.0001}');
+    expect(parseRetryAfterMs(err)).toBe(1);
+  });
+
+  it('handles whole-second retry_after', () => {
+    const err = new Error('Discord API error: 429 {"retry_after": 5}');
+    expect(parseRetryAfterMs(err)).toBe(5000);
+  });
+
+  it('handles Slack-style "Retry-After: N" header', () => {
+    const err = new Error('slack rate_limited: Retry-After: 2');
+    expect(parseRetryAfterMs(err)).toBe(2000);
+  });
+
+  it('falls back to 1000ms when 429 marker exists but value is missing', () => {
+    const err = new Error('429 too many requests');
+    expect(parseRetryAfterMs(err)).toBe(1000);
+  });
+
+  it('returns null for non-rate-limit errors', () => {
+    expect(parseRetryAfterMs(new Error('500 internal server error'))).toBeNull();
+    expect(parseRetryAfterMs(new Error('connection refused'))).toBeNull();
+  });
+
+  it('returns null for non-Error inputs', () => {
+    expect(parseRetryAfterMs(null)).toBeNull();
+    expect(parseRetryAfterMs(undefined)).toBeNull();
+    expect(parseRetryAfterMs('429 plain string')).toBeNull();
+    expect(parseRetryAfterMs({ status: 429 })).toBeNull();
+  });
+});
+
+describe('createChatSdkBridge.deliver — edit path (status post-then-edit)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('truncates to a single edit instead of posting additional chunks for oversize status text', async () => {
+    // Bug B regression guard. Previously, oversize status edits called
+    // editMessage(chunk0) THEN postMessage(chunk1..N). The new posts were
+    // not registered in delivery.ts:statusTracking and survived the orphan
+    // cleanup on chat delivery, leaving stale "thinking-block tails"
+    // visible to the user (they looked like a second thinking block — sometimes
+    // even resembling response text when the agent's reasoning was draft-shaped).
+    const edits: Array<{ threadId: string; messageId: string; body: { markdown?: string } }> = [];
+    const posts: Array<{ threadId: string }> = [];
+    const adapter = stubAdapter({
+      editMessage: async (threadId: string, messageId: string, body: { markdown?: string }) => {
+        edits.push({ threadId, messageId, body });
+      },
+      postMessage: async (threadId: string) => {
+        posts.push({ threadId });
+        return { id: 'extra-chunk', threadId, raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, maxTextLength: 50 });
+
+    // 200 char status — splits into 4 chunks of 50 under the old code.
+    const longStatus = 'a'.repeat(200);
+    await bridge.deliver('discord:c1', null, {
+      kind: 'status',
+      content: { operation: 'edit', messageId: 'msg-original', text: longStatus },
+    });
+
+    expect(edits).toHaveLength(1);
+    expect(edits[0].messageId).toBe('msg-original');
+    // Truncated, ends with ellipsis, ≤ limit (the ellipsis itself adds 1 char).
+    expect(edits[0].body.markdown!.length).toBeLessThanOrEqual(51);
+    expect(edits[0].body.markdown!.endsWith('…')).toBe(true);
+    // Critical invariant: zero additional posts.
+    expect(posts).toHaveLength(0);
+  });
+
+  it('passes short status text through unchanged (no truncation when it fits)', async () => {
+    const edits: Array<{ body: { markdown?: string } }> = [];
+    const adapter = stubAdapter({
+      editMessage: async (_t: string, _m: string, body: { markdown?: string }) => {
+        edits.push({ body });
+      },
+      postMessage: async () => ({ id: 'unused', threadId: 'x', raw: {} }),
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, maxTextLength: 50 });
+    await bridge.deliver('discord:c1', null, {
+      kind: 'status',
+      content: { operation: 'edit', messageId: 'msg-x', text: 'short status' },
+    });
+    expect(edits[0].body.markdown).toBe('short status');
+  });
+
+  it("Discord: a clearActions edit strips the resolved card's buttons after the text edit", async () => {
+    const order: string[] = [];
+    const editMessage = vi.fn(async () => {
+      order.push('edit');
+    });
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => {
+      order.push('clear');
+      return new Response(JSON.stringify({ id: 'card-1' }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ name: 'discord', editMessage } as unknown as Partial<Adapter>),
+      channelType: 'discord',
+      botToken: 'test-bot-token',
+      supportsThreads: true,
+    });
+
+    await bridge.deliver('discord:GUILD:PARENT', 'discord:GUILD:PARENT:THREAD', {
+      kind: 'chat-sdk',
+      content: { operation: 'edit', messageId: 'card-1', text: 'Ship\n\n✅ Ship — Owner', clearActions: true },
+    });
+
+    expect(order).toEqual(['edit', 'clear']);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('https://discord.com/api/v10/channels/THREAD/messages/card-1');
+    expect(init?.method).toBe('PATCH');
+    expect(JSON.parse(init?.body as string)).toEqual({ components: [] });
+  });
+
+  it('Discord: a rate-limited component clear is retried', async () => {
+    const fetchMock = vi
+      .fn(async (_input: string | URL | Request, _init?: RequestInit) => new Response('{}', { status: 200 }))
+      .mockResolvedValueOnce(new Response('{"retry_after": 0}', { status: 429 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ name: 'discord', editMessage: async () => {} } as unknown as Partial<Adapter>),
+      channelType: 'discord',
+      botToken: 'test-bot-token',
+      supportsThreads: true,
+    });
+
+    await bridge.deliver('discord:GUILD:PARENT', null, {
+      kind: 'chat-sdk',
+      content: { operation: 'edit', messageId: 'card-1', text: 'Resolved', clearActions: true },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('Discord: an ordinary edit makes no component-clearing call', async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ name: 'discord', editMessage: async () => {} } as unknown as Partial<Adapter>),
+      channelType: 'discord',
+      botToken: 'test-bot-token',
+      supportsThreads: true,
+    });
+
+    await bridge.deliver('discord:GUILD:PARENT', null, {
+      kind: 'status',
+      content: { operation: 'edit', messageId: 'status-1', text: 'thinking…' },
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('createChatSdkBridge.deliver — status fresh-post truncation', () => {
+  it('truncates oversize status fresh-post to a single chunk (no orphan thinking-block tail)', async () => {
+    // Bug observed in production after Fix B: a 2028-char STATUS was the
+    // FIRST status of a turn, so delivery.ts wrapped it as a fresh post
+    // (statusTracking was empty after the prior chat reply cleared it).
+    // The bridge's post-path then split into multiple chunks; only the
+    // first chunk's id was tracked, chunks 2+ posted as untracked Discord
+    // messages and survived orphan-cleanup as a visible "second thinking
+    // block" to the user — matching exactly the symptom reported.
+    const calls: Array<{ markdown?: string }> = [];
+    const adapter = stubAdapter({
+      postMessage: async (_threadId: string, body: { markdown?: string }) => {
+        calls.push(body);
+        return { id: `id-${calls.length}`, threadId: 'x', raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, maxTextLength: 50 });
+
+    const longStatus = '> 💭 ' + 'a'.repeat(200);
+    const id = await bridge.deliver('discord:c1', null, {
+      kind: 'status',
+      content: { text: longStatus },
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].markdown!.length).toBeLessThanOrEqual(51);
+    expect(calls[0].markdown!.endsWith('…')).toBe(true);
+    expect(id).toBe('id-1');
+  });
+
+  it('chat fresh-post still splits and posts all chunks (no regression)', async () => {
+    const calls: Array<{ markdown?: string }> = [];
+    const targets: string[] = [];
+    const adapter = stubAdapter({
+      postMessage: async (threadId: string, body: { markdown?: string }) => {
+        targets.push(threadId);
+        calls.push(body);
+        return { id: `id-${calls.length}`, threadId: 'x', raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, maxTextLength: 30 });
+    const text = 'A'.repeat(30) + '\n' + 'B'.repeat(30) + '\n' + 'C'.repeat(30);
+    await bridge.deliver('discord:c1', null, { kind: 'chat', content: { text } });
+    expect(calls).toHaveLength(3);
+    expect(calls[0].markdown).toContain('A');
+    expect(calls[1].markdown).toContain('B');
+    expect(calls[2].markdown).toContain('C');
+    // Without threadContinuationChunks every chunk stays channel-level.
+    expect(targets).toEqual(['discord:c1', 'discord:c1', 'discord:c1']);
+  });
+
+  it('threadContinuationChunks: channel-level continuation chunks thread under the first chunk', async () => {
+    // Regression guard: a 4.2k channel-level post on Slack split into two
+    // sibling parents; the second parent carried the @-mention, so the
+    // mentioned peer threaded the whole run under the wrong root.
+    const targets: string[] = [];
+    const adapter = stubAdapter({
+      postMessage: async (threadId: string) => {
+        targets.push(threadId);
+        return { id: `ts-${targets.length}`, threadId, raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({
+      adapter,
+      supportsThreads: true,
+      maxTextLength: 30,
+      threadContinuationChunks: true,
+    });
+    const text = 'A'.repeat(30) + '\n' + 'B'.repeat(30) + '\n' + 'C'.repeat(30);
+    const id = await bridge.deliver('slack:C1', null, { kind: 'chat', content: { text } });
+    expect(targets).toEqual(['slack:C1', 'slack:C1:ts-1', 'slack:C1:ts-1']);
+    expect(id).toBe('ts-1');
+  });
+
+  it('threadContinuationChunks: a continuation chunk that cannot thread falls back to channel level, not truncation', async () => {
+    const targets: string[] = [];
+    const adapter = stubAdapter({
+      postMessage: async (threadId: string) => {
+        targets.push(threadId);
+        if (threadId !== 'discord:g:c1') throw new Error('Missing Permissions');
+        return { id: `m-${targets.length}`, threadId, raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({
+      adapter,
+      supportsThreads: true,
+      maxTextLength: 30,
+      threadContinuationChunks: true,
+    });
+    const text = 'A'.repeat(30) + '\n' + 'B'.repeat(30) + '\n' + 'C'.repeat(30);
+    const id = await bridge.deliver('discord:g:c1', null, { kind: 'chat', content: { text } });
+    // Chunk 2 tries the thread once, then it and chunk 3 land at channel level.
+    expect(targets).toEqual(['discord:g:c1', 'discord:g:c1:m-1', 'discord:g:c1', 'discord:g:c1']);
+    expect(id).toBe('m-1');
+  });
+
+  it('threadContinuationChunks: thread-targeted deliveries keep all chunks on the given thread', async () => {
+    const targets: string[] = [];
+    const adapter = stubAdapter({
+      postMessage: async (threadId: string) => {
+        targets.push(threadId);
+        return { id: `ts-${targets.length}`, threadId, raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({
+      adapter,
+      supportsThreads: true,
+      maxTextLength: 30,
+      threadContinuationChunks: true,
+    });
+    const text = 'A'.repeat(30) + '\n' + 'B'.repeat(30) + '\n' + 'C'.repeat(30);
+    await bridge.deliver('slack:C1', 'slack:C1:root', { kind: 'chat', content: { text } });
+    expect(targets).toEqual(['slack:C1:root', 'slack:C1:root', 'slack:C1:root']);
+  });
+
+  it('short status delivered verbatim (no spurious ellipsis)', async () => {
+    const calls: Array<{ markdown?: string }> = [];
+    const adapter = stubAdapter({
+      postMessage: async (_threadId: string, body: { markdown?: string }) => {
+        calls.push(body);
+        return { id: 'id-1', threadId: 'x', raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, maxTextLength: 100 });
+    await bridge.deliver('discord:c1', null, {
+      kind: 'status',
+      content: { text: '> 💭 short thinking' },
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].markdown).toBe('> 💭 short thinking');
+  });
+});
+
+describe('createChatSdkBridge.deliver — post path 429 retry', () => {
+  it('retries a chunk on 429 and posts all chunks', async () => {
+    // Bug A regression guard. A 5400-char chat reply splits into multiple
+    // chunks; if Discord 429s on chunk 2 with retry_after=0.3, the prior
+    // code dropped chunks 2+ silently. The user saw their chat reply
+    // truncated mid-stream — exactly the symptom Example Agent kept reporting.
+    const calls: Array<{ chunkText: string }> = [];
+    let rateLimitCount = 0;
+    const adapter = stubAdapter({
+      postMessage: async (_threadId: string, body: { markdown?: string }) => {
+        calls.push({ chunkText: body.markdown ?? '' });
+        // Simulate Discord rate-limiting chunk 2 once, then succeeding.
+        if (calls.length === 2 && rateLimitCount === 0) {
+          rateLimitCount++;
+          throw new Error('Discord API error: 429 {"retry_after": 0.05, "global": false}');
+        }
+        return { id: `id-${calls.length}`, threadId: 'x', raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, maxTextLength: 30 });
+
+    // 90 chars → 3 chunks of 30.
+    const text = 'A'.repeat(30) + '\n' + 'B'.repeat(30) + '\n' + 'C'.repeat(30);
+    const id = await bridge.deliver('discord:c1', null, { kind: 'chat', content: { text } });
+
+    // 4 calls total: chunk 1, chunk 2 (429), chunk 2 (retry success), chunk 3.
+    expect(calls).toHaveLength(4);
+    // All three actual chunks landed.
+    expect(calls[0].chunkText).toContain('A');
+    expect(calls[1].chunkText).toContain('B');
+    expect(calls[2].chunkText).toContain('B'); // retry of chunk 2
+    expect(calls[3].chunkText).toContain('C');
+    // First-chunk id is preserved (host caches this in delivered table).
+    expect(id).toBe('id-1');
+  });
+
+  it('first chunk 429 also retries (no premature throw)', async () => {
+    const calls: number[] = [];
+    let firstChunk429 = 0;
+    const adapter = stubAdapter({
+      postMessage: async () => {
+        calls.push(Date.now());
+        if (calls.length === 1 && firstChunk429 === 0) {
+          firstChunk429++;
+          throw new Error('Discord API error: 429 {"retry_after": 0.05}');
+        }
+        return { id: 'id-ok', threadId: 'x', raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, maxTextLength: 30 });
+    const id = await bridge.deliver('discord:c1', null, { kind: 'chat', content: { text: 'short' } });
+    expect(calls).toHaveLength(2); // 429 then retry
+    expect(id).toBe('id-ok');
+  });
+
+  it('non-429 mid-message error still truncates rather than duplicating', async () => {
+    // Existing contract preserved: a true network failure on chunk 2 still
+    // returns chunk 1's id and stops, so the host doesn't retry the whole
+    // message and re-post chunk 1 → duplicate.
+    const calls: number[] = [];
+    const adapter = stubAdapter({
+      postMessage: async () => {
+        calls.push(calls.length + 1);
+        if (calls.length === 2) throw new Error('connection reset');
+        return { id: `id-${calls.length}`, threadId: 'x', raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, maxTextLength: 30 });
+    const text = 'A'.repeat(30) + '\n' + 'B'.repeat(30) + '\n' + 'C'.repeat(30);
+    const id = await bridge.deliver('discord:c1', null, { kind: 'chat', content: { text } });
+    expect(calls).toHaveLength(2);
+    expect(id).toBe('id-1');
+  });
+
+  it('strict complete delivery rejects a later chunk failure', async () => {
+    const calls: number[] = [];
+    const adapter = stubAdapter({
+      postMessage: async () => {
+        calls.push(calls.length + 1);
+        if (calls.length === 2) throw new Error('connection reset');
+        return { id: `id-${calls.length}`, threadId: 'x', raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, maxTextLength: 30 });
+    const text = 'A'.repeat(30) + '\n' + 'B'.repeat(30);
+
+    await expect(
+      bridge.deliver('discord:c1', null, { kind: 'chat', content: { text, requireCompleteDelivery: true } }),
+    ).rejects.toThrow('connection reset');
+    expect(calls).toHaveLength(2);
+  });
+
+  it('non-429 first-chunk error throws so host can retry from scratch', async () => {
+    const adapter = stubAdapter({
+      postMessage: async () => {
+        throw new Error('connection refused');
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, maxTextLength: 30 });
+    await expect(bridge.deliver('discord:c1', null, { kind: 'chat', content: { text: 'short' } })).rejects.toThrow(
+      'connection refused',
+    );
+  });
+
+  it('gives up after MAX_RATE_LIMIT_RETRIES persistent 429s on a mid-message chunk', async () => {
+    const calls: number[] = [];
+    const adapter = stubAdapter({
+      postMessage: async () => {
+        calls.push(calls.length + 1);
+        if (calls.length >= 2) throw new Error('Discord API error: 429 {"retry_after": 0.01}');
+        return { id: 'id-1', threadId: 'x', raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, maxTextLength: 30 });
+    const text = 'A'.repeat(30) + '\n' + 'B'.repeat(30);
+    const id = await bridge.deliver('discord:c1', null, { kind: 'chat', content: { text } });
+    // Chunk 1 ok (1 call) + chunk 2 first attempt (1) + 3 retries = 5 total.
+    expect(calls.length).toBe(1 + 1 + 3);
+    expect(id).toBe('id-1');
+  });
+});
+
+describe('resolveQuotedReply', () => {
+  const msg = (links: unknown): ChatMessage => ({ links }) as unknown as ChatMessage;
+
+  it('resolves the first link exposing a fetchMessage into reply context', async () => {
+    const m = msg([
+      { url: 'https://x' }, // no fetchMessage — skipped
+      {
+        fetchMessage: async () => ({
+          id: 'm1',
+          text: 'the quoted text',
+          author: { userId: 'U-OPERATOR', fullName: 'Operator' },
+        }),
+      },
+    ]);
+    expect(await resolveQuotedReply(m)).toEqual({
+      id: 'm1',
+      sender: 'Operator',
+      senderId: 'U-OPERATOR',
+      text: 'the quoted text',
+    });
+  });
+
+  it('falls back to userName when fullName is absent', async () => {
+    const m = msg([{ fetchMessage: async () => ({ text: 'hi', author: { userName: 'donthe' } }) }]);
+    expect(await resolveQuotedReply(m)).toMatchObject({ sender: 'donthe', text: 'hi' });
+  });
+
+  it('returns null when there are no resolvable links', async () => {
+    expect(await resolveQuotedReply(msg(undefined))).toBeNull();
+    expect(await resolveQuotedReply(msg([]))).toBeNull();
+    expect(await resolveQuotedReply(msg([{ url: 'https://x' }]))).toBeNull();
+  });
+
+  it('returns null (never throws) when fetchMessage rejects', async () => {
+    const m = msg([
+      {
+        fetchMessage: async () => {
+          throw new Error('slack 403');
+        },
+      },
+    ]);
+    expect(await resolveQuotedReply(m)).toBeNull();
+  });
+
+  it('returns null when the resolved message has no usable text', async () => {
+    const m = msg([{ fetchMessage: async () => ({ text: '   ', author: { fullName: 'Operator' } }) }]);
+    expect(await resolveQuotedReply(m)).toBeNull();
+  });
+
+  it('returns null on timeout — never stalls the inbound path', async () => {
+    const m = msg([{ fetchMessage: () => new Promise((res) => setTimeout(() => res({ text: 'late' }), 100)) }]);
+    expect(await resolveQuotedReply(m, 10)).toBeNull();
+  });
+});
+
+describe('reconstructInboundText', () => {
+  // The AST the Chat SDK attaches as `message.formatted`. We build it with the
+  // SDK's own markdown parser so the test exercises the real node shapes.
+  const ast = (md: string) => parseMarkdown(md);
+
+  it('preserves the newline between a flag line and a numbered list (the prod bug)', () => {
+    const md =
+      '-e xhigh\n1. Approved\n2. Approved\n3. Catch up should be done on the gold layer (SOURCE_DATA), not the raw S3 data';
+    const out = reconstructInboundText(ast(md));
+    expect(out).toBe(
+      '-e xhigh\n\n1. Approved\n2. Approved\n3. Catch up should be done on the gold layer (SOURCE_DATA), not the raw S3 data',
+    );
+  });
+
+  it('does NOT escape snake_case / glob identifiers (unlike stringifyMarkdown)', () => {
+    const out = reconstructInboundText(ast('use table SOURCE_DATA join gold_layer on user_id, run my_func() 3*4'));
+    expect(out).toBe('use table SOURCE_DATA join gold_layer on user_id, run my_func() 3*4');
+  });
+
+  it('keeps unordered list markers and nesting', () => {
+    const out = reconstructInboundText(ast('items:\n- one\n- two\n  - nested'));
+    expect(out).toBe('items:\n\n- one\n- two\n  - nested');
+  });
+
+  it('preserves ordered-list start offset', () => {
+    const out = reconstructInboundText(ast('5. five\n6. six'));
+    expect(out).toBe('5. five\n6. six');
+  });
+
+  it('preserves fenced code blocks', () => {
+    const out = reconstructInboundText(ast('run:\n```sql\nselect a_b from t\n```'));
+    expect(out).toBe('run:\n\n```sql\nselect a_b from t\n```');
+  });
+
+  it('leaves a single-paragraph message identical to the old flatten', () => {
+    expect(reconstructInboundText(ast('-e xhigh do the thing'))).toBe('-e xhigh do the thing');
+  });
+
+  it('returns null for an empty/unusable AST so callers fall back to .text', () => {
+    expect(reconstructInboundText(undefined)).toBeNull();
+    expect(reconstructInboundText({ type: 'root', children: [] })).toBeNull();
+    expect(reconstructInboundText(ast('   '))).toBeNull();
+  });
+
+  it('end-to-end: rebuilt text lets the flag parser extract -e xhigh cleanly', () => {
+    const md = '@helper -e xhigh\n1. Approved\n2. Approved\n3. Catch up on SOURCE_DATA';
+    const rebuilt = reconstructInboundText(ast(md))!;
+    const parsed = parseMessageFlags(rebuilt);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.intent).toEqual({ stickyEffort: 'xhigh' });
+    expect(parsed.cleanedText).toBe('1. Approved\n2. Approved\n3. Catch up on SOURCE_DATA');
+  });
+
+  it('end-to-end: the OLD flatten is what produced the bogus effort value', () => {
+    // Documents the regression guard: mdastToString-style flattening (what the
+    // SDK's .text does) concatenates list items with no separator, so -e's \S*
+    // swallows the run-on. This is the behavior reconstructInboundText replaces.
+    const flattened = '@helper -e xhighApprovedApprovedCatch up on SOURCE_DATA';
+    const parsed = parseMessageFlags(flattened);
+    expect(parsed.errors[0]).toMatch(/unknown effort level: xhighApprovedApprovedCatch/);
+  });
+});

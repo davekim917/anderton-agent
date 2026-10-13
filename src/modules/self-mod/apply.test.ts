@@ -1,0 +1,276 @@
+/**
+ * `applyAddMcpServer` — what an admin's approval actually persists.
+ *
+ * The spawn path reads MCP servers from `groups/<folder>/container.json`
+ * (`readContainerConfig`), not from the `container_configs` row, and the
+ * host-startup backfill syncs file → DB. So an approval that wrote only the
+ * DB column restarted the container WITHOUT the server the admin approved,
+ * and the next backfill erased the projection too. Both stores must be
+ * written, the same way `ncl groups config add-mcp-server` does it.
+ */
+import fs from 'fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { TEST_DIR } = vi.hoisted(() => ({
+  TEST_DIR: globalThis.uniqueTmpRoot('self-mod-apply'),
+}));
+
+// The hoisted root is available when the mock factory runs.
+vi.mock('../../config.js', async () => {
+  const actual = await vi.importActual('../../config.js');
+  return {
+    ...actual,
+    DATA_DIR: TEST_DIR,
+    GROUPS_DIR: `${TEST_DIR}/groups`,
+  };
+});
+
+vi.mock('../../container-runner.js', () => ({
+  buildAgentGroupImage: vi.fn().mockResolvedValue(undefined),
+  killContainer: vi.fn(),
+  wakeContainer: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../../session-manager.js', async () => {
+  const actual = await vi.importActual<typeof import('../../session-manager.js')>('../../session-manager.js');
+  return { ...actual, writeSessionMessage: vi.fn() };
+});
+
+import { readContainerConfig, writeContainerConfig } from '../../container-config.js';
+import { buildAgentGroupImage } from '../../container-runner.js';
+import { writeSessionMessage } from '../../session-manager.js';
+import { createAgentGroup } from '../../db/agent-groups.js';
+import { closeDb, initMigratedTestDb } from '../../db/index.js';
+import {
+  ensureContainerConfig,
+  getContainerConfig,
+  updateContainerConfigJson,
+  updateContainerConfigScalars,
+} from '../../db/container-configs.js';
+import { addDeniedModel } from '../../db/denied-models.js';
+import { createSession } from '../../db/sessions.js';
+import type { Session } from '../../types.js';
+import { applyAddMcpServer, applyInstallPackages, performModelChange } from './apply.js';
+
+function now(): string {
+  return new Date().toISOString();
+}
+
+let session: Session;
+
+beforeEach(async () => {
+  vi.clearAllMocks();
+  fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  fs.mkdirSync(`${TEST_DIR}/groups/agent`, { recursive: true });
+  await initMigratedTestDb();
+
+  await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+  await ensureContainerConfig('ag-1');
+  session = {
+    id: 'sess-1',
+    agent_group_id: 'ag-1',
+    messaging_group_id: null,
+    thread_id: null,
+    agent_provider: null,
+    status: 'active',
+    container_status: 'stopped',
+    last_active: now(),
+    created_at: now(),
+  } as Session;
+  await createSession(session);
+
+  writeContainerConfig('agent', {
+    mcpServers: { existing: { command: 'mcp-existing', args: [], env: {} } },
+    packages: { apt: [], npm: [] },
+    additionalMounts: [],
+    skills: 'all',
+    onecliSecrets: ['Keep-Me'],
+  });
+});
+
+afterEach(async () => {
+  await closeDb();
+  fs.rmSync(TEST_DIR, { recursive: true, force: true });
+});
+
+describe('applyAddMcpServer', () => {
+  it('writes a remote server to container.json AND the DB projection', async () => {
+    await applyAddMcpServer(
+      {
+        name: 'datafold',
+        type: 'http',
+        url: 'https://app.datafold.com/mcp/',
+        headers: { Authorization: 'Key onecli-managed' },
+      },
+      session,
+    );
+
+    const file = readContainerConfig('agent');
+    expect(file.mcpServers.datafold).toEqual({
+      type: 'http',
+      url: 'https://app.datafold.com/mcp/',
+      headers: { Authorization: 'Key onecli-managed' },
+    });
+    // Servers already in the file, and unrelated operator-owned fields, survive.
+    expect(file.mcpServers.existing).toBeDefined();
+    expect(file.onecliSecrets).toEqual(['Keep-Me']);
+    expect(JSON.parse((await getContainerConfig('ag-1'))!.mcp_servers)).toEqual(file.mcpServers);
+  });
+
+  it('tells the agent how a 401 gets fixed when the server authenticates', async () => {
+    // Declaring the placeholder wires the header; the gateway can only
+    // substitute a secret ASSIGNED to the group, and auto-created agents
+    // default to selective mode with nothing assigned.
+    await applyAddMcpServer(
+      {
+        name: 'datafold',
+        type: 'http',
+        url: 'https://app.datafold.com/mcp/',
+        headers: { Authorization: 'Key onecli-managed' },
+      },
+      session,
+    );
+    const note = vi.mocked(writeSessionMessage).mock.calls.at(-1)!;
+    const text = (JSON.parse(note[2].content) as { text: string }).text;
+    expect(text).toContain('401');
+    expect(text).toContain('ncl secrets grant');
+
+    // A server that authenticates with nothing gets no such tail — including
+    // one that carries only a configuration header. Claiming OneCLI auth there
+    // would send an operator after a credential that does not exist.
+    for (const server of [
+      { name: 'deepwiki', type: 'http', url: 'https://mcp.deepwiki.com/mcp' },
+      {
+        name: 'plainheaders',
+        type: 'http',
+        url: 'https://mcp.deepwiki.com/mcp',
+        headers: { 'Content-Type': 'application/json' },
+      },
+      { name: 'fs2', command: 'mcp-fs', args: [], env: {} },
+    ]) {
+      vi.mocked(writeSessionMessage).mockClear();
+      await applyAddMcpServer(server, session);
+      const plain = vi.mocked(writeSessionMessage).mock.calls.at(-1)!;
+      expect((JSON.parse(plain[2].content) as { text: string }).text).not.toContain('401');
+    }
+  });
+
+  it('writes a stdio server the same way', async () => {
+    await applyAddMcpServer({ name: 'fs', command: 'mcp-fs', args: ['/data'], env: {} }, session);
+    expect(readContainerConfig('agent').mcpServers.fs).toEqual({ command: 'mcp-fs', args: ['/data'], env: {} });
+  });
+
+  it('refuses an approved payload that no longer validates, leaving both stores untouched', async () => {
+    await applyAddMcpServer({ name: 'leaky', url: 'https://example.com/mcp?api_key=abc' }, session);
+    expect(readContainerConfig('agent').mcpServers.leaky).toBeUndefined();
+    expect(JSON.parse((await getContainerConfig('ag-1'))!.mcp_servers).leaky).toBeUndefined();
+  });
+
+  it.each([
+    ['a missing name', {}],
+    ['invalid config', { name: 'bad', url: 'https://example.com/mcp?api_key=abc' }],
+  ])('waits to report %s before returning', async (_description, payload) => {
+    let releaseNotification: (() => void) | undefined;
+    vi.mocked(writeSessionMessage).mockImplementationOnce(
+      () => new Promise<void>((resolve) => (releaseNotification = resolve)),
+    );
+    let settled = false;
+    const applying = applyAddMcpServer(payload, session).then(() => {
+      settled = true;
+    });
+
+    // Seam 3: the two reads before the report (`getAgentGroup`,
+    // `getContainerConfig`) are async on the driver, so the report is no
+    // longer reached within a fixed number of microtask ticks. Wait for it to
+    // be issued, then prove the call has NOT returned while it is in flight —
+    // which is the invariant this case exists for.
+    await vi.waitFor(() => expect(releaseNotification).toBeDefined());
+    expect(settled).toBe(false);
+    releaseNotification!();
+    await applying;
+    expect(settled).toBe(true);
+  });
+
+  it.each([
+    ['a missing name', {}],
+    ['invalid config', { name: 'bad', url: 'https://example.com/mcp?api_key=abc' }],
+  ])('settles when reporting %s fails', async (_description, payload) => {
+    vi.mocked(writeSessionMessage).mockRejectedValueOnce(new Error('session DB unavailable'));
+
+    await expect(applyAddMcpServer(payload, session)).resolves.toBeUndefined();
+    expect(readContainerConfig('agent').mcpServers.bad).toBeUndefined();
+  });
+});
+
+describe('applyInstallPackages', () => {
+  it('appends to the package lists in container.json AND the DB projection before the build', async () => {
+    writeContainerConfig('agent', { ...readContainerConfig('agent'), packages: { apt: ['curl'], npm: [] } });
+    await updateContainerConfigJson('ag-1', 'packages_apt', ['curl']);
+    let atBuild: unknown;
+    vi.mocked(buildAgentGroupImage).mockImplementationOnce(async () => {
+      atBuild = JSON.parse((await getContainerConfig('ag-1'))!.packages_apt);
+    });
+
+    await applyInstallPackages({ apt: ['jq', 'curl'], npm: ['left-pad'] }, session);
+
+    const file = readContainerConfig('agent');
+    expect(file.packages).toEqual({ apt: ['curl', 'jq'], npm: ['left-pad'] });
+    expect(file.onecliSecrets).toEqual(['Keep-Me']);
+    const row = (await getContainerConfig('ag-1'))!;
+    expect([JSON.parse(row.packages_apt), JSON.parse(row.packages_npm)]).toEqual([
+      file.packages.apt,
+      file.packages.npm,
+    ]);
+    expect(atBuild).toEqual(['curl', 'jq']);
+  });
+});
+
+describe('performModelChange', () => {
+  beforeEach(async () => {
+    await updateContainerConfigScalars('ag-1', { provider: 'codex' });
+    writeContainerConfig('agent', { ...readContainerConfig('agent'), provider: 'codex' });
+  });
+
+  it('writes the model and effort to container.json, which the respawned container boots from', async () => {
+    await performModelChange(session, 'gpt-6-sol', 'high', vi.fn());
+
+    const file = readContainerConfig('agent');
+    expect(file.model).toBe('gpt-6-sol');
+    expect(file.effort).toBe('high');
+    expect(file.onecliSecrets).toEqual(['Keep-Me']);
+    const row = (await getContainerConfig('ag-1'))!;
+    expect([row.model, row.effort]).toEqual(['gpt-6-sol', 'high']);
+  });
+
+  it('keeps the existing effort when none is given', async () => {
+    writeContainerConfig('agent', { ...readContainerConfig('agent'), effort: 'medium' });
+    await updateContainerConfigScalars('ag-1', { effort: 'medium' });
+
+    await performModelChange(session, 'gpt-6-sol', null, vi.fn());
+
+    expect(readContainerConfig('agent').effort).toBe('medium');
+    expect((await getContainerConfig('ag-1'))!.effort).toBe('medium');
+  });
+
+  it('leaves both stores untouched for a denied model', async () => {
+    await addDeniedModel('codex', 'gpt-6-sol', 'wrong subscription');
+    const notify = vi.fn();
+
+    await performModelChange(session, 'gpt-6-sol', 'high', notify);
+
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('deny list'));
+    expect(readContainerConfig('agent').model).toBeUndefined();
+    expect((await getContainerConfig('ag-1'))!.model).toBeNull();
+  });
+
+  it('validates against the provider in container.json when the projection disagrees', async () => {
+    writeContainerConfig('agent', { ...readContainerConfig('agent'), provider: 'opencode' });
+    const notify = vi.fn();
+
+    await performModelChange(session, 'gpt-6-sol', 'high', notify);
+
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('not a valid opencode slug'));
+    expect(readContainerConfig('agent').model).toBeUndefined();
+    expect((await getContainerConfig('ag-1'))!.model).toBeNull();
+  });
+});

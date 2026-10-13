@@ -1,0 +1,397 @@
+/**
+ * Init the first (or Nth) NanoClaw v2 agent for a DM channel.
+ *
+ * Wires a real DM channel (discord, telegram, etc.) to a new agent group,
+ * then hands a welcome message to the running service via the CLI socket
+ * (admin transport). The service routes that message into the DM session,
+ * which wakes the container synchronously — the agent processes the welcome
+ * and DMs the operator through the normal delivery path.
+ *
+ * CLI channel wiring is handled separately by `scripts/init-cli-agent.ts`.
+ *
+ * Creates/reuses: user, owner grant (if none), agent group + filesystem,
+ * messaging group(s), wiring.
+ *
+ * Runs alongside the service (WAL-mode sqlite + CLI socket IPC) — does NOT
+ * initialize channel adapters, so there's no Gateway conflict. Requires
+ * the service to be running: the welcome hand-off goes over the CLI socket
+ * and fails loudly if the service isn't up.
+ *
+ * Usage:
+ *   pnpm exec tsx scripts/init-first-agent.ts \
+ *     --channel discord \
+ *     --user-id discord:123456789000000003 \
+ *     --platform-id discord:@me:123456789000000006 \
+ *     --display-name "Gavriel" \
+ *     [--agent-name "Andy"] \
+ *     [--welcome "System instruction: ..."] \
+ *     [--role owner|admin|member] \  # default: owner
+ *     [--engage-pattern "."]         # explicit DM engage regex override
+ *
+ * For direct-addressable channels (telegram, whatsapp, etc.), --platform-id
+ * is typically the same as the handle in --user-id, with the channel prefix.
+ */
+import net from 'net';
+import path from 'path';
+
+// Registration-only barrel import: channel modules call
+// registerChannelAdapter() at module scope (factories are NOT invoked, no
+// adapter connects — no Gateway conflict with the running service), so
+// declared channel defaults resolve here without live adapters.
+import '../src/channels/index.js';
+import { resolveUnknownSenderPolicy, resolveWiringDefaults } from '../src/channels/channel-defaults.js';
+import { hasDeclaredChannelDefaults } from '../src/channels/channel-registry.js';
+import { DATA_DIR, GROUPS_DIR } from '../src/config.js';
+import { initDb, getRawDb } from '../src/db/connection.js';
+import {
+  createMessagingGroup,
+  createMessagingGroupAgent,
+  getMessagingGroupAgentByPair,
+  getMessagingGroupByPlatform,
+} from '../src/db/messaging-groups.js';
+import { runMigrations } from '../src/db/migrations/index.js';
+import { stageGroupPersona } from '../src/group-persona.js';
+import { normalizeName } from '../src/modules/agent-to-agent/db/agent-destinations.js';
+import { addMember } from '../src/modules/permissions/db/agent-group-members.js';
+import { getUserRoles, grantRole } from '../src/modules/permissions/db/user-roles.js';
+import { upsertUser } from '../src/modules/permissions/db/users.js';
+import { writeContainerConfigScalars } from '../src/container-config.js';
+import { ensureContainerConfig } from '../src/db/container-configs.js';
+import { namespacedPlatformId } from '../src/platform-id.js';
+import type { AgentGroup, MessagingGroup } from '../src/types.js';
+
+import { findOrCreateAgentGroup, generateId } from './lib/bootstrap-agent-group.js';
+
+type Role = 'owner' | 'admin' | 'member';
+
+interface Args {
+  channel: string;
+  userId: string;
+  platformId: string;
+  displayName: string;
+  agentName: string;
+  welcome: string;
+  role: Role;
+  /** Explicit engage regex for the DM wiring; omitted = channel declaration / '.'. */
+  engagePattern?: string;
+}
+
+const DEFAULT_WELCOME = 'System instruction: run /welcome to introduce yourself to the user on this new channel.';
+
+const DEFAULT_ROLE: Role = 'owner';
+
+function parseArgs(argv: string[]): Args {
+  const out: Partial<Args> = {};
+  for (let i = 0; i < argv.length; i++) {
+    const key = argv[i];
+    const val = argv[i + 1];
+    switch (key) {
+      case '--channel':
+        out.channel = (val ?? '').toLowerCase();
+        i++;
+        break;
+      case '--user-id':
+        out.userId = val;
+        i++;
+        break;
+      case '--platform-id':
+        out.platformId = val;
+        i++;
+        break;
+      case '--display-name':
+        out.displayName = val;
+        i++;
+        break;
+      case '--agent-name':
+        out.agentName = val;
+        i++;
+        break;
+      case '--welcome':
+        out.welcome = val;
+        i++;
+        break;
+      case '--engage-pattern':
+        out.engagePattern = val;
+        i++;
+        break;
+      case '--role': {
+        const raw = (val ?? '').toLowerCase();
+        if (raw !== 'owner' && raw !== 'admin' && raw !== 'member') {
+          console.error(`Invalid --role: ${raw} (expected 'owner', 'admin', or 'member')`);
+          process.exit(2);
+        }
+        out.role = raw;
+        i++;
+        break;
+      }
+    }
+  }
+
+  const required: (keyof Args)[] = ['channel', 'userId', 'platformId', 'displayName'];
+  const missing = required.filter((k) => !out[k]);
+  if (missing.length) {
+    console.error(
+      `Missing required args: ${missing.map((k) => `--${k.replace(/([A-Z])/g, '-$1').toLowerCase()}`).join(', ')}`,
+    );
+    console.error('See scripts/init-first-agent.ts header for usage.');
+    process.exit(2);
+  }
+
+  return {
+    channel: out.channel!,
+    userId: out.userId!,
+    platformId: out.platformId!,
+    displayName: out.displayName!,
+    agentName: out.agentName?.trim() || out.displayName!,
+    welcome: out.welcome?.trim() || DEFAULT_WELCOME,
+    role: out.role ?? DEFAULT_ROLE,
+    engagePattern: out.engagePattern?.trim() || undefined,
+  };
+}
+
+function namespacedUserId(channel: string, raw: string): string {
+  return raw.includes(':') ? raw : `${channel}:${raw}`;
+}
+
+async function wireIfMissing(
+  mg: MessagingGroup,
+  ag: AgentGroup,
+  now: string,
+  label: string,
+  engagePattern?: string,
+): Promise<void> {
+  const existing = await getMessagingGroupAgentByPair(mg.id, ag.id);
+  if (existing) {
+    console.log(`Wiring already exists: ${existing.id} (${label})`);
+    return;
+  }
+  // Engage defaults, first hit wins: explicit --engage-pattern → the
+  // channel's declared defaults → the legacy heuristic for stale
+  // (undeclared) adapters: DMs (is_group=0) respond to everything via a '.'
+  // regex, group chats are mention-only; admins can reconfigure via
+  // /manage-channels once the agent is in use.
+  const isGroup = mg.is_group === 1;
+  const channelKey = mg.instance ?? mg.channel_type;
+  const engage = engagePattern
+    ? { engage_mode: 'pattern' as const, engage_pattern: engagePattern }
+    : hasDeclaredChannelDefaults(channelKey, mg.channel_type)
+      ? resolveWiringDefaults(channelKey, isGroup, ag.name, mg.channel_type)
+      : isGroup
+        ? { engage_mode: 'mention' as const, engage_pattern: null }
+        : { engage_mode: 'pattern' as const, engage_pattern: '.' };
+  await createMessagingGroupAgent({
+    id: generateId('mga'),
+    messaging_group_id: mg.id,
+    agent_group_id: ag.id,
+    engage_mode: engage.engage_mode,
+    engage_pattern: engage.engage_pattern,
+    // Deliberate owner-bootstrap choices, not channel defaults: the operator
+    // wires their own DM, so every sender is trusted ('all') and ignored
+    // messages carry no value ('drop').
+    sender_scope: 'all',
+    // Overrides the 'drop' above: accumulate is the owner's default for all agents.
+    ignored_message_policy: 'accumulate',
+    session_mode: 'per-thread',
+    priority: 0,
+    default_model: null,
+    default_effort: null,
+    default_tone: null,
+    instructions_profile: null,
+    created_at: now,
+  });
+  console.log(`Wired ${label}: ${mg.id} -> ${ag.id}`);
+}
+
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2));
+
+  await initDb(path.join(DATA_DIR, 'v2.db'));
+  const db = getRawDb();
+  runMigrations(db); // idempotent
+
+  const now = new Date().toISOString();
+
+  // 1. User + (conditional) owner grant.
+  const userId = namespacedUserId(args.channel, args.userId);
+  await upsertUser({
+    id: userId,
+    kind: args.channel,
+    display_name: args.displayName,
+    created_at: now,
+  });
+
+  // Owner grant is deferred until after the agent group is resolved, since
+  // an admin grant is scoped to that group. See step 2b.
+
+  // 2. Agent group + filesystem.
+  const folder = `dm-with-${normalizeName(args.displayName)}`;
+  const pickedProvider = process.env.NANOCLAW_PICKED_PROVIDER?.trim().toLowerCase();
+  const ag = await findOrCreateAgentGroup(folder, args.agentName, now);
+  // Stamped with the setup pick, else the instance default; a reused group keeps its provider.
+  await ensureContainerConfig(ag.id, pickedProvider);
+  stageGroupPersona(
+    path.resolve(GROUPS_DIR, folder),
+    `# ${args.agentName}\n\n` +
+      `You are ${args.agentName}, a personal NanoClaw agent for ${args.displayName}. ` +
+      'When the user first reaches out (or you receive a system welcome prompt), introduce yourself briefly and invite them to chat. Keep replies concise.',
+  );
+
+  // 2b. Assign the user a role for this agent group. The caller picks via
+  // --role; the channel drivers default to 'owner' for the self-host case.
+  //  - owner:  global owner (agent_group_id=null). Cross-channel access.
+  //  - admin:  scoped admin for this agent group only.
+  //  - member: no role grant, just the membership row below.
+  // grantRole inserts a new row per call — idempotence check against
+  // getUserRoles prevents duplicates on re-runs.
+  const existingRoles = await getUserRoles(userId);
+  if (args.role === 'owner') {
+    const alreadyOwner = existingRoles.some((r) => r.role === 'owner' && r.agent_group_id === null);
+    if (!alreadyOwner) {
+      await grantRole({
+        user_id: userId,
+        role: 'owner',
+        agent_group_id: null,
+        granted_by: null,
+        granted_at: now,
+      });
+    }
+    // Owner's agent group gets global CLI access
+    await writeContainerConfigScalars(ag.id, ag.folder, { cli_scope: 'global' });
+  } else if (args.role === 'admin') {
+    const alreadyAdmin = existingRoles.some((r) => r.role === 'admin' && r.agent_group_id === ag.id);
+    if (!alreadyAdmin) {
+      await grantRole({
+        user_id: userId,
+        role: 'admin',
+        agent_group_id: ag.id,
+        granted_by: null,
+        granted_at: now,
+      });
+    }
+  }
+
+  // Always add a membership row so the access gate has a straightforward
+  // yes/no even for users without a role grant. INSERT OR IGNORE, so this
+  // is a no-op when the row already exists (e.g. re-runs, owners whose
+  // access already passes via role).
+  await addMember({
+    user_id: userId,
+    agent_group_id: ag.id,
+    added_by: null,
+    added_at: now,
+  });
+
+  // 3. DM messaging group.
+  const platformId = namespacedPlatformId(args.channel, args.platformId);
+  let dmMg = await getMessagingGroupByPlatform(args.channel, platformId);
+  if (!dmMg) {
+    const mgId = generateId('mg');
+    // Policy from the channel declaration (DM context); legacy 'strict' for
+    // stale (undeclared) adapters so a trunk update alone changes nothing.
+    const unknownSenderPolicy = hasDeclaredChannelDefaults(args.channel)
+      ? resolveUnknownSenderPolicy(args.channel, false)
+      : 'strict';
+    await createMessagingGroup({
+      id: mgId,
+      channel_type: args.channel,
+      platform_id: platformId,
+      name: args.displayName,
+      is_group: 0,
+      unknown_sender_policy: unknownSenderPolicy,
+      created_at: now,
+    });
+    dmMg = (await getMessagingGroupByPlatform(args.channel, platformId))!;
+    console.log(`Created messaging group: ${dmMg.id} (${platformId})`);
+  } else {
+    console.log(`Reusing messaging group: ${dmMg.id} (${platformId})`);
+  }
+
+  // 4. Wire DM messaging group to the agent.
+  await wireIfMissing(dmMg, ag, now, 'dm', args.engagePattern);
+
+  // 5. Welcome delivery over the CLI socket. Router picks up the line,
+  // writes the message into the DM session's inbound.db, and wakes the
+  // container synchronously — no sweep wait. The paired user's identity is
+  // passed so the sender resolver sees the real owner, not cli:local.
+  await sendWelcomeViaCliSocket(dmMg, args.welcome, {
+    senderId: userId,
+    sender: args.displayName,
+  });
+
+  const roleLabel =
+    args.role === 'owner' ? 'owner (global)' : args.role === 'admin' ? `admin (scoped to ${ag.id})` : 'member';
+
+  console.log('');
+  console.log('Init complete.');
+  console.log(`  user:    ${userId}`);
+  console.log(`  role:    ${roleLabel}`);
+  console.log(`  agent:   ${ag.name} [${ag.id}] @ groups/${folder}`);
+  console.log(`  channel: ${args.channel} ${dmMg.platform_id}`);
+  console.log('');
+  console.log('Welcome DM queued — the agent will greet you shortly.');
+}
+
+/**
+ * Hand the welcome to the running service via its CLI Unix socket. The
+ * service's CLI adapter receives `{text, to}`, builds an InboundEvent
+ * targeting the DM messaging group, and calls routeInbound(). Router writes
+ * the message into inbound.db and wakes the container synchronously.
+ *
+ * Throws if the socket isn't reachable — this script requires the service
+ * to be running.
+ */
+async function sendWelcomeViaCliSocket(
+  dmMg: MessagingGroup,
+  welcome: string,
+  identity: { senderId: string; sender: string },
+): Promise<void> {
+  const sockPath = path.join(DATA_DIR, 'cli.sock');
+
+  await new Promise<void>((resolve, reject) => {
+    const socket = net.connect(sockPath);
+    let settled = false;
+
+    const settle = (err: Error | null) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket.end();
+      } catch {
+        /* noop */
+      }
+      if (err) reject(err);
+      else resolve();
+    };
+
+    socket.once('error', (err) =>
+      settle(new Error(`CLI socket at ${sockPath} not reachable: ${err.message}. Is the NanoClaw service running?`)),
+    );
+    socket.once('connect', () => {
+      const payload =
+        JSON.stringify({
+          text: welcome,
+          senderId: identity.senderId,
+          sender: identity.sender,
+          to: {
+            channelType: dmMg.channel_type,
+            platformId: dmMg.platform_id,
+            threadId: dmMg.platform_id,
+          },
+        }) + '\n';
+      socket.write(payload, (err) => {
+        if (err) {
+          settle(err);
+          return;
+        }
+        // Brief flush delay so the router picks up the line before we close.
+        // Router handles it synchronously once read, so 50ms is plenty.
+        setTimeout(() => settle(null), 50);
+      });
+    });
+  });
+}
+
+main().catch((err) => {
+  console.error(err instanceof Error ? err.message : err);
+  process.exit(1);
+});

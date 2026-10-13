@@ -1,0 +1,903 @@
+import { execFileSync } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+
+import { afterEach, beforeEach, describe, it, expect } from 'vitest';
+
+import {
+  median,
+  checkBand,
+  pausedSeriesBreach,
+  failedStreakBreach,
+  isDuplicateBreach,
+  isWarmingUp,
+  isLiveForStreak,
+  advancePauseState,
+  computeSeriesStats,
+  countRecentErrorLines,
+  scanBannedPatterns,
+  checkContainerPatterns,
+  checkTrunkDocPatterns,
+  checkGroupStandingPatterns,
+  checkEffectiveStackSafety,
+  checkInstructionStack,
+  instructionStackBreachKind,
+} from './fleet-drift.js';
+
+/** Mirrors src/log.ts's `ts()` — local wall-clock, not UTC. Kept TZ-agnostic by building both the log
+ * stamp and the `now` argument from the SAME local-time basis, so these tests pass under any runner TZ. */
+function localStamp(d: Date): string {
+  const p2 = (n: number) => String(n).padStart(2, '0');
+  const p3 = (n: number) => String(n).padStart(3, '0');
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}.${p3(d.getMilliseconds())}`;
+}
+
+describe('median', () => {
+  it('averages the two middle values for an even-length array', () => {
+    expect(median([1, 3, 5, 7])).toBe(4);
+  });
+  it('picks the middle value for an odd-length array', () => {
+    expect(median([5, 1, 9])).toBe(5);
+  });
+  it('is 0 for an empty array', () => {
+    expect(median([])).toBe(0);
+  });
+});
+
+describe('checkBand', () => {
+  it('breaches when the value clears median + 3×MAD', () => {
+    // prior series has real spread (median 100, MAD scaled ~148); a value far
+    // above that should breach.
+    const prior = [90, 95, 100, 105, 110, 100, 95];
+    const r = checkBand(1000, prior, 20);
+    expect(r.breach).toBe(true);
+    expect(r.madScaled).toBeGreaterThan(0);
+  });
+
+  it('does not breach a value within normal spread', () => {
+    const prior = [90, 95, 100, 105, 110, 100, 95];
+    const r = checkBand(102, prior, 20);
+    expect(r.breach).toBe(false);
+  });
+
+  it('MAD=0 guard: flat-zero history stays quiet on a small blip', () => {
+    const prior = [0, 0, 0, 0, 0, 0, 0];
+    // value > median*1.5 (0*1.5=0) is true, but the absolute gap (5) is below
+    // the flat-zero guard (20), so no breach.
+    const r = checkBand(5, prior, 20);
+    expect(r.madScaled).toBe(0);
+    expect(r.breach).toBe(false);
+  });
+
+  it('MAD=0 guard: flat-zero history breaches once the gap is meaningful', () => {
+    const prior = [0, 0, 0, 0, 0, 0, 0];
+    const r = checkBand(25, prior, 20);
+    expect(r.madScaled).toBe(0);
+    expect(r.breach).toBe(true);
+  });
+
+  it('MAD=0 guard: flat nonzero history uses the ×1.5 threshold', () => {
+    const prior = [10, 10, 10, 10, 10, 10, 10];
+    const under = checkBand(12, prior, 1); // 12 <= 15 (10*1.5)
+    const over = checkBand(20, prior, 1); // 20 > 15 and gap (10) > guard (1)
+    expect(under.breach).toBe(false);
+    expect(over.breach).toBe(true);
+  });
+});
+
+describe('pausedSeriesBreach', () => {
+  it('breaches once a paused series is at least 3 days old', () => {
+    expect(pausedSeriesBreach(1, 3)).toBe(true);
+    expect(pausedSeriesBreach(2, 10)).toBe(true);
+  });
+  it('does not breach a fresh pause', () => {
+    expect(pausedSeriesBreach(1, 2.9)).toBe(false);
+  });
+  it('does not breach when nothing is paused', () => {
+    expect(pausedSeriesBreach(0, 999)).toBe(false);
+  });
+});
+
+describe('failedStreakBreach', () => {
+  it('breaches at the 6-run threshold, ahead of the 8-run auto-pause cap', () => {
+    expect(failedStreakBreach(6)).toBe(true);
+    expect(failedStreakBreach(8)).toBe(true);
+  });
+  it('does not breach below the threshold', () => {
+    expect(failedStreakBreach(5)).toBe(false);
+    expect(failedStreakBreach(0)).toBe(false);
+  });
+});
+
+describe('isDuplicateBreach (dedup — stands in for a stubbed `gh issue list --json title` result)', () => {
+  const openTitles = ['fleet-drift: error_events_24h out of band (2026-08-29)', 'some unrelated issue'];
+  it('suppresses a metric with an already-open issue', () => {
+    expect(isDuplicateBreach(openTitles, 'error_events_24h')).toBe(true);
+  });
+  it('does not suppress a metric with no open issue', () => {
+    expect(isDuplicateBreach(openTitles, 'paused_series')).toBe(false);
+  });
+  it('matches on title prefix, not full equality (date suffix varies)', () => {
+    expect(isDuplicateBreach(['fleet-drift: disk_growth_bytes out of band (2026-01-01)'], 'disk_growth_bytes')).toBe(
+      true,
+    );
+  });
+});
+
+describe('isWarmingUp', () => {
+  it('is warming up below 7 prior lines', () => {
+    expect(isWarmingUp(0)).toBe(true);
+    expect(isWarmingUp(6)).toBe(true);
+  });
+  it('is not warming up at 7 or more prior lines', () => {
+    expect(isWarmingUp(7)).toBe(false);
+    expect(isWarmingUp(30)).toBe(false);
+  });
+});
+
+describe('computeSeriesStats', () => {
+  const row = (id: string, series_id: string | null, status: string, seq: number, timestamp: string) => ({
+    id,
+    series_id,
+    status,
+    seq,
+    timestamp,
+  });
+
+  it('reports the highest-seq row as the latest status/timestamp per series', () => {
+    // Rows must be passed already ordered seq DESC, matching the SQL query.
+    const rows = [
+      row('t3', 's1', 'paused', 30, '2026-08-30T00:00:00.000Z'),
+      row('t2', 's1', 'failed', 20, '2026-08-20T00:00:00.000Z'),
+      row('t1', 's1', 'completed', 10, '2026-08-10T00:00:00.000Z'),
+    ];
+    const stats = computeSeriesStats(rows);
+    // latestStatus/latestTimestamp come from the highest-seq row regardless of status (paused).
+    // failedStreak is computed separately over the completed/failed subsequence only (t2 'failed'
+    // then t1 'completed' breaks it) — the paused row isn't part of that subsequence at all.
+    expect(stats.get('s1')).toEqual({
+      latestStatus: 'paused',
+      latestTimestamp: '2026-08-30T00:00:00.000Z',
+      failedStreak: 1,
+    });
+  });
+
+  it('counts a trailing failed streak, stopping at the first completed row', () => {
+    const rows = [
+      row('t4', 's2', 'failed', 40, '2026-08-30T00:00:00.000Z'),
+      row('t3', 's2', 'failed', 30, '2026-08-29T00:00:00.000Z'),
+      row('t2', 's2', 'completed', 20, '2026-08-28T00:00:00.000Z'),
+      row('t1', 's2', 'failed', 10, '2026-08-27T00:00:00.000Z'),
+    ];
+    expect(computeSeriesStats(rows).get('s2')?.failedStreak).toBe(2);
+  });
+
+  it('ignores pending/cancelled/expired rows when computing the streak (mirrors trailingFailedRuns)', () => {
+    const rows = [
+      row('t3', 's3', 'pending', 30, '2026-08-30T00:00:00.000Z'),
+      row('t2', 's3', 'failed', 20, '2026-08-29T00:00:00.000Z'),
+      row('t1', 's3', 'completed', 10, '2026-08-28T00:00:00.000Z'),
+    ];
+    expect(computeSeriesStats(rows).get('s3')?.failedStreak).toBe(1);
+  });
+
+  it('keys by id when series_id is null (a non-recurring one-shot task)', () => {
+    const rows = [row('solo', null, 'failed', 5, '2026-08-30T00:00:00.000Z')];
+    const stats = computeSeriesStats(rows);
+    expect(stats.get('solo')?.failedStreak).toBe(1);
+  });
+});
+
+/**
+ * A stamp for instant `d` rendered in a zone `offsetMinutes` from UTC, with
+ * the explicit marker src/log.ts now writes. Deliberately NOT the runner's
+ * zone: the regression is a logger and a reader in different zones, which a
+ * stamp built from local getters can never express.
+ */
+function offsetStamp(d: Date, offsetMinutes: number): string {
+  const p2 = (n: number) => String(n).padStart(2, '0');
+  const p3 = (n: number) => String(n).padStart(3, '0');
+  const shifted = new Date(d.getTime() + offsetMinutes * 60_000);
+  const sign = offsetMinutes < 0 ? '-' : '+';
+  const abs = Math.abs(offsetMinutes);
+  const marker = `${sign}${p2(Math.floor(abs / 60))}:${p2(abs % 60)}`;
+  return (
+    `${shifted.getUTCFullYear()}-${p2(shifted.getUTCMonth() + 1)}-${p2(shifted.getUTCDate())} ` +
+    `${p2(shifted.getUTCHours())}:${p2(shifted.getUTCMinutes())}:${p2(shifted.getUTCSeconds())}.` +
+    `${p3(shifted.getUTCMilliseconds())}${marker}`
+  );
+}
+
+describe('countRecentErrorLines — logger and reader in different zones', () => {
+  const now = Date.now();
+  // A one-minute window makes the oracle sharp: any misreading of the zone
+  // moves the line hours away and drops it.
+  const WINDOW = 60_000;
+
+  for (const [label, offMin] of [
+    ['UTC+09:00', 540],
+    ['UTC-04:00 (this install)', -240],
+    ['UTC+05:30 (half-hour zone)', 330],
+  ] as const) {
+    it(`counts a 30s-old line stamped in ${label}`, () => {
+      const line = `[${offsetStamp(new Date(now - 30_000), offMin)}] \x1b[31mERROR\x1b[39m boom`;
+      expect(countRecentErrorLines(line, now, WINDOW)).toBe(1);
+    });
+  }
+
+  it('still excludes a line genuinely outside the window', () => {
+    const line = `[${offsetStamp(new Date(now - 10 * 60_000), 540)}] \x1b[31mERROR\x1b[39m old`;
+    expect(countRecentErrorLines(line, now, WINDOW)).toBe(0);
+  });
+
+  it("keeps parsing pre-change lines that carry no offset, in the reader's zone", () => {
+    const fixedNow = Date.parse('2026-06-15T12:00:00.000Z');
+    const originalTz = process.env.TZ;
+    try {
+      for (const tz of ['UTC', 'America/New_York', 'Asia/Tokyo']) {
+        process.env.TZ = tz;
+        const line = `[${localStamp(new Date(fixedNow - 30_000))}] \x1b[31mERROR\x1b[39m legacy`;
+        expect(countRecentErrorLines(line, fixedNow, WINDOW)).toBe(1);
+      }
+    } finally {
+      if (originalTz === undefined) delete process.env.TZ;
+      else process.env.TZ = originalTz;
+    }
+  });
+});
+
+describe('countRecentErrorLines', () => {
+  // Built from real local Date objects (not hardcoded UTC 'Z' strings), so
+  // these assertions hold under any runner TZ. NOTE: an offset-less stamp is
+  // read in the READER's zone, so these cases only pass because the helper
+  // and the parser share one zone — they cannot detect a logger/reader split.
+  // The `offset` block below is the case that can; see `offsetStamp`.
+  const nowDate = new Date();
+  const now = nowDate.getTime();
+
+  it('counts ANSI-wrapped ERROR lines (the real src/log.ts format)', () => {
+    const stamp = localStamp(new Date(now - 60_000));
+    // src/log.ts emit(): `[${ts()}] ${COLORS.error}ERROR${RESET} ${MSG_COLOR}msg${RESET} key=value`
+    const content = `[${stamp}] \x1b[31mERROR\x1b[39m \x1b[36msomething broke\x1b[39m key=value`;
+    expect(countRecentErrorLines(content, now)).toBe(1);
+  });
+
+  it('still counts a plain (non-ANSI) ERROR line', () => {
+    const stamp = localStamp(new Date(now - 60_000));
+    const content = `[${stamp}] ERROR something broke`;
+    expect(countRecentErrorLines(content, now)).toBe(1);
+  });
+
+  it('counts multiple ERROR lines within the last 24h', () => {
+    const content = [
+      `[${localStamp(new Date(now - 60 * 60_000))}] \x1b[31mERROR\x1b[39m \x1b[36mone\x1b[39m`,
+      `[${localStamp(new Date(now - 18 * 60 * 60_000))}] \x1b[31mERROR\x1b[39m \x1b[36mtwo\x1b[39m`,
+    ].join('\n');
+    expect(countRecentErrorLines(content, now)).toBe(2);
+  });
+
+  it('excludes ERROR lines older than the 24h window', () => {
+    const stamp = localStamp(new Date(now - 25 * 60 * 60 * 1000));
+    const content = `[${stamp}] \x1b[31mERROR\x1b[39m \x1b[36mtoo old\x1b[39m`;
+    expect(countRecentErrorLines(content, now)).toBe(0);
+  });
+
+  it('parses the stamp as LOCAL time, not UTC (no trailing Z appended)', () => {
+    // A stamp built from UTC getters instead of local getters would misread
+    // by the host's UTC offset. Skip this assertion when local time IS UTC
+    // (can't distinguish the bug there) — it still runs under any other TZ.
+    if (nowDate.getTimezoneOffset() === 0) return;
+    const utcMisreadStamp = new Date(now - 60_000).toISOString().replace('T', ' ').replace('Z', '').slice(0, 23);
+    const localCorrectStamp = localStamp(new Date(now - 60_000));
+    expect(utcMisreadStamp).not.toBe(localCorrectStamp); // sanity: the two bases actually differ here
+    expect(countRecentErrorLines(`[${localCorrectStamp}] ERROR local`, now)).toBe(1);
+  });
+
+  it('ignores non-ERROR levels and multi-line stderr continuation tails', () => {
+    const stamp = localStamp(new Date(now - 60_000));
+    const content = [
+      `[${stamp}] \x1b[33mWARN\x1b[39m \x1b[36mnot an error\x1b[39m`,
+      '    at someFunction (file.ts:10:5)', // stack-trace continuation, no timestamp prefix
+      'unhandled rejection dump with no bracket prefix at all',
+    ].join('\n');
+    expect(countRecentErrorLines(content, now)).toBe(0);
+  });
+});
+
+describe('isLiveForStreak', () => {
+  it('excludes cancelled and paused series — a dead/already-paused series is not "about to" auto-pause', () => {
+    expect(isLiveForStreak('cancelled')).toBe(false);
+    expect(isLiveForStreak('paused')).toBe(false);
+  });
+  it('includes every other status (pending/completed/failed/expired)', () => {
+    expect(isLiveForStreak('pending')).toBe(true);
+    expect(isLiveForStreak('completed')).toBe(true);
+    expect(isLiveForStreak('failed')).toBe(true);
+    expect(isLiveForStreak('expired')).toBe(true);
+  });
+});
+
+describe('advancePauseState', () => {
+  it('stamps first observation as "now"', () => {
+    const { state, oldestPausedDays } = advancePauseState({}, ['s1'], '2026-08-30T00:00:00.000Z');
+    expect(state).toEqual({ s1: '2026-08-30T00:00:00.000Z' });
+    expect(oldestPausedDays).toBe(0);
+  });
+
+  it('keeps the original first-seen timestamp on repeat observation (does not reset the clock)', () => {
+    const prev = { s1: '2026-08-27T00:00:00.000Z' };
+    const { state, oldestPausedDays } = advancePauseState(prev, ['s1'], '2026-08-30T00:00:00.000Z');
+    expect(state).toEqual({ s1: '2026-08-27T00:00:00.000Z' });
+    expect(oldestPausedDays).toBe(3);
+  });
+
+  it('drops a series no longer paused (resumed or gone)', () => {
+    const prev = { s1: '2026-08-20T00:00:00.000Z', s2: '2026-08-29T00:00:00.000Z' };
+    const { state } = advancePauseState(prev, ['s2'], '2026-08-30T00:00:00.000Z');
+    expect(state).toEqual({ s2: '2026-08-29T00:00:00.000Z' });
+  });
+
+  it('a re-paused series (absent from prevState) is stamped fresh, not resuming its old age', () => {
+    const { state, oldestPausedDays } = advancePauseState({}, ['s1'], '2026-08-30T00:00:00.000Z');
+    expect(state.s1).toBe('2026-08-30T00:00:00.000Z');
+    expect(oldestPausedDays).toBe(0);
+  });
+
+  it('no currently-paused series → empty state, zero age', () => {
+    const { state, oldestPausedDays } = advancePauseState(
+      { s1: '2026-08-01T00:00:00.000Z' },
+      [],
+      '2026-08-30T00:00:00.000Z',
+    );
+    expect(state).toEqual({});
+    expect(oldestPausedDays).toBe(0);
+  });
+
+  it('oldest_paused_days breaches pausedSeriesBreach only after 3+ observed days', () => {
+    const prev = { s1: '2026-08-27T12:00:00.000Z' };
+    const under = advancePauseState(prev, ['s1'], '2026-08-30T11:59:00.000Z').oldestPausedDays;
+    const over = advancePauseState(prev, ['s1'], '2026-08-30T12:01:00.000Z').oldestPausedDays;
+    expect(pausedSeriesBreach(1, under)).toBe(false);
+    expect(pausedSeriesBreach(1, over)).toBe(true);
+  });
+});
+
+// ────────────────────── L4: instruction-stack tripwire ─────────────────────
+// docs/specs/instruction-stack-prune/plan.md
+
+/** Pattern-clean filler prose of a requested length (pure ASCII, so length == byte length). */
+function cleanContent(bytes: number): string {
+  const line = 'This is a timeless standing rule with no dates or references.\n';
+  let out = '';
+  while (out.length < bytes) out += line;
+  return out.slice(0, bytes);
+}
+
+describe('scanBannedPatterns', () => {
+  it('flags an ISO date', () => {
+    expect(scanBannedPatterns('Fixed on 2026-08-31 after investigation.')).toContain('iso_date');
+  });
+  it('flags an issue/PR reference', () => {
+    expect(scanBannedPatterns('Root-caused in #123.')).toContain('issue_or_pr_ref');
+  });
+  it('flags a parenthesized issue/PR reference', () => {
+    expect(scanBannedPatterns('Fixed the race condition (#207).')).toContain('issue_or_pr_ref');
+  });
+  it('flags a ticket reference only for a tracker key the install declares', () => {
+    expect(scanBannedPatterns('Tracked in ENG-4521.', ['ENG'])).toContain('ticket_ref');
+    expect(scanBannedPatterns('Tracked in ENG-4521.')).toEqual([]);
+  });
+  it('flags a "Current Focus" header', () => {
+    expect(scanBannedPatterns('## Current Focus\n\nShip the new dashboard.')).toContain('current_focus_header');
+  });
+  it.each([
+    'corrections = ONE batched push after verdict; max 3 pushes/PR; after 3 failed full rounds stop',
+    'Standing rule: at most three pushes per PR.',
+    'The 3-push cap is spent.',
+  ])('flags a push cap: %s', (rule) => {
+    expect(scanBannedPatterns(rule)).toContain('push_cap');
+  });
+  it('passes batching rules that set no push cap', () => {
+    expect(
+      scanBannedPatterns('Corrections = ONE batched push after verdict; push through codex-review.sh push.'),
+    ).toEqual([]);
+  });
+  it('passes clean timeless prose', () => {
+    expect(scanBannedPatterns('Always verify claims before reporting them done.')).toEqual([]);
+  });
+});
+
+describe('checkContainerPatterns', () => {
+  const TMP = uniqueTmpRoot('fleet-drift-container-test');
+  const containerPath = () => path.join(TMP, 'CLAUDE.md');
+
+  beforeEach(() => {
+    fs.rmSync(TMP, { recursive: true, force: true });
+    fs.mkdirSync(TMP, { recursive: true });
+  });
+  afterEach(() => fs.rmSync(TMP, { recursive: true, force: true }));
+
+  // Length is deliberately not a signal: a long file of timeless rules is clean.
+  it('passes a clean file however long it is', () => {
+    fs.writeFileSync(containerPath(), cleanContent(60_000));
+    expect(checkContainerPatterns(containerPath())).toBeNull();
+  });
+
+  it('flags a banned pattern in a file of any size', () => {
+    fs.writeFileSync(containerPath(), 'Fixed on 2026-08-31.\n');
+    const breach = checkContainerPatterns(containerPath());
+    expect(breach?.metric).toBe('container');
+    expect(breach?.scope).toBe('container/CLAUDE.md');
+    expect(breach?.bannedHits[0].patterns).toContain('iso_date');
+  });
+});
+
+describe('checkTrunkDocPatterns', () => {
+  const TMP = uniqueTmpRoot('fleet-drift-trunk-doc-test');
+  const trunkPath = () => path.join(TMP, 'CLAUDE.md');
+
+  beforeEach(() => {
+    fs.rmSync(TMP, { recursive: true, force: true });
+    fs.mkdirSync(TMP, { recursive: true });
+  });
+  afterEach(() => fs.rmSync(TMP, { recursive: true, force: true }));
+
+  it('passes a clean file however long it is', () => {
+    fs.writeFileSync(trunkPath(), cleanContent(60_000));
+    expect(checkTrunkDocPatterns(trunkPath())).toBeNull();
+  });
+
+  it('flags a banned pattern in a file of any size', () => {
+    fs.writeFileSync(trunkPath(), 'Fixed on 2026-08-31.\n');
+    const breach = checkTrunkDocPatterns(trunkPath());
+    expect(breach?.metric).toBe('trunkDoc');
+    expect(breach?.scope).toBe('CLAUDE.md');
+    expect(breach?.bannedHits[0].patterns).toContain('iso_date');
+  });
+});
+
+describe('checkGroupStandingPatterns', () => {
+  const TMP = uniqueTmpRoot('fleet-drift-group-standing-test');
+  const groupsRoot = () => path.join(TMP, 'groups');
+
+  beforeEach(() => {
+    fs.rmSync(TMP, { recursive: true, force: true });
+    fs.mkdirSync(TMP, { recursive: true });
+  });
+  afterEach(() => fs.rmSync(TMP, { recursive: true, force: true }));
+
+  // Length is deliberately not a signal: a long standing file of timeless rules is clean.
+  it('passes a clean group however long its standing files are', () => {
+    const g = path.join(groupsRoot(), 'clean-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.writeFileSync(path.join(g, 'standing-instructions.md'), cleanContent(40_000));
+    fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(20_000));
+    expect(checkGroupStandingPatterns(groupsRoot())).toEqual([]);
+  });
+
+  it('flags an ISO date in a group standing file', () => {
+    const g = path.join(groupsRoot(), 'dated-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.writeFileSync(path.join(g, 'standing-instructions.md'), 'Fixed on 2026-08-31 during triage.\n');
+    const breaches = checkGroupStandingPatterns(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].bannedHits[0].patterns).toContain('iso_date');
+  });
+
+  it('flags a #123 issue reference', () => {
+    const g = path.join(groupsRoot(), 'ref-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), 'Root-caused in #123.\n');
+    const breaches = checkGroupStandingPatterns(groupsRoot());
+    expect(breaches[0].bannedHits[0].patterns).toContain('issue_or_pr_ref');
+  });
+
+  it('flags a "Current Focus" header', () => {
+    const g = path.join(groupsRoot(), 'focus-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.writeFileSync(path.join(g, 'standing-instructions.md'), '## Current Focus\n\nShip it.\n');
+    const breaches = checkGroupStandingPatterns(groupsRoot());
+    expect(breaches[0].bannedHits[0].patterns).toContain('current_focus_header');
+  });
+
+  it('a clean file passes with zero breaches even alongside other flagged groups', () => {
+    const clean = path.join(groupsRoot(), 'clean-group');
+    const dated = path.join(groupsRoot(), 'dated-group');
+    fs.mkdirSync(clean, { recursive: true });
+    fs.mkdirSync(dated, { recursive: true });
+    fs.writeFileSync(path.join(clean, 'standing-instructions.md'), cleanContent(1000));
+    fs.writeFileSync(path.join(dated, 'standing-instructions.md'), 'Fixed on 2026-08-31.\n');
+    const breaches = checkGroupStandingPatterns(groupsRoot());
+    expect(breaches.map((b) => b.scope)).toEqual(['dated-group']);
+  });
+
+  it('counts a symlinked CLAUDE.local.md once, not once per sibling group (no double-count, no double-flag)', () => {
+    const source = path.join(groupsRoot(), 'acme');
+    const sibling = path.join(groupsRoot(), 'acme-codex');
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(sibling, { recursive: true });
+    fs.writeFileSync(path.join(source, 'standing-instructions.md'), 'Root-caused in #123.\n');
+    fs.writeFileSync(path.join(source, 'CLAUDE.local.md'), cleanContent(200));
+    fs.symlinkSync(path.join(source, 'standing-instructions.md'), path.join(sibling, 'standing-instructions.md'));
+    fs.symlinkSync(path.join(source, 'CLAUDE.local.md'), path.join(sibling, 'CLAUDE.local.md'));
+
+    const breaches = checkGroupStandingPatterns(groupsRoot());
+    // One breach entry covering both sibling names, not two duplicate entries for the same underlying file.
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].scope).toBe('acme, acme-codex');
+    expect(breaches[0].bannedHits).toHaveLength(1);
+  });
+
+  it('returns empty when the groups root does not exist (e.g. a worktree without the groups checkout)', () => {
+    expect(checkGroupStandingPatterns(path.join(TMP, 'does-not-exist'))).toEqual([]);
+  });
+
+  // P2 regression: a normal clone shares only SOME standing files (a common
+  // CLAUDE.local.md, each group keeping its own persona) — that puts the two
+  // groups in DIFFERENT clusters (their full file sets differ), so the
+  // shared file must still be pattern-scanned/reported once, not once per
+  // cluster that happens to reference it.
+  it('P2: scans a file shared by only some groups exactly once, even when their personas differ (partial cluster overlap)', () => {
+    const groupA = path.join(groupsRoot(), 'group-a');
+    const groupB = path.join(groupsRoot(), 'group-b');
+    fs.mkdirSync(groupA, { recursive: true });
+    fs.mkdirSync(groupB, { recursive: true });
+    fs.writeFileSync(path.join(groupA, 'standing-instructions.md'), cleanContent(500)); // own, distinct
+    fs.writeFileSync(path.join(groupB, 'standing-instructions.md'), cleanContent(600)); // own, distinct — different size so the cluster signature truly differs
+    fs.writeFileSync(path.join(groupA, 'CLAUDE.local.md'), 'Root-caused in #123.\n'); // shared, real
+    fs.symlinkSync(path.join(groupA, 'CLAUDE.local.md'), path.join(groupB, 'CLAUDE.local.md')); // shared, symlink
+
+    const breaches = checkGroupStandingPatterns(groupsRoot());
+    const patternBreaches = breaches.filter((b) => b.bannedHits.length > 0);
+    expect(patternBreaches).toHaveLength(1); // not one per cluster
+    expect(patternBreaches[0].scope).toBe('group-a, group-b');
+    expect(patternBreaches[0].bannedHits).toHaveLength(1);
+    expect(patternBreaches[0].bannedHits[0].patterns).toContain('issue_or_pr_ref');
+  });
+
+  it('a banned-pattern hit and an unscannable file in the same group are two distinct breach entries, not merged or colliding', () => {
+    const g = path.join(groupsRoot(), 'dup-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.writeFileSync(path.join(g, 'standing-instructions.md'), 'Fixed on 2026-08-31.\n');
+    execFileSync('mkfifo', [path.join(g, 'CLAUDE.local.md')]);
+
+    const breaches = checkGroupStandingPatterns(groupsRoot());
+    expect(breaches).toHaveLength(2);
+    const patternBreach = breaches.find((b) => b.bannedHits.length > 0);
+    const unscannableBreach = breaches.find((b) => b.unscannable.length > 0);
+    expect(patternBreach?.scope).toBe('dup-group');
+    expect(unscannableBreach?.scope).toBe('dup-group');
+    // Same scope string on both — they must still carry a distinct kind so the issue-title dedup doesn't collapse them.
+    expect(instructionStackBreachKind(patternBreach!)).not.toBe(instructionStackBreachKind(unscannableBreach!));
+  });
+});
+
+// P1: groups/ is container-writable, so a candidate standing-file path is a
+// trust boundary, not just a file to read. These lock in that a planted
+// symlink/FIFO/oversized file is skipped and reported as its own signal,
+// never read.
+describe('checkGroupStandingPatterns safety (P1: symlink containment, non-regular files, size cap)', () => {
+  const TMP = uniqueTmpRoot('fleet-drift-safety-test');
+  const groupsRoot = () => path.join(TMP, 'groups');
+
+  beforeEach(() => {
+    fs.rmSync(TMP, { recursive: true, force: true });
+    fs.mkdirSync(TMP, { recursive: true });
+  });
+  afterEach(() => fs.rmSync(TMP, { recursive: true, force: true }));
+
+  it('skips and flags a symlink that escapes the groups/ tree, never reading the target', () => {
+    const outside = path.join(TMP, 'outside-secret.md');
+    fs.writeFileSync(outside, 'host-side content with a date 2026-08-31 that must never surface.\n');
+    const g = path.join(groupsRoot(), 'escape-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.symlinkSync(outside, path.join(g, 'CLAUDE.local.md'));
+
+    const breaches = checkGroupStandingPatterns(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].scope).toBe('escape-group');
+    expect(breaches[0].unscannable).toHaveLength(1);
+    expect(breaches[0].unscannable[0].reason).toMatch(/escapes groups\//);
+    // The banned date in the outside file's content must never surface — it was never read.
+    expect(breaches[0].bannedHits).toEqual([]);
+  });
+
+  it('skips a FIFO placed directly (no symlink) without hanging', () => {
+    const g = path.join(groupsRoot(), 'fifo-group');
+    fs.mkdirSync(g, { recursive: true });
+    const fifoPath = path.join(g, 'CLAUDE.local.md');
+    execFileSync('mkfifo', [fifoPath]);
+
+    const breaches = checkGroupStandingPatterns(groupsRoot()); // must return promptly — a naive read would block forever
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].unscannable[0].reason).toBe('not a regular file');
+  });
+
+  it('skips a symlink to a FIFO without hanging', () => {
+    const source = path.join(groupsRoot(), 'fifo-source');
+    fs.mkdirSync(source, { recursive: true });
+    const fifoPath = path.join(source, 'the-fifo');
+    execFileSync('mkfifo', [fifoPath]);
+    const g = path.join(groupsRoot(), 'fifo-symlink-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.symlinkSync(fifoPath, path.join(g, 'CLAUDE.local.md'));
+
+    const breaches = checkGroupStandingPatterns(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].scope).toBe('fifo-symlink-group');
+    expect(breaches[0].unscannable[0].reason).toBe('not a regular file');
+  });
+
+  it('skips a file over the safety cap without reading its content', () => {
+    const g = path.join(groupsRoot(), 'huge-group');
+    fs.mkdirSync(g, { recursive: true });
+    // Sparse file: stat reports a huge size without allocating/reading real data.
+    const hugePath = path.join(g, 'CLAUDE.local.md');
+    fs.writeFileSync(hugePath, '');
+    fs.truncateSync(hugePath, 5_000_000);
+
+    const breaches = checkGroupStandingPatterns(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].unscannable[0].reason).toMatch(/safety cap/);
+  });
+
+  it('still follows a symlink that stays inside groups/ (a legitimate sibling share) and reads it', () => {
+    const source = path.join(groupsRoot(), 'legit-source');
+    const sibling = path.join(groupsRoot(), 'legit-sibling');
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(sibling, { recursive: true });
+    fs.writeFileSync(path.join(source, 'CLAUDE.local.md'), cleanContent(300));
+    fs.symlinkSync(path.join(source, 'CLAUDE.local.md'), path.join(sibling, 'CLAUDE.local.md'));
+
+    expect(checkGroupStandingPatterns(groupsRoot())).toEqual([]); // clean content, nothing unscannable
+
+    // Same layout, banned content: the target really is read through the symlink, not just stat'd.
+    fs.writeFileSync(path.join(source, 'CLAUDE.local.md'), 'Fixed on 2026-08-31.\n');
+    const breaches = checkGroupStandingPatterns(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].scope).toBe('legit-sibling, legit-source');
+    expect(breaches[0].bannedHits[0].patterns).toContain('iso_date');
+  });
+});
+
+describe('checkInstructionStack', () => {
+  const TMP = uniqueTmpRoot('fleet-drift-instruction-stack-test');
+
+  beforeEach(() => {
+    fs.rmSync(TMP, { recursive: true, force: true });
+    fs.mkdirSync(TMP, { recursive: true });
+  });
+  afterEach(() => fs.rmSync(TMP, { recursive: true, force: true }));
+
+  it('flags the shared base once — a hit in it is not re-reported against every group that inherits it', () => {
+    const containerPath = path.join(TMP, 'CLAUDE.md');
+    fs.writeFileSync(containerPath, `Fixed on 2026-08-31.\n${cleanContent(2000)}`);
+    const trunkPath = path.join(TMP, 'trunk-CLAUDE.md');
+    fs.writeFileSync(trunkPath, cleanContent(5000));
+
+    const groupsRoot = path.join(TMP, 'groups');
+    for (const name of ['group-one', 'group-two']) {
+      const g = path.join(groupsRoot, name);
+      fs.mkdirSync(g, { recursive: true });
+      fs.writeFileSync(path.join(g, 'standing-instructions.md'), cleanContent(2000));
+    }
+
+    const breaches = checkInstructionStack(containerPath, groupsRoot, trunkPath);
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].metric).toBe('container');
+  });
+
+  it('flags trunkDoc independently of container', () => {
+    const containerPath = path.join(TMP, 'CLAUDE.md');
+    fs.writeFileSync(containerPath, cleanContent(5000));
+    const trunkPath = path.join(TMP, 'trunk-CLAUDE.md');
+    fs.writeFileSync(trunkPath, `Tracked in ENG-4521.\n${cleanContent(5000)}`);
+
+    const groupsRoot = path.join(TMP, 'groups');
+    const board = path.join(groupsRoot, 'group-one');
+    fs.mkdirSync(board, { recursive: true });
+    fs.writeFileSync(path.join(board, 'container.json'), JSON.stringify({ backlogCanvas: { linearTeam: 'ENG' } }));
+
+    const breaches = checkInstructionStack(containerPath, groupsRoot, trunkPath);
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].metric).toBe('trunkDoc');
+  });
+
+  it.each(['container', 'groupStanding'] as const)("applies the install's tracker keys to the %s scan", (surface) => {
+    const containerPath = path.join(TMP, 'CLAUDE.md');
+    const trunkPath = path.join(TMP, 'trunk-CLAUDE.md');
+    fs.writeFileSync(trunkPath, cleanContent(5000));
+    const ticket = `Tracked in ENG-4521.\n${cleanContent(2000)}`;
+    fs.writeFileSync(containerPath, surface === 'container' ? ticket : cleanContent(2000));
+
+    const groupsRoot = path.join(TMP, 'groups');
+    const board = path.join(groupsRoot, 'group-one');
+    fs.mkdirSync(board, { recursive: true });
+    fs.writeFileSync(path.join(board, 'container.json'), JSON.stringify({ backlogCanvas: { linearTeam: 'ENG' } }));
+    fs.writeFileSync(
+      path.join(board, 'standing-instructions.md'),
+      surface === 'groupStanding' ? ticket : cleanContent(2000),
+    );
+
+    const breaches = checkInstructionStack(containerPath, groupsRoot, trunkPath);
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].metric).toBe(surface);
+    expect(breaches[0].bannedHits[0].patterns).toEqual(['ticket_ref']);
+  });
+
+  it('passes a large but timeless tree — no metric here treats size as a finding', () => {
+    const containerPath = path.join(TMP, 'CLAUDE.md');
+    fs.writeFileSync(containerPath, cleanContent(60_000));
+    const trunkPath = path.join(TMP, 'trunk-CLAUDE.md');
+    fs.writeFileSync(trunkPath, cleanContent(60_000));
+
+    const groupsRoot = path.join(TMP, 'groups');
+    for (const [name, size] of [
+      ['group-one', 30_000],
+      ['group-two', 40_000],
+      ['group-three', 50_000],
+    ] as const) {
+      const g = path.join(groupsRoot, name);
+      fs.mkdirSync(g, { recursive: true });
+      fs.writeFileSync(path.join(g, 'standing-instructions.md'), cleanContent(size));
+      fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(20_000));
+      fs.writeFileSync(path.join(g, 'CLAUDE.md'), cleanContent(60_000));
+    }
+
+    expect(checkInstructionStack(containerPath, groupsRoot, trunkPath)).toEqual([]);
+  });
+});
+
+describe('checkEffectiveStackSafety', () => {
+  const TMP = uniqueTmpRoot('fleet-drift-effective-stack-test');
+  const groupsRoot = () => path.join(TMP, 'groups');
+
+  beforeEach(() => {
+    fs.rmSync(TMP, { recursive: true, force: true });
+    fs.mkdirSync(TMP, { recursive: true });
+  });
+  afterEach(() => fs.rmSync(TMP, { recursive: true, force: true }));
+
+  function writeContainerJson(groupDir: string, provider: string): void {
+    fs.writeFileSync(path.join(groupDir, 'container.json'), JSON.stringify({ provider }));
+  }
+
+  // This walk exists to refuse unsafe files, not to judge size — a huge but readable chain is clean.
+  it('reports nothing for a readable composed chain, however large', () => {
+    const g = path.join(groupsRoot(), 'big-but-readable-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.writeFileSync(path.join(g, 'fragment.md'), cleanContent(60_000));
+    fs.writeFileSync(path.join(g, 'CLAUDE.md'), '@./fragment.md\n');
+    fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(60_000));
+
+    expect(checkEffectiveStackSafety(groupsRoot())).toEqual([]);
+  });
+
+  it('does not banned-pattern-scan the composed doc — those source files are scanned at their source', () => {
+    const g = path.join(groupsRoot(), 'dated-agents-group');
+    fs.mkdirSync(g, { recursive: true });
+    writeContainerJson(g, 'codex');
+    fs.writeFileSync(path.join(g, 'AGENTS.md'), `Fixed on 2026-08-31 (#123).\n${cleanContent(200)}`);
+
+    expect(checkEffectiveStackSafety(groupsRoot())).toEqual([]);
+  });
+
+  it('provider-aware source selection: codex/opencode walk AGENTS.md, claude/default walk CLAUDE.md + CLAUDE.local.md', () => {
+    const claudeGroup = path.join(groupsRoot(), 'claude-group');
+    const codexGroup = path.join(groupsRoot(), 'codex-group');
+    fs.mkdirSync(claudeGroup, { recursive: true });
+    fs.mkdirSync(codexGroup, { recursive: true });
+
+    // Identical layout on both: an unreadable AGENTS.md next to a fine CLAUDE.md.
+    // Only the provider whose harness actually reads AGENTS.md may report it.
+    for (const g of [claudeGroup, codexGroup]) {
+      execFileSync('mkfifo', [path.join(g, 'AGENTS.md')]);
+      fs.writeFileSync(path.join(g, 'CLAUDE.md'), cleanContent(2000));
+    }
+    // claudeGroup: no container.json — defaults to claude. codexGroup: explicit codex.
+    writeContainerJson(codexGroup, 'codex');
+
+    const breaches = checkEffectiveStackSafety(groupsRoot());
+    expect(breaches.map((b) => b.scope)).toEqual(['codex-group']);
+    expect(breaches[0].unscannable[0].reason).toBe('not a regular file');
+  });
+
+  it('an unscannable CLAUDE.local.md is reported for a claude/default-provider group (Claude Code discovers it independently of AGENTS.md)', () => {
+    const g = path.join(groupsRoot(), 'local-fifo-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.writeFileSync(path.join(g, 'CLAUDE.md'), cleanContent(2000));
+    execFileSync('mkfifo', [path.join(g, 'CLAUDE.local.md')]);
+
+    const breaches = checkEffectiveStackSafety(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].scope).toBe('local-fifo-group');
+    expect(breaches[0].unscannable[0].reason).toBe('not a regular file');
+  });
+
+  it('a FIFO behind a nested @-import does not hang the check and is reported unscannable', () => {
+    const g = path.join(groupsRoot(), 'fifo-import-group');
+    fs.mkdirSync(g, { recursive: true });
+    execFileSync('mkfifo', [path.join(g, 'the-fifo')]);
+    fs.writeFileSync(path.join(g, 'CLAUDE.md'), '@./the-fifo\n');
+
+    const breaches = checkEffectiveStackSafety(groupsRoot()); // must return promptly, not block on the FIFO
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].unscannable.length).toBeGreaterThan(0);
+  });
+
+  it('an oversized nested @-import is flagged without being read into memory', () => {
+    const g = path.join(groupsRoot(), 'oversized-import-group');
+    fs.mkdirSync(g, { recursive: true });
+    const hugePath = path.join(g, 'huge.md');
+    fs.writeFileSync(hugePath, ''); // sparse file: stat reports a huge size, no real data written/read
+    fs.truncateSync(hugePath, 5_000_000);
+    fs.writeFileSync(path.join(g, 'CLAUDE.md'), '@./huge.md\n');
+
+    const breaches = checkEffectiveStackSafety(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].unscannable[0].reason).toMatch(/safety cap/);
+  });
+
+  it('a malformed container.json is reported unscannable, not silently defaulted', () => {
+    const g = path.join(groupsRoot(), 'bad-config-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.writeFileSync(path.join(g, 'container.json'), '{ not valid json');
+    fs.writeFileSync(path.join(g, 'AGENTS.md'), cleanContent(500)); // would otherwise walk fine
+
+    const breaches = checkEffectiveStackSafety(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].unscannable[0].reason).toMatch(/malformed container\.json/);
+  });
+
+  it('an unreadable (non-regular) container.json is reported unscannable', () => {
+    const g = path.join(groupsRoot(), 'fifo-config-group');
+    fs.mkdirSync(g, { recursive: true });
+    execFileSync('mkfifo', [path.join(g, 'container.json')]);
+
+    const breaches = checkEffectiveStackSafety(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].unscannable[0].reason).toBe('not a regular file');
+  });
+
+  it('a finding carries the effectiveStack metric and "unscannable" kind', () => {
+    const g = path.join(groupsRoot(), 'kind-group');
+    fs.mkdirSync(g, { recursive: true });
+    writeContainerJson(g, 'opencode');
+    execFileSync('mkfifo', [path.join(g, 'AGENTS.md')]);
+
+    const breaches = checkEffectiveStackSafety(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].metric).toBe('effectiveStack');
+    expect(instructionStackBreachKind(breaches[0])).toBe('unscannable');
+  });
+
+  it('a stale/dangling @-import does not crash the check (flattenClaudeMd degrades to a comment marker, per its own documented behavior)', () => {
+    const g = path.join(groupsRoot(), 'dangling-group');
+    fs.mkdirSync(g, { recursive: true });
+    // No AGENTS.md — forces the flatten fallback path; the referenced target is never created.
+    fs.writeFileSync(path.join(g, 'CLAUDE.md'), '@./does-not-exist.md\n');
+
+    expect(() => checkEffectiveStackSafety(groupsRoot())).not.toThrow();
+    expect(checkEffectiveStackSafety(groupsRoot())).toEqual([]); // a missing import is staleness, not an unsafe read
+  });
+
+  it('a group with no composed doc at all (never spawned) is silently skipped, not a breach', () => {
+    const g = path.join(groupsRoot(), 'never-spawned-group');
+    fs.mkdirSync(g, { recursive: true });
+    expect(checkEffectiveStackSafety(groupsRoot())).toEqual([]);
+  });
+
+  it('checkInstructionStack includes effectiveStack breaches alongside the other metrics', () => {
+    const containerPath = path.join(TMP, 'container-CLAUDE.md');
+    fs.writeFileSync(containerPath, cleanContent(2000));
+    const trunkPath = path.join(TMP, 'trunk-CLAUDE.md');
+    fs.writeFileSync(trunkPath, cleanContent(5000));
+    const g = path.join(groupsRoot(), 'combined-group');
+    fs.mkdirSync(g, { recursive: true });
+    writeContainerJson(g, 'codex');
+    execFileSync('mkfifo', [path.join(g, 'AGENTS.md')]);
+
+    const breaches = checkInstructionStack(containerPath, groupsRoot(), trunkPath);
+    expect(breaches.some((b) => b.metric === 'effectiveStack')).toBe(true);
+  });
+});

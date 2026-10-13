@@ -1,0 +1,100 @@
+import { randomUUID } from 'crypto';
+
+import { getSession } from '../../db/sessions.js';
+import { log } from '../../log.js';
+import { writeSessionMessage } from '../../session-manager.js';
+import { killContainer } from '../../container-runner.js';
+import type { Session } from '../../types.js';
+import { getTaskById, transitionToTerminal } from './db/tasks.js';
+
+export async function applySpawnCancel(content: Record<string, unknown>, callerSession: Session): Promise<void> {
+  const taskId = content.task_id as string | undefined;
+  const reason = (content.reason as string | undefined) ?? 'cancelled';
+
+  if (!taskId) {
+    log.warn('applySpawnCancel: missing task_id', { sessionId: callerSession.id });
+    return;
+  }
+
+  const task = await getTaskById(taskId);
+  if (!task) {
+    log.warn('applySpawnCancel: task not found', { taskId });
+    return;
+  }
+
+  // Auth: ONLY the parent session; no owner override.
+  if (callerSession.id !== task.parent_session_id) {
+    log.warn('applySpawnCancel: auth failed — not the parent session', {
+      taskId,
+      expected: task.parent_session_id,
+      got: callerSession.id,
+    });
+    return;
+  }
+
+  const now = new Date().toISOString();
+
+  if (task.status === 'pending' || task.status === 'running') {
+    const transitioned = await transitionToTerminal(taskId, 'cancelled', {
+      cancelled_at: now,
+    });
+
+    if (!transitioned) {
+      log.debug('applySpawnCancel: task already in terminal state', { taskId });
+      return;
+    }
+
+    void import('../../dashboard/api/events.js')
+      .then((mod) =>
+        mod.emitDashboardEvent('task_event', {
+          task_id: taskId,
+          kind: 'cancel',
+          agent_group_id: task.parent_agent_group_id,
+        }),
+      )
+      .catch(() => {
+        /* dashboard module may not be initialized in tests */
+      });
+
+    if (task.status === 'running' && task.child_session_id) {
+      const childSession = await getSession(task.child_session_id);
+      if (childSession) {
+        try {
+          await writeSessionMessage(childSession.agent_group_id, task.child_session_id, {
+            id: randomUUID(),
+            kind: 'system',
+            timestamp: now,
+            content: JSON.stringify({ _spawn_cancel: { task_id: taskId, reason } }),
+          });
+        } catch (err) {
+          log.warn('applySpawnCancel: failed to write cancel envelope to child', { taskId, err });
+        }
+      }
+
+      const childSessionId = task.child_session_id;
+      setTimeout(() => {
+        log.info('applySpawnCancel: 2-min grace expired, killing child container', { taskId, childSessionId });
+        killContainer(childSessionId, `spawn_cancel: ${reason}`);
+      }, 120_000);
+    }
+
+    const parentSession = await getSession(task.parent_session_id);
+    if (parentSession) {
+      try {
+        await writeSessionMessage(task.parent_agent_group_id, task.parent_session_id, {
+          id: randomUUID(),
+          kind: 'chat',
+          timestamp: now,
+          content: JSON.stringify({
+            text: `Task cancelled: ${taskId}. Reason: ${reason}`,
+            _task_update: { task_id: taskId, status: 'cancelled', reason },
+          }),
+        });
+      } catch (err) {
+        log.warn('applySpawnCancel: failed to notify parent', { taskId, err });
+      }
+    }
+  } else {
+    log.debug('applySpawnCancel: task in non-cancellable state', { taskId, status: task.status });
+  }
+}

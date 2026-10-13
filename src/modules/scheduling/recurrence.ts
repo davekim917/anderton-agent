@@ -1,0 +1,206 @@
+/**
+ * Sweep hook for recurring tasks.
+ *
+ * Every sweep tick, find `messages_in` rows that are `completed` AND still
+ * have a `recurrence` cron expression. For each, compute the next run via
+ * cron-parser, insert a fresh pending row (copying series_id forward), then
+ * clear the recurrence on the original so it isn't re-cloned next tick.
+ *
+ * Called by the sweep-scheduling S18 duty via a dynamic import.
+ */
+import { withCentralSync } from '../../db/central-lease.js';
+import { withQuietInvalidationSync } from '../../db/sessions.js';
+import { CronExpressionParser } from 'cron-parser';
+
+import { resolveGroupTimezone } from '../../container-config.js';
+import { log } from '../../log.js';
+import type { NanoclawMailboxSession } from '../mailbox/index.js';
+import type { Session } from '../../types.js';
+import { appendRunLog } from './run-log.js';
+
+// Consecutive pre-task-script failures (the series' trailing FAILED runs —
+// derived from occurrence rows, no stored counter) throttle a broken monitor
+// script instead of letting it wake a container at raw cron cadence forever.
+// A deliberate wakeAgent=false gate is a normal completed run and never backs
+// off. Mirrors the stuck-message retry in host-sweep.ts (BACKOFF_BASE_MS
+// doubling, MAX_TRIES → failed): fail loud, don't spin.
+const SCRIPT_FAIL_PAUSE_CAP = 8;
+const SCRIPT_BACKOFF_CAP_MIN = 60;
+
+/**
+ * Auto-pause used to terminate in a run-log line and a host warning, and
+ * nothing read either. A paused series is an ABSORBING STATE: it stops firing,
+ * so it stops being the reason anyone looks at it, and it stays dead until a
+ * human happens to run `ncl tasks get`. Measured 2026-08-17: two series paused
+ * this way, one for 15 days, and the failing script in one of them had since
+ * started working — it would never have run again.
+ *
+ * So the pause now owes someone an action. The note is DUE IMMEDIATELY rather
+ * than on-wake: an on-wake note is only read when something else wakes the
+ * container, and for a group whose only wake source was the series that just
+ * paused, that is never. A due row makes the sweep wake it (host-sweep.ts's
+ * `dueCount > 0` branch), so the obligation lands even on an otherwise idle
+ * agent. Dedup id is the series, so one pause raises one note.
+ */
+function notifyOwnerOfPause(
+  mailbox: NanoclawMailboxSession,
+  session: Session,
+  seriesId: string,
+  scriptFails: number,
+): void {
+  try {
+    mailbox.insertDeferredMessageWithContextIfNew({
+      id: `task-paused-${seriesId}`,
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: session.agent_group_id,
+      channelType: 'agent',
+      threadId: null,
+      content: JSON.stringify({
+        text:
+          `[system] Scheduled series \`${seriesId}\` auto-paused after ${scriptFails} consecutive ` +
+          `script failures and is NOT running. Diagnose the script, then either fix it and run ` +
+          `\`ncl tasks resume ${seriesId}\`, or post once to the humans who depend on it naming what ` +
+          `you need. Do not leave it paused silently — while it is paused, whatever it watches is unwatched.`,
+        sender: 'system',
+        senderId: 'system',
+        _system: { kind: 'task-auto-paused', seriesId, scriptFails },
+      }),
+      processAfter: new Date().toISOString(),
+      recurrence: null,
+      onWake: 0,
+    });
+  } catch (err) {
+    // Same rule as the run-log note: the sweep must not crash over a notice.
+    log.warn('Could not write auto-pause notice', { seriesId, err });
+  }
+}
+
+/** 2, 4, 8, 16, 32, 60, 60… minutes for fails = 1, 2, 3… */
+export function scriptBackoffMinutes(fails: number): number {
+  return Math.min(2 * 2 ** (fails - 1), SCRIPT_BACKOFF_CAP_MIN);
+}
+
+/** Host-written line in the series run log — no agent session exists to call
+ *  append-log when a script-gated series is auto-paused. Uses the shared
+ *  appendRunLog helper (one writer format); appendRunLog throws on a bad
+ *  series charset or a missing agent group, and the sweep must not crash
+ *  over a log line, so failures are logged and swallowed. */
+async function appendHostTaskNote(agentGroupId: string, seriesId: string, note: string): Promise<void> {
+  try {
+    await appendRunLog(agentGroupId, seriesId, note);
+  } catch (err) {
+    log.warn('Could not append host task note to run log', { agentGroupId, seriesId, err });
+  }
+}
+
+/**
+ * Fan out completed recurring tasks into their next occurrence.
+ *
+ * Takes the sweep's own mailbox SESSION rather than a raw handle. `host-sweep.ts`
+ * is the only production caller and already holds a session for this key, so
+ * opening a second one here would trip the same-key nesting guard (invariant
+ * I-3); a session parameter is the seam's sanctioned object, and unlike a
+ * handle it keeps this file off the ratchet's raw-access allowlist (I-9).
+ */
+export async function handleRecurrence(mailbox: NanoclawMailboxSession, session: Session): Promise<void> {
+  const recurring = mailbox.getCompletedRecurringRows();
+  // Resolved per call, not cached at module load: a group timezone change
+  // (approved `groups config update --timezone`) shifts the series from the
+  // very next re-arm. The occurrence already armed keeps its absolute UTC
+  // instant — changing the override deliberately does not reach into live
+  // session DBs to rewrite `process_after`, so one more fire can land at the
+  // old local time before the series settles onto the new grid.
+  const tz = await resolveGroupTimezone(session.agent_group_id);
+
+  for (const msg of recurring) {
+    try {
+      // Interpret the cron expression in the user's timezone. Without it, a task written "0 9 * * *"
+      // by an agent running in a user's local TZ fires at 09:00 UTC instead of
+      // 09:00 user-local.
+      const interval = CronExpressionParser.parse(msg.recurrence, { tz });
+      const cronNext = interval.next().toDate();
+      const newId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+      const scriptFails = mailbox.trailingFailedRuns(msg.series_id ?? msg.id);
+
+      if (scriptFails >= SCRIPT_FAIL_PAUSE_CAP) {
+        // Re-arm PAUSED at the cron time so `ncl tasks resume` revives the
+        // series in place; leave the why in the run log. Insert + clear are
+        // one transaction: a crash between them would leave the predecessor
+        // still recurrence-armed next to a live successor → double-fire.
+        await withCentralSync(
+          () =>
+            withQuietInvalidationSync(session.id, () =>
+              mailbox.armNextRecurrence(msg.id, msg, newId, cronNext.toISOString(), 'paused'),
+            ),
+          'recurrence re-arm paused',
+        );
+        await appendHostTaskNote(
+          session.agent_group_id,
+          msg.series_id,
+          `auto-paused after ${scriptFails} consecutive script failures (host); fix the script, then \`ncl tasks resume ${msg.series_id}\``,
+        );
+        notifyOwnerOfPause(mailbox, session, msg.series_id ?? msg.id, scriptFails);
+        log.warn('Task series auto-paused: script keeps failing', {
+          seriesId: msg.series_id,
+          scriptFails,
+          sessionId: session.id,
+        });
+        continue;
+      }
+
+      const backoffAt = scriptFails > 0 ? Date.now() + scriptBackoffMinutes(scriptFails) * 60_000 : 0;
+      const nextRun = new Date(Math.max(cronNext.getTime(), backoffAt)).toISOString();
+
+      // Invalidated like every other due-ness write (Codex round 2 H1, round 3
+      // H1): the re-arm moves `process_after` in the session DB, which the quiet
+      // cache cannot see, so the central-DB invalidation is what makes the
+      // successor visible, and it happens in the same synchronous turn as the
+      // arm.
+      //
+      // Fail-closed: if the invalidation throws, the arm never happens and this
+      // row's `catch` below logs it — per row, so the rest of this session's
+      // recurrences still run and the duty itself does not fail. The two
+      // reasons it can throw do NOT have the same aftermath, and only one of
+      // them is a retry (Codex round 5):
+      //
+      //  - A transient central-DB error. The session is still ACTIVE, so it is
+      //    still enumerated, and the predecessor still carries its recurrence —
+      //    the next tick re-attempts the arm. Nothing is lost.
+      //  - No ACTIVE session row, which is what a session closed under this tick
+      //    looks like. There is no retry, and there must not be one: a closed
+      //    session is gone from `getActiveSessions()`, so no recurrence duty
+      //    will run for it again. The series stops here rather than arming a
+      //    successor into a session the sweep will never enumerate — invisible
+      //    work is the outcome this refusal exists to prevent, and a closed
+      //    session's schedule ending with it is the intended lifecycle.
+      //
+      // The mark this clears is flushed with `session.last_active` as its basis
+      // — the value the driver read when it listed the tick's sessions, before
+      // this pass ran (`newQuietMarks.push`, src/host-sweep.ts) — so moving the
+      // column here fails that flush's `WHERE last_active IS <basis>` guard, and
+      // the in-memory mark's `mark.lastActive === session.last_active` check on
+      // the next tick with it.
+      await withCentralSync(
+        () => withQuietInvalidationSync(session.id, () => mailbox.armNextRecurrence(msg.id, msg, newId, nextRun)),
+        'recurrence re-arm',
+      );
+
+      log.info('Inserted next recurrence', {
+        originalId: msg.id,
+        newId,
+        seriesId: msg.series_id,
+        nextRun,
+        ...(scriptFails > 0 && { scriptFails, backoffMin: scriptBackoffMinutes(scriptFails) }),
+        sessionId: session.id,
+      });
+    } catch (err) {
+      log.error('Failed to compute next recurrence', {
+        messageId: msg.id,
+        recurrence: msg.recurrence,
+        err,
+      });
+    }
+  }
+}

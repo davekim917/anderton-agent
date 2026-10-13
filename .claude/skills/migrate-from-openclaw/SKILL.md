@@ -1,0 +1,653 @@
+---
+name: migrate-from-openclaw
+description: Migrate from OpenClaw to NanoClaw v2. Detects an existing OpenClaw installation, extracts identity, channel credentials, scheduled tasks, and other config, then guides interactive migration. Triggers on "migrate from openclaw", "openclaw migration", "import from openclaw".
+---
+
+# Migrate from OpenClaw
+
+Guide the user through migrating their OpenClaw installation into NanoClaw v2.
+This is a conversation, not a batch job. Read OpenClaw state, discuss it with
+the user, decide together what to bring over and where it belongs in v2's
+entity model, and show proposed changes before applying.
+
+**Principle:** Never silently copy data. Read it, explain it, place it, then
+apply. Credentials are masked when displayed (first 4 + `...` + last 4).
+Memory and instruction migration is not a curation exercise: classify the
+source, preserve every byte, and keep the two states separate.
+
+**UX:** Use `AskUserQuestion` for multiple-choice only. Use plain text for
+free-form input. Don't dump raw data — summarize and explain conversationally.
+
+## What this skill changes (conformance)
+
+This skill drives existing NanoClaw entry points (`setup/index.ts --step
+register`, `scripts/init-first-agent.ts`, the `onecli` CLI), preserves imported
+user data, and copies selected OpenClaw skills. It makes no code-level reach-in
+into core. Its integration assumptions about v2 are guarded by
+`tests/transform.test.ts`, which runs in place against the canonical transform
+module (Phase 8). The transform module is the only shared code file this skill installs;
+`REMOVE.md` reverses those files, never migrated user data or permanent
+snapshots.
+
+## v2 architecture the migration targets
+
+OpenClaw and NanoClaw v2 differ structurally. Keep these in mind throughout:
+
+- **Entity model.** v2's central DB (`data/v2.db`) holds `users`,
+  `user_roles`, `agent_groups`, `messaging_groups`, and the
+  `messaging_group_agents` wiring between them. There is no `store/messages.db`
+  and no `scheduled_tasks` table.
+- **Container isolation.** Each agent group runs in its own Linux container.
+  An OpenClaw "agent" maps to a v2 *agent group* (workspace plus provider/group
+  instruction state); an OpenClaw chat/group maps to a v2 *messaging group*;
+  the wiring row connects them.
+- **Standing instructions vs memory.** Per-group role, personality, and
+  behavior live outside memory in group instruction state. The one durable
+  memory canon is `data/workgroups/<workgroup-id>/memory` on the host and
+  `/workspace/workgroup/memory` in containers. `/workspace/agent/memory` is a
+  compatibility link, not another store. Every current and future sibling in
+  the workgroup — Claude, Codex, OpenCode, or another provider — sees that same
+  canon. The provider project document is composed at spawn and must not be
+  edited.
+- **Credentials.** Container-facing API credentials (Anthropic, OpenAI, …) are
+  held in the OneCLI Agent Vault and injected per request — never in container
+  env vars. Host-side channel tokens (Telegram/Discord/Slack bot tokens) stay
+  in `.env`; the NanoClaw host process reads them to connect to the platform.
+- **Access control.** Per messaging group `unknown_sender_policy` plus
+  `user_roles` (owner/admin) and `agent_group_members` — not a JSON allowlist
+  file.
+- **Scheduled tasks.** A task is a `messages_in` row (`kind='task'`) in a
+  session's `inbound.db`, carrying a cron `recurrence` and a `process_after`
+  timestamp. The agent creates them via its `schedule_task` MCP tool.
+
+## Migration State File
+
+Create `migration-state.md` in the project root at the start of Phase 0. Update
+it after each phase. It's the single source of truth — if context is lost,
+re-read it to recover decisions and progress. Re-read it before starting any
+phase.
+
+Sections to maintain:
+
+- **Progress** — checkbox list of phases (Phase 0–8)
+- **Discovery** — STATE_DIR, IDENTITY_NAME, channels, groups (with v2
+  platform_id mappings), workspace files, cron count, MCP servers
+- **Decisions** — assistant_name, shared-vs-separate, primary owner agent
+- **Owner & Primary Agent** — user id, role, agent group folder
+- **Registered Groups** — table: folder, platform_id, channel, session_mode
+- **Credentials** — table: credential, destination (vault / .env), status
+- **Settings Migrated** — timezone, container timeout
+- **Identity & Memory** — byte-preserved instruction import paths, target
+  workgroup ids, canonical memory paths, SHA-256 manifests, and migration report
+- **Scheduled Tasks** — table: original_id, name, mapped schedule, status
+- **Deferred / Not Applicable** — unsupported channels, OpenClaw-only features
+
+Keep it factual and terse. Delete it at the end of Phase 8 (or offer to keep it
+as a record).
+
+## Phase 0: Discovery
+
+Run the discovery script to find and summarize the OpenClaw installation:
+
+```bash
+pnpm exec tsx ${CLAUDE_SKILL_DIR}/scripts/discover-openclaw.ts
+```
+
+If the user specifies a custom path, pass `--state-dir <path>`.
+
+Parse the status block. Key fields: STATUS, STATE_DIR, CHANNELS,
+WORKSPACE_FILES, DAILY_MEMORY_FILES, SKILL_COUNT, SKILLS, CRON_JOBS,
+MCP_SERVERS, IDENTITY_NAME, AGENT_COUNT, AGENT_IDS, GROUPS (each formatted
+`channel:id(name)=>v2_platform_id` — the right-hand value is what to pass as
+`--platform-id` to register).
+
+**Sanity-check the output.** The script detects known structures but can miss
+data if OpenClaw's format changed. Check `CONFIG_TOP_KEYS` and
+`CONFIG_CHANNEL_KEYS` — if you see keys it didn't report on, read that section
+of the config with the Read tool. Check `STATE_DIR_CONTENTS` for directories it
+doesn't scan.
+
+**If STATUS=not_found:** Tell the user no OpenClaw install was detected at the
+standard locations (`~/.openclaw`, `~/.clawdbot`). Ask for a custom path; if
+none, exit.
+
+**If STATUS=found:** Present a human-readable summary (identity name, workspace
+files, channels and which v2 supports, daily memory count, skills, cron count,
+MCP servers, agent count). Then paraphrase the key architectural differences
+from the section above — don't dump it as a table.
+
+AskUserQuestion: "Ready to start migrating? I'll go through each area one at a
+time."
+1. **Yes, let's go** — proceed to Phase 1
+2. **Tell me more** — explain any area they ask about
+3. **Skip migration** — exit
+
+## Phase 1: Agents, Groups, and Shared vs Separate
+
+**Decide this before identity/memory** — it determines where files go.
+
+**OpenClaw model:** all groups routed to one agent share a workspace
+(SOUL/MEMORY/IDENTITY) and personality; only the session is per-group.
+
+**v2 model:** each agent group is a separate container with its own filesystem
+and standing instructions. Memory belongs to the workgroup above agent groups:
+all sibling providers in one workgroup share one canon, while separate
+workgroups have independent canons. Multiple messaging groups wired to the same
+agent group naturally use that group's workgroup.
+
+AskUserQuestion: "In OpenClaw your groups shared one personality and memory. In
+v2, standing instructions stay per agent group while memory is shared by
+workgroup. How do you want to map it?"
+
+1. **One workgroup (recommended if it was one bot)** — every selected current
+   or future provider sibling shares one memory canon; each group keeps its own
+   byte-preserved instruction state.
+2. **Separate workgroups** — each selected agent group gets an independent
+   memory canon and independent instruction state.
+3. **Just the primary agent for now** — set one agent up; add others later.
+
+Remember this choice for Phase 3 and record the resulting `workgroup_id` for
+every registered agent group. Workgroup membership, not provider or folder
+suffix, determines memory sharing.
+
+### Confirm the assistant name
+
+`IDENTITY_NAME` from discovery is the OpenClaw name. Ask: "Your OpenClaw
+assistant was named `<IDENTITY_NAME>`. Keep it in v2?" If empty, ask them to
+choose (default: "Andy"). The chosen name is passed as `--assistant-name` to
+register/init.
+
+### Seed the owner and the primary DM agent
+
+The owner identity and the primary agent are created together by
+`scripts/init-first-agent.ts`. It upserts the user, grants the owner role,
+creates the agent group + filesystem, wires a DM messaging group, and queues a
+welcome DM over the running service's CLI socket — **so the service must be
+running.** If it isn't, tell the user to start it first.
+
+Resolve the owner's channel identity and the DM platform id (use the channel's
+own terminology). Then:
+
+```bash
+pnpm exec tsx scripts/init-first-agent.ts \
+  --channel <channel> \
+  --user-id <channel>:<handle> \
+  --platform-id <channel>:<dm-id> \
+  --display-name "<Owner Name>" \
+  --agent-name "<confirmed assistant name>" \
+  [--role owner]      # default: owner
+```
+
+For direct-addressable channels (telegram, whatsapp) the `--platform-id` is
+usually the same handle as `--user-id` with the channel prefix. `--role`
+defaults to `owner` (global, cross-channel) — use `admin` (scoped to the agent
+group) or `member` only if intended.
+
+### Register the remaining groups
+
+For each additional OpenClaw group the user wants to bring over, register a
+messaging group and wire it to an agent group:
+
+```bash
+pnpm exec tsx setup/index.ts --step register -- \
+  --platform-id "<v2_platform_id from discovery>" \
+  --name "<group name>" \
+  --folder "<channel>_<name-slug>" \
+  --channel "<channel>" \
+  --session-mode "<shared|agent-shared|per-thread>" \
+  [--trigger "@<assistant name>"] \
+  [--no-trigger-required] \
+  --assistant-name "<assistant name>"
+```
+
+Notes:
+- `register` namespaces the `--platform-id` the same way the adapter will at
+  runtime, so pass the `=>` value discovery emitted (or the raw OpenClaw id).
+- Reuse a `--folder` to put a group on an existing agent (shared base/separate
+  conversations); use a new `--folder` for a fully separate agent.
+- Engage defaults come from the channel adapter's declaration (most group
+  chats default to mention-based engagement; channels without a mention
+  signal default to a name pattern). Pass `--trigger` to set an explicit
+  regex, or `--no-trigger-required` for respond-to-everything.
+- Register groups from channels v2 doesn't support yet too — the messaging
+  group and wiring persist and activate when that channel is installed.
+
+Folder naming: `<channel>_<name-slug>` (e.g. `telegram_dev-team`). Confirm each
+name and folder with the user.
+
+## Phase 2: Settings from Config
+
+Read the config (`<STATE_DIR>/openclaw.json` or `clawdbot.json`) for settings
+that map to v2 setup.
+
+### Timezone
+
+Check `agents.defaults.userTimezone`. If it's a valid IANA zone, write it to
+`.env` as `TZ=<timezone>`. v2 reads `TZ` from `.env` (`src/config.ts`) and uses
+it for cron/recurrence evaluation, so this matters for scheduled tasks.
+
+### Container timeout
+
+Check `agents.defaults.timeoutSeconds`. v2's equivalent is `CONTAINER_TIMEOUT`
+(env var, default 30 min) or per-group `ncl groups config update`. If the
+OpenClaw value differs notably, note it; the user can set
+`CONTAINER_TIMEOUT=<ms>` in `.env`.
+
+### Access control (sender policies)
+
+OpenClaw per-channel `allowFrom` / `dmPolicy` / `groupPolicy` map onto v2's
+model, which is **not** a JSON file. Each messaging group has an
+`unknown_sender_policy`; access is granted via `user_roles` (owner/admin) and
+`agent_group_members`. Map:
+
+- `dmPolicy`/`groupPolicy: "open"` → leave the default; no extra grants.
+- `allowFrom` / `groupAllowFrom` lists → for each allowed sender, upsert the
+  user and add them as a member of the relevant agent group via `ncl`:
+
+  ```bash
+  ncl users create --id "<channel>:<handle>" --kind <channel> --display-name "<name>"
+  ncl members add --user "<channel>:<handle>" --group "<ag-id>"
+  ```
+- `dmPolicy: "disabled"` → don't wire that chat (or leave it registered but
+  unwired).
+
+The messaging groups `register` / `init-first-agent` create default their
+`unknown_sender_policy` to whatever the channel adapter declares for that
+context (DM vs group) — `strict` when the channel has no declaration — so
+unknown senders are gated until you add them (or an admin approves the
+adapter-declared approval card). Pass `--unknown-sender-policy` to `register`
+to override. Show the user the OpenClaw allowlist and confirm who to grant
+before running the commands.
+
+## Phase 3: Identity and Memory
+
+This phase has two deliberately separate tracks. Never turn instruction files
+into memory, and never semantically rewrite memory while migrating it.
+
+Find workspace files at `<STATE_DIR>/workspace/`. If `AGENT_COUNT > 1`, also
+inventory every `<STATE_DIR>/agents/*/workspace/` and map each source agent to
+its target v2 workgroup. Record every source path before copying anything.
+
+### Instruction state: preserve first, reconcile separately
+
+`IDENTITY.md`, `SOUL.md`, and `USER.md` are OpenClaw instruction state, not
+NanoClaw memory inputs. Preserve the instruction files byte-for-byte under a
+group-local import directory such as
+`groups/<folder>/openclaw-instructions/<source-agent>/`. Never edit a composed
+`CLAUDE.md` or `AGENTS.md`; it is regenerated each spawn.
+
+```bash
+INSTRUCTION_IMPORT="groups/<folder>/openclaw-instructions/<source-agent>"
+mkdir -p "${INSTRUCTION_IMPORT}"
+for file in IDENTITY.md SOUL.md USER.md; do
+  [ -e "<openclaw-workspace>/${file}" ] && \
+    cp -a "<openclaw-workspace>/${file}" "${INSTRUCTION_IMPORT}/${file}"
+done
+```
+
+Instruction files are byte-preserved. Never summarize, weave, or distill any
+instruction file into the memory canon.
+Legacy instruction reconciliation is an explicit separate operator workflow:
+after the memory cutover is verified, show the preserved files and separately
+propose any verbatim include or standing-instruction change the user wants.
+Until that approval, leave the active group instructions unchanged.
+
+### Memory state: byte-preserving import into the workgroup canon
+
+OpenClaw `MEMORY.md` and every file under `workspace/memory/` are memory
+sources. Import all selected sources byte-for-byte; never choose a winner,
+derive facts, consolidate, or discard a file during migration. The
+source OpenClaw tree remains untouched.
+
+Quiesce every target workgroup before creating an import path, and keep it
+quiescent through runtime verification or rollback. Then resolve the canonical
+host root from each target `workgroup_id`:
+
+```bash
+TARGET_WORKGROUP=<workgroup-id>
+OPENCLAW_WORKSPACE="<absolute-openclaw-workspace>"
+IMPORT_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+CANON="data/workgroups/${TARGET_WORKGROUP}/memory"
+CANON_MARKER="data/workgroups/${TARGET_WORKGROUP}/.memory-migration.json"
+PREIMPORT_SNAPSHOT="data/memory-migration-snapshots/openclaw-${IMPORT_RUN_ID}/${TARGET_WORKGROUP}"
+IMPORT_ROOT="${CANON}/imports/openclaw/<source-agent>"
+MANIFEST_DIR="data/memory-migration-reports"
+SOURCE_MANIFEST="${MANIFEST_DIR}/openclaw-${TARGET_WORKGROUP}-<source-agent>-source.sha256"
+IMPORT_MANIFEST="${MANIFEST_DIR}/openclaw-${TARGET_WORKGROUP}-<source-agent>-import.sha256"
+test ! -e "${IMPORT_ROOT}" || { echo "ERROR: OpenClaw import already exists: ${IMPORT_ROOT}"; exit 1; }
+
+# Run once per target workgroup, before its first external memory copy. This is
+# a permanent pre-import snapshot, separate from the migrator's later snapshot.
+test ! -e "${PREIMPORT_SNAPSHOT}" || { echo "ERROR: snapshot already exists: ${PREIMPORT_SNAPSHOT}"; exit 1; }
+mkdir -p "${PREIMPORT_SNAPSHOT}" "${MANIFEST_DIR}"
+if [ -e "${CANON}" ]; then
+  cp -a "${CANON}" "${PREIMPORT_SNAPSHOT}/memory"
+  printf 'present\n' > "${PREIMPORT_SNAPSHOT}/memory.state"
+  diff -qr "${CANON}" "${PREIMPORT_SNAPSHOT}/memory"
+else
+  printf 'missing\n' > "${PREIMPORT_SNAPSHOT}/memory.state"
+fi
+if [ -e "${CANON_MARKER}" ]; then
+  cp -a "${CANON_MARKER}" "${PREIMPORT_SNAPSHOT}/.memory-migration.json"
+  printf 'present\n' > "${PREIMPORT_SNAPSHOT}/marker.state"
+else
+  printf 'missing\n' > "${PREIMPORT_SNAPSHOT}/marker.state"
+fi
+
+mkdir -p "${IMPORT_ROOT}/workspace"
+
+memory_manifest() {
+  (
+    cd "${MANIFEST_DIR}"
+    [ ! -f MEMORY.md ] || sha256sum MEMORY.md
+    [ ! -L MEMORY.md ] || printf 'SYMLINK MEMORY.md -> %s\n' "$(readlink MEMORY.md)"
+    if [ -d memory ]; then
+      find memory -type f -print0 | sort -z | xargs -0r sha256sum
+      find memory -type l -printf 'SYMLINK %p -> %l\n' | sort
+    fi
+  )
+}
+MANIFEST_DIR="${OPENCLAW_WORKSPACE}" memory_manifest > "${SOURCE_MANIFEST}"
+test -s "${SOURCE_MANIFEST}" || { echo "ERROR: no OpenClaw memory files found"; exit 1; }
+
+# Preserve the original relative layout and metadata. Never copy through the
+# per-group compatibility link after cutover.
+[ -e "${OPENCLAW_WORKSPACE}/MEMORY.md" ] && \
+  cp -a "${OPENCLAW_WORKSPACE}/MEMORY.md" "${IMPORT_ROOT}/workspace/MEMORY.md"
+[ -d "${OPENCLAW_WORKSPACE}/memory" ] && \
+  cp -a "${OPENCLAW_WORKSPACE}/memory" "${IMPORT_ROOT}/workspace/memory"
+
+# Byte check at the same relative layout. A mismatch blocks migration.
+[ ! -e "${OPENCLAW_WORKSPACE}/MEMORY.md" ] || \
+  cmp "${OPENCLAW_WORKSPACE}/MEMORY.md" "${IMPORT_ROOT}/workspace/MEMORY.md"
+[ ! -d "${OPENCLAW_WORKSPACE}/memory" ] || \
+  diff -qr "${OPENCLAW_WORKSPACE}/memory" "${IMPORT_ROOT}/workspace/memory"
+MANIFEST_DIR="${IMPORT_ROOT}/workspace" memory_manifest > "${IMPORT_MANIFEST}"
+diff -u "${SOURCE_MANIFEST}" "${IMPORT_MANIFEST}"
+```
+
+Before and after the copy, record a SHA-256 manifest for every selected file
+and compare source bytes with the corresponding import path. Any missing entry
+or hash mismatch blocks apply. Store the manifest files beside the migration
+report and record their paths in `migration-state.md`; do not restart or
+activate a container on a mismatch.
+
+The copy above only stages an external OpenClaw source where NanoClaw's normal
+migrator can inventory it together with every existing group root,
+provider-native root, and canonical entry. While the workgroups remain
+quiescent, run the real inventory/apply/verify sequence:
+
+```bash
+REPORT="data/memory-migration-reports/openclaw-$(date -u +%Y%m%dT%H%M%SZ).json"
+mkdir -p "$(dirname "$REPORT")"
+pnpm exec tsx scripts/migrate-workgroup-memory.ts inventory --all --report "$REPORT"
+# Review every source, outcome, collision import, and permanent snapshot path.
+pnpm exec tsx scripts/migrate-workgroup-memory.ts apply --report "$REPORT"
+pnpm exec tsx scripts/verify-workgroup-memory-runtime.ts --all --json --require-applied-migration
+```
+
+Apply must follow `/migrate-memory`'s lossless cutover contract: blocked apply
+means fix the cause and create a fresh inventory report; runtime failure after
+status `applied` means explicit rollback from the report. Keep the permanent
+host-only snapshot and source OpenClaw tree. Do not restart until runtime
+verification is green for every workgroup.
+
+The permanent pre-import snapshot is the restore point for a blocked apply or
+runtime verification failure: preserve the failed canon for forensics, then
+restore the exact pre-import canon and marker. On a blocked apply, do not run
+the report rollback first; on a runtime failure after `applied`, run the report
+rollback first and then restore the pre-import snapshot. Keep both snapshots
+permanently.
+
+```bash
+FAILED_STATE="${PREIMPORT_SNAPSHOT}/failed-state-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "${FAILED_STATE}"
+[ ! -e "${CANON}" ] || mv "${CANON}" "${FAILED_STATE}/memory"
+[ ! -e "${CANON_MARKER}" ] || mv "${CANON_MARKER}" "${FAILED_STATE}/.memory-migration.json"
+
+if grep -qx present "${PREIMPORT_SNAPSHOT}/memory.state"; then
+  mkdir -p "$(dirname "${CANON}")"
+  cp -a "${PREIMPORT_SNAPSHOT}/memory" "${CANON}"
+fi
+if grep -qx present "${PREIMPORT_SNAPSHOT}/marker.state"; then
+  mkdir -p "$(dirname "${CANON_MARKER}")"
+  cp -a "${PREIMPORT_SNAPSHOT}/.memory-migration.json" "${CANON_MARKER}"
+fi
+```
+
+Once verified, the canon remains `data/workgroups/<workgroup-id>/memory`, every
+sibling reads `/workspace/workgroup/memory`, and `/workspace/agent/memory`
+remains only the compatibility link. Adding or switching providers requires no
+memory migration.
+
+### OpenClaw skills
+
+If `SKILL_COUNT > 0`, the SKILL.md format is shared, so skills are portable.
+Present each (name + description from the front matter) and let the user pick.
+For each confirmed skill, copy the directory into the container skills tree:
+
+```bash
+cp -r <skill_source_dir> container/skills/<skill_name>
+```
+
+A container rebuild is needed afterward — note it for Phase 8.
+
+### Config-registered plugins (with API keys)
+
+If `CONFIG_PLUGINS` is non-empty, OpenClaw had plugins/skills carrying keys.
+For each, read the config section and decide together:
+- **Matching v2 skill** → run that skill; route its credential per Phase 4.
+- **An MCP server** → install the exact configured package; wire via
+  `ncl groups config add-mcp-server`. Don't guess at packages.
+- **An API key** → route to the OneCLI vault if container-facing (Phase 4).
+
+Don't install unknown packages or search for replacements — supply-chain risk.
+
+## Phase 4: Credentials
+
+Two destinations, decided per credential. **Channel tokens → `.env`** (host
+reads them). **Container-facing API credentials → the OneCLI vault** (injected
+per request, never in container env).
+
+### Channel tokens (telegram, discord, slack)
+
+Preview, then write to `.env`. The script emits only masked values:
+
+```bash
+pnpm exec tsx ${CLAUDE_SKILL_DIR}/scripts/extract-channel-credentials.ts \
+  --state-dir <STATE_DIR> --channel <name>
+```
+
+Parse the status block. `DESTINATION: env` confirms a host-side token. Show
+`CREDENTIAL_MASKED` (and `CREDENTIAL_MASKED_2` for Slack's app token).
+
+AskUserQuestion:
+1. **Use this credential** — re-run with `--write-env .env` to save it.
+2. **Enter a new one** — ask in plain text, write to `.env` yourself.
+3. **Skip this channel.**
+
+```bash
+pnpm exec tsx ${CLAUDE_SKILL_DIR}/scripts/extract-channel-credentials.ts \
+  --state-dir <STATE_DIR> --channel <name> --write-env .env
+```
+
+Check `WRITTEN_TO` / `WRITTEN_COUNT`. Slack writes both `SLACK_BOT_TOKEN` and
+`SLACK_APP_TOKEN` in one run.
+
+**If `HAS_CREDENTIAL=false` but a credential is expected:** the config shape may
+be unrecognized, or it uses a `file`/`exec` SecretRef (`CREDENTIAL_SOURCE`
+ends in `_ref` with a NOTE) that can't be auto-extracted. Read the channel
+section of the config directly and ask the user to confirm or paste the value.
+
+**WhatsApp:** authenticates via QR/pairing code — there's no token. Don't copy
+Baileys auth state (stale encryption sessions break decryption).
+Re-authenticate during `/setup` via `/add-whatsapp`. The extraction script
+reports `DESTINATION: none` for it.
+
+### Anthropic and other container-facing credentials → OneCLI vault
+
+Find the agent's model credentials in OpenClaw. Check, in order:
+1. `<STATE_DIR>/auth-profiles.json` (and
+   `<STATE_DIR>/agents/<id>/agent/auth-profiles.json`) — a `profiles` map keyed
+   `provider:identifier`. For an `anthropic` provider profile the value depends
+   on `type`: `api_key` → `key`, `token` → `token`, `oauth` → `access`.
+2. `<STATE_DIR>/.env` — `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`.
+3. Config `models.providers` — Anthropic provider `apiKey`.
+
+These are container-facing, so they go to the OneCLI vault. Do **not** write
+them to `.env` or thread them into a container. Register each in the vault:
+
+```bash
+onecli secrets create --name Anthropic --type anthropic \
+  --value <key-or-token> --host-pattern api.anthropic.com
+```
+
+For other container-facing keys discovered in plugins (e.g. OpenAI):
+
+```bash
+onecli secrets create --name OpenAI --type api_key \
+  --value <key> --host-pattern api.openai.com
+```
+
+Run the command on the user's behalf so the value never lands in the chat
+transcript; confirm with `onecli secrets list`.
+
+**Caveats:** `keyRef`/`tokenRef` with `source:"exec"` or `source:"file"` can't
+be auto-extracted — ask the user to paste it. For an `oauth` profile with a
+past expiry, warn that the token may need refreshing; the user can run
+`claude setup-token` and register the fresh token.
+
+If OneCLI isn't installed yet, defer this: tell the user that during `/setup`
+(or `/init-onecli`) they'll register the Anthropic credential, and note the
+discovered profile in `migration-state.md` so it isn't lost.
+
+> If the user explicitly wants `.env`-based credentials instead of the OneCLI
+> vault, that's the `/use-native-credential-proxy` opt-out — the one place
+> credentials are read from `.env` and injected into container requests without
+> OneCLI. Only go there if the user asks for it.
+
+## Phase 5: Scheduled Tasks
+
+Read `<STATE_DIR>/cron/jobs.json`. If absent or empty, skip.
+
+If jobs exist, read `${CLAUDE_SKILL_DIR}/MIGRATE_CRONS.md` for the v2 task
+model, the `mapCronToRecurrence` transform, the full field mapping, and how
+tasks are created (the agent's `schedule_task` MCP tool, since tasks live in a
+per-session `inbound.db` the host owns). Follow it for each enabled job.
+
+## Phase 6: MCP, Webhooks, Other Config
+
+Read the relevant config sections directly. Conversational.
+
+### MCP servers
+
+If `MCP_SERVERS` is non-empty, v2 supports per-agent-group MCP servers via the
+container config. Read each server's `command`/`args`/`env`/`url` from
+`mcp.servers`. For each one the user wants:
+
+```bash
+ncl groups config add-mcp-server --id <agent-group-id> \
+  --name <server-name> --command <cmd> \
+  [--args '<json-array>'] [--env '<json-object>']
+```
+
+stdio servers must be runnable inside the container (Node/npx-based work;
+custom binaries need a Dockerfile addition). Secrets referenced by a server's
+`env` should go to the OneCLI vault (Phase 4), not be inlined. The config
+change takes effect on restart: `ncl groups restart --id <agent-group-id>`
+(add `--rebuild` only if a custom binary was added to the Dockerfile).
+
+### Webhooks
+
+OpenClaw `cron.webhook` / `failureDestination` / channel webhooks don't map to
+a v2 primitive. For a notification webhook, fold it into a scheduled task's
+prompt or a pre-agent `script` that `curl`s the endpoint. Discuss the use case.
+
+### Other config (mention and move on)
+
+- **Exec approvals / command allowlist** → v2 uses container isolation; the
+  agent runs sandboxed.
+- **Human delay / TTS / compaction / model config** → not v2 task/group fields
+  (per-group model is in the container config).
+
+## Phase 7: Welcome and First Run
+
+`init-first-agent` (Phase 1) already queued a welcome DM for the primary owner
+agent. If the service was up, the owner should have received it. For groups
+registered via `setup --step register`, the wiring also queues a `/welcome`
+onboarding message on first wiring.
+
+Tell the user which agents are live now and which await channel installation
+(unsupported channels registered for the future).
+
+## Phase 8: Validate and Summarize
+
+### Run the shipped test
+
+Copy the transform module into the project, then build and run the canonical
+test in place:
+
+```bash
+cp ${CLAUDE_SKILL_DIR}/scripts/transform.ts        scripts/openclaw-transform.ts
+
+pnpm run build
+pnpm exec vitest run --config vitest.skills.config.ts .claude/skills/migrate-from-openclaw/tests/transform.test.ts
+```
+
+The test guards the skill's two v2 integration assumptions: credential routing
+(container-facing → vault, channel tokens → `.env`) and the cron → v2
+recurrence mapping. It imports the real `cron-parser` (the same parser the host
+recurrence sweep uses), so a missing/renamed dependency turns it red. `build`
+typechecks the transform module against the project.
+
+These are the only shared code files the skill installs into the project tree;
+`REMOVE.md` deletes them. It does not delete migrated user data, reports, or
+permanent snapshots.
+
+### If a container rebuild is needed
+
+If OpenClaw skills were copied or MCP servers added: `./container/build.sh`,
+then restart the service.
+
+### Summary
+
+Print what was migrated:
+- Owner + primary agent → `users` / `user_roles` / agent group + welcome DM
+- Additional groups → messaging groups + wiring (folders + session modes)
+- Timezone → `.env TZ`; container timeout → noted
+- Access grants → members/roles for OpenClaw allowlist senders
+- Identity/personality/user instruction files → byte-preserved group-local
+  import, with any activation deferred to separate explicit instruction
+  reconciliation
+- OpenClaw `MEMORY.md` + daily memory files → byte-preserved imports in
+  `data/workgroups/<workgroup-id>/memory`, with SHA-256 comparison and a green
+  inventory/apply/runtime-verification report
+- OpenClaw skills → `container/skills/`
+- Channel tokens → `.env` (list channels)
+- Container-facing credentials → OneCLI vault (list)
+- Scheduled tasks → mapped and scheduled via the agent (or noted for first run)
+- MCP servers → wired into agent group container configs
+
+Noted for later: channel installs during `/setup`; container rebuild if needed;
+tasks deferred until a session exists.
+
+Not applicable: unsupported channels (registered for the future); OpenClaw-only
+features (exec approvals, human delay, TTS, model/thinking config).
+
+Remind: "Run `/setup` next to finish your NanoClaw install. Channel tokens are
+in `.env`; container-facing credentials are in the OneCLI vault. Select the
+channels we configured when setup asks."
+
+Then delete `migration-state.md` (or offer to keep it as a record), and remove
+the copied transform files if you don't want them lingering (see `REMOVE.md`).
+
+## Troubleshooting
+
+- **Config parse error:** the JSON5 parser may not handle unusual syntax. Read
+  the file directly and work with it manually.
+- **Credential not found:** likely a `file`/`exec` SecretRef — ask the user to
+  paste the value.
+- **`init-first-agent` can't reach the CLI socket:** the service isn't running.
+  Start it, then re-run.
+- **Multi-agent complexity:** do the primary/default agent first; add others as
+  separate agent groups later.

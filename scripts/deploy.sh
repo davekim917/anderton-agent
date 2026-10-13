@@ -1,0 +1,614 @@
+#!/usr/bin/env bash
+# Self-deploy: pull latest main, build host, rebuild container image if
+# container/ changed, restart service.
+# Spawned detached so it survives the systemctl restart.
+# Writes JSON status to logs/deploy-status.json so the post-restart
+# process can announce the result.
+
+REPO_ROOT="${NANOCLAW_DEPLOY_ROOT:-/home/ubuntu/nanoclaw-v2}"
+cd "$REPO_ROOT" || exit 1
+
+STATUS_FILE="logs/deploy-status.json"
+LOG="logs/deploy.log"
+POST_PULL="${NANOCLAW_DEPLOY_POST_PULL:-0}"
+
+# One deploy at a time. The lock rides on fd 9 so the post-pull re-exec of this
+# script (same process) keeps it: re-locking the same open file description
+# succeeds, while an fd 9 anyone else opened on the file is refused like a
+# second launch.
+mkdir -p logs
+DEPLOY_LOCK="logs/deploy.lock"
+: >> "$DEPLOY_LOCK"
+if [ "$(readlink /proc/self/fd/9 2>/dev/null)" != "$(realpath "$DEPLOY_LOCK")" ]; then
+  exec 9>>"$DEPLOY_LOCK"
+fi
+if ! flock -n 9; then
+  echo "deploy.sh: another deploy appears to be running (lock file names pid $(cat "$DEPLOY_LOCK" 2>/dev/null || echo unknown)); not starting a second one" >&2
+  exit 3
+fi
+echo "$$" > "$DEPLOY_LOCK"
+PRE_COMMIT="${NANOCLAW_DEPLOY_PRE_COMMIT:-}"
+ROLLBACK_READY=0
+DEPLOY_HANDOFF=0
+IMAGE_SAVED_BASE=""
+# Units this deploy has asked systemd to restart, recorded BEFORE the attempt so
+# a unit whose restart failed is still put back by the rollback. nanoclaw-v2 is
+# not in here — it restarts last, under its own guard.
+RESTART_ATTEMPTED_UNITS=""
+COMMIT_RESTORED=0
+
+# The operator-facing deploy status, written by a JSON encoder rather than a
+# `printf '{"status":"%s"…}'` template. `error` carries a unit id at the
+# sibling-restart failures below, and systemd escapes any byte a unit id may not
+# hold literally as `\xNN`, so a legitimately-named unit puts a BACKSLASH in the
+# text and a template emits something that is not JSON. This file is what the
+# announcer and the health alert read, so a malformed one turns a reported
+# failure into silence at the moment somebody needed to hear about it — the same
+# defect as the rollback manifest's, at the call site the first fix did not
+# audit. Routing the FUNCTION, not the one interpolating caller, is what closes
+# it: all 30-odd write_status calls and every future one come out of the encoder.
+#
+# The fallback exists because this is the reporter of last resort and must not
+# depend on more than the shell. It interpolates nothing it did not author: the
+# encoder refuses a `status` outside ok|running|failed, so reaching the fallback
+# with one of those three literals is the only way through, and the full text is
+# in "$LOG" regardless of what lands here.
+write_status() {
+  local status="$1" step="$2" error="$3" stamp
+  stamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  if NANOCLAW_STATUS_STATUS="$status" \
+    NANOCLAW_STATUS_STEP="$step" \
+    NANOCLAW_STATUS_ERROR="$error" \
+    NANOCLAW_STATUS_TIMESTAMP="$stamp" \
+    node scripts/write-deploy-json.mjs status > "${STATUS_FILE}.tmp" 2>> "$LOG" &&
+    mv "${STATUS_FILE}.tmp" "$STATUS_FILE"; then
+    return 0
+  fi
+  rm -f "${STATUS_FILE}.tmp"
+  # `safe` and `stamp` are the only values that reach this template, and both
+  # are authored here: one of three literals assigned below, and a `date` format
+  # string that can only yield digits and `-:TZ`. An unrecognised status reads
+  # as `failed` rather than passing through — this path is only reached when
+  # something is already wrong.
+  local safe=failed
+  case "$status" in
+    ok) safe=ok ;;
+    running) safe=running ;;
+  esac
+  printf '{"status":"%s","step":"encoder","error":"deploy status could not be encoded — see logs/deploy.log","timestamp":"%s"}\n' \
+    "$safe" "$stamp" > "$STATUS_FILE"
+}
+
+tracked_changes() {
+  [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]
+}
+
+# Every ACTIVE systemd service that holds this checkout's code resident, one
+# unit id per line, nanoclaw-v2 included. Non-zero exit means "could not look",
+# which is never the same answer as "nothing there" (#818).
+#
+# Discovered, not listed. `nanoclaw-codex-sync.service` runs
+# `pnpm exec tsx src/codex-sync-watcher.ts`: tsx loads the TypeScript into
+# memory once at process start, so nothing short of a restart moves it off the
+# source it booted with, and until this ran a deploy never restarted it — one
+# watcher sat two days behind main and kept re-mirroring a stale worker-model
+# map (then in src/claude-agent-md.ts, since deleted with the worker roster;
+# the watcher still calls that module's formatter, src/codex-sync-watcher.ts)
+# over every ~/.codex*/agents and groups/*/.codex/agents tree. A hardcoded second name
+# would have fixed exactly that unit and gone quietly wrong at the third; this
+# host already carries a third `Type=simple` nanoclaw unit file
+# (nanoclaw-container-limits.service, currently disabled, and correctly
+# excluded below because it runs /usr/local/sbin, not this checkout).
+#
+# Three predicates, each chosen to be wrong LOUDLY rather than quietly:
+#   - ACTIVE, so an installed-but-stopped or disabled unit is never started by
+#     a deploy. An active unit is by definition loaded, so `list-units` sees it.
+#   - WorkingDirectory == REPO_ROOT, which is what "runs this checkout's code"
+#     actually means — it catches a long-running unit named outside the
+#     `nanoclaw-` prefix, and a spelling mismatch here takes nanoclaw-v2 out of
+#     the result too, where the caller's self-check refuses the deploy.
+#   - NOT Type=oneshot. oneshot is the only type that is definitionally not a
+#     resident process; every other type (simple, exec, notify, forking, dbus,
+#     idle, and whatever systemd adds next) is. An unknown type therefore lands
+#     in the restart set rather than being skipped unexamined.
+#
+# `systemctl show` emits one blank-line-separated block per unit with the
+# properties in an unspecified order, so parse by key, never by position.
+long_running_repo_units() {
+  local active
+  active=$(systemctl list-units --type=service --state=active --plain --no-legend --no-pager 2>/dev/null) || return 1
+  active=$(printf '%s\n' "$active" | awk '{print $1}' | grep '\.service$')
+  [ -n "$active" ] || return 1
+  local blocks
+  # shellcheck disable=SC2086
+  blocks=$(systemctl show --no-pager --property=Id --property=Type --property=WorkingDirectory $active 2>/dev/null) || return 1
+  printf '%s\n' "$blocks" |
+    awk -v root="$REPO_ROOT" '
+      BEGIN { RS = ""; FS = "\n" }
+      {
+        id = ""; type = ""; wd = ""
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^Id=/) id = substr($i, 4)
+          else if ($i ~ /^Type=/) type = substr($i, 6)
+          else if ($i ~ /^WorkingDirectory=/) wd = substr($i, 18)
+        }
+        sub(/^-/, "", wd)
+        if (id == "" || type == "" || wd != root) next
+        if (type == "oneshot") next
+        print id
+      }'
+}
+
+snapshot_dir() {
+  local name="$1" tmp="${1}.pre-deploy.tmp"
+  [ -d "$name" ] || return 1
+  rm -rf "$tmp" || return 1
+  cp -al "$name" "$tmp" >> "$LOG" 2>&1 || {
+    rm -rf "$tmp"
+    return 1
+  }
+  rm -rf "${name}.pre-deploy" || {
+    rm -rf "$tmp"
+    return 1
+  }
+  mv "$tmp" "${name}.pre-deploy"
+}
+
+restore_before_restart() {
+  local exit_code="$?" restored=""
+  trap - EXIT HUP INT TERM
+
+  if [ "$ROLLBACK_READY" != "1" ] || [ "$DEPLOY_HANDOFF" = "1" ]; then
+    exit "$exit_code"
+  fi
+
+  # The service is still running the old build. Put its on-disk artifacts back
+  # immediately so an unrelated restart cannot turn a failed deploy into an
+  # outage, and so a retry snapshots the last healthy build rather than debris.
+  for name in dist node_modules; do
+    if [ -d "${name}.pre-deploy" ]; then
+      rm -rf "${name}.failed-deploy"
+      if [ -d "$name" ] && ! mv "$name" "${name}.failed-deploy"; then
+        echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Could not move failed ${name}; healthy snapshot left intact" >> "$LOG"
+        continue
+      fi
+      if mv "${name}.pre-deploy" "$name"; then
+        restored="${restored}${name} "
+        rm -rf "${name}.failed-deploy"
+      else
+        # Do not leave the live path absent if the snapshot rename fails.
+        [ -d "${name}.failed-deploy" ] && mv "${name}.failed-deploy" "$name"
+      fi
+    fi
+  done
+
+  # Never erase provider/channel customizations or another concurrent edit.
+  # The restored dist is sufficient to boot the healthy service; source reset
+  # is only safe when the tracked checkout is still clean.
+  if tracked_changes; then
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Pre-restart rollback preserved tracked source changes; commit reset skipped" >> "$LOG"
+  elif git reset --hard "$PRE_COMMIT" >> "$LOG" 2>&1; then
+    restored="${restored}commit ${PRE_COMMIT:0:8} "
+    COMMIT_RESTORED=1
+  fi
+
+  # A sibling this deploy restarted is now resident on the code the reset above
+  # just removed — the same stale-long-running-service class this script exists
+  # to close, in mirror image. Put them back onto the restored checkout. Only
+  # when the commit actually moved: if the reset was skipped, the checkout is
+  # still at the new commit and the siblings already match it. Never changes the
+  # exit code — the status file already says the deploy failed — but a unit that
+  # will not come back is named, because that one IS an outage.
+  if [ "$COMMIT_RESTORED" = "1" ] && [ -n "$RESTART_ATTEMPTED_UNITS" ]; then
+    for unit in $RESTART_ATTEMPTED_UNITS; do
+      if sudo systemctl restart "$unit" >> "$LOG" 2>&1; then
+        restored="${restored}${unit} "
+      else
+        echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Rollback could not restart ${unit} onto the restored build — it is NOT running this checkout's code; check it by hand" >> "$LOG"
+      fi
+    done
+  fi
+
+  if [ -n "$IMAGE_SAVED_BASE" ]; then
+    docker tag "${IMAGE_SAVED_BASE}:pre-deploy" "${IMAGE_SAVED_BASE}:latest" >> "$LOG" 2>&1 || true
+  fi
+  rm -f data/deploy-rollback.json data/deploy-rollback.json.tmp data/deploy-boot-attempts.json
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Pre-restart rollback restored ${restored:-nothing}" >> "$LOG"
+  exit "$exit_code"
+}
+
+trap restore_before_restart EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ "$POST_PULL" != "1" ]; then
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Deploy started" >> "$LOG"
+  write_status "running" "preflight" ""
+
+  # Automatic rollback uses git reset. Refuse before mutating anything when
+  # tracked customizations exist; silently deleting them is never an option.
+  if tracked_changes; then
+    write_status "failed" "preflight" "tracked source changes present — commit or stash them before /deploy"
+    exit 1
+  fi
+
+  if ! git checkout main >> "$LOG" 2>&1; then
+    write_status "failed" "git checkout" "checkout failed — check deploy.log"
+    exit 1
+  fi
+
+  # Capture and verify the last healthy on-disk build BEFORE git pull or pnpm
+  # touches it. A failed pre-restart deploy restores these snapshots immediately.
+  PRE_COMMIT="${PRE_COMMIT:-$(git rev-parse HEAD)}"
+  write_status "running" "rollback snapshot" ""
+  if ! snapshot_dir node_modules || ! snapshot_dir dist; then
+    rm -rf node_modules.pre-deploy.tmp dist.pre-deploy.tmp
+    write_status "failed" "rollback snapshot" "could not snapshot dist and node_modules — live artifacts were not changed"
+    exit 1
+  fi
+  ROLLBACK_READY=1
+
+  write_status "running" "git pull" ""
+  if ! git pull --ff-only origin main >> "$LOG" 2>&1; then
+    write_status "failed" "git pull" "fast-forward pull failed — check deploy.log"
+    exit 1
+  fi
+
+  # Bash keeps reading the already-open script after git replaces it. Re-exec
+  # the freshly pulled copy so the deployment always uses the code it installs.
+  # Validate it before exec replaces this shell and discards its rollback trap.
+  if [ ! -r scripts/deploy.sh ] || ! bash -n scripts/deploy.sh >> "$LOG" 2>&1; then
+    write_status "failed" "deploy handoff" "pulled deploy script is missing or invalid — restored the previous build"
+    exit 1
+  fi
+  exec env \
+    NANOCLAW_DEPLOY_POST_PULL=1 \
+    NANOCLAW_DEPLOY_PRE_COMMIT="$PRE_COMMIT" \
+    NANOCLAW_DEPLOY_ROOT="$REPO_ROOT" \
+    bash scripts/deploy.sh
+fi
+
+if ! [[ "$PRE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || [ ! -d node_modules.pre-deploy ] || [ ! -d dist.pre-deploy ]; then
+  write_status "failed" "rollback snapshot" "post-pull deploy is missing a valid rollback commit or snapshots"
+  exit 1
+fi
+ROLLBACK_READY=1
+
+# Fail fast if the pull advanced package.json past the upgrade marker.
+# src/index.ts:145 runs enforceUpgradeTripwire(), which process.exit(1)s when
+# data/upgrade-state.json's version != package.json's. Without this gate the
+# restart crash-loops AND goes silent: write_status "ok" is written *before*
+# the restart, and the "Deploy complete" announcement only fires from a
+# successful boot — so Discord reports nothing at all. Catch it here, where
+# the poller in the still-alive host process can still report the failure.
+write_status "running" "upgrade marker" ""
+CODE_VER=$(node -p "require('./package.json').version" 2>/dev/null)
+MARKER_VER=$(node -p "require('./data/upgrade-state.json').version" 2>/dev/null)
+if [ "$CODE_VER" != "$MARKER_VER" ]; then
+  write_status "failed" "upgrade marker" \
+    "code ${CODE_VER} != marker ${MARKER_VER:-none} — run /update-nanoclaw (do NOT hand-stamp unless the upgrade really completed)"
+  exit 1
+fi
+
+write_status "running" "install" ""
+if ! pnpm install --frozen-lockfile >> "$LOG" 2>&1; then
+  write_status "failed" "install" "pnpm install failed — check deploy.log"
+  exit 1
+fi
+
+# Verify the install the build and restart below will run on: a package link another checkout's install
+# wrote into this tree is a start failure once that checkout is removed.
+write_status "running" "dependency links" ""
+if ! pnpm run -s check:dependency-links >> "$LOG" 2>&1; then
+  write_status "failed" "dependency links" "node_modules links leave the checkout or dangle — check deploy.log"
+  exit 1
+fi
+
+write_status "running" "build" ""
+# `build` is bare `tsc` — it never prunes dist/. A renamed or deleted source
+# file leaves an orphan .js behind that the service (ExecStart runs
+# dist/index.js) still resolves at runtime. Clean first.
+#
+# This also wipes `dist/dashboard-spa/`. That is safe *because* the SPA build
+# gate (scripts/build-dashboard-spa.ts) keeps its bundle cache under `data/`,
+# outside dist/ — so the steps below repopulate the bundle on every deploy
+# whether they rebuild it or restore it. Do not move that cache into dist/.
+rm -rf dist
+
+# Dashboard SPA is a separate Vite project outside the pnpm workspace, so it
+# needs its own install. Without this step `/deploy` could ship server code
+# with stale SPA assets (browser keeps loading the previous bundle hash).
+#
+# MUST run before `pnpm run build` below (#309): `build` reaches `build:spa`,
+# which never installs. If `build:spa` ran first against a deploy that both
+# bumps a dashboard dependency and imports it, the typecheck+vite build fails
+# against the PREVIOUS deploy's stale dashboard/node_modules and the deploy
+# exits before ever reaching the install that would have fixed it. Running
+# the frozen install here first means `build:spa` below always sees
+# dashboard/node_modules that matches the current lockfile.
+#
+# Both this and `build:spa` below route through scripts/build-dashboard-spa.ts,
+# which rebuilds only when the content hash of dashboard/ changed and otherwise
+# restores the cached bundle. Unchanged dashboard/ => this step is a file copy,
+# not a `pnpm install` + `vite build`. DASHBOARD_BUILD_FORCE=1 bypasses it.
+# build-dashboard-spa.ts's cache is only ever seeded by the --install path
+# (depsVerified), so this must also run before `build:spa` for the cache to
+# be populated for that restore.
+write_status "running" "dashboard build" ""
+if ! pnpm run build:dashboard >> "$LOG" 2>&1; then
+  write_status "failed" "dashboard build" "Vite SPA build failed"
+  exit 1
+fi
+
+if ! pnpm run build >> "$LOG" 2>&1; then
+  write_status "failed" "build" "TypeScript build failed"
+  exit 1
+fi
+
+# Rebuild the container image the host spawns from if any container/ files
+# changed since it was built. The host spawns from CONTAINER_IMAGE
+# (src/config.ts -> getDefaultContainerImage = <install-slug-base>:latest), so
+# we must inspect and rebuild *that exact tag*. The legacy `nanoclaw-agent:v2`
+# name used here was wrong on both base (unslugged) and tag (`v2` vs `latest`):
+# the inspect always missed -> CONTAINER_CHANGES="no-image" -> a full rebuild
+# every deploy, and `build.sh v2` produced a tag nothing ever spawns from, so
+# the container rebuild only ever took effect because the rebuild watcher
+# (which builds the correct tag) happened to run too. Mirrors the fix already
+# in src/container-rebuild-watcher.ts.
+PROJECT_ROOT="$(pwd)"
+# shellcheck source=setup/lib/install-slug.sh
+source "setup/lib/install-slug.sh"
+SPAWN_TAG="latest"
+SPAWN_IMAGE="$(container_image_base):${SPAWN_TAG}"
+
+# Compare the commit baked into the image (nanoclaw.commit LABEL, stamped by
+# container/build.sh) against HEAD. Created-timestamp + `git log --before`
+# heuristics are unreliable — Docker reuses an existing image's Created time on
+# a full cache hit. Fall back to rebuild whenever the label is missing or its
+# commit isn't in local history; never skip the rebuild on uncertainty.
+IMAGE_COMMIT=$(docker inspect "$SPAWN_IMAGE" --format '{{index .Config.Labels "nanoclaw.commit"}}' 2>/dev/null)
+if [ -n "$IMAGE_COMMIT" ] && git cat-file -e "${IMAGE_COMMIT}^{commit}" 2>/dev/null; then
+  CONTAINER_CHANGES=$(git diff --name-only "$IMAGE_COMMIT" HEAD -- container/ 2>/dev/null)
+else
+  CONTAINER_CHANGES="no-image-or-unlabeled"
+fi
+if [ -n "$CONTAINER_CHANGES" ]; then
+  # Keep the current spawn image reachable for the crash guard's rollback:
+  # the rebuild replaces :latest, so retag it first. Record that THIS deploy
+  # saved it — the guard must never retag a stale tag from an older deploy.
+  if docker inspect "$SPAWN_IMAGE" >/dev/null 2>&1; then
+    if ! docker tag "$SPAWN_IMAGE" "$(container_image_base):pre-deploy" >> "$LOG" 2>&1; then
+      write_status "failed" "container snapshot" "could not preserve the current agent image — build not started"
+      exit 1
+    fi
+    IMAGE_SAVED_BASE="$(container_image_base)"
+  fi
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Container changed (or image unlabeled), rebuilding ${SPAWN_IMAGE}..." >> "$LOG"
+  write_status "running" "container build" ""
+  if ! CONTAINER_IMAGE_REF="$SPAWN_IMAGE" ./container/build.sh "$SPAWN_TAG" >> "$LOG" 2>&1; then
+    write_status "failed" "container build" "Container image build failed"
+    exit 1
+  fi
+fi
+
+# A repository action that drains sessions (publish, transfer) replays from
+# scratch after a host restart and drains every session a second time (#718).
+# The host keeps data/repository-drain-in-flight.json while one runs, so hold
+# the restart until it settles. A marker whose pid is not the service's main
+# process was left by a host that died mid-drain.
+#
+# Bounded, and the default fits a healthy worst case: a transfer drains its
+# source and then its destination (src/modules/repository-workspaces/index.ts
+# :1774 and :1784), each allowed REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS, 10
+# minutes by default (src/config.ts:113-117). Raise this if that is raised. A
+# drain still running past the cap is stuck, and a stuck host may be exactly
+# what this deploy fixes, so the restart then goes ahead.
+DRAIN_MARKER="data/repository-drain-in-flight.json"
+DRAIN_WAIT_SECONDS="${NANOCLAW_DEPLOY_DRAIN_WAIT_SECONDS:-1800}"
+drain_in_flight() {
+  [ -f "$DRAIN_MARKER" ] || return 1
+  local pid main
+  pid=$(grep -o '"pid":[0-9]*' "$DRAIN_MARKER" 2>/dev/null | cut -d: -f2)
+  main=$(systemctl show -p MainPID --value nanoclaw-v2 2>/dev/null)
+  [ -n "$pid" ] && [ "$pid" = "$main" ]
+}
+# One budget for the whole deploy: the check right before the restart spends
+# only what the first wait left, so a drain that already ran the budget out is
+# not waited on a second time.
+DRAIN_DEADLINE=""
+wait_for_drain() {
+  drain_in_flight || return 0
+  [ -n "$DRAIN_DEADLINE" ] || DRAIN_DEADLINE=$(($(date +%s) + DRAIN_WAIT_SECONDS))
+  write_status "running" "waiting for repository drain" ""
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Waiting for an in-flight repository drain before restarting: $(cat "$DRAIN_MARKER")" >> "$LOG"
+  local started
+  started=$(date +%s)
+  while drain_in_flight && [ "$(date +%s)" -lt "$DRAIN_DEADLINE" ]; do
+    sleep 10
+  done
+  if drain_in_flight; then
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Repository drain still running when the ${DRAIN_WAIT_SECONDS}s wait budget ran out; restarting anyway" >> "$LOG"
+  else
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Repository drain settled after $(($(date +%s) - started))s" >> "$LOG"
+  fi
+}
+wait_for_drain
+
+echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Build complete, restarting..." >> "$LOG"
+
+# Whether this deploy ships migrations decides whether the post-restart crash
+# guard gets armed at all; the manifest that arms it is written further down,
+# after the sibling restarts it has to record. Read the diff HERE, while
+# PRE_COMMIT and HEAD are both still what the checks below assume.
+MIGRATION_CHANGES=$(git diff --name-only "$PRE_COMMIT" HEAD -- src/db/migrations/ 2>/dev/null)
+if tracked_changes; then
+  write_status "failed" "pre-restart" "tracked source changed during deploy — restart refused to preserve customizations"
+  exit 1
+fi
+# A drain that started during the steps above gets the same wait, and a long
+# wait gets the tracked-changes check again. What remains is the moment between
+# this check and the restart; closing that needs the host to stop admitting
+# draining jobs, which it does not do.
+if drain_in_flight; then
+  wait_for_drain
+  if tracked_changes; then
+    write_status "failed" "pre-restart" "tracked source changed during deploy — restart refused to preserve customizations"
+    exit 1
+  fi
+fi
+# Quarantine any `<session>/.host/` this host did not create (#749).
+#
+# `.host/` is the host-owned directory holding inbound.db. A container can
+# CREATE it: under a mount set built before the directory existed, /workspace is
+# read-write and nothing is overlaid over a path that is not there. A planted
+# directory OUTLIVES the container that made it, so restarting containers does
+# not close it — the next spawn would find a host-owned file present and adopt
+# it. The spawn path refuses that via the provenance record; this asks the same
+# question at the deploy boundary, where the answer can be acted on.
+#
+# Runs on EVERY deploy, not once, because the predicate is provenance rather
+# than age: before this layout shipped no host binary ever created `.host/` and
+# no record exists, so everything found is container-created; afterwards only a
+# directory with no matching record is taken. Quarantine MOVES the directory —
+# `<session>/inbound.db` is a hard link to the same inode, so the database stays
+# reachable under the legacy name and the next spawn re-migrates it.
+#
+# Fails the deploy if it cannot run: a sweep that did not happen cannot rule out
+# a planted directory, and restarting into that is the failure this exists to
+# prevent.
+write_status "running" "planted host-dir sweep" ""
+if ! pnpm exec tsx scripts/quarantine-planted-host-dirs.ts --apply >> "$LOG" 2>&1; then
+  write_status "failed" "planted host-dir sweep" "could not sweep container-planted .host directories — restart refused"
+  exit 1
+fi
+
+# Restart every OTHER long-running service that holds this checkout's code
+# resident, BEFORE the handoff below (#822).
+#
+# This has to be here and not after the restart of nanoclaw-v2: that restart
+# kills this script (the host spawns it `detached: true`, which gives it its own
+# process group and session but leaves it in the unit's cgroup —
+# src/channels/discord-slash-commands.ts:110-118 — and neither
+# scripts/nanoclaw-v2.service nor the installed copy sets KillMode, so systemd's
+# default `control-group` SIGTERMs the whole cgroup on stop). Nothing appended
+# after that restart ever executes — which is the same reason the success status
+# is written before it, per the comment below.
+#
+# Failure is terminal, and deliberately so: the rollback trap has not handed off
+# yet, so exiting here restores dist/, node_modules/ and the previous commit
+# exactly the way the planted-host-dir sweep above does, and the deploy reports
+# `failed`, never `ok`, with the unit named. Restarting the siblings last, right
+# before the handoff, also keeps the window in which they run newer code than
+# the still-live host as short as it can be.
+write_status "running" "sibling service restart" ""
+SIBLING_UNITS=$(long_running_repo_units) || {
+  write_status "failed" "sibling service restart" \
+    "could not enumerate this checkout's long-running services — restart refused"
+  exit 1
+}
+# nanoclaw-v2 is the one unit guaranteed to satisfy every clause of that
+# predicate while it is running, so it is the enumeration's own control. A
+# broken enumeration — systemctl unreadable, a REPO_ROOT that does not match the
+# unit's WorkingDirectory byte for byte, a `systemctl show` output shape that
+# moved — answers "no siblings" in exactly the words a host with no siblings
+# uses. Losing the control says the answer is not trustworthy, so refuse rather
+# than restart nothing and report ok (#818).
+if systemctl is-active --quiet nanoclaw-v2.service 2>/dev/null &&
+  ! printf '%s\n' "$SIBLING_UNITS" | grep -qxF 'nanoclaw-v2.service'; then
+  write_status "failed" "sibling service restart" \
+    "long-running-service discovery did not find the running nanoclaw-v2.service — refusing to trust it"
+  exit 1
+fi
+while IFS= read -r unit; do
+  [ -n "$unit" ] || continue
+  [ "$unit" = "nanoclaw-v2.service" ] && continue
+  # Recorded before the attempt: a unit whose restart fails is in an unknown
+  # state, and the rollback's job is to put it back on the restored build.
+  RESTART_ATTEMPTED_UNITS="${RESTART_ATTEMPTED_UNITS}${unit} "
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Restarting ${unit} onto the new build" >> "$LOG"
+  if ! sudo systemctl restart "$unit" >> "$LOG" 2>&1; then
+    write_status "failed" "sibling service restart" \
+      "systemctl restart ${unit} failed — restored the previous build"
+    exit 1
+  fi
+done <<< "$SIBLING_UNITS"
+
+# Arm the post-restart crash guard (src/deploy-crash-guard.ts). The restart
+# kills this script's process group, so nothing HERE can watch the service come
+# up — the guard runs inside every boot of the new build instead, and this
+# manifest is what tells it a rollback point exists and is fresh.
+#
+# Written AFTER the sibling restarts, not before, because `restartedUnits` is a
+# record of what this deploy actually did: reaching this line means every unit
+# listed came back cleanly (a failure exits above, before the handoff, where the
+# shell trap owns the rollback). The crash guard cannot re-derive the set — this
+# shell and its RESTART_ATTEMPTED_UNITS are dead by the time it runs — and
+# should not: like `imageBase` below, the guard's whole contract is to undo what
+# THIS deploy did rather than to act on what the host looks like three boots
+# later. Re-deriving would also mean a second copy of the discovery predicate,
+# in another language, with nothing to catch the drift.
+#
+# Three deliberate limits (the first two from the codex review on PR #180):
+# - A deploy that ships new migrations does NOT arm the guard: migrations can
+#   be destructive (dropped columns/tables), so restoring old code against the
+#   migrated database is worse than the crash loop. Those deploys keep the
+#   pre-guard behavior; the operator decides. Their siblings are then the
+#   operator's to restart too — the same call, made once.
+# - imageBase is recorded only when THIS deploy retagged :pre-deploy. A stale
+#   tag from an earlier deploy must never be retagged over the current image.
+# - `restartedUnits` is emitted whenever the guard is armed, `[]` included: an
+#   ABSENT field means a deploy that predates this and restarted nothing, and
+#   the guard must be able to tell that apart from "this deploy found none".
+#
+# The manifest is JSON, so a JSON ENCODER writes it — not a `printf` template.
+# systemd escapes any byte a unit id may not carry literally as `\xNN`, so a
+# legitimately-named unit puts a BACKSLASH in the list, and a template emitted
+# that raw: valid-looking output that is not valid JSON. The write succeeds, the
+# restart hands off, and two processes later readJson answers null, evaluateBoot
+# reads null as `no-op`, and the crashing deployment silently loses automatic
+# rollback for the host AND every sibling. Values reach the encoder through the
+# ENVIRONMENT, never argv, so nothing is interpolated into a command line
+# either; see scripts/write-deploy-json.mjs, which writes every JSON this
+# script emits, the status file included.
+#
+# Written to a temp file and renamed, because a half-written manifest is
+# unparsable in exactly the same way, and refused loudly if it cannot be
+# produced: this is still before the handoff, where the trap can restore.
+if [ -z "$MIGRATION_CHANGES" ]; then
+  mkdir -p data
+  # shellcheck disable=SC2086
+  if ! NANOCLAW_ROLLBACK_COMMIT="$PRE_COMMIT" \
+    NANOCLAW_ROLLBACK_IMAGE_BASE="$IMAGE_SAVED_BASE" \
+    NANOCLAW_ROLLBACK_TIMESTAMP="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    NANOCLAW_ROLLBACK_NODE="$(node --version 2>/dev/null)" \
+    NANOCLAW_ROLLBACK_UNITS="$(printf '%s\n' $RESTART_ATTEMPTED_UNITS)" \
+    node scripts/write-deploy-json.mjs rollback-manifest > data/deploy-rollback.json.tmp 2>> "$LOG"; then
+    rm -f data/deploy-rollback.json.tmp
+    write_status "failed" "crash guard manifest" \
+      "could not write the rollback manifest — restart refused rather than deploy with no rollback point"
+    exit 1
+  fi
+  if ! mv data/deploy-rollback.json.tmp data/deploy-rollback.json; then
+    rm -f data/deploy-rollback.json.tmp
+    write_status "failed" "crash guard manifest" \
+      "could not install the rollback manifest — restart refused rather than deploy with no rollback point"
+    exit 1
+  fi
+else
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Crash guard NOT armed: deploy ships migrations ($(echo "$MIGRATION_CHANGES" | head -3 | tr '\n' ' '))" >> "$LOG"
+  rm -f data/deploy-rollback.json
+fi
+
+# Write success status BEFORE restart — systemctl restart kills this script's
+# process group, so lines after don't run. The new process reads this file
+# on startup to announce the result.
+write_status "ok" "done" ""
+echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Deploy complete" >> "$LOG"
+
+DEPLOY_HANDOFF=1
+if ! sudo systemctl restart nanoclaw-v2 >> "$LOG" 2>&1; then
+  DEPLOY_HANDOFF=0
+  write_status "failed" "restart" "systemctl restart failed — restored the previous build"
+  exit 1
+fi

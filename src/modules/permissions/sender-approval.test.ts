@@ -1,0 +1,639 @@
+/**
+ * Integration tests for the unknown-sender request_approval flow
+ * (ACTION-ITEMS item 5).
+ *
+ * Covers:
+ *  - request_approval policy fires `requestSenderApproval` on first unknown
+ *    message from a sender
+ *  - In-flight dedup: second message from the same sender while pending is
+ *    silently dropped (no second card, no second row)
+ *  - Approve path: member added, original message replayed via routeInbound,
+ *    container woken
+ *  - Deny path: pending row deleted, no member added
+ */
+import fs from 'fs';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+
+import { closeDb, getRawDb, initMigratedTestDb } from '../../db/index.js';
+import { createAgentGroup } from '../../db/agent-groups.js';
+import { createMessagingGroup, createMessagingGroupAgent } from '../../db/messaging-groups.js';
+import { upsertUser } from './db/users.js';
+import { grantRole } from './db/user-roles.js';
+import { AGENT_ACCESS_SCOPE_WARNING } from './channel-approval.js';
+
+// Mock container runner — prevent actual docker spawn.
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
+  wakeContainer: vi.fn().mockResolvedValue(undefined),
+  isContainerRunning: vi.fn().mockReturnValue(false),
+  getActiveContainerCount: vi.fn().mockReturnValue(0),
+  killContainer: vi.fn(),
+}));
+
+// Mock delivery adapter — record card deliveries for assertions.
+const deliverMock = vi.fn().mockResolvedValue('plat-msg-id');
+vi.mock('../../delivery.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../delivery.js')>()),
+  getDeliveryAdapter: () => ({
+    deliver: deliverMock,
+  }),
+  onDeliveryAdapterReady: vi.fn(),
+  registerDeliveryAction: vi.fn(),
+}));
+
+// Mock ensureUserDm to return the approver's existing messaging group
+// instead of hitting a real openDM RPC.
+// importOriginal, not a bare factory: only `ensureUserDm` needs stubbing
+// (these tests pre-seed user_dms and must not hit a platform openDM).
+// `resolveUserChannelType` stays real so the approver-reachability check
+// under test is the shipped one.
+// Counts calls to the members leaf without changing its behavior, so the
+// duplicate-callback case below can assert that only ONE callback acted.
+const addMemberCalls = vi.hoisted(() => ({ n: 0, failNext: false }));
+vi.mock('./db/agent-group-members.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./db/agent-group-members.js')>();
+  return {
+    ...real,
+    addMember: async (row: Parameters<typeof real.addMember>[0]) => {
+      addMemberCalls.n++;
+      if (addMemberCalls.failNext) {
+        addMemberCalls.failNext = false;
+        throw new Error('simulated member-write failure');
+      }
+      return real.addMember(row);
+    },
+  };
+});
+
+vi.mock('./user-dm.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./user-dm.js')>()),
+  ensureUserDm: vi.fn(async (userId: string) => {
+    const { getRawDb } = await import('../../db/connection.js');
+    const row = getRawDb()
+      .prepare(
+        `SELECT mg.* FROM messaging_groups mg
+           JOIN user_dms ud ON ud.messaging_group_id = mg.id
+          WHERE ud.user_id = ?`,
+      )
+      .get(userId);
+    return row;
+  }),
+}));
+
+vi.mock('../../config.js', async () => {
+  const actual = await vi.importActual('../../config.js');
+  return { ...actual, DATA_DIR: TEST_DIR };
+});
+
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-sender-approval') }));
+
+function now() {
+  return new Date().toISOString();
+}
+
+beforeEach(async () => {
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  fs.mkdirSync(TEST_DIR, { recursive: true });
+  await initMigratedTestDb();
+
+  // Side-effect imports: register hooks (permissions module) AFTER the
+  // mocks are in place so the access gate / response handler pick up the
+  // mocked delivery + user-dm helpers.
+  await import('./index.js');
+
+  // Fixtures: agent group, messaging group with request_approval, wiring,
+  // owner + DM messaging group for approver delivery.
+  await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+
+  await createMessagingGroup({
+    id: 'mg-chat',
+    channel_type: 'telegram',
+    platform_id: 'chat-123',
+    name: 'Group Chat',
+    is_group: 1,
+    unknown_sender_policy: 'request_approval',
+    created_at: now(),
+  });
+  await createMessagingGroupAgent({
+    id: 'mga-1',
+    messaging_group_id: 'mg-chat',
+    agent_group_id: 'ag-1',
+    engage_mode: 'pattern',
+    engage_pattern: '.',
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
+    session_mode: 'shared',
+    priority: 0,
+    default_model: null,
+    default_effort: null,
+    default_tone: null,
+    instructions_profile: null,
+    created_at: now(),
+  });
+
+  // Owner user + their DM messaging group (pickApprover + ensureUserDm target).
+  await upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
+  await grantRole({
+    user_id: 'telegram:owner',
+    role: 'owner',
+    agent_group_id: null,
+    granted_by: null,
+    granted_at: now(),
+  });
+  await createMessagingGroup({
+    id: 'mg-dm-owner',
+    channel_type: 'telegram',
+    platform_id: 'dm-owner',
+    name: 'Owner DM',
+    is_group: 0,
+    unknown_sender_policy: 'public',
+    created_at: now(),
+  });
+  getRawDb()
+    .prepare(
+      `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
+       VALUES (?, ?, ?, ?)`,
+    )
+    .run('telegram:owner', 'telegram', 'mg-dm-owner', now());
+
+  deliverMock.mockClear();
+});
+
+afterEach(async () => {
+  await closeDb();
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+});
+
+function stranger(text: string) {
+  return {
+    channelType: 'telegram',
+    platformId: 'chat-123',
+    threadId: null,
+    message: {
+      id: `stranger-${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'chat' as const,
+      content: JSON.stringify({
+        senderId: 'tg:stranger',
+        senderName: 'Stranger',
+        text,
+      }),
+      timestamp: now(),
+    },
+  };
+}
+
+describe('unknown-sender request_approval flow', () => {
+  it('delivers an approval card on first unknown message', async () => {
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(stranger('hi'));
+
+    // Wait for the fire-and-forget requestSenderApproval to resolve.
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    const [channel, platformId, thread, kind, content] = deliverMock.mock.calls[0];
+    expect(channel).toBe('telegram');
+    expect(platformId).toBe('dm-owner'); // delivered to owner's DM
+    expect(thread).toBeNull();
+    expect(kind).toBe('chat-sdk');
+    const payload = JSON.parse(content as string);
+    expect(payload.type).toBe('ask_question');
+    expect(payload.questionId).toMatch(/^nsa-/);
+    expect(payload.question).toContain(AGENT_ACCESS_SCOPE_WARNING);
+
+    const { getRawDb } = await import('../../db/connection.js');
+    const rows = getRawDb().prepare('SELECT * FROM pending_sender_approvals').all();
+    expect(rows).toHaveLength(1);
+  });
+
+  // T4 PR1 (§5 case 12): the unknown-sender card must be delivered through
+  // the approver DM's own adapter instance — same live defect as the
+  // channel-registration card, one call site over in sender-approval.ts.
+  it('the unknown-sender card is delivered on the origin conversation instance', async () => {
+    const { getRawDb } = await import('../../db/connection.js');
+    getRawDb().prepare("UPDATE messaging_groups SET instance = 'telegram-work' WHERE id = 'mg-dm-owner'").run();
+
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(stranger('hi'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    // 7th positional arg is `instance` on ChannelDeliveryAdapter.deliver.
+    expect(deliverMock.mock.calls[0][6]).toBe('telegram-work');
+  });
+
+  it('dedups a second message from the same stranger while pending', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const first = stranger('hello');
+    const second = stranger('are you there?');
+    await routeInbound(first);
+    await new Promise((r) => setTimeout(r, 10));
+    await routeInbound(second);
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    const { getRawDb } = await import('../../db/connection.js');
+    const count = (getRawDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number }).c;
+    expect(count).toBe(1);
+    const receipts = getRawDb().prepare('SELECT message_id, status FROM channel_ingress_receipts').all() as Array<{
+      message_id: string;
+      status: string;
+    }>;
+    expect(Object.fromEntries(receipts.map((row) => [row.message_id, row.status]))).toEqual({
+      [first.message.id]: 'deferred',
+      [second.message.id]: 'completed',
+    });
+  });
+
+  it('approve → adds member and replays the original message', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    const { wakeContainer } = await import('../../container-runner.js');
+    (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
+
+    await routeInbound(stranger('please let me in'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const { getRawDb } = await import('../../db/connection.js');
+    const pending = getRawDb().prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
+    expect(pending).toBeDefined();
+
+    // Fire the approve click through the response-handler chain.
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.id,
+        value: 'approve',
+        // Chat SDK's onAction surfaces the raw platform userId (e.g. Telegram
+        // chat id). The permissions handler namespaces it with channelType to
+        // match users(id).
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+
+    // Member row added for the stranger against the wired agent group.
+    const member = getRawDb()
+      .prepare('SELECT 1 AS x FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
+      .get('tg:stranger', 'ag-1');
+    expect(member).toBeDefined();
+
+    // Pending row cleared.
+    const stillPending = getRawDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as {
+      c: number;
+    };
+    expect(stillPending.c).toBe(0);
+
+    // Message replayed + container woken.
+    expect(wakeContainer).toHaveBeenCalled();
+  });
+
+  // Issue #443, Codex round 1 — the async read-then-write class.
+  //
+  // `getPendingSenderApproval` is awaited, so it yields. Two callbacks for the
+  // SAME card (an adapter retry, a double-click) both found the row live and
+  // both ran the whole branch, and the approve branch ends in
+  // `replayDeferredInbound` — a real second delivery of the retained message
+  // to the agent. The fix makes the DELETE the claim: exactly one caller sees
+  // `changes === 1` and only that caller adds the member and replays.
+  //
+  // Both clicks are started before either is awaited, which is what makes them
+  // overlap: the first suspends at its first `await` and the second then reads
+  // the same still-present row.
+  it('two overlapping approve clicks replay once and add one member', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    const { wakeContainer } = await import('../../container-runner.js');
+
+    await routeInbound(stranger('please let me in'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const { getRawDb } = await import('../../db/connection.js');
+    const pending = getRawDb().prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
+    expect(pending).toBeDefined();
+
+    (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
+    addMemberCalls.n = 0;
+
+    const click = async (): Promise<void> => {
+      for (const handler of getResponseHandlers()) {
+        if (
+          await handler({
+            questionId: pending.id,
+            value: 'approve',
+            userId: 'owner',
+            channelType: 'telegram',
+            platformId: 'dm-owner',
+            threadId: null,
+          })
+        ) {
+          break;
+        }
+      }
+    };
+    await Promise.all([click(), click()]);
+    await new Promise((r) => setTimeout(r, 10));
+
+    // The assertion the bug breaks: only the winner ran the approve branch.
+    // `addMember` is INSERT OR IGNORE and `replayDeferredInbound` has its own
+    // atomic receipt claim, so the ROW state below is identical either way —
+    // the call count is the only thing that distinguishes one caller acting
+    // from two, which is exactly what the claim guarantees.
+    expect(addMemberCalls.n).toBe(1);
+    expect(wakeContainer).toHaveBeenCalledTimes(1);
+
+    // One member row, and the card is gone.
+    const members = getRawDb()
+      .prepare('SELECT COUNT(*) AS c FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
+      .get('tg:stranger', 'ag-1') as { c: number };
+    expect(members.c).toBe(1);
+    const stillPending = getRawDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as {
+      c: number;
+    };
+    expect(stillPending.c).toBe(0);
+  });
+
+  // Issue #443, Codex round 2 — a claim that cannot be recovered is a lost card.
+  //
+  // The claim removes the approval row, and that row holds the ONLY copy of the
+  // retained inbound. If the member write then fails, the sender is left
+  // approved-but-not-admitted with nothing to replay and no card to click
+  // again. The handler now restores the row on failure, so the card stays
+  // actionable and a retry completes normally.
+  it('a failed member write restores the card, and a retry admits the sender once', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    const { wakeContainer } = await import('../../container-runner.js');
+    const { getRawDb } = await import('../../db/connection.js');
+
+    await routeInbound(stranger('please let me in'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const before = getRawDb().prepare('SELECT id, original_message FROM pending_sender_approvals').get() as {
+      id: string;
+      original_message: string;
+    };
+    expect(before).toBeDefined();
+
+    const click = async (): Promise<void> => {
+      for (const handler of getResponseHandlers()) {
+        if (
+          await handler({
+            questionId: before.id,
+            value: 'approve',
+            userId: 'owner',
+            channelType: 'telegram',
+            platformId: 'dm-owner',
+            threadId: null,
+          })
+        ) {
+          break;
+        }
+      }
+    };
+
+    // First click: the member write fails.
+    (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
+    addMemberCalls.failNext = true;
+    await click();
+
+    // The card survived, with its retained body intact — this is the assertion
+    // the bug breaks: without the restore the row is gone forever.
+    const after = getRawDb().prepare('SELECT id, original_message FROM pending_sender_approvals').get() as
+      | { id: string; original_message: string }
+      | undefined;
+    expect(after).toBeDefined();
+    expect(after!.id).toBe(before.id);
+    expect(after!.original_message).toBe(before.original_message);
+    // Nothing was replayed on the failed attempt.
+    expect(wakeContainer).not.toHaveBeenCalled();
+    // And no member was admitted.
+    const midMembers = getRawDb()
+      .prepare('SELECT COUNT(*) AS c FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
+      .get('tg:stranger', 'ag-1') as { c: number };
+    expect(midMembers.c).toBe(0);
+
+    // Second click: the retry succeeds, exactly once.
+    await click();
+    await new Promise((r) => setTimeout(r, 10));
+
+    const members = getRawDb()
+      .prepare('SELECT COUNT(*) AS c FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
+      .get('tg:stranger', 'ag-1') as { c: number };
+    expect(members.c).toBe(1);
+    const stillPending = getRawDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as {
+      c: number;
+    };
+    expect(stillPending.c).toBe(0);
+    expect(wakeContainer).toHaveBeenCalledTimes(1);
+  });
+
+  it('deny → deletes the pending row without adding a member', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+
+    await routeInbound(stranger('hello'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const { getRawDb } = await import('../../db/connection.js');
+    const pending = getRawDb().prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
+    expect(pending).toBeDefined();
+
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.id,
+        value: 'reject',
+        userId: 'owner', // raw platform id — handler namespaces with channelType
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+
+    const count = (getRawDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number }).c;
+    expect(count).toBe(0);
+    const member = getRawDb()
+      .prepare('SELECT 1 AS x FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
+      .get('tg:stranger', 'ag-1');
+    expect(member).toBeUndefined();
+  });
+
+  it('rejects clicks from an unauthorized user (prevents self-admit via forwarded card)', async () => {
+    // Stranger triggers the approval flow; card goes to the owner.
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+
+    await routeInbound(stranger('can I play'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const { getRawDb } = await import('../../db/connection.js');
+    const pending = getRawDb().prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
+    expect(pending).toBeDefined();
+
+    // A random user (not the stranger, not the owner, not an admin) tries to
+    // click the approval — e.g. they got the card forwarded. Should be
+    // rejected without admitting them.
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.id,
+        value: 'approve',
+        userId: 'random-bystander', // not owner, not admin
+        channelType: 'telegram',
+        platformId: 'dm-random',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+
+    // No member added for the stranger.
+    const member = getRawDb()
+      .prepare('SELECT 1 AS x FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
+      .get('tg:stranger', 'ag-1');
+    expect(member).toBeUndefined();
+
+    // Pending row is still there — a legitimate approver can still act on it.
+    const stillPending = (
+      getRawDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number }
+    ).c;
+    expect(stillPending).toBe(1);
+  });
+
+  it('accepts a click from a global admin even if they are not the designated approver', async () => {
+    // Pre-seed a separate admin user so we can click as them.
+    await upsertUser({ id: 'telegram:admin-bob', kind: 'telegram', display_name: 'Bob', created_at: now() });
+    await grantRole({
+      user_id: 'telegram:admin-bob',
+      role: 'admin',
+      agent_group_id: null,
+      granted_by: 'telegram:owner',
+      granted_at: now(),
+    });
+
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+
+    await routeInbound(stranger('knock knock'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const { getRawDb } = await import('../../db/connection.js');
+    const pending = getRawDb().prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
+    expect(pending).toBeDefined();
+
+    // Admin clicks approve (not the designated approver, which was owner).
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.id,
+        value: 'approve',
+        userId: 'admin-bob',
+        channelType: 'telegram',
+        platformId: 'dm-bob',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+
+    // Stranger admitted thanks to the admin's authority.
+    const member = getRawDb()
+      .prepare('SELECT 1 AS x FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
+      .get('tg:stranger', 'ag-1');
+    expect(member).toBeDefined();
+  });
+});
+
+describe('unknown-sender request_approval when no card can reach anyone', () => {
+  async function pendingRows(): Promise<number> {
+    const { getRawDb } = await import('../../db/connection.js');
+    return (getRawDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number }).c;
+  }
+
+  it('sends no card and keeps no row when nobody is owner or admin', async () => {
+    getRawDb().prepare("DELETE FROM user_roles WHERE user_id = 'telegram:owner'").run();
+
+    const { requestSenderApproval } = await import('./sender-approval.js');
+    const queued = await requestSenderApproval({
+      messagingGroupId: 'mg-chat',
+      agentGroupId: 'ag-1',
+      senderIdentity: 'tg:stranger',
+      senderName: 'Stranger',
+      event: stranger('hi'),
+    });
+
+    // false: nothing is retained for replay, so the caller does not defer the message.
+    expect(queued).toBe(false);
+    expect(deliverMock).not.toHaveBeenCalled();
+    expect(await pendingRows()).toBe(0);
+  });
+
+  it('does not fall back to an approver on another platform, and leaves the next message free to try again', async () => {
+    // The only owner is on Slack; the stranger wrote on Telegram. The card
+    // carries this workspace's sender identity and text, so it must not cross.
+    getRawDb().prepare("DELETE FROM user_roles WHERE user_id = 'telegram:owner'").run();
+    await upsertUser({ id: 'slack:boss', kind: 'slack', display_name: 'Boss', created_at: now() });
+    await grantRole({
+      user_id: 'slack:boss',
+      role: 'owner',
+      agent_group_id: null,
+      granted_by: null,
+      granted_at: now(),
+    });
+    await createMessagingGroup({
+      id: 'mg-dm-boss',
+      channel_type: 'slack',
+      platform_id: 'dm-boss',
+      name: 'Boss DM',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    getRawDb()
+      .prepare('INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)')
+      .run('slack:boss', 'slack', 'mg-dm-boss', now());
+
+    const { requestSenderApproval } = await import('./sender-approval.js');
+    const input = {
+      messagingGroupId: 'mg-chat',
+      agentGroupId: 'ag-1',
+      senderIdentity: 'tg:stranger',
+      senderName: 'Stranger',
+      event: stranger('hi'),
+    };
+    expect(await requestSenderApproval(input)).toBe(false);
+    expect(await requestSenderApproval({ ...input, event: stranger('hello?') })).toBe(false);
+
+    expect(deliverMock).not.toHaveBeenCalled();
+    expect(await pendingRows()).toBe(0);
+  });
+
+  it('keeps the row after a failed card delivery, so the dedup gate still holds', async () => {
+    deliverMock.mockRejectedValueOnce(new Error('telegram 502'));
+
+    const { requestSenderApproval } = await import('./sender-approval.js');
+    const first = stranger('hi');
+    const queued = await requestSenderApproval({
+      messagingGroupId: 'mg-chat',
+      agentGroupId: 'ag-1',
+      senderIdentity: 'tg:stranger',
+      senderName: 'Stranger',
+      event: first,
+    });
+
+    // The event is retained for replay behind the undelivered card.
+    expect(queued).toBe(true);
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    expect(await pendingRows()).toBe(1);
+
+    const again = await requestSenderApproval({
+      messagingGroupId: 'mg-chat',
+      agentGroupId: 'ag-1',
+      senderIdentity: 'tg:stranger',
+      senderName: 'Stranger',
+      event: stranger('still there?'),
+    });
+    expect(again).toBe(false);
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    expect(await pendingRows()).toBe(1);
+  });
+});

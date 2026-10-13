@@ -1,0 +1,121 @@
+# One-way export of the product tree to the public repository. run.ts renders
+# __ORIGIN_URL__, __STAGING_URL__ and __AUTHOR__ into a scratch copy before every run.
+
+PUBLIC_AUTHOR = "__AUTHOR__"
+
+# Fail closed: a new top-level folder or root file stays private until it is
+# named here.
+PRODUCT_FILES = glob(
+    include = [
+        "src/**",
+        "container/**",
+        "setup/**",
+        "scripts/**",
+        "dashboard/**",
+        "assets/**",
+        "bin/**",
+        "config-examples/**",
+        "launchd/**",
+        "patches/**",
+        "templates/**",
+        "tests/**",
+        "repo-tokens/**",
+        "tone-profiles/**",
+        ".claude/skills/**",
+        "public-overlay/**",
+        "docs/*.md",
+        "docs/dependency-changes/**",
+        ".husky/**",
+        "LICENSE",
+        "CHANGELOG.md",
+        "CONTRIBUTING.md",
+        "CODE_OF_CONDUCT.md",
+        "CONTRIBUTORS.md",
+        "RELEASING.md",
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "tsconfig*.json",
+        "vitest*.ts",
+        "eslint.config.js",
+        "knip.json",
+        ".jscpd.json",
+        ".prettierrc",
+        ".prettierignore",
+        ".gitignore",
+        ".nvmrc",
+        ".pnpmfile.cjs",
+        ".env.example",
+        "setup.sh",
+        "nanoclaw.sh",
+        "uninstall.sh",
+        "migrate-v2*.sh",
+        "versions.json",
+        "coverage-risk-baseline.json",
+    ],
+    exclude = [
+        "docs/specs/**",
+        "docs/retros/**",
+        "docs/review-notes/**",
+        "docs/review-notes.md",
+        "docs/handoffs/**",
+        "docs/CUTOVER_RUNBOOK.md",
+        "docs/MIGRATION_FROM_V1.md",
+        "docs/PHASE_*.md",
+        "docs/SPIKE_NOTES.md",
+        "docs/V2_BACKLOG.md",
+        "docs/profound.md",
+        "docs/project-scope.md",
+        "docs/review-policy.md",
+        "docs/codex-parity-test-plan.md",
+        "docs/codex-hook-support.md",
+        "docs/always-on-directive-*.md",
+        "container/skills/smoke-test/scripts/testdata/controller-replay-corpus.ndjson",
+        "container/skills/smoke-test/scripts/smoke-controller-shadow-report.test.sh",
+        "data/**",
+        ".public-boundary-*.json",
+        "PROGRESS.md",
+        ".github/**",
+        ".agents/**",
+        ".design-artifact-loop/**",
+        "groups/**",
+        "**/groups/**",
+        ".context/**",
+        "**/.context/**",
+    ],
+)
+
+def export_workflow(name, mode, transformations):
+    core.workflow(
+        name = name,
+        origin = git.origin(url = "__ORIGIN_URL__", ref = "main"),
+        destination = git.destination(url = "__STAGING_URL__", push = "main", fetch = "main"),
+        origin_files = PRODUCT_FILES,
+        destination_files = glob(["**"]),
+        authoring = authoring.overwrite(PUBLIC_AUTHOR),
+        mode = mode,
+        transformations = transformations,
+    )
+
+# The root README.md and CLAUDE.md describe this private install; the public ones live in public-overlay/.
+PUBLIC_OVERLAY = core.move("public-overlay", "")
+
+export_workflow(
+    name = "export",
+    mode = "ITERATIVE",
+    transformations = [
+        PUBLIC_OVERLAY,
+        metadata.replace_message("${COPYBARA_CURRENT_MESSAGE_TITLE}"),
+        metadata.scrubber("^Merge (pull request #[0-9]+ from|remote-tracking branch|branch) .*$", replacement = "Merge changes"),
+        metadata.scrubber(" *\\(#[0-9]+\\)$"),
+    ],
+)
+
+export_workflow(
+    name = "export_squash",
+    mode = "SQUASH",
+    transformations = [
+        PUBLIC_OVERLAY,
+        metadata.replace_message("Snapshot of the product tree"),
+    ],
+)

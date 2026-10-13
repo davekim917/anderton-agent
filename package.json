@@ -1,0 +1,95 @@
+{
+  "name": "nanoclaw",
+  "version": "2.1.53",
+  "description": "Personal Claude assistant. Lightweight, secure, customizable.",
+  "type": "module",
+  "packageManager": "pnpm@10.34.5",
+  "main": "dist/index.js",
+  "bin": {
+    "ncl": "bin/ncl"
+  },
+  "scripts": {
+    "prebuild": "tsx scripts/check-build-clean.ts",
+    "build": "tsc && pnpm run build:spa",
+    "postbuild": "tsx scripts/write-build-info.ts",
+    "build:spa": "tsx scripts/build-dashboard-spa.ts",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:fix": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "prepare": "husky && sh scripts/pin-git-hooks-path.sh",
+    "setup": "tsx setup/index.ts",
+    "setup:auto": "tsx setup/auto.ts",
+    "ncl": "tsx src/cli/client.ts",
+    "worktrees": "tsx scripts/agent-worktree-gc.ts",
+    "chat": "tsx scripts/chat.ts",
+    "lint": "eslint src/ scripts/ setup/",
+    "lint:fix": "eslint src/ scripts/ setup/ --fix",
+    "test": "vitest run",
+    "test:correctness": "VITEST_LANE=correctness vitest run",
+    "test:drift": "VITEST_LANE=drift vitest run",
+    "test:watch": "vitest",
+    "test:coverage:risk": "VITEST_LANE=correctness vitest run --coverage",
+    "check:risk-coverage": "tsx scripts/check-risk-coverage.ts",
+    "check:public-boundary": "tsx scripts/check-public-boundary.ts",
+    "check:dependency-links": "tsx scripts/check-dependency-links.ts",
+    "check:git-safety-selfcheck": "bash scripts/git-safety-selfcheck.sh",
+    "check:wiki-pre-push-hook-selfcheck": "bash scripts/wiki-pre-push-hook-selfcheck.sh",
+    "check:health-sentinel-selfcheck": "bash scripts/health-sentinel-selfcheck.sh",
+    "ratchet:report": "tsx scripts/upstream-ratchet-report.ts",
+    "upstream-dryrun-report": "tsx scripts/upstream-dry-run-report.ts",
+    "build:dashboard": "tsx scripts/build-dashboard-spa.ts --install",
+    "mailbox-model:generate": "cp src/mailbox/model.ts container/agent-runner/src/mailbox/model.generated.ts",
+    "mailbox-model:check": "cmp src/mailbox/model.ts container/agent-runner/src/mailbox/model.generated.ts"
+  },
+  "dependencies": {
+    "@chat-adapter/discord": "4.41.1",
+    "@chat-adapter/shared": "4.41.1",
+    "@chat-adapter/slack": "4.41.1",
+    "@clack/core": "^1.5.1",
+    "@clack/prompts": "^1.8.1",
+    "@onecli-sh/sdk": "2.2.1",
+    "@slack/web-api": "8.2.0",
+    "better-sqlite3": "13.0.3",
+    "chat": "4.41.1",
+    "chokidar": "5.0.0",
+    "cron-parser": "5.10.1",
+    "discord.js": "^14.27.0",
+    "kleur": "^4.1.5",
+    "undici": "8.11.2",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^22.20.5",
+    "@types/ws": "8.18.1",
+    "@vitest/coverage-v8": "5.0.3",
+    "eslint": "^10.12.0",
+    "eslint-plugin-no-catch-all": "^1.1.0",
+    "globals": "^17.13.0",
+    "husky": "^9.1.7",
+    "jscpd": "5.4.0",
+    "knip": "6.39.0",
+    "prettier": "^3.8.1",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.71.1",
+    "vitest": "^5.0.3",
+    "ws": "8.21.0"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "ws@<8.20.1": "^8.20.1"
+    },
+    "patchedDependencies": {
+      "@chat-adapter/discord@4.41.1": "patches/@chat-adapter__discord@4.41.1.patch",
+      "@chat-adapter/shared@4.41.1": "patches/@chat-adapter__shared@4.41.1.patch"
+    }
+  }
+}

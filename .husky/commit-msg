@@ -1,0 +1,17 @@
+# Boundary gate for the COMMIT MESSAGE.
+#
+# pre-commit scans staged files; pre-push scans the index. Neither ever saw the
+# commit message — but history travels with the branch, so a message naming a
+# real group folder, tenant, or account arrangement publishes upstream exactly
+# like source does. On 2026-08-25 a message spelling out an install's OAuth
+# slot arrangement committed clean while the same identifier was correctly
+# rejected in the diff.
+#
+# `$1` is git's message file. Resolve the main checkout the same way the other
+# hooks do: agent worktrees carry no node_modules, so a bare `pnpm run` here
+# dies with `tsx: not found`. Absolutize the path BEFORE the cd, since git
+# passes it relative to the original $PWD.
+msg_path=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
+
+(cd "$repo_root" && pnpm run check:public-boundary -- --message "$msg_path")

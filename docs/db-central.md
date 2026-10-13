@@ -1,0 +1,633 @@
+# NanoClaw — Central DB Schema
+
+Complete reference for `data/v2.db`, the host-owned admin-plane database. Start with [db.md](db.md) for the three-DB overview, the map, and the cross-mount rules.
+
+Access layer: `src/db/`. The schema's source of truth is the numbered migration files under `src/db/migrations/`: each table is created, and later altered, by the migration that introduced it.
+
+---
+
+## 0. Driver
+
+Everything below is reached through `src/db/connection.ts`. Since seam 3 PR 1 that module exposes two handles on the same SQLite connection.
+
+`getDb()` returns upstream's `DbDriver` (`src/db/driver.ts`, ported byte-for-byte along with `src/db/drivers/sqlite.ts`, `src/db/driver-registry.ts` and `src/db/compose.ts`). Its `get`/`all`/`run`/`exec`/`transaction`/`hasTable`/`close` all return promises, the composition in `compose.ts` picks the backend, and `initDb`/`initTestDb`/`closeDb`/`hasTable` are async with it. The driver is the boundary a non-SQLite backend would replace; session mailboxes deliberately do not use it.
+
+`getRawDb()` returns the underlying synchronous better-sqlite3 handle, via upstream's own `sqliteRaw` escape hatch. It is TRANSITIONAL. The fork's call sites were all synchronous when the driver landed and convert leaf by leaf across seam-3 PRs 3 to 5; `getRawDb()` and its companion `hasTableRaw()` are deleted in PR 6. The set of files that reference either one is pinned by `src/db/raw-db-ratchet.test.ts`, which allows removals and fails on any addition.
+
+The two handles share one connection, so transactions stay raw until PR 6. A driver transaction yields at every `await`, and a raw statement landing in that window would execute inside the open `BEGIN IMMEDIATE`. A synchronous `db.transaction(() => …)()` closure cannot be interleaved, so every fork transaction remains one until PR 6 introduces `src/db/central-lease.ts`. `src/db/transaction-closures-tripwire.test.ts` enforces both halves with the TypeScript checker rather than by text: a `DbDriver` receiver on `.transaction(` is forbidden anywhere in `src/`, and a better-sqlite3 receiver is allowed only in the file set that test pins.
+
+## 1. Tables
+
+### 1.1 `agent_groups`
+
+Agent workspaces. Each maps 1:1 to a `groups/<folder>/` directory containing `CLAUDE.md` and skills. Container config lives in `container_configs` (see §1.x below); a `container.json` file is materialized at spawn time for the container runner to read.
+
+```sql
+CREATE TABLE agent_groups (
+  id               TEXT PRIMARY KEY,
+  name             TEXT NOT NULL,
+  folder           TEXT NOT NULL UNIQUE,
+  agent_provider   TEXT,
+  created_at       TEXT NOT NULL
+);
+```
+
+- **Readers:** `src/session-manager.ts`, `src/delivery.ts`, `src/router.ts`
+- **Writers:** `src/db/agent-groups.ts`
+
+### 1.2 `messaging_groups`
+
+One row per platform chat (one WhatsApp group, one Slack channel, one 1:1 DM, etc.) per adapter instance.
+
+```sql
+CREATE TABLE messaging_groups (
+  id                    TEXT PRIMARY KEY,
+  channel_type          TEXT NOT NULL,
+  platform_id           TEXT NOT NULL,
+  instance              TEXT NOT NULL,
+  name                  TEXT,
+  is_group              INTEGER DEFAULT 0,
+  unknown_sender_policy TEXT NOT NULL DEFAULT 'strict',
+  created_at            TEXT NOT NULL,
+  denied_at             TEXT,
+  UNIQUE(channel_type, platform_id, instance)
+);
+```
+
+- `instance`: adapter-instance name — N adapters of one platform (e.g. three Slack apps in one workspace) each own their rows. The default instance IS the channel type: migration 016 backfills `instance = channel_type` and `createMessagingGroup` stamps the same default, so single-instance installs never see the dimension. Inbound lookups are exact-on-instance (an unknown named instance auto-creates its own row); outbound lookups resolve default-instance-first.
+- `unknown_sender_policy`: `strict` (drop silently), `request_approval` (drop + card an admin), `decline_notify` (drop + politely decline in the sender's DM and FYI the owner, no card), `public` (allow).
+- **Readers:** `src/router.ts`, `src/delivery.ts`, `src/session-manager.ts`
+- **Writers:** `src/db/messaging-groups.ts`, channel setup flows
+
+### 1.3 `messaging_group_agents`
+
+Wiring: which agent group handles which messaging group. Many-to-many — the same channel can route to multiple agents (see [isolation-model.md](isolation-model.md)).
+
+```sql
+CREATE TABLE messaging_group_agents (
+  id                     TEXT PRIMARY KEY,
+  messaging_group_id     TEXT NOT NULL REFERENCES messaging_groups(id),
+  agent_group_id         TEXT NOT NULL REFERENCES agent_groups(id),
+  engage_mode            TEXT NOT NULL DEFAULT 'mention',
+                         -- 'pattern' | 'mention' | 'mention-sticky'
+  engage_pattern         TEXT,   -- regex; required when engage_mode='pattern';
+                                 -- '.' means "match every message"
+  sender_scope           TEXT NOT NULL DEFAULT 'all',    -- 'all' | 'known'
+  ignored_message_policy TEXT NOT NULL DEFAULT 'drop',   -- 'drop' | 'accumulate'
+  session_mode           TEXT DEFAULT 'shared',
+  priority               INTEGER DEFAULT 0,
+  default_tone           TEXT,   -- voice: tone profile name (migration 016)
+  instructions_profile   TEXT,   -- operating rules: channel-instructions
+                                 -- profile name (migration 063)
+  created_at             TEXT NOT NULL,
+  UNIQUE(messaging_group_id, agent_group_id)
+);
+```
+
+- `session_mode`: `shared` (one session per channel), `per-thread` (one per thread), `agent-shared` (one per agent group across all channels).
+- `engage_mode` / `engage_pattern` / `sender_scope` / `ignored_message_policy`: four orthogonal axes (migration 010) that replaced v1's opaque `trigger_rules` JSON + `response_scope` enum. `engage_mode='pattern'` requires `engage_pattern` (`'.'` matches every message — the "always respond" flavor); `sender_scope='known'` restricts engagement to group members; `ignored_message_policy='accumulate'` keeps ignored messages as context instead of dropping them.
+- `default_tone` / `instructions_profile`: the two per-channel always-on layers, and deliberately separate. `default_tone` is **voice only** — one slot, by invariant — resolving to `groups/<folder>/tone-profiles/<name>.md` then the shared `tone-profiles/<name>.md`. `instructions_profile` is the room's **operating rules**, resolving to `groups/<folder>/channel-instructions/<name>.md` only, and injected ahead of the tone block so rules are read before register. Both NULL by default; neither is inherited by auto-wire. Full mechanics in [api-details.md](api-details.md#channel-instructions).
+- `default_model` / `default_effort`: sticky per-channel overrides using the same vocabulary as the `-m` / `-e` chat flags. An in-chat flag persists here, so a one-off experiment becomes the channel default.
+- **Side effect:** creating a wiring must also populate `agent_destinations` — don't mutate one without the other (see §1.10).
+
+### 1.4 `users`
+
+Platform user identities. ID is namespaced: `tg:123456`, `discord:abc`, `phone:+1555...`, `email:person9@fixture16.example.com`. One human may own several rows — no cross-channel linking yet.
+
+```sql
+CREATE TABLE users (
+  id           TEXT PRIMARY KEY,
+  kind         TEXT NOT NULL,
+  display_name TEXT,
+  created_at   TEXT NOT NULL
+);
+```
+
+- **Writers/readers:** `src/db/users.ts`; channel auth flows
+
+### 1.5 `user_roles`
+
+Permissions. **Privilege is user-level, never agent-group-level.**
+
+```sql
+CREATE TABLE user_roles (
+  user_id        TEXT NOT NULL REFERENCES users(id),
+  role           TEXT NOT NULL,
+  agent_group_id TEXT REFERENCES agent_groups(id),
+  granted_by     TEXT REFERENCES users(id),
+  granted_at     TEXT NOT NULL,
+  PRIMARY KEY (user_id, role, agent_group_id)
+);
+CREATE INDEX idx_user_roles_scope ON user_roles(agent_group_id, role);
+```
+
+Invariants:
+
+- `role = 'owner'` → must be global (`agent_group_id IS NULL`). Enforced in `grantRole()`.
+- `role = 'admin'` → global (NULL) or scoped to one agent group.
+- Admin @ A implies membership in A — no `agent_group_members` row required.
+
+Access layer: `src/db/user-roles.ts`, `src/access.ts`.
+
+### 1.6 `agent_group_members`
+
+Explicit membership for non-privileged users. Owner and admins don't need rows here — they're implicit members.
+
+```sql
+CREATE TABLE agent_group_members (
+  user_id        TEXT NOT NULL REFERENCES users(id),
+  agent_group_id TEXT NOT NULL REFERENCES agent_groups(id),
+  added_by       TEXT REFERENCES users(id),
+  added_at       TEXT NOT NULL,
+  PRIMARY KEY (user_id, agent_group_id)
+);
+```
+
+### 1.7 `user_dms`
+
+Cache of DM channel discovery. Lets the host send a cold DM (approval card, pairing code) without hitting the platform's `openConversation` API every time.
+
+```sql
+CREATE TABLE user_dms (
+  user_id            TEXT NOT NULL REFERENCES users(id),
+  channel_type       TEXT NOT NULL,
+  messaging_group_id TEXT NOT NULL REFERENCES messaging_groups(id),
+  resolved_at        TEXT NOT NULL,
+  PRIMARY KEY (user_id, channel_type)
+);
+```
+
+Populated lazily by `ensureUserDm()` in `src/user-dm.ts`. Cold DMs resolve via the channel's default adapter instance — `PRIMARY KEY (user_id, channel_type)` is per-platform, not per-instance.
+
+### 1.8 `sessions`
+
+Session registry. One row per (agent group, messaging group, thread) tuple subject to `session_mode`. Stores lifecycle metadata only — no messages.
+
+```sql
+CREATE TABLE sessions (
+  id                 TEXT PRIMARY KEY,
+  agent_group_id     TEXT NOT NULL REFERENCES agent_groups(id),
+  messaging_group_id TEXT REFERENCES messaging_groups(id),
+  thread_id          TEXT,
+  agent_provider     TEXT,
+  status             TEXT DEFAULT 'active',
+  container_status   TEXT DEFAULT 'stopped',
+  last_active        TEXT,
+  created_at         TEXT NOT NULL
+);
+CREATE INDEX idx_sessions_agent_group ON sessions(agent_group_id);
+CREATE INDEX idx_sessions_lookup     ON sessions(messaging_group_id, thread_id);
+```
+
+- **Resolved by:** `resolveSession()` in `src/session-manager.ts`.
+- Creating a session also provisions the session folder and both session DBs via `initSessionFolder()` — see [db-session.md](db-session.md).
+
+### 1.9 `pending_questions`
+
+The `ask_user_question` MCP tool parks an interactive question here, and the container matches incoming `system` messages back to it by `questionId`.
+
+```sql
+CREATE TABLE pending_questions (
+  question_id    TEXT PRIMARY KEY,
+  session_id     TEXT NOT NULL REFERENCES sessions(id),
+  message_out_id TEXT NOT NULL,
+  platform_id    TEXT,
+  channel_type   TEXT,
+  thread_id      TEXT,
+  title          TEXT NOT NULL,
+  options_json   TEXT NOT NULL,
+  created_at     TEXT NOT NULL
+);
+```
+
+### 1.10 `agent_destinations`
+
+Permission ACL _and_ name-resolution map for outbound sending. An agent asking to `send_message(to="dev-channel")` must have a row here with `local_name = 'dev-channel'`, or the send is rejected as `unknown destination`.
+
+```sql
+CREATE TABLE agent_destinations (
+  agent_group_id TEXT NOT NULL REFERENCES agent_groups(id),
+  local_name     TEXT NOT NULL,
+  target_type    TEXT NOT NULL,   -- 'channel' | 'agent'
+  target_id      TEXT NOT NULL,   -- messaging_group_id | agent_group_id
+  created_at     TEXT NOT NULL,
+  PRIMARY KEY (agent_group_id, local_name)
+);
+CREATE INDEX idx_agent_dest_target ON agent_destinations(target_type, target_id);
+```
+
+**Projection invariant (load-bearing).** The central table is the source of truth, but each running container reads from a projection in its own `inbound.db` (see [db-session.md §2.3](db-session.md#23-destinations)). Any code that mutates `agent_destinations` while a container is running must also call `writeDestinations()` (`src/session-manager.ts`) or the container will reject sends with stale data. Known call sites: `createMessagingGroupAgent()` in `src/db/messaging-groups.ts`, the `create_agent` system action in `src/delivery.ts`.
+
+Access layer: `src/db/agent-destinations.ts`.
+
+### 1.11 `pending_approvals`
+
+Two workflows share this table:
+
+- **Session-bound MCP approvals** — `install_packages`, `add_mcp_server`. `session_id` is set.
+- **OneCLI credential approvals** — `session_id` may be NULL; `agent_group_id` + `channel_type` + `platform_id` route the admin card.
+
+```sql
+CREATE TABLE pending_approvals (
+  approval_id         TEXT PRIMARY KEY,
+  session_id          TEXT REFERENCES sessions(id),
+  request_id          TEXT NOT NULL,
+  action              TEXT NOT NULL,
+  payload             TEXT NOT NULL,
+  created_at          TEXT NOT NULL,
+  agent_group_id      TEXT REFERENCES agent_groups(id),
+  channel_type        TEXT,
+  platform_id         TEXT,
+  platform_message_id TEXT,
+  expires_at          TEXT,
+  status              TEXT NOT NULL DEFAULT 'pending',
+  title               TEXT NOT NULL DEFAULT '',
+  options_json        TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX idx_pending_approvals_action_status ON pending_approvals(action, status);
+```
+
+- `status`: `pending` | `approved` | `rejected` | `expired`.
+- `platform_message_id` lets the host edit the admin card in place after a decision.
+- Access layer: `src/db/sessions.ts`; sweep + delivery: `src/onecli-approvals.ts`.
+
+### 1.12 `unregistered_senders`
+
+Audit trail: every time a message gets dropped (unknown sender, strict policy), we increment a counter here so admins can see who's been trying to knock.
+
+```sql
+CREATE TABLE unregistered_senders (
+  channel_type       TEXT NOT NULL,
+  platform_id        TEXT NOT NULL,
+  user_id            TEXT,
+  sender_name        TEXT,
+  reason             TEXT NOT NULL,
+  messaging_group_id TEXT,
+  agent_group_id     TEXT,
+  message_count      INTEGER NOT NULL DEFAULT 1,
+  first_seen         TEXT NOT NULL,
+  last_seen          TEXT NOT NULL,
+  PRIMARY KEY (channel_type, platform_id)
+);
+CREATE INDEX idx_unregistered_senders_last_seen ON unregistered_senders(last_seen);
+```
+
+Writer: `recordDroppedMessage()` in `src/db/dropped-messages.ts`. On conflict, bumps `message_count` + `last_seen`.
+
+### 1.13 Chat SDK bridge tables
+
+State backing the `SqliteStateAdapter` used by the Chat SDK bridge (see [api-details.md](api-details.md)). NanoClaw code rarely touches these directly — they're owned by `src/state-sqlite.ts`.
+
+```sql
+CREATE TABLE chat_sdk_kv (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  expires_at INTEGER                    -- unix ts, nullable
+);
+
+CREATE TABLE chat_sdk_subscriptions (
+  thread_id     TEXT PRIMARY KEY,
+  subscribed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE chat_sdk_locks (
+  thread_id  TEXT PRIMARY KEY,
+  token      TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+
+CREATE TABLE chat_sdk_lists (
+  key        TEXT NOT NULL,
+  idx        INTEGER NOT NULL,
+  value      TEXT NOT NULL,
+  expires_at INTEGER,
+  PRIMARY KEY (key, idx)
+);
+```
+
+### 1.14 `schema_version`
+
+Migration ledger, written by the migration runner (§2).
+
+```sql
+CREATE TABLE schema_version (
+  version INTEGER PRIMARY KEY,
+  name    TEXT NOT NULL,
+  applied TEXT NOT NULL
+);
+```
+
+### 1.15 `container_configs`
+
+Per-agent-group container runtime config. Source of truth for provider, model, packages, MCP servers, mounts, CLI scope, timezone, etc. Materialized to `groups/<folder>/container.json` at spawn time.
+
+```sql
+CREATE TABLE container_configs (
+  agent_group_id         TEXT PRIMARY KEY REFERENCES agent_groups(id) ON DELETE CASCADE,
+  provider               TEXT,
+  model                  TEXT,
+  effort                 TEXT,
+  image_tag              TEXT,
+  assistant_name         TEXT,
+  max_messages_per_prompt INTEGER,
+  skills                 TEXT NOT NULL DEFAULT '"all"',
+  mcp_servers            TEXT NOT NULL DEFAULT '{}',
+  packages_apt           TEXT NOT NULL DEFAULT '[]',
+  packages_npm           TEXT NOT NULL DEFAULT '[]',
+  additional_mounts      TEXT NOT NULL DEFAULT '[]',
+  cli_scope              TEXT NOT NULL DEFAULT 'group',   -- disabled | group | global
+  security_json          TEXT,                            -- JSON: SecurityConfig | NULL = safe defaults
+  timezone               TEXT,                            -- IANA id; NULL = install-global TZ (migration `container-config-timezone`)
+  speed                  TEXT,                            -- provider speed tier, 'standard'|'fast' for claude; NULL = provider default (migration `container-config-speed`)
+  updated_at             TEXT NOT NULL
+);
+```
+
+`timezone` overrides the install-global timezone for one agent group. Host-side scheduling (cron interpretation, `--process-after`, run-log stamps, dashboard cron edits) resolves it live via `resolveGroupTimezone` (`src/container-config.ts`), which reads this row. Resolution is per call, never cached, so a change takes effect at the next point a wall-clock value is computed — task creation, a task edit, or a series' next re-arm. Occurrences already armed keep the absolute UTC instant they were armed at, so one more fire can land at the old local time; changing the override does not rewrite live `process_after` values. The container gets it as its `TZ` env on next respawn, read from `groups/<folder>/container.json` — the `ncl` write paths dual-write the DB row and the file, exactly like `provider`/`model`/`effort`. Set via `ncl groups config update --timezone <IANA>` (`""` clears back to NULL) or `ncl groups create --timezone`. The value must name a region (`Region/City`, or `UTC`), be one Intl accepts, and have an entry in the zone database on disk (`/usr/share/zoneinfo`). It is stored verbatim. A stored value failing that same check is ignored in favour of the install timezone. The check fails closed: a host with no zone database at all confirms nothing, so no override is honoured there and every group keeps the install timezone. ICU is not a second authority — it accepts `asia/tokyo`, and this Node build's own `Intl.supportedValuesOf('timeZone')` omits `UTC` and `Asia/Kolkata` while listing the legacy `Asia/Calcutta`. All of this is because the container receives the string as POSIX `TZ` and opens it as a case-sensitive file path: `europe/lisbon` is not a path, `+01:00` means UTC-1, `CST` is a zero-offset abbreviation, and a retired alias like `Asia/Calcutta` silently yields +0000 on tzdata that no longer ships its backward link. Notably this means ICU's canonical spelling is NOT what gets stored — `Asia/Kolkata` and `Europe/Kyiv` are kept as typed.
+
+The check reads the HOST's zone database, not the agent image's. A host with newer tzdata than an older image can therefore accept a recently renamed zone the container cannot resolve, where the container falls back to UTC while host scheduling uses the requested zone. The same exposure already applies to the install-wide `TIMEZONE`, which reaches every container as `TZ` with no validation at all; validating per-group overrides narrows it. Asking the image directly is tracked in the fork's issues. Operator-facing host display (`ncl` human output, the dashboard's rendered times) stays in the install timezone. `scripts/list-scheduled-tasks.ts` is the exception: it names the grid a series is actually interpreted on, and every time it prints carries its zone label, so it reads a group's own zone through the same resolver.
+
+- **Readers:** `src/container-config.ts`, `src/container-runner.ts`, `src/cli/dispatch.ts` (scope enforcement), `src/claude-md-compose.ts`
+- **Writers:** `src/db/container-configs.ts`, `src/modules/self-mod/apply.ts`, `src/backfill-container-configs.ts`
+
+### 1.16 `pending_sender_approvals`
+
+In-flight state for the unknown-sender flows. `UNIQUE(messaging_group_id, sender_identity)` dedups repeat attempts from the same sender instead of spamming the admin.
+
+The table holds **two kinds of row**, told apart by the `id` prefix:
+
+- **Approval cards** (`nsa-*`) — `unknown_sender_policy = 'request_approval'`. A row exists while an admin-approval card is outstanding for a first-time sender in a wired messaging group. It retains the original `InboundEvent` so the message can be replayed once the sender is approved.
+- **Decline stamps** (`decline:*`) — `unknown_sender_policy = 'decline_notify'`. Not a card, and never rendered as one: it is a dedupe receipt meaning "this sender was already declined here", suppressing further decline/FYI pairs for 24h. It deliberately keeps no trace of the declined message — `original_message` is the literal `{"declined":true}`, `sender_name` is NULL, and `title`/`options_json` are empty so nothing can draw it as a card.
+
+Both kinds share the UNIQUE key, so flipping a messaging group's policy converts one into the other rather than colliding: `requestSenderApproval` clears a stale stamp before carding, and `declineAndNotify` overwrites a pending card with a stamp (dropping the retained message body).
+
+```sql
+CREATE TABLE pending_sender_approvals (
+  id                 TEXT PRIMARY KEY,
+  messaging_group_id TEXT NOT NULL REFERENCES messaging_groups(id),
+  agent_group_id     TEXT NOT NULL REFERENCES agent_groups(id),
+  sender_identity    TEXT NOT NULL,    -- namespaced user id (channel_type:handle)
+  sender_name        TEXT,
+  original_message   TEXT NOT NULL,    -- JSON of the original InboundEvent
+  approver_user_id   TEXT NOT NULL,
+  created_at         TEXT NOT NULL,
+  title              TEXT NOT NULL DEFAULT '',       -- added by migration 013
+  options_json       TEXT NOT NULL DEFAULT '[]',     -- added by migration 013
+  UNIQUE(messaging_group_id, sender_identity)
+);
+```
+
+A card row is deleted on admin approve (after adding the sender as a member) or deny. A stamp row is never clicked — it expires by age (24h) and is cleared if the policy flips back to `request_approval`.
+
+- Access layer: `src/modules/permissions/db/pending-sender-approvals.ts`
+- **Readers/writers:** `src/modules/permissions/sender-approval.ts`, `src/modules/permissions/index.ts`, `src/db/sessions.ts` (`getAskQuestionRender`), `src/cli/resources/groups.ts`
+
+### 1.17 `pending_channel_approvals`
+
+In-flight state for the unknown-channel registration flow. When a channel with no `messaging_group_agents` wiring receives a mention or DM, the router escalates to the owner; `PRIMARY KEY(messaging_group_id)` gives free in-flight dedup via `INSERT OR IGNORE` — a second mention while a card is pending drops silently.
+
+```sql
+CREATE TABLE pending_channel_approvals (
+  messaging_group_id TEXT PRIMARY KEY REFERENCES messaging_groups(id),
+  agent_group_id     TEXT NOT NULL REFERENCES agent_groups(id),
+                     -- agent the approved wiring will target (earliest
+                     -- agent_group by created_at, picked at request time)
+  original_message   TEXT NOT NULL,      -- JSON of the original InboundEvent
+  approver_user_id   TEXT NOT NULL,
+  created_at         TEXT NOT NULL,
+  title              TEXT NOT NULL DEFAULT '',       -- added by migration 013
+  options_json       TEXT NOT NULL DEFAULT '[]'      -- added by migration 013
+);
+```
+
+Approve creates the `messaging_group_agents` wiring and replays the triggering event; deny sets `messaging_groups.denied_at` so future messages on that channel drop without re-prompting. Either way, this row is deleted.
+
+- Access layer: `src/modules/permissions/db/pending-channel-approvals.ts`
+- **Readers/writers:** `src/modules/permissions/channel-approval.ts`, `src/modules/permissions/index.ts`, `src/router.ts`, `src/db/sessions.ts` (`getAskQuestionRender`), `src/cli/resources/groups.ts`
+
+### 1.18 `agent_message_policies`
+
+Per-message approval gate on an agent-to-agent connection between two agent groups. No row for a `(from, to)` pair means free flow (no approval required); a row names the `approver` who must sign off on each message.
+
+```sql
+CREATE TABLE agent_message_policies (
+  from_agent_group_id TEXT NOT NULL REFERENCES agent_groups(id),
+  to_agent_group_id   TEXT NOT NULL REFERENCES agent_groups(id),
+  approver            TEXT NOT NULL,
+  created_at          TEXT NOT NULL,
+  PRIMARY KEY (from_agent_group_id, to_agent_group_id)
+);
+```
+
+- Access layer: `src/modules/agent-to-agent/db/agent-message-policies.ts`
+- **Readers/writers:** `src/cli/resources/policies.ts`; approved messages create a row in `pending_approvals` (see §1.11) via the a2a send path.
+
+### 1.19 `scheduled_audit`
+
+Audit trail for operator actions on the Scheduled Tasks Board (edit / pause / resume / run-now / cancel / move). One row per action; `action` is an open enum (`edit|pause|resume|run_now|cancel|move|move_intent|move_restore_failed`, no CHECK constraint). Bodies are stored hash-first: `before_hash`/`after_hash` always; `before_preview`/`after_preview` truncated previews; scripts are NEVER stored verbatim (hash-only). `detail_json` holds structured deltas — for moves, secret _counts_+hashes only (never names/values); the one exception is a `move_intent` row, which persists the full task snapshot verbatim until the move resolves, then `purgeIntentBody` NULLs it and stamps `resolved_at`. A 90-day sweep (`pruneAuditBodies`) NULLs the body columns while keeping the action-metadata row for the series lifetime (so `action='cancel'` stays distinguishable from natural completion indefinitely). `correlation_id` ties the two-sided rows of a move (one per group). Added by migration 043.
+
+```sql
+CREATE TABLE scheduled_audit (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts              TEXT NOT NULL DEFAULT (datetime('now')),
+  actor           TEXT NOT NULL,
+  action          TEXT NOT NULL,    -- edit|pause|resume|run_now|cancel|move|move_intent|move_restore_failed
+  agent_group_id  TEXT NOT NULL,
+  session_id      TEXT NOT NULL,
+  series_id       TEXT NOT NULL,
+  before_hash     TEXT,
+  after_hash      TEXT,
+  before_preview  TEXT,
+  after_preview   TEXT,
+  before_len      INTEGER,
+  after_len       INTEGER,
+  detail_json     TEXT,             -- structured delta; move secret COUNTS+hashes only; move_intent snapshot purged on resolve
+  correlation_id  TEXT,             -- ties the two-sided audit rows of a move
+  resolved_at     TEXT              -- stamped when a move_intent resolves (then detail_json is NULLed)
+);
+
+CREATE INDEX idx_scheduled_audit_series ON scheduled_audit(series_id);
+CREATE INDEX idx_scheduled_audit_correlation ON scheduled_audit(correlation_id);
+CREATE INDEX idx_scheduled_audit_unresolved ON scheduled_audit(action, resolved_at);  -- sweep recovery scan
+```
+
+- **Readers:** `src/dashboard/api/scheduled-read.ts` (drawer `audit_tail`, mutation-tier only), `src/host-sweep.ts` (`recoverMoveIntents`, `pruneAuditBodies`)
+- **Writers:** `src/dashboard/api/scheduled-shared.ts` (`writeAudit`, `purgeIntentBody`), `src/dashboard/api/scheduled-mutations.ts`, `src/dashboard/api/scheduled-move.ts`, `src/host-sweep.ts`
+
+---
+
+### 1.20 `host_inbound_provenance`
+
+Which `<session>/.host/inbound.db` files **this host created**. One row per session, written by the migration in `src/modules/mailbox/host-inbound.ts` at the moment it `link()`s the database into `.host/`, and checked before that migration will touch an existing one. Added by migration 079.
+
+This table exists because no property of the file itself can answer the question. A container can create `.host/` and write its own `inbound.db` there — under a mount set built before the directory existed, `/workspace` is read-write and nothing is overlaid over a path that is not yet there. Ownership is no signal (host and container run as the same uid), mode depends on whichever umask applied, and timestamps are chosen by whoever plants. Content is worse than useless: the attacker authors the schema too, so a zero-row database carrying a hostile `TRIGGER` or `VIEW` on `messages_in`/`delivered` would win any "prefer the non-empty side" tie-break. The only question worth asking is _did this host create it_, and the answer is kept where no container can reach it — the central DB is never mounted.
+
+`device`/`inode` are TEXT holding decimal strings, not INTEGER: `st_ino` can exceed 2^53, and a JS number would round it silently, making neighbouring inodes compare equal — a fail-open in exactly the rare case the gate exists to catch. They are read with `fs.statSync(p, { bigint: true })`.
+
+No foreign key to `sessions`, deliberately: a record whose absence is a **refusal** must never be removed as a side effect of unrelated cascade behaviour. Removal is explicit, from the mailbox's own `destroy()`.
+
+```sql
+CREATE TABLE host_inbound_provenance (
+  agent_group_id TEXT NOT NULL,
+  session_id     TEXT NOT NULL,
+  device         TEXT NOT NULL,   -- st_dev, decimal string
+  inode          TEXT NOT NULL,   -- st_ino, decimal string
+  created_at     TEXT NOT NULL,
+  PRIMARY KEY (agent_group_id, session_id)
+);
+```
+
+- **Readers/Writers:** `src/db/host-inbound-provenance.ts` only (`recordHostInboundProvenance`, `hostInboundProvenanceMatches`, `deleteHostInboundProvenance`), reached from `src/modules/mailbox/host-inbound.ts` and `src/modules/mailbox/index.ts`
+- **Operator override:** `scripts/adopt-host-inbound-provenance.ts` — see [db-session.md](db-session.md), "Provenance, and the override"
+
+---
+
+### 1.21 `thread_key_anchors`
+
+Where each agent-named incident or topic key's first post landed, so later posts under the same key thread beneath it. Written and read only by delivery (`src/delivery.ts` via `src/db/thread-key-anchors.ts`) for outbound rows whose content carries `threadKey` (set by `send_message`/`send_file`'s `thread_key`). Added by migration 081.
+
+No rotation: `created_at` is informational. `last_used_at` moves on every post under the key; a key unused for 30 days (`THREAD_KEY_RETENTION_MS`) reads as absent, and every new record prunes such keys. Keyed by agent group, not session, so a recreated task session keeps its open incidents; and by messaging group, so two adapter instances wired to one conversation each keep their own parent. The unkeyed, per-session, day-rotated sibling is `task_thread_anchors` (migration 048). See [agent-runner-details.md](agent-runner-details.md), "Keyed threads".
+
+```sql
+CREATE TABLE thread_key_anchors (
+  agent_group_id      TEXT NOT NULL,
+  messaging_group_id  TEXT NOT NULL,   -- the resolved route: channel, address AND adapter instance
+  thread_key          TEXT NOT NULL,
+  thread_platform_id  TEXT NOT NULL,   -- platform message id of the key's root post
+  created_at          TEXT NOT NULL,
+  last_used_at        TEXT NOT NULL,
+  PRIMARY KEY (agent_group_id, messaging_group_id, thread_key)
+);
+```
+
+---
+
+### 1.22 `mcp_oauth_integrations`
+
+Remote MCP servers connected over standard MCP authorization (`ncl integrations`). Added by migration
+082. Written and read by `src/db/mcp-oauth-integrations.ts`, reached from
+`src/modules/mcp-oauth/service.ts` (login / complete / refresh / remove) and the CLI resource
+`src/cli/resources/integrations.ts`.
+
+**No token material.** Every column is metadata an unauthenticated probe of the MCP URL would have
+told you anyway. The access token lives in the named OneCLI secret; the refresh token and client
+secret live in `DATA_DIR/mcp-oauth/<name>.json` (mode 0600), because `onecli@1.4.1` has no route that
+reads a secret value back. See [mcp-oauth-integrations.md](mcp-oauth-integrations.md).
+
+Keyed by `name` (the operator's handle, and the CLI's argument) rather than by (group, name). The
+UNIQUE on `(agent_group_id, mcp_url)` is the collision guard that matters: two integrations for one
+group pointed at one endpoint would race each other's writes to the same OneCLI secret. No foreign
+key on `agent_group_id`, same as 048/081 — a cascade here would delete an OAuth registration on an
+unrelated group delete, and a stale row is cleared by `ncl integrations remove`.
+
+```sql
+CREATE TABLE mcp_oauth_integrations (
+  name                     TEXT PRIMARY KEY,  -- operator handle, e.g. dropbox-files
+  agent_group_id           TEXT NOT NULL,     -- whose container.json declares the bearer secret
+  mcp_url                  TEXT NOT NULL,
+  resource                 TEXT,              -- RFC 8707 resource indicator
+  authorization_endpoint   TEXT NOT NULL,
+  token_endpoint           TEXT NOT NULL,     -- may be a different host from the issuer
+  registration_endpoint    TEXT,
+  issuer                   TEXT,
+  scopes                   TEXT,              -- space-delimited, as it travels on the wire
+  redirect_uri             TEXT NOT NULL,
+  bearer_secret_name       TEXT NOT NULL,     -- the OneCLI secret the gateway injects
+  bearer_secret_id         TEXT,
+  host_pattern             TEXT NOT NULL,
+  path_pattern             TEXT,
+  status                   TEXT NOT NULL,     -- pending | active | needs_login | error
+  status_detail            TEXT,
+  expires_at               TEXT,              -- access-token expiry, ISO-8601 UTC
+  last_refresh_at          TEXT,
+  created_at               TEXT NOT NULL,
+  updated_at               TEXT NOT NULL
+);
+CREATE UNIQUE INDEX idx_mcp_oauth_integrations_group_url
+  ON mcp_oauth_integrations (agent_group_id, mcp_url);
+CREATE INDEX idx_mcp_oauth_integrations_status ON mcp_oauth_integrations (status);
+```
+
+---
+
+### 1.23 `thread_route_checks`
+
+One row per routing check on an `lb-` keyed post (`src/thread-route-check.ts`; see [agent-runner-details.md](agent-runner-details.md), "Keyed threads"): the Jev score a candidate thread got for the post, the threshold, and what the host did, kept so the threshold can be re-tuned on live decisions. Added by migration 086; written only by the check. `score` is NULL when the check failed and `error` says why; `split_thread_key` is set when a `handoff` into a key's own thread was vetoed.
+
+```sql
+CREATE TABLE thread_route_checks (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  checked_at           TEXT NOT NULL,
+  agent_group_id       TEXT NOT NULL,
+  messaging_group_id   TEXT NOT NULL,
+  session_id           TEXT NOT NULL,
+  message_out_id       TEXT NOT NULL,
+  thread_key           TEXT NOT NULL,
+  check_point          TEXT NOT NULL,   -- a: continue_thread adoption, b: the key's own thread, c: adoption outside 48h
+  candidate_thread_id  TEXT NOT NULL,
+  thread_last_activity TEXT,
+  score                REAL,
+  threshold            REAL NOT NULL,
+  decision             TEXT NOT NULL,   -- keep|veto
+  latency_ms           INTEGER NOT NULL,
+  model                TEXT NOT NULL,
+  error                TEXT,
+  split_thread_key     TEXT
+);
+```
+
+---
+
+## 2. Migration system
+
+Migrations live in `src/db/migrations/`, one file per migration. Runner: `runMigrations()` in `src/db/migrations/index.ts`. It:
+
+1. Creates `schema_version` if absent.
+2. Reads every already-applied `name` from `schema_version` into a `Set` and filters the `migrations` barrel array down to the ones whose `name` isn't in that set — dedup is by **name**, not by the numeric `version` field.
+3. Runs each pending migration's `up(db)` inside a transaction, in the barrel array's literal order (which is _not_ sorted by `version`), then inserts a `schema_version` row.
+4. The `version` column stored in `schema_version` is **not** the migration's own `version` field — it's `COALESCE(MAX(version), 0) + 1`, i.e. an auto-assigned applied-order number computed at insert time. The `version` field on the `Migration` object is just an ordering hint for humans reading the barrel file; it lets module migrations (installed later by skills) pick arbitrary numbers without coordinating with trunk.
+
+### The ledger rule (name, not file number)
+
+`name` is the ledger's only identity — `schema_version` carries a UNIQUE index on it, and the `NNN-` prefix on a file is cosmetic. Two consequences run the whole ledger. A migration may be **adopted from upstream under upstream's file name** while every live install skips it, because the install already holds a row with that `name`: seam 3 did exactly this for `wiring-threads-override` (019), `container-config-timezone` (020, was fork 065) and `approvals-instance` (023, was fork 066), each verified SQL-identical to the fork file it replaced. And two array entries may never share a `name`: `pending` is computed once before the loop, so on a fresh database both entries run and the second dies on the UNIQUE index after its DDL has already committed — a break a live install cannot see. `src/db/migrations/registry.test.ts` pins both properties, including a live-upgrade-vs-fresh-install schema diff.
+
+Upstream's `021-approval-question` is deliberately **not** imported. Fork `045-approval-question-render-metadata.ts` carries the same `name` and is a strict superset of it: it adds `question` to `pending_questions` as well as to the three approval tables.
+
+Fork files `070-messaging-group-detached-at.ts` and `071-host-coordination.ts` are upstream's 022 and 024 at fork numbers. `071` creates `host_instances`, `session_claims`, `delivery_attempts` and `wake_signals` as **shadow schema** — the fork has no reader and no writer for them today; the durable-host-coordination theme that follows seam 3 is what wires them up.
+
+The `sqliteOnly` flag on a `Migration` is inert here. Upstream's async runner uses it to refuse a SQLite-specific migration on another dialect; the fork's runner is synchronous and SQLite-only and never reads it. The field exists so upstream's migration files can land byte-identical.
+
+A few migrations also set `disableForeignKeys: true` (needed for table recreates — SQLite can't relax a table-level `UNIQUE` without DROP+RENAME, which fails FK integrity checks with live child rows). The runner toggles `PRAGMA foreign_keys` around the transaction and runs `PRAGMA foreign_key_check` inside it, snapshotting pre-existing violations so it only fails on violations the migration itself introduced.
+
+Several early migrations were later renamed/retired and replaced by "module" files (their original `name` is retained on the new file so already-migrated DBs don't re-run them):
+
+| Ver. | Name (stored in `schema_version`) | File                                    | Introduces                                                                                                                                                                                                                                           |
+| ---- | --------------------------------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | `initial-v2-schema`               | `001-initial.ts`                        | Core tables: `agent_groups`, `messaging_groups`, `messaging_group_agents` (with the original `trigger_rules`/`response_scope` columns — see v10), `users`, `user_roles`, `agent_group_members`, `user_dms`, `sessions`, `pending_questions`          |
+| 2    | `chat-sdk-state`                  | `002-chat-sdk-state.ts`                 | `chat_sdk_kv`, `chat_sdk_subscriptions`, `chat_sdk_locks`, `chat_sdk_lists`                                                                                                                                                                          |
+| 3    | `pending-approvals`               | `module-approvals-pending-approvals.ts` | `pending_approvals` (session-bound + OneCLI fields)                                                                                                                                                                                                  |
+| 4    | `agent-destinations`              | `module-agent-to-agent-destinations.ts` | `agent_destinations` + backfill from existing `messaging_group_agents` wirings                                                                                                                                                                       |
+| 7    | `pending-approvals-title-options` | `module-approvals-title-options.ts`     | Retroactive `ALTER TABLE pending_approvals` add `title`, `options_json` for DBs that ran migration 3 before its `CREATE TABLE` was edited to include those columns                                                                                   |
+| 8    | `dropped-messages`                | `008-dropped-messages.ts`               | `unregistered_senders`                                                                                                                                                                                                                               |
+| 9    | `drop-pending-credentials`        | `009-drop-pending-credentials.ts`       | Drop the defunct `pending_credentials` table                                                                                                                                                                                                         |
+| 10   | `engage-modes`                    | `010-engage-modes.ts`                   | `messaging_group_agents`: add `engage_mode`, `engage_pattern`, `sender_scope`, `ignored_message_policy`; backfill from `trigger_rules`/`response_scope`; drop those two legacy columns (see §1.3)                                                    |
+| 11   | `pending-sender-approvals`        | `011-pending-sender-approvals.ts`       | `pending_sender_approvals` (see §1.16)                                                                                                                                                                                                               |
+| 12   | `channel-registration`            | `012-channel-registration.ts`           | `messaging_groups.denied_at` + `pending_channel_approvals` (see §1.17)                                                                                                                                                                               |
+| 13   | `approval-render-metadata`        | `013-approval-render-metadata.ts`       | `title`, `options_json` columns on `pending_channel_approvals` and `pending_sender_approvals`                                                                                                                                                        |
+| 14   | `container-configs`               | `014-container-configs.ts`              | `container_configs` — per-agent-group container runtime config                                                                                                                                                                                       |
+| 15   | `cli-scope`                       | `015-cli-scope.ts`                      | `ALTER TABLE container_configs ADD COLUMN cli_scope`                                                                                                                                                                                                 |
+| 16   | `messaging-group-instance`        | `016-messaging-group-instance.ts`       | `messaging_groups` gets an `instance` column (adapter-instance dimension); table recreate (`disableForeignKeys: true`) backfills `instance = channel_type` on every existing row and relaxes the `UNIQUE` to `(channel_type, platform_id, instance)` |
+| 17   | `agent-message-policies`          | `017-agent-message-policies.ts`         | `agent_message_policies` (see §1.18)                                                                                                                                                                                                                 |
+| 18   | `approvals-approver-user-id`      | `018-approvals-approver-user-id.ts`     | `pending_approvals.approver_user_id` — names a single required approver for a2a message-gate policies                                                                                                                                                |
+
+Numbers 5 and 6 are intentionally absent — migrations were renumbered during early development.
+
+Session DB schemas (`INBOUND_SCHEMA`, `OUTBOUND_SCHEMA`) are **not** versioned here. They're `CREATE TABLE IF NOT EXISTS` so new columns land via the session-DB lazy migration helpers (`migrateDeliveredTable()` etc.) when a session file from an older build is reopened. See [db-session.md](db-session.md).
+
+## 3. Conversion state (seam 3)
+
+Four leaves are on the async driver as of PR 3: `src/db/usage.ts` (`listUsageDaily`, `summarizeTurnUsage`, `pruneOldTurnUsage`), `src/db/provider-health.ts` (`markProviderAvailable`), `src/db/dropped-messages.ts` (both exports, now byte-identical to upstream), and `src/db/scheduled-tasks.ts` (nothing — its only central-DB access is a pinned raw transaction). What stays synchronous is not an oversight and has no async twin: an export reachable from a raw `db.transaction(() => …)()` closure cannot be awaited from inside it, so `rollupSessionUsage`, `markProviderUnavailable`, `getProviderHealth` (called inside `markProviderUnavailable`'s closure) and `resolveAndValidateDestination` stay on `getRawDb()` until PR 6 converts each closure with its callees. `isProviderUnavailable` issues no statement of its own and follows `getProviderHealth`. Everything else in those files converted, and every caller awaits it — the type checker forces that, since a `Promise` has no row columns.
+
+## 4. The central lease (seam 3 PR 6a)
+
+`src/db/central-lease.ts` is the primitive that lets an async driver transaction and a synchronous central-DB block share one connection without either refusing the other. Both take a fork-level FIFO lease, so they are mutually exclusive: **`centralTransaction(fn)`** acquires it, runs `getDb().transaction(fn)` and releases it, and is the only sanctioned caller of `DbDriver.transaction` in the fork (`src/db/transaction-closures-tripwire.test.ts` fails on a driver receiver in any other file); **`withCentralSync(fn)`** acquires it, runs a synchronous block to completion and releases it, rejecting an async block both at compile time (a conditional rest parameter) and at runtime (`GuardNotSynchronousError`), because the lease would otherwise be held across a yield. Inside such a block, **`withRawDb(fn)`** hands over the synchronous better-sqlite3 handle; called outside one it throws `RawAccessOutsideSyncBlockError`, so the allowlisted sync sites are enforced rather than conventional, and it throws `RawAccessDuringTransactionError` if better-sqlite3 reports an open transaction — a belt that is unreachable under the lease and counted in the post-restart gate as evidence. **`evaluateGuardSync(guard)`** calls a guard and throws `GuardNotSynchronousError` if the result is thenable, which is what stops a cast or accidentally-async guard from returning a promise that every caller reads as "allowed". Non-transactional driver `get`/`all`/`run` do not take the lease: they open no transaction, so nothing can collide with them. The lease is not re-entrant — a nested acquire throws `CentralLeaseReentrancyError` immediately instead of waiting forever — and a waiter that waited more than a second logs `Central lease wait exceeded 1 s` at WARN, the tripwire for a closure that grew a non-DB effect. `src/db/migrations/index.ts` and the storage-maintenance worker thread stay allowlisted raw users outside this primitive; both run with no concurrent central-DB activity. PR 6a ships the module with **zero production callers**: PR 6 is what moves the guards, `withQuietInvalidationSync`, `modules/agent-to-agent/write-destinations.ts` and the eleven transaction sites onto it, and deletes `getRawDb()`.

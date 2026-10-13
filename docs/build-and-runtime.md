@@ -1,0 +1,174 @@
+# Build & Runtime
+
+NanoClaw runs a split stack: the host is Node + pnpm, the agent container is Bun. They communicate exclusively through two SQLite files per session — there are no shared modules between them, which is what lets them use different runtimes cleanly.
+
+## Why the split
+
+- **Host stays on Node** because Baileys (WhatsApp) depends on `libsignal-node` native bindings and a long-tested WebSocket/HTTP stack. Bun's Node-API compat has improved, but this isn't where we want risk.
+- **Container runs Bun** because `bun:sqlite` is built-in (no native compile of `better-sqlite3` per image rebuild), source runs directly (no tsc build step at image build or session wake), and `bun install` is ~5-10× faster than `npm install`.
+
+Host and container each have their own package tree:
+
+```
+/                             pnpm + Node 22
+  pnpm-lock.yaml              host deps (channels, Chat SDK, Baileys, better-sqlite3, etc.)
+  pnpm-workspace.yaml         allowBuilds + latest-stable policy
+
+/container/agent-runner/      Bun 1.3+
+  bun.lock                    agent-runner runtime deps (Claude Agent SDK, MCP SDK, zod, etc.)
+  package.json                @types/bun, typescript devDeps for type-checking
+```
+
+The container image also has pnpm + Node inside for global CLIs (`@anthropic-ai/claude-code`, `agent-browser`, `vercel`). Those are Node binaries the agent invokes at runtime, not library deps. Keeping them on pnpm preserves the supply-chain policy for CLI versions.
+
+## Lockfiles
+
+| Tree         | Lockfile                          | Manager                  | Regenerate after dep change                |
+| ------------ | --------------------------------- | ------------------------ | ------------------------------------------ |
+| Host         | `pnpm-lock.yaml`                  | package.json-pinned pnpm | `pnpm install`                             |
+| Agent-runner | `container/agent-runner/bun.lock` | Bun 1.3+                 | `cd container/agent-runner && bun install` |
+
+All are committed. CI and the Dockerfile run frozen/hash-locked install variants — any dependency drift fails the build.
+
+## Supply chain
+
+- **Host + global CLIs** (pnpm): latest stable releases, including majors, with committed manifests/lockfiles and the unchanged `allowBuilds` map. `minimumReleaseAge: 0` makes the no-delay policy explicit across pnpm 10 and 11. See `pnpm-workspace.yaml`, `docs/SECURITY.md`, and `docs/dependency-updates.md`.
+- **Agent-runner** (Bun): the same latest-stable policy, exact manifest declarations, and committed `bun.lock`. High-impact SDK majors still require review and the full container test lane.
+
+## Image build surface
+
+`container/Dockerfile` uses a pinned helper stage for MCP Toolbox, then a `node:22-slim` runtime stage:
+
+- **Pinned ARGs** — Bun, pnpm, helper tools, and global Node CLI versions are explicit Dockerfile build arguments. Bump deliberately in PRs. `INSTALL_CJK_FONTS` is the only feature-style build argument.
+- **CJK fonts** — `ARG INSTALL_CJK_FONTS=false`. `container/build.sh` reads `INSTALL_CJK_FONTS` from `.env` and passes it through. Default build saves ~200MB; opt in when the user works with Chinese/Japanese/Korean content.
+- **BuildKit cache mounts** — `/var/cache/apt`, `/var/lib/apt`, `/root/.bun/install/cache`, `/root/.cache/pnpm`. Rebuilds where `package.json`/`bun.lock` haven't changed are fast. Requires BuildKit (default on Docker 23+, Apple Container-compat).
+- **`tini` as init** — reaps Chromium zombies, forwards signals so in-flight `outbound.db` writes finalize on SIGTERM.
+- **`entrypoint.sh`** (extracted) — `exec bun run /app/src/index.ts` under tini. Readable and diffable.
+- **No compiled `/app/dist`** — Bun runs TS directly. The host also mounts source over `/app/src` at session start. Since PR 0 of the mailbox seam (`src/agent-runner-source.ts`), that mount is a snapshot of `container/agent-runner/src` taken once at host boot, not the live checkout — a runner-source edit takes effect at the next host restart, not the next spawn. `NANOCLAW_AGENT_RUNNER_SRC_LIVE=1` mounts the checkout directly for local dev.
+
+## Build versus activation
+
+`./container/build.sh` produces and exercises a candidate image only. It does
+not restart `nanoclaw-v2.service`, replace an active container, or make the
+candidate live. Rollout is a separate decision that must check in-flight turns
+before activation.
+
+## Session wake (two paths)
+
+1. **Base image ENTRYPOINT** — used for stdin-piped test invocations like the sample in `container/build.sh`: `tini --> entrypoint.sh` captures stdin to `/tmp/input.json`, then `exec bun run src/index.ts`.
+2. **Host-spawned session** — `src/container-runner.ts` at line ~503 uses `--entrypoint bash` with `-c 'exec bun run /app/src/index.ts'`. Bypasses tini (Docker's default PID 1 handling applies). Stdin is unused; all IO flows through the mounted session DBs.
+
+Both paths end with Bun running the same source file from `/app/src/index.ts`.
+
+## Host liveness and channel catch-up
+
+Storage inventory and cleanup remain enabled, but their synchronous filesystem walks, SQLite reads, recursive cache removals, and Docker commands run in a persistent Node worker thread (`src/storage-maintenance-worker*.ts`). The host sweep only submits/coalesces work and handles the resulting pressure report. Normal container admission uses an asynchronous `statfs` probe; only a filesystem at cleanup pressure enters the serialized maintenance queue. This keeps the main Node event loop available for channel heartbeats and inbound routing without weakening disk-pressure admission.
+
+Channel recovery is an adapter contract rather than a Discord special case. Before platform initialization, each Chat SDK bridge durably preserves the prior cursor as an unresolved startup gap. The host then catches up after startup, transport reconnects, and detected event-loop stalls; platform adapters can augment wired roots and known sessions with native thread discovery (including threads created while the host was unavailable). Live callbacks received during partial startup are held in arrival order until the first recovery pass has run and permissions/delivery wiring is ready. Replayed messages traverse the normal router and are deduplicated by platform message ID at channel ingress and again in each session DB. A cursor advances only after every target was covered successfully, while incomplete passes retain the earliest gap and retry autonomously with bounded exponential backoff.
+
+## CI shape
+
+`.github/workflows/ci-full.yml` (nightly and `workflow_dispatch`; a pull_request only gets `ci.yml`'s typecheck job) installs both Node (with pnpm cache) and Bun, then runs in order:
+
+1. `pnpm install --frozen-lockfile` (host)
+2. `bun install --frozen-lockfile` in `container/agent-runner/` (container)
+3. `pnpm run format:check`
+4. `pnpm exec tsc --noEmit` (host typecheck)
+5. `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` (container typecheck)
+6. `pnpm exec vitest run` (host tests)
+7. `bun run test` in `container/agent-runner/` (container tests; the package script adds the hermeticity tripwire preload, and the suite shares process-global session fixtures)
+
+A failure here does **not** fail a PR by itself: this workflow runs nightly on `main` and on demand. A red nightly opens or updates the issue "Nightly CI is red on main" (the `report` job, schedule runs only), to be fixed forward the same day. A PR is blocked only by its own `CI` typecheck run and, if someone dispatched `CI full` on that PR head (`gh workflow run ci-full.yml --ref <branch>`), by that run — the merge gate reads a red or unfinished run on the head as blocking. Everything else is the author's local test run before pushing (CLAUDE.md, Development).
+
+### Self-hosted CI runners
+
+Every workflow job runs on one of two runner lanes on the production host, so the repo's CI costs no GitHub-hosted minutes. A job's lane is its `runs-on` label:
+
+| Lane | Label | Runners | Linux user | Jobs |
+|---|---|---|---|---|
+| PR | `nanoclaw-pr` | `r2`, `r3` | `ghrunner-pr` (UID/GID 64002) | everything that runs branch code: `ci.yml`, and `ci-full.yml`'s `correctness` and `bookkeeping` |
+| Trusted | `nanoclaw-trusted` | `r1` | `ghrunner` (UID/GID 64001) | everything that holds a secret or a write-capable token: labelling, shadow review, main provenance, review metrics, the nightly report |
+
+Each lane's runners live under their own `/opt/gh-runner/<rN>` (mode 750, owned by that lane's user), so a PR-lane job cannot read or plant anything in the trusted runner's files. GitHub's guidance is that a persistent self-hosted runner is not clean between jobs; the split confines that to PR-lane jobs, which carry no secrets.
+
+The split does not stop a branch from editing its own workflow's `runs-on` to the trusted label: a `pull_request` run uses the branch's workflow files, and a personal repository has no runner groups to pin workflows to runners. That is acceptable only while the repo is private and every PR author already holds the account's own GitHub credentials, which outrank anything on a runner. Outside contributions arrive on the public mirror ([public-export.md](public-export.md)) and never run here. Before accepting PRs from anyone else, move to ephemeral just-in-time runners.
+
+Host configuration, outside the repo:
+
+- **Users:** `ghrunner` and `ghrunner-pr`, with no login shell, no sudo and no `docker` group. Pin the IDs explicitly: `useradd --system` hands out IDs just under 1000, and container images run their own users at those IDs (the OneCLI vault's postgres runs as UID 999), so a default system ID would let CI jobs signal or own the same host files as a container's database.
+- **Services:** `gh-runner@.service` (trusted: `gh-runner@r1`) and `gh-runner-pr@.service` (`gh-runner-pr@r2`, `gh-runner-pr@r3`). They are identical apart from `User`/`Group`. Each runs `run.sh` with its own `HOME` (`/opt/gh-runner/<rN>/home`), because setup actions such as `pnpm/action-setup` install into `$HOME` and two concurrent jobs sharing one home race and fail with `ENOTEMPTY`. Both use `ProtectHome=yes`, so a job cannot read `/home/ubuntu`, plus `ProtectSystem=full`, `NoNewPrivileges`, `Nice=10`, idle IO, and `KillMode=mixed`, so stopping a runner also ends its job processes (`KillMode=process` left orphaned jobs running).
+- **Slice:** `gh-runner.slice` caps all runners together at 4 CPUs (`CPUQuota=400%`), `MemoryMax=16G` and `CPUWeight`/`IOWeight` 10, so a nightly suite cannot starve the agent fleet. Under that cap the host tests alone take about 40 minutes, hence `ci-full.yml`'s 75-minute timeout.
+
+To re-register a runner (for example after the host is rebuilt), fetch a token with `gh api -X POST repos/<owner>/<repo>/actions/runners/registration-token -q .token`, then run as that lane's user:
+
+```
+/opt/gh-runner/<rN>/config.sh --unattended --replace --url https://github.com/<owner>/<repo> --token <token> --name nanoclaw-host-<rN> --labels <nanoclaw-pr|nanoclaw-trusted> --work _work
+```
+
+Then start it with `sudo systemctl enable --now gh-runner@<rN>` (trusted) or `gh-runner-pr@<rN>` (PR). A job needing a tool the host lacks fails on the runner; install it host-wide rather than widening a runner's privileges.
+
+## Test hermeticity
+
+Unit tests on both trees run behind a tripwire that records and reports any call
+reaching outside the process (issue #305). It exists because two suites were
+found doing exactly that on the same day: one advanced fake timers past the
+plugin updater's startup delay and ran a real `git pull` across every repo under
+`~/plugins` — a live, fail-closed mount into every agent container, where a
+mid-pull tree denies every tool fleet-wide — and another had been doing a real
+disk walk plus a GitHub and an Anthropic API call since before anyone looked.
+
+- Host: `src/test-hermeticity.ts`, loaded from `setupFiles` in `vitest.config.ts`.
+- Agent-runner: `container/agent-runner/src/test-hermeticity.ts`, added as a
+  `--preload` by the package's own `test` script. Run the runner suite as
+  `bun run test`, not bare `bun test`, or the guard is not installed.
+  `bunfig.toml` would be the natural home for the entry, but that file is a
+  byte-for-byte upstream port pinned by `src/mailbox-seam-upstream-tripwire.test.ts`.
+
+Three seams are guarded. `child_process` and `node:child_process` have every
+spawning export wrapped. `globalThis.fetch`, and `undici`'s `fetch`/`request` on
+the host, are wrapped the same way. Writes through `fs` and `fs/promises` are
+checked against a denylist of paths a unit test has no business touching:
+`~/plugins`, and the checkout's own `data/`, `groups/`, `dist/`, `logs/` and
+`node_modules/`, plus `$HOME` dotfiles. Writes under the temp directory, where
+`uniqueTmpRoot` puts every fixture, are untouched — a denylist rather than an
+allowlist, because fixtures live all over `/tmp` while the escapes worth
+catching are a short known list.
+
+A test that legitimately needs one of these opts in by name, so the exemption
+shows up in the diff:
+
+```ts
+import { allowSubprocess, allowNetwork, allowWritesTo } from './test-hermeticity.js';
+beforeAll(() => allowSubprocess(['git']));
+```
+
+`NANOCLAW_TEST_HERMETICITY` sets the mode: `warn` (the default) records and logs
+the call site, `enforce` throws, `off` disables the guard. The default is `warn`
+because the suite is not clean yet — the first full host run under the guard
+failed 40 of 313 files, nearly all of them suites that shell out to real `git`
+against a scratch checkout. The ratchet is per file: a host suite that is
+hermetic calls `enforceHermeticity()` in its own body and can never regress.
+There is no per-file equivalent on the runner, because `bun test` shares one
+process across every file and flipping the mode would silently enforce
+everything that ran afterwards; a runner suite wraps the call in
+`withHermeticityMode('enforce', ...)` instead.
+
+Recording matters independently of throwing. Most host callers already wrap
+their real work in `try`/`catch` so a git or network failure never crashes the
+host, which means a throw-only tripwire can fire and still leave a test green.
+Under `enforce`, the end-of-scope teardown therefore fails on any recorded
+escape that was never acknowledged, whether or not the throw survived. A test
+that means to assert on the record calls `clearHermeticityAttempts()` once it
+has done so.
+
+## Key invariants
+
+- **Session DBs must use `journal_mode=DELETE`.** WAL's `-shm` memory-map doesn't cross VirtioFS between host and guest. See the doc comment at the top of `container/agent-runner/src/db/connection.ts` and `src/session-manager.ts`.
+- **Named SQL parameters in the container require the prefix in JS object keys.** `bun:sqlite` does not auto-strip `@`/`$`/`:` the way `better-sqlite3` does on the host. Use `$name` in both SQL and keys: `.run({ $id: msg.id })`. Positional `?` params work normally.
+- **Agent-runner tests run under `bun:test`, not vitest.** `vitest.config.ts` excludes the `container/agent-runner/` tree because vitest runs on Node and can't load `bun:sqlite`.
+- **No tsc build step in the container image.** Re-adding one would reintroduce the ~200-500ms per-session-wake cost we removed.
+- **Global container CLIs stay on pnpm, not Bun.** `agent-browser`, `@anthropic-ai/claude-code`, `vercel` and any future Node CLIs the agent invokes should be pinned versions under the Dockerfile's pnpm global-install block. `bun install -g` would bypass the pnpm supply-chain policy.
+
+## Migration history
+
+This structure replaced a uniform npm-on-Node stack across both host and container. The pnpm migration landed first (PR #1771) to bring the host under supply-chain policy, then the container moved to Bun to eliminate native-module compilation and the per-wake tsc step. The split was chosen over going full-Bun because Baileys' native deps are the main risk surface on the host — the container has no such deps, so it benefits from Bun without taking the risk.

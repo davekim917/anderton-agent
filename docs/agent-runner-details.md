@@ -1,0 +1,1045 @@
+# NanoClaw Agent-Runner Details
+
+Implementation-level details for the agent-runner inside the container. See [architecture.md](architecture.md) for the high-level design.
+
+## Separation of Concerns
+
+The agent-runner has two layers:
+
+1. **Agent-runner core** — owns the poll loop, message formatting, DB reads/writes, MCP tool implementations, routing, status management, media handling. This is NanoClaw-specific and shared across all providers.
+
+2. **Agent provider** — owns the SDK interaction. Takes formatted prompts, pushes them to the SDK, yields events back. Trunk ships the `claude` provider; additional providers (OpenCode, Codex, etc.) are installed by `/add-<provider>` skills from the `providers` branch.
+
+The boundary: the agent-runner decides **what** to send and **what to do** with results. The provider decides **how** to talk to the SDK.
+
+## AgentProvider Interface
+
+Provider-wide settings (MCP servers, env, additional directories, model, effort,
+assistant name) are passed to the provider **constructor** via `ProviderOptions`, not
+per query. `QueryInput` carries only what changes turn to turn: the prompt, the
+continuation token to resume, the working directory, and system context to inject.
+
+```typescript
+interface AgentProvider {
+  /** True if the SDK handles slash commands natively and wants them passed
+   *  through raw. When false, the poll-loop formats them like any chat message. */
+  readonly supportsNativeSlashCommands: boolean;
+
+  /** Register shared memory through the provider's native session-start mechanism. */
+  registerMemorySessionHook(hook: MemorySessionHookRegistration): void;
+
+  /** Optional. Called after each completed exchange so providers whose harness
+   *  keeps no on-disk transcript can persist it themselves. Claude (the SDK
+   *  writes its own .jsonl) omits this. */
+  onExchangeComplete?(exchange: ProviderExchange): void;
+
+  /** Start a new query. Returns a handle for streaming input and output. */
+  query(input: QueryInput): AgentQuery;
+
+  /** True if the error means the stored continuation is invalid (missing
+   *  transcript, unknown session) and should be cleared. */
+  isSessionInvalid(err: unknown): boolean;
+
+  /** Optional pre-resume maintenance: given the stored continuation, return a
+   *  reason string to drop it and start fresh (e.g. transcript too large/old to
+   *  cold-resume before the host idle ceiling), or null to keep resuming. */
+  maybeRotateContinuation?(continuation: string, cwd: string): string | null;
+}
+
+interface ProviderOptions {
+  assistantName?: string;
+  mcpServers?: Record<string, McpServerConfig>;
+  env?: Record<string, string | undefined>;
+  additionalDirectories?: string[];
+  model?: string; // alias (sonnet/opus/haiku) or full model ID
+  effort?: string; // low | medium | high | xhigh | max
+}
+
+interface QueryInput {
+  /** Initial prompt, already formatted by the agent-runner into a string. */
+  prompt: string;
+
+  /** Opaque continuation token from a previous query. The provider decides
+   *  what it means (session ID, thread ID, or nothing). */
+  continuation?: string;
+
+  /** Working directory inside the container. */
+  cwd: string;
+
+  /** System context to inject; the provider translates it into whatever its
+   *  SDK expects (preset append, full system prompt, per-turn injection). */
+  systemContext?: { instructions?: string };
+}
+
+interface McpServerConfig {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
+interface AgentQuery {
+  /** Push a follow-up message into the active query. */
+  push(message: string): void;
+
+  /** Signal that no more input will be sent. */
+  end(): void;
+
+  /** Output event stream. */
+  events: AsyncIterable<ProviderEvent>;
+
+  /** Force-stop the query (e.g., container shutting down). */
+  abort(): void;
+}
+
+type ProviderEvent =
+  | { type: 'init'; continuation: string }
+  | { type: 'result'; text: string | null; isError?: boolean }
+  | { type: 'error'; message: string; retryable: boolean; classification?: string }
+  | { type: 'progress'; message: string }
+  | { type: 'activity' };
+```
+
+### What the interface does NOT include
+
+- **Message formatting** — the agent-runner formats messages before passing to the provider. The provider receives a ready-to-send prompt string.
+- **Hooks** — Claude-specific. The Claude provider registers hooks internally (PreToolUse, PostToolUse, PreCompact). Other providers don't need them.
+- **Tool allowlists** — Claude uses `allowedTools` + `disallowedTools`. Other SDKs use their own equivalents. Each provider configures this internally.
+- **Session persistence** — the agent-runner stores one opaque `continuation` token per provider (see [Session Resume](#session-resume)) and passes it back as `QueryInput.continuation`. What it means is provider-private; Claude persists its own `.jsonl` transcript on disk keyed by the continuation (session ID).
+- **Sandbox configuration** — provider-specific. Each provider configures its own sandbox internally.
+
+### Provider event semantics
+
+- **`init`** — emitted once per query when the provider establishes or resumes a session. The agent-runner captures `continuation` and persists it for future resume.
+- **`result`** — emitted when the agent produces a complete response. May be emitted multiple times per query (e.g., Claude's multi-turn with subagents). `isError` is set when the SDK flagged the turn as an error (e.g. a non-retryable billing error) so the poll-loop still surfaces the text instead of dropping it. The agent-runner writes each result to messages_out.
+- **`error`** — emitted on failure. `retryable` indicates whether the agent-runner should retry. `classification` is optional detail (e.g., 'quota').
+- **`progress`** — optional, for logging. The agent-runner logs these but doesn't act on them.
+- **`activity`** — a liveness signal. Providers MUST yield it on every underlying SDK event (tool call, thinking, partial message) so the poll-loop's idle timer stays honest during long tool runs.
+
+## Provider Implementations
+
+Only the `claude` provider ships in trunk. The Codex and OpenCode sections below document the provider interface for reference and for skills that install additional providers — they are not baked into the core image.
+
+### Claude Provider
+
+Wraps `@anthropic-ai/claude-agent-sdk`'s `query()`.
+
+The provider takes its settings (`mcpServers`, `env`, `additionalDirectories`,
+`model`, `effort`, `assistantName`) in its constructor via `ProviderOptions`; `query()`
+only reads the per-turn `QueryInput`.
+
+```typescript
+class ClaudeProvider implements AgentProvider {
+  readonly supportsNativeSlashCommands = true;
+  // ...constructor stores options.mcpServers, .env, .additionalDirectories,
+  //    .model, .effort, .assistantName...
+
+  query(input: QueryInput): AgentQuery {
+    const stream = new MessageStream(); // AsyncIterable<SDKUserMessage>
+    stream.push(input.prompt);
+
+    const sdkResult = sdkQuery({
+      prompt: stream,
+      options: {
+        cwd: input.cwd,
+        additionalDirectories: this.additionalDirectories,
+        resume: input.continuation,
+        pathToClaudeCodeExecutable: '/pnpm/claude',
+        systemPrompt: input.systemContext?.instructions
+          ? { type: 'preset', preset: 'claude_code', append: input.systemContext.instructions }
+          : undefined,
+        // No explicit `allowedTools` list — `allowedTools` is an auto-allow
+        // list, not an include-filter, and this query already runs under
+        // `bypassPermissions`, so every tool the SDK surfaces (including
+        // any registered MCP server's tools) is open by default.
+        // `disallowedTools` is the only thing that narrows the surface.
+        disallowedTools: SDK_DISALLOWED_TOOLS,
+        env: this.env,
+        model: this.model,
+        effort: this.effort,
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        settingSources: ['project', 'user', 'local'],
+        mcpServers: this.mcpServers,
+        hooks: {
+          PreToolUse: [{ hooks: [preToolUseHook] }],
+          PostToolUse: [{ hooks: [postToolUseHook] }],
+          PostToolUseFailure: [{ hooks: [postToolUseHook] }],
+          PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
+        },
+      },
+    });
+
+    let aborted = false;
+    return {
+      push: (msg) => stream.push(msg),
+      end: () => stream.end(),
+      // Abort doesn't call into the SDK — it flips a flag the event generator
+      // checks and ends the input stream so the query drains and stops.
+      abort: () => {
+        aborted = true;
+        stream.end();
+      },
+      events: translateEvents(sdkResult, () => aborted),
+    };
+  }
+}
+```
+
+`translateEvents` is an async generator that yields `{ type: 'activity' }` for **every**
+SDK message (so the idle timer stays honest) and maps recognized messages to `ProviderEvent`:
+
+- `system`/`init` → `{ type: 'init', continuation: session_id }`
+- `result` → `{ type: 'result', text, isError }` — `text` is `result.result`, or the joined `result.errors[]` on error subtypes (billing/quota), so the notice still reaches the user
+- `system`/`api_retry` → `{ type: 'error', retryable: true }`
+- `system`/`rate_limit_event` → `{ type: 'error', retryable: false, classification: 'quota' }`
+- `system`/`compact_boundary` → `{ type: 'result', text: 'Context compacted…' }`
+- `system`/`task_notification` → `{ type: 'progress', message }`
+- when the `aborted` flag is set → the generator returns immediately
+
+**Claude-specific behavior inside the provider:**
+
+- `MessageStream` for async iterable input (push-based follow-ups)
+- Resume via the SDK `resume` option keyed on the stored `continuation` (the SDK session ID) — no separate resume-at cursor
+- No explicit `allowedTools` list — enumerating one only risks silently dropping a new SDK built-in the next time the CLI adds one, and the query already runs under `bypassPermissions`, so every tool the SDK surfaces (including any registered MCP server's tools) is open by default; `SDK_DISALLOWED_TOOLS` blocks SDK builtins that collide with NanoClaw's own scheduling/interaction model (CronCreate/Delete/List, ScheduleWakeup, AskUserQuestion, Enter/ExitPlanMode, Enter/ExitWorktree)
+- **PreToolUse hook** records the current tool + its declared timeout to `container_state` (so the host sweep widens its stuck tolerance while a long Bash runs) and, as defense-in-depth, blocks any `SDK_DISALLOWED_TOOLS` call that slips through. It does **not** sanitize bash env vars — there is no such hook.
+- **PostToolUse / PostToolUseFailure** hooks clear the in-flight tool
+- **Credentials in container shells**: a container's shell inherits all three provider credentials, whatever provider it runs on (`claude -p`, `codex exec`, `opencode run` all work headless in-session); Claude and OpenCode children strip only `MCP_HEADER_ONLY_SECRET_VARS`; Codex children strip nothing (pre-existing, tracked separately) — see `container/agent-runner/src/providers/secret-env.ts`
+- **Resource telemetry** samples cgroup v2 `memory.current`, `memory.peak`, `memory.max`, and `memory.events` every 15 seconds into `container_state`; the host sweep logs increases in `oom_kill`
+- **PreCompact** hook archives the transcript to `conversations/` before compaction
+- `maybeRotateContinuation` drops an oversized/aged transcript (default caps 12 MB / 14 days, both operator-overridable) so a cold container isn't killed reloading days of `.jsonl` before the host idle ceiling; `isSessionInvalid` clears a continuation whose transcript is gone
+- `additionalDirectories` for multi-directory access
+
+### Codex Provider
+
+Codex publishes a `CodexItem` operation to `container_state` while one or more
+native items are active. This extends the host sweep ceiling from 30 minutes to
+a bounded hour during silent subagent/tool work; completion, failure, provider
+cleanup, and replacement-container startup all clear the state.
+
+Wraps `@openai/codex-sdk`.
+
+```typescript
+class CodexProvider implements AgentProvider {
+  query(input: QueryInput): AgentQuery {
+    const codex = new Codex(this.buildOptions(input));
+    const thread = input.continuation
+      ? codex.resumeThread(input.continuation, this.threadOptions(input))
+      : codex.startThread(this.threadOptions(input));
+
+    const abortController = new AbortController();
+    let pendingFollowUp: string | null = null;
+
+    return {
+      push: (msg) => {
+        // Codex doesn't support streaming input.
+        // Store the follow-up and abort the current turn.
+        pendingFollowUp = msg;
+        abortController.abort();
+      },
+      end: () => {
+        /* no-op — Codex turns end naturally */
+      },
+      abort: () => abortController.abort(),
+      events: this.run(thread, input.prompt, abortController, () => pendingFollowUp),
+    };
+  }
+
+  private async *run(thread, prompt, abortController, getPendingFollowUp): AsyncIterable<ProviderEvent> {
+    let currentPrompt = prompt;
+
+    while (true) {
+      try {
+        const streamed = await thread.runStreamed(currentPrompt, {
+          signal: abortController.signal,
+        });
+
+        let continuation: string | undefined;
+        let resultText = '';
+
+        for await (const event of streamed.events) {
+          if (event.type === 'thread.started') {
+            continuation = event.thread_id;
+            yield { type: 'init', continuation };
+          }
+          if (event.type === 'item.completed' && event.item.type === 'agent_message') {
+            resultText = event.item.text || resultText;
+          }
+          if (event.type === 'turn.failed') {
+            yield { type: 'error', message: event.error.message, retryable: false };
+            return;
+          }
+        }
+
+        yield { type: 'result', text: resultText || null };
+
+        // Check if a follow-up was queued during this turn
+        const followUp = getPendingFollowUp();
+        if (followUp) {
+          currentPrompt = followUp;
+          // Reset for next iteration
+          continue;
+        }
+
+        return;
+      } catch (err) {
+        if (abortController.signal.aborted && getPendingFollowUp()) {
+          // Aborted because of follow-up — restart with new prompt
+          currentPrompt = getPendingFollowUp();
+          abortController = new AbortController();
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+}
+```
+
+**Codex-specific behavior inside the provider:**
+
+- `developer_instructions` for system prompt (loaded from CLAUDE.md)
+- `git init` in workspace (Codex requires a git repo)
+- Abort+restart pattern for follow-up messages
+- `sandboxMode`, `approvalPolicy`, `networkAccessEnabled` from env vars
+- Conversation archiving (Codex doesn't have PreCompact)
+
+### OpenCode Provider
+
+Wraps `@opencode-ai/sdk`.
+
+```typescript
+class OpenCodeProvider implements AgentProvider {
+  query(input: QueryInput): AgentQuery {
+    // OpenCode runs a local server — create it once, reuse across queries
+    const { client, server } = await createOpencode({ config: this.buildConfig(input) });
+    const { stream } = await client.event.subscribe();
+
+    let aborted = false;
+    let pendingFollowUp: string | null = null;
+
+    return {
+      push: (msg) => {
+        pendingFollowUp = msg;
+        server.close(); // interrupt current query
+      },
+      end: () => {
+        /* no-op */
+      },
+      abort: () => {
+        aborted = true;
+        server.close();
+      },
+      events: this.run(client, server, stream, input, () => pendingFollowUp),
+    };
+  }
+
+  private async *run(client, server, stream, input, getPendingFollowUp): AsyncIterable<ProviderEvent> {
+    const session = await client.session.create();
+    yield { type: 'init', continuation: session.data.id };
+
+    await client.session.promptAsync({
+      path: { id: session.data.id },
+      body: { parts: [{ type: 'text', text: input.prompt }] },
+    });
+
+    for await (const event of stream) {
+      if (event.type === 'session.idle') {
+        // Collect result text from accumulated message parts
+        const resultText = this.extractResult(event);
+        yield { type: 'result', text: resultText };
+
+        const followUp = getPendingFollowUp();
+        if (followUp) {
+          await client.session.promptAsync({
+            path: { id: session.data.id },
+            body: { parts: [{ type: 'text', text: followUp }] },
+          });
+          continue;
+        }
+
+        return;
+      }
+
+      if (event.type === 'session.error') {
+        yield { type: 'error', message: event.properties?.error?.data?.message, retryable: false };
+        return;
+      }
+    }
+  }
+}
+```
+
+**OpenCode-specific behavior inside the provider:**
+
+- Local gRPC/HTTP server lifecycle (`server.close()`)
+- SSE event stream for output
+- Provider/model selection via config (`OPENCODE_PROVIDER`, `OPENCODE_MODEL`)
+- MCP config format translation (`type: 'local'`, `command: [cmd, ...args]`, `environment`)
+- System prompt injected via `<system>` prefix in prompt text
+- No resume support (sessions are always new or reused by ID)
+
+## Agent-Runner Core
+
+Everything below is handled by the agent-runner, not the provider.
+
+### Poll Loop
+
+```
+┌─────────────────────────────────────────┐
+│                                         │
+│  1. Query messages_in for pending rows  │
+│     WHERE status = 'pending'            │
+│     AND (process_after IS NULL          │
+│          OR process_after <= now())     │
+│                                         │
+│  2. If rows found:                      │
+│     a. Set status = 'processing'        │
+│     b. Format messages by kind          │
+│     c. Strip routing fields             │
+│     d. Call provider.query(prompt)      │
+│     e. Process provider events          │
+│     f. Write results to messages_out    │
+│     g. Set status = 'completed'         │
+│                                         │
+│  3. While query is active:              │
+│     - Continue polling messages_in      │
+│     - New messages → provider.push()    │
+│                                         │
+│  4. When query finishes:                │
+│     - Back to step 1                    │
+│     - If no messages, sleep + re-poll   │
+│                                         │
+└─────────────────────────────────────────┘
+```
+
+**Concurrent polling during active query:** While the provider is running a query, the agent-runner continues polling messages_in on a short interval (~500ms). New pending messages are formatted and pushed into the active query via `provider.push()`. This lets follow-up messages arrive while the agent is processing — Claude handles this natively, Codex/OpenCode handle it via abort+restart internally.
+
+**Idle behavior:** When no messages are pending and no query is active, the agent-runner sleeps briefly (1s) and re-polls. The container stays warm until the host kills it (idle timeout).
+
+**Idle detection exceptions:** The container should NOT be considered idle when:
+
+- An `ask_user_question` tool call is pending (waiting for user response in messages_in)
+- The agent is actively working (tool calls in progress, subagents running)
+
+The agent-runner signals "busy" status to the host. The mechanism for this is provider-specific — for Claude, the query AsyncGenerator is still yielding events. For others, the agent-runner can write a heartbeat or status indicator to the session DB that the host checks before killing.
+
+**Durable work continuation.** Immediate follow-through is explicit tool state, not parsed prose. `continue_work({task})` stores a versioned task in `session_state.work_continuation`; `cancel_continuation()` removes it. A result is tied to the continuation ID whose prompt launched it, so completion cannot erase a replacement queued during that work. The runner starts queued work only after the current result was delivered and the prompt FIFO is empty; already-arrived user input therefore runs first and may cancel the task. A running row records the runner ID, preventing the same process from injecting it twice, while a fresh process may recover it. Real inbound resets the chain and recovery counters without silently deleting the task. Clean completion compare-clears the matching ID; errors or a stream ending without that result requeue it. Plain future-tense text and `NEXT:` have no control effect. The chain cap is 50; host recovery is capped at two attempts before a visible parked notice.
+
+**Reaped with work only on disk.** Ending a turn while "waiting on CI" without `continue_work` leaves nothing to resume, and the 15-minute chat idle reap kills the container. The reap is not delayed. Instead the runner snapshots every checkout under `/workspace/worktrees` before its first turn (changed paths with a status/blob/stat identity, and the unpushed commits of every local branch) and, at each turn end, writes `session_state.worktree_in_flight`: the paths that are new or changed against that snapshot (deletions included) and the unpushed commits it did not start with, per checkout, bounded and best-effort (a failure or a spent time budget clears the record; submodule changes are not tracked). When the reap fires, the host reads that record; if it is non-empty and stamped at or after the killed container started (the instant in its name, which survives a host restart's adoption), it queues a deferred `reap-respawn-<spawn ms>` wake naming each checkout, its branch, the pushed upstream head and up to 20 changed files, and the fresh container must post done / lost / next — the same contract as a ceiling respawn, capped at two since the last real inbound and parked with the other recovery wakes when a continuation budget is spent. The host never runs git on container-writable checkouts. Gated by `NANOCLAW_SELF_HEAL` like the other self-heal wakes. `container/agent-runner/src/worktree-in-flight.ts`, `src/modules/sweep-continuation/reap-respawn.ts` **Killed with the task list unfinished.** Three parts keep a killed session's list truthful and wake only a session that is really stopped. (1) `update_task_list` items take a fourth status, `waiting`, with `waiting_on` naming who or what the agent cannot move the item without; it renders as `◷ … (waiting on …)`, and a list whose open items are all waiting carries `waiting on …` instead of `stopped` in its interrupted label. (2) When a container is killed, `settleTaskListOnKill` replaces the runner's label only with the one thing the host knows for certain (`armedWaitAt`, `src/task-list-host.ts`): `paused · next check <time in the group's timezone>` when the agent armed a `wait` that has not come due; otherwise the runner's own label stands, as it does for a closed or archived session. An unanswered approval or question card is not labelled: answering one for a killed container wakes nothing, so "waiting on a person" is said only by the agent marking items `waiting`. The host never labels a list as resuming: whether a pending row will run is decided by the sweep and by the runner's own selector, which the host cannot import, so it is not forecast. A label the host composes is host literals and host-formatted times only, `todos as of <time>` included, rendered from the record's `updatedAt`; nothing the container wrote sits under a state the host vouches for. The list therefore reads `stopped` for the interval before a queued wake resumes it. (3) The reap wake above takes a second kind of evidence: a `session_state.task_list` record that is open, was last touched during the killed container's life and has an item that is neither done nor `waiting` (a status the host does not know counts as owed). It applies to three kills and no others (an allowlist: the chat idle reap, an absolute-ceiling kill, after that path's own wake decision, and the `provider_unavailable` kill, where the row is written after the old container exits and before the fallback respawn is requested; like every such row it is not triggering until the sweep's due admission, so the fallback container takes it within a sweep interval, not on its first poll). A task session is never woken this way: its series fires again by itself. The wake is withheld only on a fact read directly, never on a reading of what is pending, because a wrongly withheld wake strands the work and a redundant one costs a single capped turn: the ceiling branch reported queuing its own wake for this kill, or, when the list is the only evidence, a `work_continuation` is saved (the sweep resumes it while it has recovery budget; with the budget spent the session stays stopped until another inbound, as it did before the list counted), the agent armed a `wait` that has not come due (`getNextScheduledWakeAt`, keyed on the id prefix and system kind the `wait` action writes), or the session cannot take a wake. Work recorded only on disk has no other path back, so nothing stored withholds its wake: with worktree evidence the chat idle reap accepts the same records, decides the same way and, when the list adds nothing, writes the same note as it did before the list counted. An open card does not withhold either: the woken agent marks the items it holds up `waiting`, after which there is no evidence and no further wake. A due message, a claimed batch, an acknowledged trigger and any other future row do not withhold it, so a wake can arrive beside a message that was already going to wake the session. The note names up to five items and asks for each to be marked done, done now, scheduled with `wait`/`continue_work`, or marked `waiting`; a message is required only when work was lost or an ask was never made, unless worktree evidence is also present. The `wait` fact is the same one the label reads. Every decision logs one `Kill follow-up decided` line with `killReason`, `evidence` and `outcome`.
+
+### Message Formatting
+
+The agent-runner transforms messages_in rows into a prompt string. The provider receives a ready-to-send string — it doesn't know about message kinds or routing.
+
+**Routing field stripping:** `platform_id`, `channel_type`, `thread_id` are never included in the prompt. They're stored as context for writing messages_out.
+
+Every kind renders to a single self-contained XML element. The `id` attribute is the
+message's `seq` (the agent-facing message ID it passes to `edit_message` / `add_reaction`).
+The `from` attribute is the origin destination name (resolved from the routing fields via
+the destination map), so the agent always knows where a message came from — routing fields
+themselves are never shown.
+
+- **`chat`** — one `<message>` per row:
+
+  ```xml
+  <message id="5" from="family" sender="John" time="Jan 1, 10:00 AM">Check this PR</message>
+  ```
+
+  A reply carries a `reply_to` attribute and an inline `<quoted_message from="…">…</quoted_message>`.
+
+  A message routed from genuine platform ingress also carries `platform_msg_id="…"`
+  (e.g. a Slack `ts`) so the agent can cite the exact message it answered; it is
+  absent on host notes, system rows, spawn envelopes, and any message this host
+  itself synthesized (the CLI admin transport, Discord slash commands, `ncl
+  messaging-groups send`, CLI's own "plain chat") — the field is host-only,
+  stamped only from `main.ts`'s `onInbound` for non-CLI adapters, and stripped
+  from every other write (`src/host-origin.ts` `PLATFORM_MSG_ID_FIELD`).
+
+- **`chat-sdk`** — same `<message>` shape, fields extracted from the serialized Chat SDK
+  message. Attachments are appended inline: `[image: screenshot.png — saved to /workspace/…]`
+  or `[image: screenshot.png (https://signed-url…)]`. Images/PDFs that Claude handles
+  natively are also passed as content blocks (see Media Handling below).
+
+- **`task`** — a `<task>` element, script output first when present:
+
+  ```xml
+  <task from="scheduler" time="Jan 1, 9:00 AM" current_time="Thursday, January 1, 2026 at 9:01 AM">Script output:
+  {"data": …}
+
+  Instructions:
+  Review open PRs</task>
+  ```
+
+  `time` is the occurrence's scheduled slot — `scheduled_for`, falling back to
+  `process_after` and then the row's creation timestamp for rows written before
+  that column existed. This matters for a recurring series: the successor row is
+  inserted the moment the previous run completes, so its creation timestamp
+  belongs to the PREVIOUS occurrence.
+
+  `scheduled_for` rather than `process_after` because the two diverge under a
+  retry. A crashed provider turn is put behind a retry deadline by rewriting
+  `process_after`, which is a "don't touch me until", not a new slot — reading
+  it here told the agent a 9:00 run was scheduled for 11:47, and anything
+  date-windowed or idempotent keyed off that time lost its occurrence identity
+  across the retry. See [db-session.md §2.1](db-session.md).
+
+  `current_time` is generated when the task reaches the agent, so relative
+  instructions such as "today" stay correct after a pause, a delayed run, a
+  host restart, or a ceiling respawn. Both render in the agent group's
+  timezone.
+
+- **`webhook`** — a `<webhook>` element wrapping the JSON payload:
+
+  ```xml
+  <webhook from="github" source="github" event="pull_request">{"action": "opened", …}</webhook>
+  ```
+
+- **`system`** — host action result, rendered as `<system_response>`:
+  ```xml
+  <system_response from="host" action="create_agent" status="success">{"agent_group_id": "ag-456"}</system_response>
+  ```
+
+**Batch formatting:** All pending messages are combined into one prompt. The prompt opens
+with a self-closing `<context timezone="<IANA>" />` header (so the agent interprets every
+timestamp — and every time it schedules — in the user's zone), then the chat messages
+concatenated as consecutive `<message>` blocks, then any task/webhook/system elements,
+joined by blank lines:
+
+```xml
+<context timezone="America/Los_Angeles" />
+<message id="2" from="family" sender="John" time="10:00">Check this PR</message>
+<message id="4" from="family" sender="Jane" time="10:01">Already on it</message>
+```
+
+There is **no** outer `<messages>` envelope — an earlier revision wrapped multi-message
+batches that way, but the Claude Agent SDK answered the wrapped shape with a synthetic
+"No response requested." stub instead of calling the API (#2555). Dropping the wrapper made
+the single-message path just the N=1 case of the same concatenation.
+
+**Command detection:** Messages starting with `/` are checked against a command list. Recognized commands bypass formatting and are passed raw to the provider (for Claude's slash command handling) or intercepted by the agent-runner (for NanoClaw-level commands like session reset).
+
+### Routing
+
+When the agent-runner picks up messages_in rows, it captures the routing fields from the batch:
+
+```typescript
+interface RoutingContext {
+  platformId: string | null;
+  channelType: string | null;
+  threadId: string | null;
+  inReplyTo: string | null; // messages_in.id of the triggering message
+}
+```
+
+When writing messages_out (either from provider results or MCP tool calls), the agent-runner copies this routing context by default. The agent never sees routing fields — it just produces text. The routing is implicit: "respond to whoever sent the message."
+
+MCP tools that target a named destination (`send_message` / `send_file` with a `to`
+argument) resolve routing through the session's destination map instead of the default
+reply context — including agent-to-agent sends, which are just a `to` pointing at an
+`agent`-type destination.
+
+### Status Management
+
+`inbound.db` is a read-only mount inside the container, so the agent-runner never writes
+`messages_in`. It tracks processing status in the `processing_ack` table in the
+container-owned `outbound.db`; the host reads `processing_ack` and mirrors completion
+back onto `messages_in.status`.
+
+```
+processing_ack: (no row) → processing → completed
+```
+
+- **Pick up:** `INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES (?, 'processing', now())` for each claimed row (`markProcessing`). Pending queries skip any row already present in `processing_ack`.
+- **Complete:** same upsert with `status = 'completed'` (`markCompleted`). Every consumed batch ends here — error outcomes included. On a provider error the poll-loop writes an error **chat message** to `messages_out` (so the user sees it), then still acks the batch completed; errors surface as messages, not as an ack status. (A `markFailed` helper exists in `messages-in.ts` but currently has no callers.)
+- The host's `syncProcessingAcks` mirrors acked ids onto `messages_in.status = 'completed'`. Its stale/retry policy is driven off the `.heartbeat` file mtime and the `processing_ack` claim timestamps. On startup the agent-runner clears leftover `processing` acks (crash recovery) so orphaned claims re-process.
+
+### MCP Tools
+
+The agent-runner runs an MCP server (stdio) that exposes NanoClaw tools to the agent. The
+tool modules use the same two-DB connection layer as the rest of the runner
+(`container/agent-runner/src/db/connection.ts`): they read the host-written `inbound.db`
+at `/workspace/inbound.db` **read-only** (destinations, session routing, question
+responses, task lists) and write to the container-owned `outbound.db` at
+`/workspace/outbound.db`. There is no shared single-file connection and no WAL — both files
+are `journal_mode=DELETE` because WAL's memory-mapped `-shm` file does not stay coherent
+across the VirtioFS host↔container mount.
+
+#### send_message
+
+Send a chat message to a named destination. Agents address destinations by name, never by
+raw platform/channel/thread IDs — the destination map (`destinations` table in `inbound.db`,
+written by the host) resolves the name to routing fields.
+
+```typescript
+{
+  name: 'send_message',
+  params: {
+    text: string,    // message content (required)
+    to?: string,     // destination name (e.g. "family", "worker-1").
+                     // Optional when the agent has exactly one destination.
+    thread_key?: string, // stable incident/topic id — see "Keyed threads" below
+    continue_thread?: string, // with thread_key: an existing thread the key adopts — see "Keyed threads"
+  }
+}
+```
+
+Implementation: `resolveRouting(to)` looks up the destination. With no `to`, it defaults to
+the session's own reply routing (`session_routing`); if the destination resolves to the same
+channel the session is bound to, the session's `thread_id` is preserved so the reply lands
+in-thread, otherwise `thread_id` is null. A send that carries `continue_thread` never inherits
+the session's thread, so a session bound to one thread can post into another thread of its own
+channel. The tool then writes a `messages_out` row with
+`kind: 'chat'` and content `{ text }` (`{ text, threadKey }` when a `thread_key` was given),
+and returns the new `seq` as the message id.
+
+##### Keyed threads
+
+`thread_key` names the incident or topic a post belongs to. The runner trims it and refuses
+anything over 128 characters or outside `[A-Za-z0-9._:-]` (first character alphanumeric);
+the host re-checks the same rule and delivers a row with a malformed key as if it had none.
+
+On the host (`deliverMessage`, `src/delivery.ts`), a row with a `threadKey` and no explicit
+`thread_id` looks the key up in `thread_key_anchors`, keyed by (agent group, resolved
+messaging group — so the adapter instance counts — key):
+
+- **Found** → post under `<platform_id>:<anchor message id>`, and bump `last_used_at`. No day
+  rotation, so an incident that spans midnight stays in one thread.
+- **Not found**, or unused for 30 days → post at root and record the returned message id
+  (for an oversize post, the bridge returns the first chunk's id). Recording also prunes
+  every key unused for 30 days.
+- **Threaded post fails** → post at root; the record is replaced by the new root, dropped if
+  the root post returned no id, and kept if the root post threw too.
+- Bookkeeping writes after a post has landed are logged on failure, never thrown, so a
+  database hiccup can't make delivery re-post the message.
+
+`continue_thread` (content `continueThread`, runner-validated only together with `thread_key`)
+lets the **not found** case adopt an existing thread instead of opening a new root: the
+encoded id `search_threads` prints, a bare thread id, or a Discord/Slack link. The row is
+container-written, so the host (`src/continue-thread.ts`) resolves it against the
+destination's own `platform_id` and adopts it only when it has already seen that thread on
+the resolved messaging group — a session bound to (messaging group, thread), or an archived
+message on the same `channel_type` + `platform_id` in it. Adopted → post there and record the
+thread as the key's anchor, so later posts under the key follow it. Unconfirmed → a warn log
+and the ordinary root post. A live anchor always wins and the argument is ignored.
+
+**Routing check (`lb-` keys only).** For a key starting with `lb-` (littlebird-watch topics), the host
+asks Jev (`src/thread-route-check.ts`, model pinned `jev-1.13.0`) whether the existing thread is already
+working the post's request, judged on the post text and the thread's opener plus its five newest messages
+from the archive. It runs at two points: a `continue_thread` adoption (any purpose), and a `handoff` post
+under a key that already has a thread. Below `ROUTE_CHECK_THRESHOLD` (0.25), and on any failure (Jev
+error or timeout, no gateway credential, empty or unreadable archive, a score that cannot be stored, a
+check not finished 20 s after the runner queued the post), the post opens a new root thread instead:
+
+- **Adoption vetoed** → the key's anchor becomes the new root, exactly as for an unconfirmed `continue_thread`.
+- **Handoff into the key's own thread vetoed** → the earlier key keeps its anchor; the post's root is
+  recorded under the split key `<key>.split-<outbound id>` (`src/thread-route-split.ts`, mirrored in
+  the runner), and the delivery ack carries a `notice` naming it.
+
+The check runs in the background (`routeVerdict`, `src/thread-route-verdict.ts`): the post stays queued
+behind it in its own session, and a later delivery cycle sends it from the stored verdict, so no other
+session's delivery waits on Jev. A retried row reuses its verdict. A kept verdict whose post cannot go out
+within 40 s of queueing becomes a veto, because by then the runner has stopped waiting.
+`send_message` waits for that ack (up to 45 s) on an `lb-` `handoff` post only, and returns the notice;
+later posts follow the new thread only if the agent uses the key the notice names. Every decision is
+stored in `thread_route_checks`. Every other key, and an unkeyed post, never reaches the check.
+
+A keyed post takes precedence over both unkeyed anchors — the rolling per-session day anchor
+for task sessions (`task_thread_anchors`, rotated by `anchorRotationKey` in
+`src/db/task-thread-anchors.ts`, opt-out `ncl tasks … --thread-anchor false`) and the
+in-memory per-turn anchor — and neither reads nor writes them. Edits and reactions carrying a
+key (`edit_message`/`add_reaction` accept the same optional `thread_key`) follow the same rule as under the day anchor: the anchor message itself is addressed at
+root, anything else through the thread, and nothing is recorded. Keying on the agent group
+rather than the session means a task session closed by the spent-session GC and recreated
+keeps its open incidents. The archive stores every anchored post (keyed, day, or turn) under
+the thread it landed in, so `read_thread` finds it. Posts under one key are serialized
+in-process, so two sessions can't both open the same new key. Otherwise unkeyed rows behave
+as before.
+
+A watcher mints the key from something that changes when the incident does — e.g.
+`<job>-<first failing run of the current failure streak>`, so a recovery followed by a new
+failure naturally yields a new key and a new top-level post.
+
+#### send_file
+
+Send a file to a named destination (same destination model as `send_message`).
+
+```typescript
+{
+  name: 'send_file',
+  params: {
+    path: string,          // file path (relative to /workspace/agent/ or absolute) (required)
+    to?: string,           // destination name; optional if the agent has one destination
+    text?: string,         // optional accompanying message
+    filename?: string,     // display name (default: basename of path)
+    thread_key?: string,   // as send_message
+    continue_thread?: string, // as send_message
+  }
+}
+```
+
+Implementation:
+
+1. Resolve routing via `resolveRouting(to)` (as `send_message`)
+2. Generate a message ID and create `/workspace/outbox/{messageId}/`
+3. Copy the file into that outbox directory
+4. Write a `messages_out` row (`kind: 'chat'`) with content `{ text, files: [filename] }` (plus `threadKey` and `continueThread` when given)
+
+#### send_card
+
+Send a structured card (interactive or display-only).
+
+```typescript
+{
+  name: 'send_card',
+  params: {
+    card: CardElement,     // card structure (title, children, actions)
+    fallbackText?: string, // text fallback for platforms without card support
+  }
+}
+```
+
+Implementation: write a `messages_out` row with `kind: 'chat-sdk'` and the card structure in content.
+
+#### ask_user_question
+
+Send an interactive question and wait for the user's response. This is a **blocking tool call** — the tool doesn't return until the user responds.
+
+```typescript
+{
+  name: 'ask_user_question',
+  params: {
+    title: string,         // short card title, e.g. "Confirm deletion"
+    question: string,
+    options: (string | { label: string; selectedLabel?: string; value?: string })[],
+    timeout?: number,      // seconds (default: 300)
+  }
+}
+```
+
+Implementation:
+
+1. Generate a `questionId` and normalize each option to `{ label, selectedLabel, value }`
+2. Write a `messages_out` row with `kind: 'chat-sdk'` and content `{ type: 'ask_question', questionId, title, question, options }`
+3. Poll `inbound.db` (read-only) for a pending `messages_in` row whose content carries the matching `questionId` (`findQuestionResponse`), skipping any already in `processing_ack`
+4. When found, `markCompleted` the response row (a `processing_ack` write in `outbound.db`) and return its `selectedOption` as the tool result
+5. If the deadline passes, return a timeout error as the tool result
+
+The agent's execution is paused at this tool call. The provider's query keeps running (Claude holds the tool call open). The agent-runner polls for the response in a separate loop.
+
+#### request_choice
+
+Post a card of buttons and return immediately. Unlike `ask_user_question` this is **not** blocking: the answer arrives later as a chat message, possibly after the container has exited.
+
+```typescript
+{
+  name: 'request_choice',
+  params: {
+    title: string,
+    question: string,
+    options: { label: string; value: string; style?: 'primary' | 'danger' | 'default' }[], // 1..10, unique values
+    to?: string,          // channel destination name; the card posts top-level there
+    key?: string,         // ≤128 of [A-Za-z0-9._:-]; a newer card with the same key supersedes this one
+    approvers?: string[], // namespaced user ids; narrows who may answer to these owners/admins
+  }
+}
+```
+
+Implementation:
+
+1. Validate, generate a `choiceId`, and write a `messages_out` row with `kind: 'system'` and content `{ action: 'request_choice', choiceId, title, question, options, key?, approvers?, to?, channelType?, platformId? }`. With `to`, the container resolves the destination name into routing; without it, the session must have a conversation (a task session must pass `to`). A system row never counts against the chat budget, so a muted task can post a card. Return the `choiceId`
+2. On the host, `src/modules/interactive/choice.ts` refuses `approvers` that are not owners/admins of the agent group, refuses a `choiceId` that already has a pending approval (any agent group), re-authorizes `to` routing with the same destination check an outbound message gets, and opens an approvals-backed card (`pending_approvals`, no expiry): in the session's own thread, or top-level in the destination. With a `key`, the group's older open card under that key is then retired (edited to "Superseded by a newer ask", row removed)
+3. The bridge does not edit the card on click (`src/answer-cards.ts`). Only a user with admin privilege on the agent group (and on the `approvers` list, if one was given) can answer; any other click changes nothing. The first authorized click wins; once its answer is delivered the host edits the card to "✅ label — name". A click whose answer cannot be delivered leaves the card open
+4. The answer is written by `notifyAgent` into the session a typed reply in the card's thread would reach (resolved as the router does, created if absent), falling back to the asking session when the card's channel is not wired to the agent group, and that session is woken: `choice_response choice_id=<id> approval_id=<aid> value=<v> label=<l> user_id=<channel:handle> user_name=<name>` (fixed key order, each value percent-encoded). Anyone can type that line, and a host note can echo text it was sent, so the agent acts on it only inside a message marked `origin="host"` AND `event="choice_response"`: the host strips the host-only `origin` and `event` content fields from every inbound write except `notifyAgent`'s (`WriteSessionMessageOptions.hostOrigin`), only the choice relay sets `event`, and the runner renders both attributes from those fields alone
+
+#### edit_message
+
+Edit a previously sent message.
+
+```typescript
+{
+  name: 'edit_message',
+  params: {
+    messageId: string,     // integer ID as shown to the agent
+    text: string,          // new content
+  }
+}
+```
+
+Implementation: write a `messages_out` row with `operation: 'edit'`, the message ID, and new text.
+
+#### add_reaction
+
+Add an emoji reaction to a message.
+
+```typescript
+{
+  name: 'add_reaction',
+  params: {
+    messageId: string,     // integer ID as shown to the agent
+    emoji: string,         // emoji name (e.g., 'thumbs_up')
+  }
+}
+```
+
+Implementation: write a `messages_out` row with `operation: 'reaction'`.
+
+#### Agent-to-agent sends (no dedicated tool)
+
+There is no `send_to_agent` tool. Agents and channels share one destination namespace, so
+messaging another agent is just `send_message(to="<agent-name>")` where the named
+destination is of type `agent`. `resolveRouting` maps it to a `messages_out` row with
+`channel_type: 'agent'` and `platform_id` set to the target agent group id; the host
+validates the send and routes it into the target session's `inbound.db`.
+
+#### ncl tasks
+
+Schedule, inspect, and modify one-shot or recurring tasks.
+
+```bash
+ncl tasks create --prompt "..." --process-after "2026-01-15T09:00:00" --recurrence "0 9 * * *"
+ncl tasks list
+ncl tasks update <series_id> --prompt "..."
+ncl tasks cancel <series_id>
+```
+
+Implementation: the host writes `messages_in` task rows into the agent group's system session (`thread_id = system:tasks`). The host sweep wakes that system-session container when a task is due. The task agent chooses its destination at fire time by emitting `<message to="name">...</message>` or using `send_message`.
+
+Each scheduled fire starts a fresh provider conversation (the `/clear` reset without its notice); only the continuation resets, never the session row or its `thread_id`. A thread-bound series (`--thread` / `--thread-id`) starts fresh too — the thread is where it posts, not a conversation it resumes. A fire resumes the stored conversation when its series is marked `--continuous`, a keyed `ncl tasks dispatch` event, or a retry of an interrupted fire (`tries > 0`); or while the session still holds a queued `continue_work` or a pending `wait` wake, so that work resumes in the conversation that set it; or when a non-task row shares its batch. `wait` wakes and `continue_work` resumes are not scheduled fires. Keep a series' state in files; mark it `--continuous` only if a fire relies on what earlier fires said. `container/agent-runner/src/fresh-context-task.ts`
+
+#### create_agent
+
+Create a long-lived companion sub-agent. The `name` becomes a destination the creating
+agent can address. (There is no `register_agent_group` tool — this replaced it.)
+
+```typescript
+{
+  name: 'create_agent',
+  params: {
+    name: string,           // human-readable name; also the destination name (required)
+    instructions?: string,  // CLAUDE.md content for the new agent (role, personality)
+  }
+}
+```
+
+Implementation: fire-and-forget. Writes a `messages_out` row with `kind: 'system'`,
+`action: 'create_agent'`, `requestId`, `name`, and `instructions`. The container is
+untrusted and does not gate itself; the host authorizes by CLI scope — trusted owner groups
+(scope `global`) create directly, confined groups require admin approval
+(`src/modules/agent-to-agent/create-agent.ts`) — then creates the entity rows and notifies
+the agent via a chat message when the agent is ready.
+
+#### Self-modification: install_packages, add_mcp_server
+
+Two fire-and-forget system-action tools let an agent extend its own runtime (both require
+admin approval, applied host-side):
+
+- **`install_packages`** — `{ apt?: string[], npm?: string[], reason?: string }`. Package
+  names are validated at the tool boundary and re-validated on the host. On approval the
+  host rebuilds the per-agent image and restarts the container.
+- **`add_mcp_server`** — `{ name, command, args?, env? }`. Wires an existing third-party MCP
+  server into the agent's `container.json`; on approval the host updates the config and
+  restarts (no rebuild — Bun runs the TS directly).
+
+Both write a `messages_out` row with `kind: 'system'` and the matching `action`, then return
+immediately; the host notifies the agent when approval resolves.
+
+#### Guard-coverage boundary: the destructive classifier sees Bash only
+
+The shared destructive-command classifier (`block-destructive-core.ts`, consumed by the
+Claude PreToolUse hook, codex-guard, opencode-guard, and the pre-task script classifier)
+evaluates **Bash command strings only**. Calls made through MCP tools are never string-
+classified — an MCP server that can delete data executes on its own authority once wired.
+
+This is a deliberate boundary, not a gap to patch with string matching: MCP tools are
+**trusted by registration, not by call**. The enforcement point is `add_mcp_server` being
+HOLD-gated (admin approval per server, above) plus the review of what each approved server
+can do — so approve a server for what its _worst_ tool can do, not its typical use. Adding
+per-call classification of MCP arguments would give false safety: arguments are opaque
+JSON with server-specific semantics, and a classifier that can't see meaning can't gate it.
+
+### Media Handling
+
+#### Inbound (messages_in → agent prompt)
+
+The agent-runner inspects attachments in chat/chat-sdk messages and handles them based on type and provider capability:
+
+**Provider-native content blocks:**
+
+| Type                                      | Claude                        | Codex / OpenCode |
+| ----------------------------------------- | ----------------------------- | ---------------- |
+| Images (JPEG, PNG, GIF, WebP)             | Native image content block    | Save to disk     |
+| PDFs                                      | Native document content block | Save to disk     |
+| Audio                                     | Native audio content block    | Save to disk     |
+| Other files (code, data, video, archives) | Save to disk                  | Save to disk     |
+
+**"Save to disk"** means: download to `/workspace/downloads/{messageId}/`, reference in the prompt text:
+
+```
+<message sender="John" time="10:00">
+  Check this spreadsheet
+  [file available at: /workspace/downloads/msg-123/data.xlsx]
+</message>
+```
+
+The agent can use tools (Read, Bash) to access saved files.
+
+For channels where direct download isn't possible (e.g., WhatsApp buffered streams), the channel adapter serves the media via a local URL. The agent-runner downloads from that URL.
+
+**Content block construction (Claude):** The agent-runner builds multi-part `MessageParam` content: `[{ type: 'image', source: { type: 'base64', media_type, data } }, { type: 'text', text: '...' }]`. The prompt passed to the provider is not a plain string in this case — the `QueryInput.prompt` field needs to support structured content for Claude. The provider's `query()` method handles the format-specific construction.
+
+**Content block construction (Codex/OpenCode):** Everything is text. File references are inlined in the prompt string. The provider receives a plain string prompt.
+
+#### Outbound (agent → messages_out)
+
+Handled via the `send_file` MCP tool (see above). The agent explicitly decides to send a file — the agent-runner doesn't scan output for file references.
+
+### Pre-Agent Scripts (Tasks)
+
+For `task` kind messages with a `script` field in the content:
+
+1. Agent-runner writes the script to a temp file
+2. Executes with `bash` (timeout: `NANOCLAW_TASK_SCRIPT_TIMEOUT_MS`, default 120s — the flat 30s it replaced killed a working 56s watcher script into an auto-pause; host path shares the same knob via `config.TASK_SCRIPT_TIMEOUT_MS`)
+3. Parses last line of stdout as JSON: `{ wakeAgent: boolean, data?: unknown }`
+4. If `wakeAgent === false`: mark message as completed, don't invoke the provider
+5. If `wakeAgent === true`: enrich the prompt with script output, then invoke the provider
+
+### Transcript Archiving
+
+The agent-runner archives conversation transcripts before context compaction. For Claude, this is handled via the PreCompact hook (provider-internal). For other providers that don't have hooks, the agent-runner archives after each query completes based on the provider's output.
+
+Archive location: `/workspace/agent/conversations/{date}-{summary}.md`
+
+### Session Resume
+
+The agent-runner tracks a single opaque `continuation` token per provider:
+
+- Captured from `ProviderEvent { type: 'init', continuation }` and persisted to the
+  `session_state` table in `outbound.db` under the key `continuation:<provider>` (keyed per
+  provider because a continuation is provider-private — a Claude session id is meaningless to
+  another provider).
+- Passed back as `QueryInput.continuation` on the next query. For Claude that becomes the
+  SDK `resume` option; the SDK reloads its on-disk `.jsonl` transcript for that session id.
+
+Because it lives in the session folder's `outbound.db`, the continuation survives container
+teardown and restart — a fresh container reads it back and resumes. `/clear` deletes the row
+to start a clean session. Before resuming, `maybeRotateContinuation` may archive and drop an
+oversized/aged transcript (so a cold container isn't killed reloading it), and
+`isSessionInvalid` clears a continuation whose backing transcript has gone missing.
+
+### Container Startup
+
+The agent-runner receives configuration via:
+
+- **`container.json`:** The provider name, model, assistant name, MCP servers, and other NanoClaw config are read from `/workspace/agent/container.json` (materialized by the host from the `container_configs` table), not from environment variables. See `container/agent-runner/src/config.ts`.
+- **Environment variables:** provider-specific vars only (API keys, model overrides), `TZ`.
+- **Fixed mount paths:** Host-written `inbound.db` (read-only) at `/workspace/inbound.db` and container-owned `outbound.db` at `/workspace/outbound.db`. Agent group folder at `/workspace/agent/`. System prompt from `/workspace/agent/CLAUDE.md` and `/workspace/global/CLAUDE.md`.
+
+The agent-runner reads config, creates the provider, and enters the poll loop. No stdin, no initial prompt — messages are already in the session DB.
+
+### Provider Factory
+
+```typescript
+type ProviderName = 'claude' | string;
+
+function createProvider(name: ProviderName, config: ProviderConfig): AgentProvider {
+  // Trunk registers 'claude'; additional providers self-register when installed via skills.
+  const factory = providerRegistry.get(name);
+  if (!factory) throw new Error(`Unknown provider: ${name}`);
+  return factory(config);
+}
+```
+
+The provider name comes from the `provider` key in `/workspace/agent/container.json` (defaulting to `'claude'`), which the host materializes from the `container_configs` table — set it with `ncl groups config update --provider`. It is not an environment variable.
+
+`ProviderConfig` contains provider-specific settings (API keys, model overrides, etc.) passed via environment variables — not via the interface. Each provider reads what it needs from `env`.
+
+## Status Subtext
+
+A long-lived thread drifts: `-m`/`-e` were set twenty turns ago and nobody remembers what took
+effect. Every reply an agent posts **into its own conversation** carries a small, de-emphasized
+line naming what produced it:
+
+```
+opus-5 · xhigh · 142k context
+```
+
+**What it is made of.** `container/agent-runner/src/turn-status.ts` holds three facts and renders
+them; missing parts are simply omitted. Model and effort both come from the provider's RESOLVED
+values — `modelInForce` and `AgentQuery.resolvedEffort` — never from what the turn requested. For
+model that is because an unpinned turn requests nothing. For effort the stakes are higher:
+`querySettings.effort` is user intent only (`applyFlagBatch`'s stated contract), so a group
+carrying its effort in `container.json` requests nothing and the line would show no effort at
+all, and an effort the resolved model cannot support is clamped away by the provider, so the line
+would name a level the turn never ran at. `resolvedEffort` is a REQUIRED field on `AgentQuery`
+for the same reason `resolvedModel` is — an optional one is a forgettable one — and `null` is a
+real answer meaning "this turn runs with no effort setting". `ultracode` displaces the effort level it forces, because printing `xhigh`
+would hide the orchestration half of that setting.
+
+**Where the context figure comes from.** Each provider reports a finished number rather than raw
+fields, because the arithmetic is provider-specific and getting it wrong is silent:
+
+| Provider | Source | Occupancy |
+|---|---|---|
+| Claude | assistant message `usage` | `input + cache_read + cache_creation` — Anthropic's three prompt counters are **disjoint** |
+| Codex | `thread/tokenUsage/updated` → `last` | `totalTokens`, which is Codex's own `tokens_in_context_window()`. `cachedInputTokens` is a **subset** of `inputTokens` here, so summing them double-counts |
+| OpenCode | assistant `message.updated`, turn session only | `input + cache.read + cache.write` — disjoint, like Anthropic |
+
+It is a LATEST-WINS reading of the most recent request, never a per-turn delta. This is why it
+does **not** ride `TurnUsageInfo`: that seam's numbers go through `toTurnDelta`, and context
+occupancy is an absolute reading that must not be differenced.
+
+**Whose voice gets stamped.** One decision function, `stampStatusSubtext`
+(`container/agent-runner/src/turn-status.ts`), called through `withStatusSubtext` at each call site
+that writes agent-composed text: `sendToDestination` and `deliverErrorResult` (poll-loop), and
+`send_message`, `send_file` and `edit_message` (`mcp-tools/core.ts`). Not inside `writeMessageOut`:
+`db/messages-out.ts` is a byte-identical upstream shim, and a marker on the row could not reach the
+mailbox anyway. `send_message` is *the* reply path on a default install (outcome reporting is on
+unless a group disables it), and it runs in the MCP subprocess, so the turn's state rides a
+persisted session-state snapshot rather than module memory.
+
+Two gates, both of which must pass. The row must be marked `agentReply`, an explicit opt-in, because
+`kind: 'chat'` is broader than "text the agent composed": the runner posts its own `/clear` notice
+as chat, and no turn authored that. A `send_file` row is marked when it carries a caption, since
+the caption is agent text and is often the whole report with the file attached; a bare file is not.
+And the destination must resolve to the session's own conversation, so a cross-destination send (a
+sibling agent's DM, another channel, or a message the operator asked the agent to relay on their
+behalf) goes out clean. `add_reaction` and the runner's own infra notices are never stamped.
+
+*Known gap, accepted:* "post in THIS thread, as me" resolves to the origin and is stamped. No
+routing fact distinguishes it from a normal reply. A suppress flag on the sending tool was
+rejected as the worse failure: an agent that forgets to pass it stamps the operator's words.
+
+**Rendering is per platform and opt-in.** An adapter declares `renderSubtext` on its bridge
+config; one that does not gets no subtext at all, because a full-size line of telemetry under
+every reply is worse than no line.
+
+- **Slack** — a Block Kit `context` block. A Slack message carries either `markdown_text` **or**
+  `blocks`, never both, so `src/channels/slack-subtext.ts` wraps the adapter's Web client and
+  rewrites the finished payload into `[{type:'markdown'}, {type:'context'}]`. It wraps the client
+  rather than `postMessage` so the adapter's mention resolution and emoji normalization still
+  run. A drift guard in `slack-subtext.test.ts` fails if the vendored adapter renames either seam.
+- **Discord** — `-# ` at line start (Discord's native subtext). Ordinary message markdown, so no
+  payload surgery.
+
+The bridge reserves the footer's room *before* splitting an oversize reply, so an appended footer
+cannot push the final chunk past the platform's cap, and stamps the last chunk only.
+
+**Opting out.** On for every group by default. `ncl groups config update --id <group> --status-subtext off`
+writes `"statusSubtext": false` into that group's `container.json` (no DB projection — nothing on
+the host reads it) and takes effect at the next restart. Turning it back `on` erases the key
+rather than writing `true`, so only a deliberate opt-out is ever recorded. A config the runner
+cannot read fails **closed**: the flag exists so a group can ask for silence, and honouring that
+ask is what matters when we cannot tell which group we are.
+
+## Agent-Runner Properties
+
+- MCP server is a separate Node process spawned by the provider (via `mcpServers` config)
+- The MCP server binary is shared across providers — same tools, same DB access
+- CLAUDE.md loading (global + per-group) — agent-runner reads and passes as `systemPrompt`
+- Additional directories discovery (`/workspace/extra/*`)
+- Logging via stderr (`[agent-runner] ...`)
+
+## Related Documents
+
+- **[architecture.md](architecture.md)** — High-level architecture (session DB schema, central DB, channel adapters, message flow)
+- **[api-details.md](api-details.md)** — Channel adapter interface, message content examples, host delivery logic

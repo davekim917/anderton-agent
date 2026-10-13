@@ -1,0 +1,537 @@
+/**
+ * Container leg of the script-failure backoff chain, tested at unit level so
+ * the e2e suite doesn't need a live multi-sweep scenario for it:
+ *
+ *   script error → applyPreTaskScripts skips with reason 'error'
+ *   → markScriptSkipped acks `script-skip:error` in outbound.db
+ *   (gated → plain 'completed': the monitor working as designed).
+ *
+ * The host leg (ack → FAILED run → streak backoff) is pinned in
+ * src/db/session-db.test.ts and src/modules/scheduling/recurrence.test.ts —
+ * both sides pin the literal 'script-skip:error'; if either renames it, its
+ * own test goes red.
+ */
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
+import { getPendingMessages, markScriptSkipped } from '../db/messages-in.js';
+import {
+  beginProviderBusyScope,
+  clearStaleProcessingAcks,
+  setProviderTurnExecuting,
+} from '../modules/mailbox/index.js';
+import { applyPreTaskScripts, runScript } from './task-script.js';
+
+// Point the pre-task classifier at the real shared destructive core (same
+// module the interactive Bash gate uses). In a container this lives at
+// /workspace/plugins/...; on the host test runner it's the bootstrap checkout.
+const REAL_CORE = '/home/ubuntu/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
+const savedCore = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
+const savedHostDataDir = process.env.NANOCLAW_HOST_DATA_DIR;
+const savedHostTopicWorktreesDir = process.env.NANOCLAW_HOST_TOPIC_WORKTREES_DIR;
+const markerPaths = new Set<string>();
+
+beforeEach(() => {
+  process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = REAL_CORE;
+  process.env.NANOCLAW_HOST_DATA_DIR = '/srv/nanoclaw/data';
+  process.env.NANOCLAW_HOST_TOPIC_WORKTREES_DIR = '/srv/nanoclaw/data/topic-worktrees';
+  initTestSessionDb();
+});
+
+afterEach(() => {
+  if (savedCore === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
+  else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = savedCore;
+  if (savedHostDataDir === undefined) delete process.env.NANOCLAW_HOST_DATA_DIR;
+  else process.env.NANOCLAW_HOST_DATA_DIR = savedHostDataDir;
+  if (savedHostTopicWorktreesDir === undefined) delete process.env.NANOCLAW_HOST_TOPIC_WORKTREES_DIR;
+  else process.env.NANOCLAW_HOST_TOPIC_WORKTREES_DIR = savedHostTopicWorktreesDir;
+  for (const markerPath of markerPaths) {
+    try {
+      fs.unlinkSync(markerPath);
+    } catch {
+      // Missing means the guarded script did not execute, which is expected.
+    }
+  }
+  markerPaths.clear();
+  closeSessionDb();
+});
+
+function freshMarker(name: string): string {
+  const markerPath = `/tmp/nanoclaw-task-script-${process.pid}-${name}`;
+  try {
+    fs.unlinkSync(markerPath);
+  } catch {
+    // Already absent.
+  }
+  markerPaths.add(markerPath);
+  return markerPath;
+}
+
+function insertTask(id: string, script: string) {
+  getInboundDb()
+    .prepare(
+      `INSERT INTO messages_in (id, kind, timestamp, status, trigger, content)
+       VALUES (?, 'task', datetime('now'), 'pending', 1, ?)`,
+    )
+    .run(id, JSON.stringify({ prompt: 'monitor', script }));
+}
+
+const ackStatus = (id: string): string | undefined =>
+  (
+    getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
+      | { status: string }
+      | undefined
+  )?.status;
+
+describe('script-skip ack chain (container leg)', () => {
+  it('an erroring script skips with reason "error" and acks script-skip:error', async () => {
+    insertTask('t-err', 'echo boom >&2; exit 1');
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(keep).toHaveLength(0);
+    expect(skipped).toEqual([{ id: 't-err', reason: 'error' }]);
+
+    markScriptSkipped(skipped);
+    expect(ackStatus('t-err')).toBe('script-skip:error');
+  });
+
+  it('a deliberate wakeAgent=false gate acks plain completed — never backs off', async () => {
+    insertTask('t-gated', 'echo \'{"wakeAgent": false}\'');
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(keep).toHaveLength(0);
+    expect(skipped).toEqual([{ id: 't-gated', reason: 'gated' }]);
+
+    markScriptSkipped(skipped);
+    expect(ackStatus('t-gated')).toBe('completed');
+  });
+
+  it('wakeAgent=true keeps the task and enriches the prompt with script data', async () => {
+    insertTask('t-wake', 'echo \'{"wakeAgent": true, "data": {"alerts": 2}}\'');
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(skipped).toHaveLength(0);
+    expect(keep).toHaveLength(1);
+    expect(JSON.parse(keep[0].content).scriptOutput).toEqual({ alerts: 2 });
+  });
+
+  // Fleet-hardening Phase 1.1: a host-gated fire (content.scriptHost) already
+  // ran its script on the host and wrote scriptOutput before the container
+  // was even spawned (src/modules/scheduling/host-script.ts). The container
+  // must not run it a second time.
+  it('a row that already carries scriptOutput is passed through without re-running the script', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, content)
+         VALUES ('t-host-gated', 'task', datetime('now'), 'pending', 1, ?)`,
+      )
+      .run(
+        JSON.stringify({
+          prompt: 'monitor',
+          script: 'exit 1', // would fail if re-run — proves it never executes
+          scriptHost: true,
+          scriptOutput: { alerts: 5 },
+        }),
+      );
+
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(skipped).toHaveLength(0);
+    expect(keep).toHaveLength(1);
+    expect(JSON.parse(keep[0].content).scriptOutput).toEqual({ alerts: 5 });
+  });
+
+  it('treats a null scriptOutput as a completed host result and does not re-run the script', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, content)
+         VALUES ('t-host-gated-null', 'task', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'pending', 1, ?)`,
+      )
+      .run(
+        JSON.stringify({
+          prompt: 'monitor',
+          script: 'exit 1', // would fail if re-run — null is still a result
+          scriptHost: true,
+          scriptOutput: null,
+        }),
+      );
+
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(skipped).toHaveLength(0);
+    expect(keep).toHaveLength(1);
+    expect(JSON.parse(keep[0].content)).toMatchObject({ scriptOutput: null });
+  });
+});
+
+// Fleet-hardening Phase 4, P1 leg 2: a pre-task script runs unattended with no
+// approval round-trip, so it must be classified by the SAME destructive-command
+// core as the interactive Bash gate — otherwise `ncl tasks create --script` was
+// an ungated exec path. Its subprocess env is also at parity with that gate,
+// which now means the container's provider credential is present (secret-env.ts).
+describe('pre-task script destructive-classifier gate (P1 leg 2)', () => {
+  it('refuses a destructive script (rm -rf) — never executes it, acks script-skip:error', async () => {
+    // If it ran, the `touch` side effect would prove execution — but block
+    // means runScript is never reached, so only the ack is observable.
+    insertTask('t-rm', 'rm -rf /workspace/workgroup\necho \'{"wakeAgent": false}\'');
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(keep).toHaveLength(0);
+    expect(skipped).toEqual([{ id: 't-rm', reason: 'blocked' }]);
+
+    markScriptSkipped(skipped);
+    expect(ackStatus('t-rm')).toBe('script-skip:error');
+  });
+
+  it('refuses a gated destructive script (DROP TABLE) the same way', async () => {
+    insertTask('t-drop', 'sqlite3 x.db "DROP TABLE users"\necho \'{"wakeAgent": true}\'');
+    const { skipped } = await applyPreTaskScripts(getPendingMessages());
+    expect(skipped).toEqual([{ id: 't-drop', reason: 'blocked' }]);
+  });
+
+  it('lets a legit credentialed monitor script through (curl | jq)', async () => {
+    insertTask('t-ok', 'echo \'{"wakeAgent": true, "data": {"n": 1}}\'');
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+    expect(skipped).toHaveLength(0);
+    expect(JSON.parse(keep[0].content).scriptOutput).toEqual({ n: 1 });
+  });
+
+  // The script env matches an interactive Bash command's: the container's own
+  // provider credential is present (so a scheduled script can drive `claude -p`
+  // / `codex exec`), and only the MCP header-only secrets — which no shell ever
+  // needs — are removed. See secret-env.ts for why the credential boundary is
+  // scope rather than the bash env.
+  //
+  // MUTATION CHECK: re-adding ANTHROPIC_API_KEY to the strip set in scriptEnv
+  // fails the first assertion; dropping EXA_API_KEY from
+  // MCP_HEADER_ONLY_SECRET_VARS fails the third.
+  it('keeps the provider credential in the script env, strips the MCP header-only secrets', async () => {
+    process.env.ANTHROPIC_API_KEY = 'sk-secret';
+    process.env.EXA_API_KEY = 'exa-secret';
+    process.env.TASK_SCRIPT_KEEP = 'kept';
+    try {
+      insertTask(
+        't-env',
+        'echo "{\\"wakeAgent\\": true, \\"data\\": {\\"secret\\": \\"$ANTHROPIC_API_KEY\\", \\"header\\": \\"$EXA_API_KEY\\", \\"kept\\": \\"$TASK_SCRIPT_KEEP\\"}}"',
+      );
+      const { keep } = await applyPreTaskScripts(getPendingMessages());
+      const out = JSON.parse(keep[0].content).scriptOutput;
+      expect(out.secret).toBe('sk-secret'); // provider credential reaches the script
+      expect(out.kept).toBe('kept'); // ordinary var survives
+      expect(out.header).toBe(''); // MCP header-only secret still stripped
+    } finally {
+      delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.EXA_API_KEY;
+      delete process.env.TASK_SCRIPT_KEEP;
+    }
+  });
+});
+
+describe('pre-task managed Git guard', () => {
+  it('blocks managed worktree maintenance before any script side effect', async () => {
+    const marker = freshMarker('worktree-prune');
+    insertTask(
+      't-managed-worktree-prune',
+      `git --git-dir="$NANOCLAW_HOST_DATA_DIR/repositories/wg/repo/.git" worktree prune\ntouch ${marker}\necho '{"wakeAgent": true}'`,
+    );
+
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(keep).toHaveLength(0);
+    expect(skipped).toEqual([{ id: 't-managed-worktree-prune', reason: 'blocked' }]);
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('blocks managed Git object maintenance before any script side effect', async () => {
+    const marker = freshMarker('git-gc');
+    insertTask(
+      't-managed-git-gc',
+      `git -C "$NANOCLAW_HOST_DATA_DIR/repositories/wg/repo" gc\ntouch ${marker}\necho '{"wakeAgent": true}'`,
+    );
+
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(keep).toHaveLength(0);
+    expect(skipped).toEqual([{ id: 't-managed-git-gc', reason: 'blocked' }]);
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('still executes an ordinary safe script when managed Git paths are configured', async () => {
+    const marker = freshMarker('safe-command');
+    insertTask('t-managed-safe', `touch ${marker}\necho '{"wakeAgent": true, "data": {"safe": true}}'`);
+
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(skipped).toHaveLength(0);
+    expect(keep).toHaveLength(1);
+    expect(JSON.parse(keep[0]!.content).scriptOutput).toEqual({ safe: true });
+    expect(fs.existsSync(marker)).toBe(true);
+  });
+});
+
+describe('a timed-out script is reported as a timeout', () => {
+  /**
+   * execFile kills on timeout, so the callback receives a generic
+   * "Command failed" — the same shape a script that exited non-zero produces.
+   * `killed` is the only thing that tells them apart. Without it the log said
+   * `error: Command failed: bash /tmp/task-script-<id>.sh` for a script that
+   * merely ran long, which reads as a broken script and sends whoever is
+   * debugging it looking for a bug that isn't there. The fork's 120s ceiling
+   * and 8-failure auto-pause make that misread expensive: the series pauses
+   * and the operator never learns the ceiling was the cause.
+   */
+  const captureLogs = async (fn: () => Promise<unknown>): Promise<string[]> => {
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => void lines.push(args.map(String).join(' '));
+    try {
+      await fn();
+    } finally {
+      console.error = original;
+    }
+    return lines;
+  };
+
+  it('names the timeout and the ceiling it hit, not a generic command failure', async () => {
+    const lines = await captureLogs(() => runScript('sleep 5', 't-timeout', 150));
+    const joined = lines.join('\n');
+    expect(joined).toContain('[t-timeout] timed out after 150ms');
+    expect(joined).toContain('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS');
+    expect(joined).not.toContain('error: Command failed');
+  });
+
+  it('still resolves null, so the task is skipped exactly as before', async () => {
+    await captureLogs(async () => {
+      expect(await runScript('sleep 5', 't-timeout-null', 150)).toBeNull();
+    });
+  });
+
+  it('leaves a genuine non-zero exit reported as an error', async () => {
+    const lines = await captureLogs(() => runScript('exit 3', 't-exit', 5000));
+    const joined = lines.join('\n');
+    expect(joined).toContain('error: Command failed');
+    expect(joined).not.toContain('timed out');
+  });
+
+  it("a timed-out script still acks 'script-skip:error', so auto-pause accounting is unchanged", async () => {
+    // The skip reason stays 'error' on purpose. A script that hangs every fire
+    // is as broken as one that exits 1, and the 8-consecutive-failure pause
+    // (src/modules/scheduling/recurrence.ts, SCRIPT_FAIL_PAUSE_CAP) is exactly
+    // the right response. Only the log line that tells the operator WHY it
+    // failed changes — the ack the host counts does not.
+    process.env.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS = '150';
+    try {
+      insertTask('t-timeout-ack', 'sleep 5');
+      let outcome!: Awaited<ReturnType<typeof applyPreTaskScripts>>;
+      const lines = await captureLogs(async () => {
+        outcome = await applyPreTaskScripts(getPendingMessages());
+      });
+
+      expect(outcome.keep).toHaveLength(0);
+      expect(outcome.skipped).toEqual([{ id: 't-timeout-ack', reason: 'error' }]);
+      expect(lines.join('\n')).toContain('[t-timeout-ack] timed out after 150ms');
+
+      markScriptSkipped(outcome.skipped);
+      expect(ackStatus('t-timeout-ack')).toBe('script-skip:error');
+    } finally {
+      delete process.env.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS;
+    }
+  });
+});
+
+/**
+ * Reaper visibility. A pre-task script runs BEFORE its batch is claimed (see
+ * the claim-ordering note in poll-loop.ts), so while it executes the host sees
+ * no processing_ack claim for it, and once the row stops counting as due the
+ * task reaper's remaining terms all read "idle" — it kills the container
+ * mid-script. `provider_executing` is the term that says "busy"; the host side
+ * of the contract is pinned in src/modules/mailbox/mailbox.test.ts, so if
+ * either end renames the column its own test goes red.
+ */
+describe('applyPreTaskScripts provider_executing', () => {
+  const providerExecuting = (): number =>
+    (
+      getOutboundDb().prepare('SELECT provider_executing FROM container_state WHERE id = 1').get() as
+        | { provider_executing: number }
+        | undefined
+    )?.provider_executing ?? 0;
+
+  it('publishes the busy flag while a script runs and clears it when it finishes', async () => {
+    insertTask('t-busy-flag', `sleep 3\necho '{"wakeAgent": true}'`);
+
+    expect(providerExecuting()).toBe(0);
+    const run = applyPreTaskScripts(getPendingMessages());
+
+    // Poll rather than sleep a fixed amount: the first classifyScript call
+    // imports the shared destructive core, whose cost is not bounded here.
+    let sawBusy = 0;
+    const deadline = Date.now() + 2_500;
+    while (Date.now() < deadline) {
+      sawBusy = providerExecuting();
+      if (sawBusy === 1) break;
+      await Bun.sleep(25);
+    }
+    expect(sawBusy).toBe(1);
+
+    const { keep, skipped } = await run;
+    expect(skipped).toHaveLength(0);
+    expect(keep).toHaveLength(1);
+    expect(providerExecuting()).toBe(0);
+  });
+
+  it('clears the busy flag when the script fails, so a broken monitor cannot pin the container', async () => {
+    insertTask('t-busy-flag-error', 'exit 3');
+
+    const { skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(skipped).toEqual([{ id: 't-busy-flag-error', reason: 'error' }]);
+    expect(providerExecuting()).toBe(0);
+  });
+
+  it('clears a flag leaked by a killed container at the next container startup', () => {
+    beginProviderBusyScope();
+    expect(providerExecuting()).toBe(1);
+
+    clearStaleProcessingAcks();
+
+    expect(providerExecuting()).toBe(0);
+  });
+
+  // The active poll callback runs pre-task scripts for in-turn follow-ups while
+  // a provider turn is streaming. One shared boolean made the two scopes cut
+  // each other down: whichever finished first published idle and exposed the
+  // other to the reaper. They are tracked separately, so each ends on its own.
+  it('does not clear a provider turn that is still running when a script ends', async () => {
+    setProviderTurnExecuting(true);
+    insertTask('t-scope-under-turn', `echo '{"wakeAgent": false}'`);
+
+    await applyPreTaskScripts(getPendingMessages());
+
+    expect(providerExecuting()).toBe(1);
+    setProviderTurnExecuting(false);
+    expect(providerExecuting()).toBe(0);
+  });
+
+  it('does not clear a running script when the turn it overlaps ends first', async () => {
+    const marker = freshMarker('turn-ends-first');
+    setProviderTurnExecuting(true);
+    insertTask('t-turn-ends-first', `touch ${marker}\nsleep 2\necho '{"wakeAgent": true}'`);
+    const run = applyPreTaskScripts(getPendingMessages());
+
+    // The published bit is already 1 from the turn, so poll the marker: it
+    // only exists once the script is actually executing inside its scope.
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline && !fs.existsSync(marker)) await Bun.sleep(25);
+    expect(fs.existsSync(marker)).toBe(true);
+
+    // The stream's `result` lands while the script is still executing.
+    setProviderTurnExecuting(false);
+    const sawBusy = providerExecuting();
+
+    await run;
+
+    expect(sawBusy).toBe(1);
+    expect(providerExecuting()).toBe(0);
+  });
+});
+
+describe('a timed-out script takes its children down with it', () => {
+  let tmp: string;
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'task-script-'));
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  it('kills the forked last command, so its side effect never lands', async () => {
+    const marker = path.join(tmp, 'side-effect');
+    const pidFile = path.join(tmp, 'grandchild.pid');
+    // bash forks (not execs) this last command, so the grandchild outlives a bash-only kill.
+    const script = `bash -c 'echo $$ > ${pidFile}; sleep 1; echo 1 > ${marker}'`;
+
+    const original = console.error;
+    console.error = () => {};
+    try {
+      expect(await runScript(script, 't-orphan', 300)).toBeNull();
+    } finally {
+      console.error = original;
+    }
+
+    // Wait past the grandchild's own sleep, which also gives init time to reap it.
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(fs.existsSync(marker)).toBe(false);
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    expect(() => process.kill(pid, 0)).toThrow();
+  });
+
+  it('resolves after the kill grace even if a child escaped the group and holds the pipes', async () => {
+    const started = Date.now();
+    const original = console.error;
+    console.error = () => {};
+    try {
+      // set -m puts the background job in its own process group.
+      expect(await runScript('set -m; (sleep 6; echo escaped >&2) & wait', 't-escape', 200)).toBeNull();
+    } finally {
+      console.error = original;
+    }
+    expect(Date.now() - started).toBeLessThan(4000);
+  }, 10_000);
+
+  it('sends SIGTERM first, so a script can trap its timeout and clean up', async () => {
+    const cleaned = path.join(tmp, 'cleaned');
+    const original = console.error;
+    console.error = () => {};
+    try {
+      const script = `trap 'echo 1 > ${cleaned}; exit 1' TERM; sleep 5 & wait`;
+      const started = Date.now();
+      expect(await runScript(script, 't-trap', 200)).toBeNull();
+      // Exited on SIGTERM, so it resolves inside the grace instead of waiting for SIGKILL.
+      expect(Date.now() - started).toBeLessThan(1500);
+    } finally {
+      console.error = original;
+    }
+    expect(fs.existsSync(cleaned)).toBe(true);
+  });
+
+  it('SIGKILLs a child that ignores SIGTERM, and resolves only once it is dead', async () => {
+    const marker = path.join(tmp, 'stubborn');
+    const pidFile = path.join(tmp, 'stubborn.pid');
+    const pgidFile = path.join(tmp, 'stubborn.pgid');
+    const original = console.error;
+    console.error = () => {};
+    try {
+      // An ignored signal stays ignored across exec, so sleep ignores SIGTERM too.
+      // The script's own bash is the group leader, so its pid is the group id.
+      const script = `echo $$ > ${pgidFile}; bash -c 'trap "" TERM; echo $$ > ${pidFile}; sleep 3; echo 1 > ${marker}'`;
+      const started = Date.now();
+      expect(await runScript(script, 't-stubborn', 200)).toBeNull();
+      expect(Date.now() - started).toBeGreaterThanOrEqual(2000);
+    } finally {
+      console.error = original;
+    }
+    // Checked at resolution, not later: resolving early would let the next task's script overlap this one.
+    const pgid = Number(fs.readFileSync(pgidFile, 'utf8'));
+    expect(() => process.kill(-pgid, 0)).toThrow();
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    expect(() => process.kill(pid, 0)).toThrow();
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(fs.existsSync(marker)).toBe(false);
+  }, 10_000);
+
+  it('enforces the output limit in bytes, not characters', async () => {
+    const original = console.error;
+    const lines: string[] = [];
+    console.error = (...args: unknown[]) => void lines.push(args.map(String).join(' '));
+    try {
+      // 400k three-byte chars: under 1 MiB of characters, over 1 MiB of bytes.
+      const script = `printf '{"wakeAgent":true,"data":"'; head -c 400000 /dev/zero | tr '\\0' 'x' | sed 's/x/界/g'; printf '"}\\n'`;
+      expect(await runScript(script, 't-bytes', 10_000)).toBeNull();
+    } finally {
+      console.error = original;
+    }
+    expect(lines.join('\n')).toContain('stdout maxBuffer length exceeded');
+  });
+});

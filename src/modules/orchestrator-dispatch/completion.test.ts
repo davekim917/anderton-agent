@@ -1,0 +1,250 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { closeDb, createAgentGroup, initMigratedTestDb } from '../../db/index.js';
+import { getRawDb } from '../../db/connection.js';
+import { getTaskById, insertTaskAtomic } from './db/tasks.js';
+import type { Task } from './db/tasks.js';
+import { applySpawnComplete, applySpawnFailed } from './completion.js';
+import type { Session } from '../../types.js';
+
+vi.mock('../../session-manager.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../session-manager.js')>()),
+  writeSessionMessage: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
+  wakeContainer: vi.fn().mockResolvedValue(true),
+}));
+
+vi.mock('../../db/sessions.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../db/sessions.js')>();
+  return {
+    ...real,
+    getSession: vi.fn(),
+  };
+});
+
+function now(): string {
+  return new Date().toISOString();
+}
+
+async function setupDb(): Promise<void> {
+  await initMigratedTestDb();
+}
+
+async function seedGroups(): Promise<void> {
+  await createAgentGroup({
+    id: 'ag-parent',
+    name: 'ag-parent',
+    folder: 'ag-parent',
+    agent_provider: null,
+    created_at: now(),
+  });
+  await createAgentGroup({
+    id: 'ag-child',
+    name: 'ag-child',
+    folder: 'ag-child',
+    agent_provider: null,
+    created_at: now(),
+  });
+  getRawDb()
+    .prepare(`INSERT INTO sessions (id, agent_group_id, created_at) VALUES (?, ?, ?)`)
+    .run('sess-parent', 'ag-parent', now());
+  getRawDb()
+    .prepare(`INSERT INTO sessions (id, agent_group_id, created_at) VALUES (?, ?, ?)`)
+    .run('sess-child', 'ag-child', now());
+}
+
+async function makeRunningTask(): Promise<Task> {
+  return (await insertTaskAtomic({
+    task_id: 'task-1',
+    idempotency_key: 'ik-1',
+    parent_session_id: 'sess-parent',
+    parent_agent_group_id: 'ag-parent',
+    parent_messaging_group_id: null,
+    child_session_id: 'sess-child',
+    status: 'running',
+    task_content: 'do something',
+    request_hash: 'hash123',
+    deadline: null,
+    parent_platform_message_id: null,
+    child_platform_thread_id: null,
+    child_messaging_group_id: null,
+    admitted_at: now(),
+    started_at: now(),
+    completed_at: null,
+    failed_at: null,
+    cancelled_at: null,
+    last_progress_at: now(),
+    last_progress_message: null,
+    fail_reason: null,
+    result_summary: null,
+    dispatch_completion_attempts: 0,
+    completion_lease_at: null,
+    surface_mode: 'headless',
+  }))!;
+}
+
+function makeChildSession(): Session {
+  return {
+    id: 'sess-child',
+    agent_group_id: 'ag-child',
+    messaging_group_id: null,
+    thread_id: null,
+    status: 'active',
+    container_status: 'running',
+    agent_provider: null,
+    last_active: null,
+    created_at: now(),
+  };
+}
+
+function makeWrongSession(): Session {
+  return {
+    id: 'sess-wrong',
+    agent_group_id: 'ag-other',
+    messaging_group_id: null,
+    thread_id: null,
+    status: 'active',
+    container_status: 'running',
+    agent_provider: null,
+    last_active: null,
+    created_at: now(),
+  };
+}
+
+function makeParentSession(): Session {
+  return {
+    id: 'sess-parent',
+    agent_group_id: 'ag-parent',
+    messaging_group_id: null,
+    thread_id: null,
+    status: 'active',
+    container_status: 'idle',
+    agent_provider: null,
+    last_active: null,
+    created_at: now(),
+  };
+}
+
+afterEach(async () => {
+  await closeDb();
+  vi.clearAllMocks();
+});
+
+describe('applySpawnComplete', () => {
+  it('test_complete_happy_path: transitions to completed and notifies parent', async () => {
+    await setupDb();
+    await seedGroups();
+    await makeRunningTask();
+
+    const { getSession } = await import('../../db/sessions.js');
+    vi.mocked(getSession).mockResolvedValue(makeParentSession());
+
+    await applySpawnComplete({ task_id: 'task-1', summary: 'Done!' }, makeChildSession());
+
+    const task = await getTaskById('task-1');
+    expect(task!.status).toBe('completed');
+    expect(task!.result_summary).toBe('Done!');
+    expect(task!.completed_at).toBeTruthy();
+
+    const { writeSessionMessage } = await import('../../session-manager.js');
+    expect(vi.mocked(writeSessionMessage)).toHaveBeenCalledWith(
+      'ag-parent',
+      'sess-parent',
+      expect.objectContaining({ content: expect.stringContaining('task-1') }),
+    );
+  });
+
+  it('ASSERT: rejects when content lacks task_id', async () => {
+    await setupDb();
+    await seedGroups();
+    await makeRunningTask();
+
+    await applySpawnComplete({}, makeChildSession()); // no task_id
+
+    const task = await getTaskById('task-1');
+    expect(task!.status).toBe('running'); // unchanged
+  });
+
+  it('test_auth_rejects_wrong_session: does not transition when child_session_id mismatch', async () => {
+    await setupDb();
+    await seedGroups();
+    await makeRunningTask();
+
+    await applySpawnComplete({ task_id: 'task-1', summary: 'Done' }, makeWrongSession());
+
+    const task = await getTaskById('task-1');
+    expect(task!.status).toBe('running'); // unchanged
+
+    const { writeSessionMessage } = await import('../../session-manager.js');
+    expect(vi.mocked(writeSessionMessage)).not.toHaveBeenCalled();
+  });
+
+  it('test_complete_after_cancel_skips_notify: skips parent notify when already terminal', async () => {
+    await setupDb();
+    await seedGroups();
+    const task = await makeRunningTask();
+
+    // Pre-cancel the task
+    getRawDb()
+      .prepare(`UPDATE tasks SET status = 'cancelled', cancelled_at = ? WHERE task_id = ?`)
+      .run(now(), task.task_id);
+
+    const { writeSessionMessage } = await import('../../session-manager.js');
+    await applySpawnComplete({ task_id: 'task-1', summary: 'Done' }, makeChildSession());
+
+    const updated = await getTaskById('task-1');
+    expect(updated!.status).toBe('cancelled'); // unchanged — CAS rejected
+    expect(vi.mocked(writeSessionMessage)).not.toHaveBeenCalled();
+  });
+});
+
+describe('applySpawnFailed', () => {
+  it('test_failed_includes_reason: stores fail_reason and transitions to failed', async () => {
+    await setupDb();
+    await seedGroups();
+    await makeRunningTask();
+
+    const { getSession } = await import('../../db/sessions.js');
+    vi.mocked(getSession).mockResolvedValue(makeParentSession());
+
+    await applySpawnFailed(
+      { task_id: 'task-1', summary: 'Error occurred', fail_reason: 'agent_error' },
+      makeChildSession(),
+    );
+
+    const task = await getTaskById('task-1');
+    expect(task!.status).toBe('failed');
+    expect(task!.fail_reason).toBe('agent_error');
+    expect(task!.result_summary).toBe('Error occurred');
+  });
+
+  it('ASSERT: two-column auth enforced for failed', async () => {
+    await setupDb();
+    await seedGroups();
+    await makeRunningTask();
+
+    await applySpawnFailed({ task_id: 'task-1', summary: 'X' }, makeWrongSession());
+
+    const task = await getTaskById('task-1');
+    expect(task!.status).toBe('running'); // unchanged
+  });
+
+  it('ASSERT: skips parent notify when transition returns false', async () => {
+    await setupDb();
+    await seedGroups();
+    await makeRunningTask();
+
+    // Pre-complete the task
+    getRawDb()
+      .prepare(`UPDATE tasks SET status = 'completed', completed_at = ? WHERE task_id = ?`)
+      .run(now(), 'task-1');
+
+    const { writeSessionMessage } = await import('../../session-manager.js');
+    await applySpawnFailed({ task_id: 'task-1', summary: 'X' }, makeChildSession());
+
+    expect(vi.mocked(writeSessionMessage)).not.toHaveBeenCalled();
+  });
+});

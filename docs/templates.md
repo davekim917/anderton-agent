@@ -1,0 +1,312 @@
+# Agent Templates
+
+A **template** is a reusable folder you stamp into a working agent group: it
+carries the agent's standing instructions, its MCP tool servers, its skills,
+and optional recurring tasks, but **no secrets and no provider**. Point `ncl` at one and
+you get a configured agent in seconds; you choose the runtime/provider
+separately.
+
+> **Format change.** A template is now an [Agent Plugins
+> 1.0.0](https://agent-plugins.org/schemas/1.0.0/) plugin directory (`plugin.json`
+> required; `skills/`, `mcp.json` and the `ai.nanoco.nanoclaw/` extension
+> optional). A folder in the pre-plugin layout described below is refused with a
+> migration error — there is no fallback parse. The authoring reference below
+> describes the plugin layout the reader actually accepts. Stamping copies the
+> plugin to
+> `groups/<folder>/plugins/<name>` read-only and creates
+> `groups/<folder>/plugin-data/<name>` beside it; **`plugin-data/` is
+> agent-writable and storage maintenance does not sweep it.**
+
+Templates are purely additive and require no DB migration. **Templates
+are resolved only from a local directory**: `templates/` at the
+project root by default (committed but shipped empty), or whatever
+`NANOCLAW_TEMPLATES_DIR` points at (a local path only). The public registry
+([`nanocoai/nanoclaw-templates`](https://github.com/nanocoai/nanoclaw-templates))
+is a manual copy source — clone or download it yourself and copy the chosen
+template into your local `templates/` before stamping.
+
+## Using a template
+
+**Via the CLI:**
+
+```bash
+ncl groups create --template sales/sdr --name "SDR Agent"
+```
+
+This stamps the group but does **not** wire it to a channel. Run
+`/manage-channels` (or `ncl wirings create`) afterward, exactly as for a
+hand-built group.
+
+### The template ref
+
+`--template <ref>` is a path **relative to the local templates directory**
+(`templates/` by default, or `NANOCLAW_TEMPLATES_DIR`). Refs are multi-segment,
+e.g. `sales/sdr` → `templates/sales/sdr`.
+
+For safety the ref must stay inside the templates directory: absolute paths, a
+leading `~`, and `../` escapes are rejected. There is no `--source`, no git URL,
+and no remote fetch at `ncl` time. Populate `templates/` first (by hand, e.g.
+copying from the public registry), then stamp.
+
+`NANOCLAW_TEMPLATES_DIR` may point the library at another **local** directory; it
+is never a URL and never changes at runtime.
+
+## What's in a template
+
+A template is an [Agent Plugins 1.0.0](https://agent-plugins.org/schemas/1.0.0/)
+plugin directory. Only `plugin.json` is required; everything else is optional
+and defaults sensibly. Persona, extra context and tasks live under the NanoClaw
+extension directory, `ai.nanoco.nanoclaw/`, so the portable half of the plugin
+stays readable by any Agent Plugins consumer.
+
+```
+<template>/
+├── plugin.json                       # REQUIRED: the Agent Plugins manifest; marks the folder as a plugin
+├── mcp.json                          # optional: MCP servers ($schema + mcpServers), NO secrets
+├── skills/<name>/                    # optional: one folder per skill (SKILL.md + any references/), copied whole
+├── ai.nanoco.nanoclaw/               # optional: everything specific to this host
+│   ├── context/
+│   │   ├── instructions.md           # optional: the agent's standing persona
+│   │   └── **/*.md                   # optional: extra context, names relative to context/
+│   └── tasks/*.md                    # optional: recurring tasks, created paused
+└── README.md                         # recommended: per-template docs
+```
+
+| Path                                         | Loaded as                                                                                                    | Required |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | -------- |
+| `plugin.json`                                | The Agent Plugins manifest; `extensions["ai.nanoco.nanoclaw"].agentName` optionally names the agent          | **Yes**  |
+| `mcp.json` → `mcpServers`                    | MCP tool servers, stamped into both container config stores and marked plugin-owned                          | No       |
+| `skills/<name>/`                             | A skill, auto-triggered by its `description`, copied into that group's own overlay                           | No       |
+| `ai.nanoco.nanoclaw/context/instructions.md` | The agent's persona, prepended to its `CLAUDE.md`/`AGENTS.md` every spawn (system-prompt tier, any provider) | No       |
+| `ai.nanoco.nanoclaw/context/**/*.md`         | Extra context, copied into the agent's workspace with the same layout relative to `instructions.md`          | No       |
+| `ai.nanoco.nanoclaw/tasks/*.md`              | Recurring scheduled tasks, created paused pending user activation                                            | No       |
+
+A folder without `plugin.json` — the pre-plugin layout, with `context/` and
+`tasks/` at the root — is refused with a migration error naming the missing
+manifest. See the upgrade section at the end of this document.
+
+Notes:
+
+- **No provider, model, effort, or packages in a template.** Those are set on
+  the agent later via `ncl groups config update`. The runtime defaults to the
+  install's configured provider.
+- **Keep `instructions.md` focused (under ~200 lines).** It's always in the
+  agent's prompt, and some providers cap that doc (Codex ~32 KB), so an over-long
+  persona gets truncated. Put bulk material in `skills/` or extra context files instead.
+- Skills are copied into the agent's own skills overlay, keyed to that group,
+  never shared across groups.
+
+### Recurring tasks
+
+Each immediate Markdown file under `tasks/` defines one recurring task. The
+filename becomes its readable name, the frontmatter supplies its cron schedule,
+an optional script can decide whether to wake the agent, and the Markdown body
+is the prompt:
+
+```markdown
+---
+schedule: '*/15 * * * *'
+script: |
+  if [ -f /workspace/agent/wake-next-task ]; then
+    echo '{"wakeAgent": true}'
+  else
+    python3 /app/skills/task-observation/task_observation.py \
+      --kind empty --evidence "no wake marker" --bound 1h
+  fi
+---
+
+Investigate the alerts reported by the script and notify me if they are serious.
+```
+
+`schedule` is required. `script` is optional and may be a single-line or
+multiline YAML string. The frontmatter accepts no other fields, so typos cannot
+silently change behavior. In particular, a template cannot opt a task into
+host-side execution: `--script-host` is a host-operator-only choice through
+`ncl`. Task files are template input, like `mcp.json`: they are not copied into
+the agent workspace after stamping.
+
+Template tasks use the same creation path as `ncl tasks create`, including cron
+validation, the install timezone, first-run calculation, isolated task sessions,
+the run-log prompt, script behavior, and frequency limits. Ungated tasks are
+limited to four fires in the next 24 hours; tasks with a script gate may run more
+often. Templates do not expose the dangerous frequency override or one-time
+tasks.
+
+The script is passed unchanged to NanoClaw's normal task creation and execution
+path. See [Scheduled Tasks](scheduled-tasks.md#script-gates) for the script
+contract, testing workflow, frequency limit, and failure behavior. Avoid putting
+secrets directly in scripts; prefer runtime credential injection through OneCLI.
+
+Before adding a recurring template task, compare its owner, cadence, and
+purpose with active series at the installation where it will run. Record whether
+an overlap replaces an existing workflow or has a deliberate parallel purpose;
+matching prompts alone are not a safe deduplication rule. For monitors, make
+the script return a quiet result only after a successful observation with no
+pending work, preserve pending versus completed outcomes outside the prompt,
+and test failure and recovery paths. Requested briefings, research, planning
+reviews, and full campaigns may intentionally run without a gate when their
+cadence needs judgment. The complete authoring and verification contract is in
+[Workflow automation](workflow-automation.md).
+
+Tasks start **paused**, so stamping a template never starts background work
+without user consent. Until the setup welcome flow offers activation, inspect
+and enable them with the existing task CLI:
+
+```bash
+ncl tasks list --group <agent-group-id> --status paused
+ncl tasks resume <task-id>
+```
+
+Resuming preserves NanoClaw's normal pause/resume semantics: if the stored next
+run passed while paused, the task is eligible immediately.
+
+### Referencing extra context files
+
+Extra `.md` files under `ai.nanoco.nanoclaw/context/` (by convention in an
+`additional_context/` subfolder) are copied into the agent's workspace
+preserving their position relative to `instructions.md` — a template file at
+`ai.nanoco.nanoclaw/context/additional_context/pricing.md` is readable by the agent as
+`additional_context/pricing.md`, the same relative path you'd use from
+`instructions.md` itself. Nothing is injected automatically: the agent only
+reads an extra file if `instructions.md` points to it, so reference every file
+you ship.
+
+```markdown
+Pricing rules live in `additional_context/pricing.md`. Read it before quoting a price.
+```
+
+Context files are copied when you stamp, so files added to the template later
+won't reach an already-created agent. Re-stamp the same name to update it.
+
+## MCP servers and credentials
+
+**Templates declare MCP servers, not secrets.** Each entry is either a local
+stdio server (`command` + optional `args`/`env`) or a remote Streamable HTTP
+server (`url` + optional `headers`):
+
+```json
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "hubspot": { "type": "stdio", "command": "npx", "args": ["-y", "@hubspot/mcp-server"] },
+    "exa": { "type": "stdio", "command": "npx", "args": ["-y", "exa-mcp-server"] },
+    "datafold": {
+      "type": "streamable-http",
+      "url": "https://app.datafold.com/mcp/",
+      "headers": { "Authorization": "Key onecli-managed" }
+    }
+  }
+}
+```
+
+Both `$schema` (exactly that URL) and a declared `type` on every entry are
+required: the reader skips the whole MCP component when either is missing, and
+an `mcp.json` that cannot be parsed at all refuses the plugin outright, because
+a file that cannot be checked for credentials must not reach the agent.
+
+Entries are validated at parse time by the same parser the `ncl` and approval
+paths use, so a template cannot stamp a config those paths would reject:
+server names are `[A-Za-z0-9_-]{1,64}`, exactly one of `command` or `url` is
+required, remote URLs must be HTTPS (plain HTTP only for `localhost` /
+`host.docker.internal`) with no credentials, fragment, credential-looking
+query parameter, or recognizable credential shape anywhere in the path or a
+query value. A declared `type` must agree with the fields (`stdio` with
+`command`, `http`/`streamable-http` with `url`). Only known configuration
+headers may hold a literal value — `Accept`, `Accept-Encoding`,
+`Accept-Language`, `Content-Type`, `User-Agent`, `MCP-Protocol-Version`,
+`X-Api-Version`, `X-Request-Id` — and every other header must be exactly
+`onecli-managed` or an auth scheme followed by it. That is an allowlist of
+configuration rather than a denylist of credentials, because credential header
+names and credential values are both open sets while configuration headers are
+not. An unknown field is an error rather than a silent
+drop.
+
+The URL is stored verbatim, and an opaque path segment is indistinguishable
+from a tenant id, so recognition is a backstop rather than a guarantee: keep
+credentials out of the URL and put them in a header with the placeholder.
+
+Credentials are held by the **credentials proxy** and injected into outbound
+HTTPS calls at the proxy boundary, matched by API host, at request time. The key
+never sits in `mcp.json`, the container env, or chat context. See
+[the credentials proxy section in CLAUDE.md](../CLAUDE.md#secrets--credentials--onecli)
+for the model.
+
+Two ways a credential gets connected:
+
+1. **Up front.** Register the secret with the credentials proxy (its web UI or
+   CLI), matched to the service's API host (e.g. `api.example.com`). Matching
+   credentials are injected automatically, so usually nothing else is needed.
+2. **On demand (the common path).** Don't set anything up first. The first time
+   the agent calls a service with no credential, the API returns **401/403** and
+   the agent replies with a prefilled connect link for that host. The user opens
+   it, pastes the key, and asks the agent to retry. The key lands in the
+   credentials proxy, which injects it on every later call.
+
+### MCP servers that require an env var to boot
+
+Some MCP servers refuse to start unless an env var is _present_, even though the
+real credential should come from the credentials proxy, not the env. Because `mcp.json`'s `env`
+block passes through verbatim to the agent's container config, put a **placeholder
+value** there to satisfy the boot check:
+
+```json
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "acme": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@acme/mcp-server"],
+      "env": { "ACME_API_KEY": "placeholder" }
+    }
+  }
+}
+```
+
+The server starts; its real outbound calls are still authenticated by the
+credentials proxy. **Never put a real key in `env`**: a placeholder only, and only when
+the server won't boot without one.
+
+### Approval-gating sensitive actions
+
+The credentials proxy can _hold_ a credentialed outbound request and require a
+human to approve it before it leaves the proxy: enforcement the agent can't talk
+around. This is matched on the outbound HTTP request (host + method + path),
+configured on the credentials proxy, and answered by NanoClaw (it DMs an approver). The host side is
+already wired; see
+[the credentialed-approval flow in CLAUDE.md](../CLAUDE.md#requiring-approval-for-credential-use)
+and the [`sales/sdr` template README](https://github.com/nanocoai/nanoclaw-templates/blob/main/sales/sdr/README.md)
+for a worked example.
+
+## Contributing a template
+
+Templates ship in the separate
+[`nanocoai/nanoclaw-templates`](https://github.com/nanocoai/nanoclaw-templates)
+repo, not this one. To add one: fork that repo, drop a folder at
+`<category>/<template>/` with at least a `plugin.json`, test it end to
+end (copy it under `templates/` and run
+`ncl groups create --template <category>/<template> --name Test`), confirm
+any predefined tasks appear under `ncl tasks list --status paused`, confirm no
+secrets are committed, and open a PR. The repo's README has the full anatomy,
+category conventions, and checklist.
+
+## Upgrading from a pre-plugin template
+
+The reader accepts Agent Plugins only; a pre-plugin template folder is refused
+with a migration error and never parsed as a fallback. Re-fetch the template in
+plugin layout (a `plugin.json` manifest, `skills/`, `mcp.json` with its
+`$schema` and a declared `type` per entry, and the NanoClaw extension carrying
+persona, context, and tasks).
+
+**`--template` creates; it does not update.** `groups create --template` always
+mints a new group id, and suffixes the folder when the derived one is taken, so
+running it again against an updated template produces a SECOND group and leaves
+the existing one exactly as it was stamped. Updating a stamped group in place
+needs the restamp verb, which lands later in this series. Until then the
+supported paths are: create a new group from the updated template and retire
+the old one, or leave the existing group alone — nothing about it changes when
+the template does. Groups already created are untouched by the format change;
+only the create path reads templates.
+
+The `[BREAKING]` entry in [CHANGELOG.md](../CHANGELOG.md) carries the same
+migration for `/update-nanoclaw`.

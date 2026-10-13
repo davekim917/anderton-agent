@@ -1,0 +1,2337 @@
+/* ────────────────────────────────────────────────────────────
+   Agent Board — orchestration control surface.
+
+   The tokens below are the tom-modern light theme (see theme.css, which owns
+   the values and the type). This sheet is the legacy chrome that reads them,
+   and it shrinks as surfaces migrate onto the component layer.
+
+   Tweak wrappers (applied at root by main.tsx):
+     .tw-statusbar   — add left status accent bar to cards
+     .tw-no-heat     — disable heat dimming on cold cards
+     .tw-no-phasebar — hide phase micro-bar
+     .tw-no-grid     — hide hair-grid background
+     .tw-compact     — denser card padding
+     .tw-accent-{amber|violet|green} — recolor the "live" cyan
+   Operator's current variant: .tw-no-heat .tw-no-phasebar .tw-no-grid
+   ──────────────────────────────────────────────────────────── */
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces — the tom-modern canvas. One theme; see theme.css for why there
+     is no dark block rather than an uncalibrated one. */
+  --bg-deep:    #fafafa;
+  --bg-panel:   #ffffff;
+  --bg-card:    #ffffff;
+  --bg-card-2:  #fafafa;
+  --bg-inset:   #f4f4f5;
+
+  /* Blueprint grid */
+  --grid:       rgba(150, 150, 150, 0.05);
+
+  /* Text */
+  --fg:         #27272a;
+  --fg-2:       #52525b;
+  --fg-3:       #71717a;
+  --fg-4:       #a1a1aa;
+
+  /* Border */
+  --line:       #d4d4d8;
+  --line-2:     #969696;
+
+  /* Status. The palette is closed, so six states map onto it by MEANING and
+     each colour keeps exactly one: green is working, red is failed, vermillion
+     is needs-you, and the greys are degrees of nothing-happening. A finished
+     task is not an achievement to colour — it is over. */
+  --st-failed:     #c81e1e;
+  --st-failed-bg:  rgba(200, 30, 30, 0.10);
+  --st-pending:    #71717a;
+  --st-pending-bg: rgba(113, 113, 122, 0.10);
+  --st-running:    #1f7a4d;
+  --st-running-bg: rgba(31, 122, 77, 0.10);
+  --st-done:       #52525b;
+  --st-done-bg:    rgba(82, 82, 91, 0.08);
+  --st-cancel:     #a1a1aa;
+  --st-cancel-bg:  rgba(161, 161, 170, 0.10);
+  --st-needs:      #ff5a00;
+  --st-needs-bg:   rgba(255, 90, 0, 0.10);
+
+  --brand:      #ff5a00;
+
+  --font-sans: 'Geist Variable', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Legacy token aliases — kept so SessionList and any inline-styled
+   leftovers continue to work without a deep refactor. */
+:root {
+  --bg-page: var(--bg-deep);
+  --bg-lane: var(--bg-panel);
+  --bg-input: var(--bg-inset);
+  --bg-message-agent: var(--bg-card);
+  --bg-message-dashboard: #eef2f8;
+  --bg-message-system: #faf3e8;
+  --text-primary: var(--fg);
+  --text-secondary: var(--fg-2);
+  --text-muted: var(--fg-3);
+  --border: var(--line);
+  --border-strong: var(--line-2);
+  --link: var(--fg);
+  --link-hover: var(--brand);
+  --status-pending: var(--st-pending);
+  --status-running: var(--st-running);
+  --status-completed: var(--st-done);
+  --status-failed: var(--st-failed);
+  --status-cancelled: var(--st-cancel);
+}
+
+* { box-sizing: border-box; }
+html, body, #root { margin: 0; padding: 0; }
+html, body { background: var(--bg-deep); }
+body {
+  font-family: var(--font-sans);
+  color: var(--fg);
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+a { color: var(--fg-2); text-decoration: none; }
+a:hover { color: var(--fg); }
+
+/* ─── Frame: faint hair-grid mission-control bg, applied to root */
+.nc-frame {
+  min-height: 100vh;
+  background:
+    linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 100% 30px,
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 30px 100%,
+    var(--bg-deep);
+}
+.tw-no-grid .nc-frame { background: var(--bg-deep); }
+
+/* ─── Pulse header */
+.nc-pulse {
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-panel);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.nc-pulse-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.nc-brand {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+  white-space: nowrap;
+}
+.nc-brand .mark {
+  width: 14px; height: 14px;
+  display: grid; place-items: center;
+  position: relative;
+}
+.nc-brand .mark::before {
+  content: ""; position: absolute; inset: 0;
+  border: 1.5px solid var(--brand);
+  border-radius:0;
+  transform: rotate(45deg);
+}
+.nc-brand .mark::after {
+  content: ""; width: 4px; height: 4px;
+  background: var(--brand);
+  border-radius: 50%;
+  box-shadow: 0 0 8px var(--brand);
+}
+/* Group title — the brand-line slot that morphs to the active group's
+   name when filtered. Renders inline next to the diamond brand mark. */
+.nc-group-title { position: relative; display: inline-block; }
+.nc-group-title-static {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+  white-space: nowrap;
+}
+.nc-group-title-trigger {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+  white-space: nowrap;
+}
+.nc-group-title-trigger:hover { color: var(--fg); }
+.nc-group-title-chev {
+  font-size: 10px;
+  color: var(--fg-3);
+  transition: transform 0.15s ease;
+}
+.nc-group-title-trigger[aria-expanded='true'] .nc-group-title-chev {
+  transform: rotate(180deg);
+  color: var(--fg-2);
+}
+.nc-group-title-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  min-width: 180px;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--bg-card-2);
+  border: 1px solid var(--line-2);
+  border-radius:0;
+  box-shadow: var(--tm-shadow-hard);
+}
+.nc-group-title-menu li {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 10px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--fg);
+  cursor: pointer;
+  border-radius:0;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.nc-group-title-menu li .hint {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-4);
+}
+.nc-group-title-menu li:hover { background: var(--bg-deep); }
+.nc-group-title-menu li.active {
+  background: var(--bg-inset);
+  color: var(--fg);
+}
+.nc-group-title-menu li.active::after {
+  content: '✓';
+  color: var(--st-running);
+  margin-left: auto;
+}
+.nc-group-title-menu li.active .hint { color: var(--fg-3); }
+
+.nc-pulse-actions { display: flex; gap: 14px; align-items: center; }
+.nc-pulse-actions .nav-link {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+.nc-pulse-actions .nav-link.active { color: var(--fg); }
+.nc-pulse-actions .nav-link:hover { color: var(--fg); }
+
+.nc-pulse-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 14px;
+  align-items: end;
+}
+.nc-pulse-bigcount {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 48px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  color: var(--fg);
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+.nc-pulse-bigcount .lbl {
+  font-size: 10px;
+  color: var(--fg-3);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-weight: 500;
+  font-family: var(--font-mono);
+  padding-bottom: 6px;
+  line-height: 1.1;
+}
+.nc-pulse-breakdown {
+  display: flex; gap: 14px;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.nc-pulse-cell { display: flex; flex-direction: column; gap: 2px; }
+.nc-pulse-cell .n {
+  color: var(--fg);
+  font-size: 16px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+.nc-pulse-cell .lbl {
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+}
+.nc-pulse-cell.failed .n  { color: var(--st-failed); }
+.nc-pulse-cell.needs .n   { color: var(--st-needs); }
+.nc-pulse-cell.running .n { color: var(--st-running); }
+.nc-pulse-cell.done .n    { color: var(--st-done); }
+/* Tap-to-filter affordance when the cell is rendered as a <button>.
+   Reset native button chrome, add a hover hint, and surface the active
+   filter with a colored ring + brighter label text. */
+button.nc-pulse-cell {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius:0;
+  padding: 6px 8px;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  margin: -6px -8px;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+button.nc-pulse-cell:hover { background: var(--bg-card-2); }
+button.nc-pulse-cell.active {
+  background: var(--bg-card-2);
+  border-color: var(--bd-1);
+}
+button.nc-pulse-cell.active.failed  { border-color: var(--st-failed); }
+button.nc-pulse-cell.active.needs   { border-color: var(--st-needs); }
+button.nc-pulse-cell.active.running { border-color: var(--st-running); }
+button.nc-pulse-cell.active.done    { border-color: var(--st-done); }
+button.nc-pulse-cell.active .lbl { color: var(--fg); }
+
+.nc-pulse-meta {
+  display: flex; justify-content: space-between; align-items: center;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--fg-3);
+  letter-spacing: 0.02em;
+  margin-top: 12px;
+}
+.nc-pulse-meta .dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--st-running);
+  display: inline-block;
+  margin-right: 6px;
+  box-shadow: 0 0 8px var(--st-running);
+  animation: nc-pulse 1.6s ease-in-out infinite;
+}
+@keyframes nc-pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+/* Swipe-to-dismiss wrapper. The card sits on top of a `.nc-swipe-reveal`
+   layer that's hidden at rest (opacity 0) and fades up as the card
+   translates left during a touch gesture. Desktop is unaffected — the
+   touch handlers never fire and the wrapper renders as a transparent
+   pass-through. */
+.nc-swipeable {
+  position: relative;
+  /* Disable browser-native horizontal pan so the card translate isn't
+     fighting a scroll gesture. Vertical scroll is preserved. */
+  touch-action: pan-y;
+}
+.nc-swipe-reveal {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 22px;
+  background: var(--st-failed-bg);
+  color: var(--st-failed);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border-radius:0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+/* Desktop pulse header row — brand on the left, Board/Inbox primary nav
+   pinned to the right. Mirrors the mobile `.nc-pulse-top` flex layout so
+   the two viewports stay symmetric. */
+.nc-desktop-headerrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+/* SessionDetail layout (sibling to TaskDetail's nc-detail-*) */
+.nc-task-detail { padding: 16px 18px 32px; max-width: 880px; margin: 0 auto; }
+.nc-task-detail h2 { margin: 12px 0 6px; font-size: 18px; }
+.nc-task-detail h3 { margin: 16px 0 8px; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-3); }
+.nc-meta-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0 10px; }
+.nc-meta-row button.nc-pill { cursor: pointer; }
+.nc-composer-meta {
+  display: flex; gap: 12px; align-items: center; justify-content: flex-end;
+  margin-top: 6px; font-family: var(--font-mono); font-size: 10.5px;
+}
+.nc-transcript { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.nc-transcript-row {
+  padding: 8px 10px; border-radius:0; border: 1px solid var(--bd-2);
+  background: var(--bg-inset);
+}
+.nc-transcript-row.inbound { border-left: 2px solid var(--st-running); }
+.nc-transcript-row.outbound { border-left: 2px solid var(--fg-3); }
+.nc-transcript-meta { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; }
+.nc-transcript-text { font-size: 13px; line-height: 1.4; word-break: break-word; }
+
+/* Markdown-rendered transcript bodies. Keep the spacing tight — these live
+   inside an already-padded card — and override marked.js defaults so tables
+   render with visible borders against the inset background. */
+.nc-md p { margin: 0 0 8px; }
+.nc-md p:last-child { margin-bottom: 0; }
+.nc-md ul, .nc-md ol { margin: 0 0 8px; padding-left: 22px; }
+.nc-md li { margin: 2px 0; }
+.nc-md code {
+  background: var(--bg-card-2);
+  padding: 1px 5px;
+  border-radius:0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.nc-md pre {
+  background: var(--bg-inset);
+  padding: 10px 12px;
+  border-radius:0;
+  overflow-x: auto;
+  margin: 6px 0;
+}
+.nc-md pre code { background: transparent; padding: 0; }
+.nc-md blockquote {
+  border-left: 2px solid var(--bd-2);
+  margin: 4px 0;
+  padding: 2px 0 2px 10px;
+  color: var(--fg-3);
+}
+.nc-md a { color: var(--st-running); text-decoration: underline; }
+.nc-md h1, .nc-md h2, .nc-md h3, .nc-md h4 {
+  margin: 10px 0 4px;
+  font-size: 14px;
+  font-weight: 600;
+}
+/* GFM tables — the core ask in the operator's feedback. Compact enough
+   to fit in the card width, with stripes for row scanning. */
+.nc-md table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 12px;
+  width: 100%;
+  overflow-x: auto;
+  display: block;
+}
+.nc-md thead { background: var(--bg-card-2); }
+.nc-md th, .nc-md td {
+  border: 1px solid var(--bd-2);
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+.nc-md tbody tr:nth-child(even) { background: var(--bg-card-2); }
+.nc-md hr { border: 0; border-top: 1px solid var(--bd-2); margin: 10px 0; }
+
+/* Expand/collapse for long messages. The summary holds the preview; opening
+   the <details> swaps in the full message body. Native semantics, no React
+   state needed. */
+.nc-transcript-expand summary {
+  cursor: pointer;
+  list-style: none;
+}
+.nc-transcript-expand summary::-webkit-details-marker { display: none; }
+.nc-transcript-more {
+  display: inline-block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--st-running);
+  font-family: var(--font-mono);
+}
+.nc-transcript-expand[open] summary .nc-transcript-more::after { content: ' (open — close to collapse)'; }
+.nc-transcript-expand[open] summary .nc-transcript-text { display: none; }
+.nc-truncate-ellipsis { color: var(--fg-3); font-weight: bold; padding-left: 2px; }
+
+/* Collapsed thinking-group block. Default closed; the operator opens the
+   <details> to inspect the individual thinking steps. */
+.nc-transcript-thinking summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 2px 0;
+}
+.nc-transcript-thinking summary::-webkit-details-marker { display: none; }
+.nc-transcript-thinking summary::before {
+  content: '▸';
+  color: var(--fg-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  width: 12px;
+  display: inline-block;
+}
+.nc-transcript-thinking details[open] > summary::before { content: '▾'; }
+.nc-thinking-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-left: 12px;
+  border-left: 1px dashed var(--bd-2);
+}
+.nc-thinking-entry { padding: 6px 0; }
+
+/* ─── Filter chips */
+.nc-chips {
+  display: flex; gap: 6px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.nc-chips::-webkit-scrollbar { display: none; }
+.nc-chip {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 6px 10px;
+  border-radius:0;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  background: transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.nc-chip .count { color: var(--fg-3); font-size: 10px; }
+.nc-chip.active {
+  background: var(--fg);
+  color: var(--bg-deep);
+  border-color: var(--fg);
+}
+.nc-chip.active .count { color: var(--bg-deep); opacity: 0.6; }
+.nc-chip.attn {
+  border-color: var(--st-failed);
+  color: var(--st-failed);
+}
+.nc-chip.attn.active {
+  background: var(--st-failed);
+  color: var(--bg-deep);
+  border-color: var(--st-failed);
+}
+.nc-chip.attn.active .count { color: var(--bg-deep); }
+
+/* ─── Stream / list */
+.nc-stream {
+  padding: 10px 12px 24px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.nc-section-label {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+  padding: 12px 4px 4px;
+  display: flex; justify-content: space-between; align-items: baseline;
+}
+.nc-section-label .rule {
+  flex: 1; height: 1px; background: var(--line);
+  margin-left: 10px; margin-right: 10px;
+}
+.nc-section-label .cnt {
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-2);
+}
+
+/* ─── Task card */
+.nc-card {
+  position: relative;
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius:0;
+  padding: 12px 13px 11px 13px;
+  display: flex; flex-direction: column; gap: 7px;
+  cursor: pointer;
+  transition: background 0.12s ease;
+  font-family: var(--font-sans);
+  color: var(--fg);
+}
+.nc-card:hover { background: var(--bg-card-2); }
+.nc-card:focus { outline: 1px solid var(--line-2); outline-offset: 1px; }
+
+.nc-card.heat-hot { background: var(--bg-card-2); }
+.nc-card.heat-cold { opacity: 0.62; }
+.nc-card.heat-cold .nc-card-goal { color: var(--fg-2); }
+
+/* Status accent bar variant */
+.tw-statusbar .nc-card { border-left-width: 3px; padding-left: 13px; }
+.tw-statusbar .nc-card.failed    { border-left-color: var(--st-failed); }
+.tw-statusbar .nc-card.running   { border-left-color: var(--st-running); }
+.tw-statusbar .nc-card.pending   { border-left-color: var(--st-pending); }
+.tw-statusbar .nc-card.completed { border-left-color: var(--st-done); }
+.tw-statusbar .nc-card.cancelled { border-left-color: var(--st-cancel); }
+.tw-statusbar .nc-card.needs     { border-left-color: var(--st-needs); }
+
+.tw-compact .nc-card { padding: 9px 11px 9px 11px; gap: 5px; }
+.tw-compact .nc-card-goal { font-size: 13px; }
+.tw-compact .nc-card-progress { font-size: 11px; }
+
+.tw-no-heat .nc-card.heat-cold { opacity: 1; }
+.tw-no-heat .nc-card.heat-hot  { background: var(--bg-card); }
+
+
+.tw-accent-amber  { --st-running: #8c6400; --brand: #8c6400; }
+.tw-accent-violet { --st-running: #5b4b8a; --brand: #5b4b8a; }
+.tw-accent-green  { --st-running: #1f7a4d; --brand: #1f7a4d; }
+
+.nc-card-head {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--fg-3);
+  letter-spacing: 0.04em;
+}
+.nc-card-head .status-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.nc-card-head .glyph {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+.nc-card.failed .status-icon    { color: var(--st-failed); }
+.nc-card.running .status-icon   { color: var(--st-running); }
+.nc-card.pending .status-icon   { color: var(--st-pending); }
+.nc-card.completed .status-icon { color: var(--st-done); }
+.nc-card.cancelled .status-icon { color: var(--st-cancel); }
+.nc-card.needs .status-icon     { color: var(--st-needs); }
+
+.nc-card.running .glyph {
+  animation: nc-pulse 1.4s ease-in-out infinite;
+  box-shadow: 0 0 6px currentColor;
+}
+
+.nc-card-head .linear-id {
+  margin-left: auto;
+  font-weight: 600;
+  color: var(--fg-2);
+  letter-spacing: 0.06em;
+}
+.nc-card-head .age { color: var(--fg-3); }
+.nc-card-head .sep { color: var(--fg-4); }
+.nc-card-dismiss {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: var(--fg-3);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius:0;
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+.nc-card:hover .nc-card-dismiss,
+.nc-card:focus-within .nc-card-dismiss { opacity: 1; }
+.nc-card-dismiss:hover {
+  background: var(--surface-2);
+  color: var(--fg);
+}
+/* Dim archived cards with filter (no opacity — that bleeds onto child
+   action buttons and made the unarchive control invisible on mobile). */
+.nc-card.archived {
+  filter: saturate(0.45) brightness(0.78);
+}
+/* The unarchive button needs to be obvious, not an opacity-on-hover
+   secret. Always visible on archived cards, with a labeled affordance. */
+.nc-card.archived .nc-card-dismiss {
+  opacity: 1;
+  background: var(--surface-2);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 10px;
+  letter-spacing: 0.04em;
+}
+.nc-card.archived .nc-card-dismiss:hover {
+  background: var(--surface-3, var(--surface-2));
+  filter: brightness(1.15);
+}
+
+.nc-archive-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px;
+  margin: 4px 0 0;
+  font-size: 12px;
+}
+.nc-archive-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg-2);
+  cursor: pointer;
+  user-select: none;
+}
+.nc-archive-toggle input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+}
+
+.nc-card-goal {
+  font-size: 14px;
+  line-height: 1.35;
+  color: var(--fg);
+  letter-spacing: -0.005em;
+  text-wrap: pretty;
+}
+
+.nc-card-progress {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--fg-3);
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-style: italic;
+}
+.nc-card.running .nc-card-progress { color: var(--st-running); font-style: normal; }
+
+.nc-card-pillrow {
+  display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  margin-top: 1px;
+}
+
+.nc-pill {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 3px 7px;
+  border-radius:0;
+  display: inline-flex; align-items: center; gap: 4px;
+  font-weight: 500;
+}
+.nc-pill.failed { background: var(--st-failed-bg); color: var(--st-failed); }
+.nc-pill.needs  { background: var(--st-needs-bg);  color: var(--st-needs); }
+.nc-pill.phase  { background: var(--bg-inset); color: var(--fg-2); }
+.nc-pill.linear { background: var(--bg-inset); color: var(--fg); font-weight: 600; letter-spacing: 0.04em; }
+
+/* Collapsed older section */
+.nc-fold {
+  margin-top: 12px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+  padding: 10px;
+  border: 1px dashed var(--line);
+  border-radius:0;
+  cursor: pointer;
+  background: transparent;
+}
+.nc-fold:hover { color: var(--fg-2); border-color: var(--line-2); }
+
+.nc-empty {
+  margin: 14px 12px;
+  padding: 14px 12px;
+  border: 1px dashed var(--line);
+  border-radius:0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-3);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-align: center;
+}
+
+/* ─── Task detail */
+.nc-detail-header {
+  padding: 12px 16px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-panel);
+}
+.nc-detail-nav {
+  display: flex; align-items: center; gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-3);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+.nc-detail-nav .back {
+  color: var(--fg-2);
+  cursor: pointer;
+  background: transparent; border: 0; padding: 0;
+  font-family: inherit; font-size: inherit; letter-spacing: inherit; text-transform: inherit;
+}
+.nc-detail-nav .back:hover { color: var(--fg); }
+.nc-detail-nav .crumb-id { margin-left: auto; color: var(--fg-3); }
+
+.nc-detail-title {
+  font-size: 18px;
+  line-height: 1.3;
+  color: var(--fg);
+  margin: 0 0 10px 0;
+  letter-spacing: -0.01em;
+  text-wrap: pretty;
+  font-weight: 500;
+}
+.nc-detail-title .ticket {
+  font-family: var(--font-mono);
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  padding: 1px 6px;
+  font-size: 13px;
+  border-radius:0;
+  margin-right: 6px;
+  letter-spacing: 0.04em;
+  vertical-align: 2px;
+}
+
+.nc-detail-meta {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--fg-3);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.nc-detail-meta .status-chip {
+  padding: 3px 8px; border-radius:0;
+  font-weight: 600;
+}
+.nc-detail-meta .status-chip.running   { background: var(--st-running-bg); color: var(--st-running); }
+.nc-detail-meta .status-chip.failed    { background: var(--st-failed-bg);  color: var(--st-failed); }
+.nc-detail-meta .status-chip.completed { background: var(--st-done-bg);    color: var(--st-done); }
+.nc-detail-meta .status-chip.pending   { background: var(--st-pending-bg); color: var(--st-pending); }
+.nc-detail-meta .status-chip.cancelled { background: var(--st-cancel-bg);  color: var(--st-cancel); }
+
+.nc-detail-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.nc-btn {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 8px 12px;
+  border-radius:0;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.nc-btn:hover:not(:disabled) { background: var(--bg-card-2); }
+.nc-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.nc-btn.primary {
+  background: var(--st-failed);
+  border-color: var(--st-failed);
+  color: var(--bg-deep);
+  font-weight: 600;
+}
+.nc-btn.primary:hover:not(:disabled) { filter: brightness(1.05); background: var(--st-failed); }
+.nc-btn.ghost { color: var(--fg-2); }
+
+/* Detail sections (Brief / Progress / Transcript) */
+.nc-detail-body { padding: 0 0 12px; }
+.nc-section { border-bottom: 1px solid var(--line); }
+.nc-section-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 16px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+  cursor: pointer;
+  user-select: none;
+  background: transparent; border: 0;
+  width: 100%;
+}
+.nc-section-head:hover { color: var(--fg); }
+.nc-section-head .chev {
+  font-size: 14px;
+  color: var(--fg-3);
+  transition: transform 0.15s ease;
+  font-family: var(--font-mono);
+}
+.nc-section-head.open .chev { transform: rotate(90deg); }
+.nc-section-head .meta { color: var(--fg-3); font-weight: 400; letter-spacing: 0.08em; }
+.nc-section-body { padding: 0 16px 14px; }
+
+/* Markdown — light/cozy */
+.md {
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--fg-2);
+  word-wrap: break-word;
+}
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+  margin: 14px 0 6px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.md h1:first-child, .md h2:first-child, .md h3:first-child { margin-top: 0; }
+.md p { margin: 4px 0; }
+.md ul, .md ol { margin: 4px 0; padding-left: 18px; }
+.md li { margin: 3px 0; }
+.md code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  padding: 1px 5px;
+  border-radius:0;
+  color: var(--fg);
+}
+.md pre {
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-radius:0;
+  padding: 8px 10px;
+  overflow-x: auto;
+  font-size: 11.5px;
+}
+.md pre code { background: transparent; border: 0; padding: 0; }
+.md a {
+  color: var(--fg);
+  border-bottom: 1px dashed var(--line-2);
+  text-decoration: none;
+}
+.md strong { color: var(--fg); font-weight: 600; }
+.md blockquote {
+  margin: 4px 0;
+  padding: 0 10px;
+  border-left: 3px solid var(--line-2);
+  color: var(--fg-3);
+}
+.md table { border-collapse: collapse; margin: 6px 0; }
+.md th, .md td {
+  border: 1px solid var(--line);
+  padding: 4px 8px;
+}
+.md th { background: var(--bg-inset); }
+
+/* Card-preview markdown: tight, no block-level visuals */
+.md-preview { font-size: inherit; }
+.md-preview h1, .md-preview h2, .md-preview h3,
+.md-preview h4, .md-preview h5, .md-preview h6 {
+  font-size: 1em;
+  margin: 0.1em 0;
+  letter-spacing: 0.04em;
+}
+.md-preview p { margin: 0.1em 0; }
+.md-preview ul, .md-preview ol { padding-left: 1.2em; margin: 0.1em 0; }
+.md-preview pre, .md-preview blockquote { display: none; }
+
+/* Result card */
+.nc-result {
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--st-done);
+  border-radius:0;
+  padding: 12px 14px;
+  margin-top: 8px;
+}
+.nc-result.failed { border-left-color: var(--st-failed); }
+
+/* Transcript bubbles */
+.nc-msg {
+  border: 1px solid var(--line);
+  border-radius:0;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  background: var(--bg-card);
+}
+.nc-msg.dashboard { background: var(--bg-message-dashboard); border-color: #c9d6e8; }
+.nc-msg.system    { background: var(--bg-message-system);  border-color: #e6d5b8; }
+.nc-msg .who {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+  display: flex; gap: 8px; align-items: center;
+  margin-bottom: 4px;
+}
+.nc-msg .who .name { color: var(--fg-2); font-weight: 600; }
+.nc-msg .who .when { margin-left: auto; }
+.nc-msg.dashboard .who .name { color: #3a5a8c; }
+.nc-msg.system .who .name    { color: #8c6400; }
+
+/* Steer composer: amber "worker is asking" prompt above the textarea
+   when needs_input is set. */
+.nc-needs-prompt {
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  background: var(--st-needs-bg);
+  border: 1px solid var(--st-needs);
+  border-radius:0;
+  font-size: 13px;
+  color: var(--st-needs);
+  line-height: 1.4;
+}
+.nc-needs-prompt-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+  opacity: 0.85;
+}
+
+/* Steer composer */
+.nc-composer {
+  position: sticky;
+  bottom: 0;
+  background: linear-gradient(180deg, transparent 0%, var(--bg-deep) 22%);
+  padding: 16px 12px 12px;
+  border-top: 1px solid var(--line);
+}
+.nc-composer .field {
+  background: var(--bg-inset);
+  border: 1px solid var(--line-2);
+  border-radius:0;
+  padding: 10px 12px 8px;
+  display: flex; flex-direction: column;
+  gap: 6px;
+}
+.nc-composer .field:focus-within { border-color: var(--brand); }
+.nc-composer .field.over { border-color: var(--st-failed); }
+.nc-composer textarea {
+  width: 100%;
+  resize: vertical;
+  background: transparent;
+  color: var(--fg);
+  border: 0;
+  outline: 0;
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.4;
+  min-height: 38px;
+}
+.nc-composer .row {
+  display: flex; justify-content: space-between; align-items: center;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-4);
+}
+.nc-composer .row .over { color: var(--st-failed); }
+.nc-composer .send {
+  background: var(--brand);
+  border: 0;
+  color: var(--bg-deep);
+  padding: 6px 12px;
+  border-radius:0;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-weight: 600;
+  cursor: pointer;
+}
+.nc-composer .send:disabled { opacity: 0.4; cursor: not-allowed; }
+.nc-error {
+  color: var(--st-failed);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  margin-top: 6px;
+  letter-spacing: 0.04em;
+}
+.nc-success {
+  color: var(--st-done);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  margin-top: 6px;
+  letter-spacing: 0.04em;
+}
+
+/* ─── Desktop board (≥900px) */
+.nc-desktop { display: none; }
+
+@media (min-width: 900px) {
+  .nc-mobile { display: none; }
+  .nc-desktop { display: flex; flex-direction: column; min-height: 100vh; }
+
+  .nc-desktop-top {
+    display: grid;
+    grid-template-columns: 360px 1fr;
+    border-bottom: 1px solid var(--line);
+  }
+  .nc-desktop-pulse {
+    border-right: 1px solid var(--line);
+    padding: 20px 22px;
+    background: var(--bg-panel);
+  }
+  .nc-desktop-pulse .nc-brand { margin-bottom: 14px; }
+  .nc-desktop-pulse .bigcount {
+    display: flex; align-items: flex-end; gap: 12px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 72px;
+    line-height: 0.9;
+    letter-spacing: -0.04em;
+    font-weight: 500;
+    color: var(--fg);
+  }
+  .nc-desktop-pulse .bigcount .lbl {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--fg-3);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    padding-bottom: 10px;
+    line-height: 1.4;
+  }
+  .nc-desktop-pulse .row2 {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    margin-top: 12px;
+    gap: 8px;
+  }
+  .nc-desktop-pulse .breadcell {
+    border-left: 2px solid var(--line);
+    padding-left: 8px;
+  }
+  .nc-desktop-pulse .breadcell.failed  { border-color: var(--st-failed); }
+  .nc-desktop-pulse .breadcell.needs   { border-color: var(--st-needs); }
+  .nc-desktop-pulse .breadcell.running { border-color: var(--st-running); }
+  .nc-desktop-pulse .breadcell.done    { border-color: var(--st-done); }
+  .nc-desktop-pulse .breadcell .n {
+    font-family: var(--font-mono);
+    font-size: 22px;
+    font-variant-numeric: tabular-nums;
+    color: var(--fg);
+    letter-spacing: -0.02em;
+    display: block;
+  }
+  .nc-desktop-pulse .breadcell .lbl {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--fg-3);
+  }
+
+  .nc-desktop-toolbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 22px;
+  }
+  .nc-desktop-toolbar h1 {
+    margin: 0;
+    font-size: 22px;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+  }
+  .nc-desktop-toolbar .sub {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: var(--fg-3);
+    text-transform: uppercase;
+    margin-left: 10px;
+  }
+  .nc-desktop-toolbar .right { display: flex; gap: 14px; align-items: center; }
+
+  .nc-desktop-summary {
+    padding: 0 22px 18px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--fg-3);
+    letter-spacing: 0.06em;
+    line-height: 1.7;
+  }
+  .nc-desktop-summary strong { color: var(--fg); font-weight: 500; }
+  .nc-desktop-summary .c-fail { color: var(--st-failed); }
+  .nc-desktop-summary .c-need { color: var(--st-needs); }
+  .nc-desktop-summary .c-run  { color: var(--st-running); }
+  .nc-desktop-summary .c-done { color: var(--st-done); }
+
+  .nc-desktop-body {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    border-top: 1px solid var(--line);
+    min-height: 0;
+  }
+  .nc-col {
+    display: flex; flex-direction: column;
+    border-right: 1px solid var(--line);
+    min-height: 0;
+    background: var(--bg-deep);
+  }
+  .nc-col:last-child { border-right: 0; }
+  .nc-col-head {
+    padding: 16px 18px 14px;
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--bg-card-2);
+  }
+  .nc-col-head .ttl {
+    display: flex; align-items: center; gap: 10px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .nc-col-head .ttl .swatch { width: 8px; height: 8px; border-radius: 50%; }
+  .nc-col-head .ttl .cnt {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    color: var(--fg);
+    font-weight: 500;
+    letter-spacing: 0.04em;
+  }
+  .nc-col-head .hint {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    color: var(--fg-3);
+    text-transform: uppercase;
+  }
+  .nc-col-head.attention .ttl { color: var(--st-failed); }
+  .nc-col-head.attention .ttl .swatch {
+    background: var(--st-failed); box-shadow: 0 0 6px var(--st-failed);
+  }
+  .nc-col-head.working .ttl { color: var(--st-running); }
+  .nc-col-head.working .ttl .swatch {
+    background: var(--st-running); box-shadow: 0 0 6px var(--st-running);
+    animation: nc-pulse 1.5s ease-in-out infinite;
+  }
+  .nc-col-head.done .ttl { color: var(--st-done); }
+  .nc-col-head.done .ttl .swatch { background: var(--st-done); }
+  .nc-col-body {
+    padding: 12px 14px;
+    overflow-y: auto;
+    flex: 1;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+
+  /* Detail desktop: side-by-side metadata + thread */
+  .nc-detail-desktop {
+    display: grid;
+    grid-template-columns: 420px 1fr;
+    min-height: calc(100vh - 0px);
+  }
+  .nc-detail-desktop .nc-detail-meta-pane {
+    border-right: 1px solid var(--line);
+    overflow-y: auto;
+  }
+  .nc-detail-desktop .nc-detail-thread-pane {
+    display: flex; flex-direction: column;
+    overflow-y: auto;
+  }
+}
+
+/* a11y */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Scheduled-tasks board (Group E). Reuses the status-token palette defined in
+   :root — stalled/strand map to --st-failed (attention-red), late to
+   --st-needs (orange), paused to --st-pending (amber), processing to
+   --st-running (cyan), healthy to --st-done (green), unknown/unreadable to
+   --st-cancel (grey) so an observability failure reads visibly different from
+   a known-bad state. [RENDER-CHECK ✓ PASS] stalled-red-on-dark-card contrast
+   verified by computed WCAG (design §3c): count --st-failed on --st-failed-bg
+   over panel = 4.82:1 (≥4.5 AA text), border on panel = 5.74:1 (≥3 AA UI).
+   ───────────────────────────────────────────────────────────────────────── */
+
+.nc-sched-top {
+  padding: 18px 22px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-panel);
+}
+.nc-sched-headerrow {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+/* Health summary strip */
+.nc-sched-strip {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: stretch;
+}
+.nc-sched-pill {
+  display: flex; flex-direction: column; gap: 2px;
+  min-width: 64px; padding: 7px 11px;
+  border-radius:0;
+  border: 1px solid var(--line);
+  background: var(--bg-card);
+}
+.nc-sched-pill .n {
+  font-family: var(--font-mono); font-size: 18px; font-weight: 600; line-height: 1;
+  color: var(--fg);
+}
+.nc-sched-pill .lbl {
+  font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--fg-3);
+}
+/* tone accents — left border + count colour */
+.nc-sched-pill.stalled    { border-color: var(--st-failed);  background: var(--st-failed-bg); }
+.nc-sched-pill.stalled .n { color: var(--st-failed); }
+.nc-sched-pill.late       { border-color: var(--st-needs);   background: var(--st-needs-bg); }
+.nc-sched-pill.late .n    { color: var(--st-needs); }
+.nc-sched-pill.paused     { border-color: var(--st-pending); background: var(--st-pending-bg); }
+.nc-sched-pill.paused .n  { color: var(--st-pending); }
+.nc-sched-pill.healthy    { border-color: var(--st-done);    background: var(--st-done-bg); }
+.nc-sched-pill.healthy .n { color: var(--st-done); }
+.nc-sched-pill.unknown,
+.nc-sched-pill.unreadable    { border-color: var(--st-cancel); background: var(--st-cancel-bg); }
+.nc-sched-pill.unknown .n,
+.nc-sched-pill.unreadable .n { color: var(--fg-2); }
+.nc-sched-pill.oneoff     { border-color: var(--line-2); }
+
+.nc-sched-degraded {
+  display: inline-flex; align-items: center; gap: 6px; align-self: center;
+  margin-left: auto;
+  padding: 5px 10px; border-radius:0;
+  background: var(--st-failed-bg); color: var(--st-failed);
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+}
+.nc-sched-degraded .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--st-failed); box-shadow: 0 0 6px var(--st-failed);
+}
+
+/* Stalled inline list — always first, enumerated (§3c) */
+.nc-sched-stalled-inline {
+  margin-top: 12px; padding: 10px 12px;
+  border: 1px solid var(--st-failed);
+  background: var(--st-failed-bg);
+  border-radius:0;
+}
+.nc-sched-stalled-inline .hdr {
+  font-family: var(--font-mono); font-size: 12px; font-weight: 600; color: var(--st-failed);
+  letter-spacing: 0.04em;
+}
+.nc-sched-stalled-inline ul { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.nc-sched-stalled-link {
+  display: inline-flex; gap: 6px; align-items: baseline;
+  background: var(--bg-card); border: 1px solid var(--line-2); border-radius:0;
+  padding: 4px 8px; cursor: pointer; color: var(--fg);
+}
+.nc-sched-stalled-link:hover { border-color: var(--st-failed); }
+.nc-sched-stalled-link .nm  { font-family: var(--font-mono); font-size: 12px; }
+.nc-sched-stalled-link .grp { font-size: 11px; color: var(--fg-3); }
+
+/* Toolbar */
+.nc-sched-toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.nc-sched-toolbar select,
+.nc-sched-toolbar input {
+  background: var(--bg-inset); color: var(--fg);
+  border: 1px solid var(--line); border-radius:0;
+  padding: 6px 9px; font-size: 13px; font-family: var(--font-sans);
+}
+.nc-sched-toolbar input.nc-sched-search { flex: 1; min-width: 180px; }
+.nc-sched-toolbar select:focus,
+.nc-sched-toolbar input:focus { outline: none; border-color: var(--brand); }
+
+/* Body — grouped sections */
+.nc-sched-body { padding: 14px 22px 40px; }
+.nc-sched-section { margin-bottom: 14px; }
+.nc-sched-section-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: none; border: none; cursor: pointer; padding: 6px 0;
+  color: var(--fg); text-align: left;
+}
+.nc-sched-section-head .chev { color: var(--fg-3); width: 12px; }
+.nc-sched-section-head .nm { font-weight: 600; font-size: 14px; }
+.nc-sched-section-head .cnt {
+  font-family: var(--font-mono); font-size: 11px; color: var(--fg-3);
+  background: var(--bg-card); border-radius:0; padding: 1px 8px;
+}
+.nc-sched-section-body { display: flex; flex-direction: column; gap: 6px; padding-top: 4px; }
+
+/* Row */
+.nc-sched-row {
+  border: 1px solid var(--line); border-left-width: 3px; border-radius:0;
+  background: var(--bg-card); padding: 9px 12px; cursor: pointer;
+}
+.nc-sched-row:hover { border-color: var(--line-2); }
+.nc-sched-row:focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; }
+.nc-sched-row.health-stalled,
+.nc-sched-row.health-strand  { border-left-color: var(--st-failed); }
+.nc-sched-row.health-late    { border-left-color: var(--st-needs); }
+.nc-sched-row.health-paused  { border-left-color: var(--st-pending); }
+.nc-sched-row.health-processing { border-left-color: var(--st-running); }
+.nc-sched-row.health-healthy { border-left-color: var(--st-done); }
+.nc-sched-row.health-unknown { border-left-color: var(--st-cancel); }
+
+.nc-sched-row-main { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.nc-sched-name { font-family: var(--font-mono); font-size: 13px; color: var(--fg); }
+.nc-sched-row-meta {
+  display: flex; flex-wrap: wrap; gap: 12px; margin-top: 5px;
+  font-size: 11px; color: var(--fg-3);
+}
+.nc-sched-row-meta .utc { color: var(--fg-2); font-family: var(--font-mono); }
+.nc-sched-row-meta .local { color: var(--fg-3); }
+.nc-sched-row-meta .cron { font-family: var(--font-mono); }
+
+/* Health pill on the row */
+.nc-sched-healthpill {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 2px 7px; border-radius:0; font-weight: 600;
+}
+.nc-sched-healthpill.stalled,
+.nc-sched-healthpill.strand  { background: var(--st-failed-bg);  color: var(--st-failed); }
+.nc-sched-healthpill.late    { background: var(--st-needs-bg);   color: var(--st-needs); }
+.nc-sched-healthpill.paused  { background: var(--st-pending-bg); color: var(--st-pending); }
+.nc-sched-healthpill.processing { background: var(--st-running-bg); color: var(--st-running); }
+.nc-sched-healthpill.healthy { background: var(--st-done-bg);    color: var(--st-done); }
+.nc-sched-healthpill.unknown { background: var(--st-cancel-bg);  color: var(--fg-2); }
+
+/* Badges */
+.nc-sched-badge {
+  font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 2px 6px; border-radius: 0; background: var(--bg-inset); color: var(--fg-2);
+}
+.nc-sched-badge.module { background: rgba(91, 75, 138, 0.10); color: #5b4b8a; }
+.nc-sched-badge.thread { background: var(--bg-inset); color: var(--fg-2); }
+.nc-sched-badge.quiet  { background: var(--bg-card-2); color: var(--fg-3); }
+
+/* ─── Drawer ─── */
+/* The scheduled-series drawer. Its only caller is the Observatory, so it wears
+   the atrium chrome: light panel, hairline rules, sentence case, monospace on
+   the cron/prompt/ids and nothing else. */
+
+.nc-sched-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 92vw);
+  background: var(--card-2, #fff); border-left: 1px solid var(--line, rgba(35,32,27,.10));
+  box-shadow: -18px 0 40px -24px rgba(35, 32, 27, 0.5);
+  display: flex; flex-direction: column; z-index: 40;
+  overflow: hidden; color: var(--ink, #23201b);
+  font-family: var(--font-sans); font-size: 13px;
+}
+.nc-sched-drawer-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 13px 16px; border-bottom: 1px solid var(--line);
+}
+.nc-sched-drawer-head h3 {
+  margin: 0; font-size: 13.5px; font-weight: 600; letter-spacing: -0.008em;
+  font-family: var(--font-mono); overflow-wrap: anywhere;
+}
+.nc-sched-drawer-close {
+  background: none; border: 0; color: var(--ink-3); font-size: 18px; line-height: 1;
+  width: 44px; height: 44px; border-radius:0; cursor: pointer; flex: none;
+}
+.nc-sched-drawer-close:hover { background: rgba(35, 32, 27, 0.05); color: var(--ink); }
+.nc-sched-drawer-body { overflow-y: auto; padding: 14px 16px 20px; }
+
+.nc-sched-drawer-meta {
+  display: grid; grid-template-columns: 84px 1fr; gap: 7px 14px;
+  padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--line);
+}
+.nc-sched-field { display: contents; }
+.nc-sched-field .k { font-size: 12.5px; color: var(--ink-3); }
+.nc-sched-field .v { font-size: 12.5px; color: var(--ink); word-break: break-word; }
+.nc-sched-field .sub { grid-column: 1 / -1; font-size: 11px; color: var(--ink-3); margin-top: -2px; }
+
+.nc-sched-overrides, .nc-sched-prompt, .nc-sched-history, .nc-sched-audit { margin-bottom: 16px; }
+.nc-sched-drawer-body h4 {
+  margin: 0 0 7px; font-size: 12.5px; font-weight: 600; color: var(--ink);
+  letter-spacing: 0; text-transform: none;
+}
+.nc-sched-overrides .ovr { font-size: 12px; color: var(--ink-2); }
+.nc-sched-prompt pre {
+  background: var(--card); border: 1px solid var(--line); border-radius:0;
+  padding: 10px 12px; font-family: var(--font-mono);
+  font-size: 12px; color: var(--ink-2);
+  white-space: pre-wrap; word-break: break-word; margin: 0 0 10px;
+}
+.nc-sched-history ul, .nc-sched-audit ul { list-style: none; margin: 0; padding: 0; }
+.nc-sched-history li, .nc-sched-audit li {
+  display: flex; gap: 12px; align-items: baseline; padding: 6px 0;
+  border-bottom: 1px solid var(--line); font-size: 12.5px;
+}
+.nc-sched-history .ts, .nc-sched-audit .ts {
+  font-family: var(--font-mono); color: var(--ink-3); font-size: 11.5px;
+}
+.nc-sched-history .outcome.ok    { color: var(--go); }
+.nc-sched-history .outcome.bad   { color: var(--stop); }
+.nc-sched-history .outcome.muted { color: var(--ink-3); }
+
+/* Verb buttons — quiet chips; only the destructive one carries colour. */
+.nc-sched-verbs {
+  display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0;
+  padding-top: 14px; border-top: 1px solid var(--line);
+}
+.nc-sched-verb {
+  padding: 0 12px; min-height: 34px; border-radius:0; cursor: pointer;
+  border: 1px solid var(--line-2); background: var(--card-2); color: var(--ink);
+  font: 500 12.5px/1 inherit;
+}
+.nc-sched-verb:hover:not(:disabled) { background: rgba(35, 32, 27, 0.04); }
+.nc-sched-verb.cancel:not(:disabled) { border-color: rgba(176, 80, 63, 0.45); color: var(--stop); }
+.nc-sched-verb:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Confirm / form panes */
+.nc-sched-confirm, .nc-sched-move-confirm, .nc-sched-edit-form, .nc-sched-move-form {
+  border: 1px solid var(--line); border-radius: var(--r, 0); background: var(--card);
+  padding: 14px; margin-top: 8px;
+}
+.nc-sched-confirm h4, .nc-sched-move-confirm h4 { font-size: 13px; }
+.nc-sched-confirm p { font-size: 12.5px; color: var(--ink-2); margin: 6px 0 12px; line-height: 1.5; }
+.nc-sched-edit-form label, .nc-sched-move-form label {
+  display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px;
+  font-size: 12.5px; letter-spacing: 0; text-transform: none; color: var(--ink-2);
+}
+.nc-sched-edit-form textarea, .nc-sched-edit-form input,
+.nc-sched-move-form input {
+  background: var(--card-2); border: 1px solid var(--line-2); border-radius:0;
+  padding: 7px 9px; color: var(--ink);
+  font-family: var(--font-mono); font-size: 12px;
+}
+.nc-sched-edit-form textarea.prompt { min-height: 40vh; resize: vertical; }
+.nc-sched-cron-sub { font-size: 11px; color: var(--ink-3); font-family: inherit; text-transform: none; }
+.nc-sched-form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
+.nc-sched-form-actions button {
+  padding: 0 13px; min-height: 34px; border-radius:0; cursor: pointer;
+  border: 1px solid var(--line-2); background: var(--card-2); color: var(--ink);
+  font: 500 12.5px/1 inherit;
+}
+.nc-sched-form-actions button.danger { border-color: rgba(176, 80, 63, 0.45); color: var(--stop); }
+.nc-sched-form-actions button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.nc-sched-reseed-warning {
+  border: 1px solid rgba(179, 134, 44, 0.4); background: rgba(179, 134, 44, 0.08);
+  color: var(--ink); border-radius:0; padding: 9px 11px; font-size: 12px;
+  line-height: 1.5; margin-bottom: 10px;
+}
+.nc-sched-delta { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 10px 0; }
+.nc-sched-delta .lbl { font-size: 12px; color: var(--ink-3); display: block; }
+.nc-sched-delta ul { list-style: none; margin: 4px 0 0; padding: 0; }
+.nc-sched-delta li {
+  font-family: var(--font-mono); font-size: 12px; padding: 2px 0;
+}
+.nc-sched-delta .gains li  { color: var(--go); }
+.nc-sched-delta .losses li { color: var(--stop); }
+.nc-sched-delta .none { font-size: 12px; color: var(--ink-3); }
+.nc-sched-caveat { font-size: 12px; color: var(--ink-2); margin: 8px 0; line-height: 1.5; }
+.nc-sched-drawer-error {
+  border: 1px solid rgba(176, 80, 63, 0.4); background: rgba(176, 80, 63, 0.07);
+  color: var(--stop); border-radius:0; padding: 8px 10px; font-size: 12px; margin: 8px 0;
+}
+
+@media (max-width: 899px) {
+  .nc-sched-drawer { width: 100vw; }
+  .nc-sched-delta { grid-template-columns: 1fr; }
+}
+
+/* ─── Agent drawer ─── */
+/* Shares the .nc-sched-drawer shell (fixed panel, header/body chrome, mobile
+   full-width) — only the bits specific to a PERSON, not a series, are new. */
+
+.nc-agent-drawer-who { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.nc-agent-drawer-state {
+  display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px;
+  color: var(--ink-3); text-transform: capitalize; white-space: nowrap;
+}
+.nc-agent-drawer-where { margin: 0 0 14px; font-size: 12.5px; color: var(--ink-2); }
+.nc-agent-drawer-next { font-size: 12.5px; color: var(--ink-2); margin-bottom: 8px; }
+.nc-agent-drawer-section { margin-bottom: 18px; }
+
+/* ─── Observatory — the office page ──────────────────────────────────────────
+   Scoped to `.nc-of`. The floor itself is drawn by FloorPlan.tsx and styled in
+   theme.css alongside the rest of the component layer; what lives here is the
+   chrome around it, and it shrinks as surfaces move across. */
+
+.nc-frame.nc-of {
+  background: var(--page);
+  color: var(--ink);
+  /* The blueprint grid is the canvas's own atmosphere — see theme.css. */
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 30px 30px;
+}
+
+.nc-of .nc-obs-body { max-width: 1200px; margin: 0 auto; padding: 16px; }
+.nc-of .nc-empty { color: var(--ink-3); font-size: 12.5px; }
+
+.nc-of .nc-obs-offline {
+  margin: 40px auto; max-width: 320px; padding: 24px;
+  border: 1px solid var(--line); border-radius: var(--r); background: var(--card-2);
+  font-size: 12.5px; color: var(--ink-3); text-align: center;
+}
+
+/* Single column top to bottom: the floor, then whichever card the segmented
+   control is pointing at. Every card stays in normal document flow — no
+   fixed/sticky position, no independent scroll region. */
+/* minmax(0,1fr), not 1fr: a bare `1fr` track has an AUTO minimum, so the
+   widest min-content inside it (the map's own intrinsic width) set the column
+   width and pushed the whole page past a 390px viewport. */
+.nc-of .nc-obs-main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; align-items: start; }
+
+/* ─── The Observatory's own token names ──────────────────────────────────── */
+/* ALIASES ONLY. This block used to be a second palette — a light one, defined
+   in hex, sitting alongside a dark one at :root, with nothing switching
+   between them. There is one palette now, its values live in theme.css, and
+   every name below simply points at it. Nothing here may take a literal
+   colour: two places to change a colour is how the two palettes drifted apart
+   in the first place.
+   The names themselves stay because ~400 rules under this line read them, and
+   renaming those buys nothing a reader can see. */
+.nc-of{
+  --ink:var(--foreground); --ink-2:var(--fg-2); --ink-3:var(--muted-foreground);
+  --line:var(--border-soft); --line-2:var(--border);
+  --page:var(--background); --card:var(--surface); --card-2:var(--surface);
+  /* --accent and --accent-text are theme.css's; only the state names below
+     need mapping onto this sheet's older vocabulary. */
+  --stop:var(--sev-hands); --warn:var(--sev-decision); --go:var(--sev-working); --idle:var(--muted-foreground);
+  /* Sharp corners are the brand. */
+  --r:0px;
+  background:var(--page); color:var(--ink);
+  font-family:'Geist Variable',system-ui,-apple-system,'Segoe UI',sans-serif;
+  font-size:14px; -webkit-font-smoothing:antialiased;
+}
+.nc-of .num,.nc-of .mono{font-family:'Geist Mono Variable',ui-monospace,SFMono-Regular,Menlo,monospace}
+
+.nc-of .nc-of-bar{
+  display:flex; align-items:center; gap:16px; padding:13px 20px;
+  background:var(--card-2); border-bottom:1px solid var(--line);
+}
+.nc-of .nc-of-bar-title{font-size:14.5px; font-weight:600; letter-spacing:-.01em}
+.nc-of .nc-of-mapcard-title,.nc-of .nc-of-card-title{font-size:15px; letter-spacing:-.008em}
+.nc-of .nc-of-bar-meta{
+  margin-left:auto; display:flex; align-items:center; gap:14px;
+  font-size:12px; color:var(--ink-3);
+}
+
+/* The segmented control. It switches what sits UNDER the office; the headline
+   and the map are on every view, so the control belongs in the chrome and not
+   at the top of the region it swaps. Pressed is a raised white plate — the
+   accent is reserved for links and focus. */
+.nc-of .nc-of-seg{
+  display:flex; gap:2px; padding:2px; border-radius:0; background:rgba(35,32,27,.05);
+  overflow-x:auto; scrollbar-width:none;
+}
+.nc-of .nc-of-seg::-webkit-scrollbar{display:none}
+.nc-of .nc-of-seg-btn{
+  appearance:none; border:0; background:none; cursor:pointer; white-space:nowrap;
+  font:500 12.5px/1 inherit; color:var(--ink-2); padding:0 12px; min-height:44px; border-radius:0;
+}
+.nc-of .nc-of-seg-btn:hover{color:var(--ink)}
+.nc-of .nc-of-seg-btn:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
+.nc-of .nc-of-seg-btn.on{
+  background:var(--card-2); color:var(--ink);
+  box-shadow:0 1px 2px rgba(35,32,27,.10), inset 0 0 0 1px var(--line);
+}
+.nc-of .nc-of-live{display:inline-flex; align-items:center; gap:6px}
+.nc-of .nc-of-live i{width:6px; height:6px; border-radius:50%; background:var(--idle)}
+.nc-of .nc-of-live i.on{background:var(--go)}
+
+/* Headline: three equal stat tiles, the data gaps beside them. */
+.nc-of .nc-of-head{
+  display:flex; gap:20px; align-items:stretch; padding:18px 20px 16px;
+  border-bottom:1px solid var(--line); background:var(--card-2); margin-bottom:12px;
+  border-radius:var(--r);
+}
+.nc-of .nc-of-head-main{flex:1; min-width:0}
+/* The three numbers are the queue's filter. They read as one control each:
+   pressed state is a tinted plate, not a border, so the headline stays a
+   headline and does not turn into a toolbar. */
+.nc-of .nc-of-tiles{display:flex; gap:10px; align-items:stretch}
+.nc-of .nc-of-tile{
+  flex:1; display:flex; flex-direction:column; gap:4px; appearance:none; border:0; background:none;
+  font:inherit; color:inherit; text-align:left; cursor:pointer; padding:10px 12px; border-radius:0;
+}
+.nc-of .nc-of-tile:hover{background:rgba(35,32,27,.04)}
+.nc-of .nc-of-tile.on{background:var(--accent-soft)}
+.nc-of .nc-of-tile:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
+.nc-of .nc-of-clearfilter{
+  appearance:none; border:0; background:none; cursor:pointer; font:inherit;
+  font-size:12px; font-weight:500; color:var(--accent-text); padding:4px 6px; min-height:44px; border-radius:0;
+}
+.nc-of .nc-of-clearfilter:hover{background:var(--accent-soft)}
+.nc-of .nc-of-tile-n{
+  font-family:var(--font-mono); font-size:36px; font-weight:600;
+  line-height:.86; letter-spacing:-.03em; font-variant-numeric:tabular-nums;
+}
+.nc-of .nc-of-tile-n.stop{color:var(--stop)}
+.nc-of .nc-of-tile-n.warn{color:var(--warn)}
+.nc-of .nc-of-tile-n.go{color:var(--go)}
+.nc-of .nc-of-tile-l{font-size:13px; color:var(--ink-2)}
+.nc-of .nc-of-tile-sub{display:block; font-size:11.5px; margin-top:2px}
+.nc-of .nc-of-sub-total{display:block; margin-top:12px; padding-top:12px; border-top:1px solid var(--line); font-size:12.5px; color:var(--ink-3)}
+.nc-of .nc-of-notes{
+  width:400px; max-width:100%; display:flex; flex-direction:column; gap:10px;
+  justify-content:center; border-left:1px solid var(--line); padding-left:20px;
+}
+.nc-of .nc-of-notes p{margin:0; display:flex; gap:9px; align-items:flex-start; font-size:12.5px; line-height:1.45}
+.nc-of .nc-of-notes i{width:6px; height:6px; border-radius:50%; margin-top:5px; flex:none}
+.nc-of .nc-of-notes i.warn{background:var(--warn)} .nc-of .nc-of-notes i.stop{background:var(--stop)}
+.nc-of .nc-of-notes b{font-weight:600; font-size:12.5px}
+.nc-of .nc-of-notes p{max-width:46ch}
+.nc-of .nc-of-notes span{color:var(--ink-2)}
+.nc-of .nc-of-notes b + span,.nc-of .nc-of-notes span b{color:var(--ink)}
+@media (max-width:900px){
+  .nc-of .nc-of-head{flex-direction:column; gap:14px}
+  .nc-of .nc-of-notes{width:auto; border-left:0; border-top:1px solid var(--line); padding-left:0; padding-top:12px}
+  .nc-of .nc-of-tile-n{font-size:32px}
+}
+/* Phone: the headline has to fit in roughly a third of the screen or the
+   office — the thing this page exists to show — starts below the fold. The
+   three tiles stay on ONE row, compressed, so nothing is dropped; only the
+   air is. */
+@media (max-width:700px){
+  .nc-of .nc-of-head{padding:12px 14px 11px; gap:10px; margin-bottom:10px}
+  .nc-of .nc-of-tiles{gap:6px}
+  .nc-of .nc-of-tile{padding:7px 8px; gap:2px}
+  .nc-of .nc-of-tile-n{font-size:24px}
+  .nc-of .nc-of-tile-l{font-size:11.5px}
+  .nc-of .nc-of-tile-sub{display:none}
+  .nc-of .nc-of-sub-total{margin-top:9px; padding-top:9px; font-size:11.5px}
+  .nc-of .nc-of-notes{gap:6px; padding-top:9px}
+  .nc-of .nc-of-notes p{font-size:12px; line-height:1.4}
+}
+
+/* ─── The office card ────────────────────────────────────────────────────── */
+/* The floor is the only drawn surface in the product; its container is not. */
+.nc-of .nc-of-mapcard{
+  background:var(--card-2); border:1px solid var(--line); border-radius:var(--r); overflow:hidden;
+  box-shadow:0 1px 2px rgba(35,32,27,.05); margin-bottom:12px;
+}
+.nc-of .nc-of-mapcard-head{
+  display:flex; align-items:center; gap:10px; padding:10px 12px; border-bottom:1px solid var(--line);
+}
+/* obs.C.7 — folded away, the card is just its own header, so the rule under it
+   would be a hairline hanging off nothing. */
+.nc-of .nc-of-mapcard.collapsed .nc-of-mapcard-head{border-bottom:0}
+.nc-of .nc-of-mapcard-title{font-size:12.5px; font-weight:600; color:var(--ink)}
+.nc-of .nc-of-mapcard-hint{font-size:12px; color:var(--ink-3)}
+/* obs.C.15 — one flex unit carries every trailing control (All rooms, fold) to
+   the right edge together, and wraps as a cluster on a narrow header instead of
+   each chip claiming its own margin-left:auto and splitting the line wherever
+   the first one ran out of room. */
+.nc-of .nc-of-mapcard-actions{
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; margin-left:auto;
+}
+.nc-of .nc-of-mapcard-head{border-bottom:1px solid var(--line)}
+/* The plan is drawn to fit — no fade, no clip, no drag. It is glanceable at a
+   fixed scale, which is what a schematic buys over an illustration. */
+.nc-of .nc-of-chip{
+  appearance:none; display:inline-flex; align-items:center; gap:6px; flex:none;
+  min-height:44px; padding:0 12px; border-radius:0; cursor:pointer;
+  border:1px solid var(--line-2); background:var(--card-2); color:var(--ink);
+  font:500 11.5px/1 inherit; white-space:nowrap;
+}
+.nc-of .nc-of-chip:hover{background:rgba(35,32,27,.04)}
+.nc-of .nc-of-chip.on{background:var(--ink); color:var(--card); border-color:var(--ink)}
+.nc-of .nc-of-chip:disabled{opacity:.4; cursor:default; pointer-events:none}
+.nc-of .nc-of-sd{width:6px; height:6px; border-radius:50%; flex:none; background:var(--idle)}
+.nc-of .nc-of-sd.blocked{background:var(--stop)}
+.nc-of .nc-of-sd.waiting{background:var(--warn)}
+.nc-of .nc-of-sd.working{background:var(--go)}
+
+/* Phone: the bar carries the title, the picker and the one live number. The
+   agent/channel counts are reference, not signal, and pushed the live dot off
+   the right edge — nothing on this page may be wider than the viewport. */
+@media (max-width:700px){
+  /* flex-wrap is load-bearing: the segmented control below takes `order:2` and
+     a forced 100% width, and without a wrap it has no line of its own to take
+     — it just runs off the right edge instead. */
+  .nc-of .nc-of-bar{gap:10px; padding:11px 14px; flex-wrap:wrap}
+  /* Below ~420px the two-word title and the hint each wrapped mid-phrase. */
+  .nc-of .nc-of-bar-title{white-space:nowrap; font-size:13.5px}
+  .nc-of .nc-of-mapcard-head{flex-wrap:wrap; row-gap:2px}
+  .nc-of .nc-of-mapcard-title{flex:0 0 100%}
+  /* order:1 keeps the live count on the title/picker row (its own
+     margin-left:auto still pushes it to that row's right edge); the
+     segmented control gets order:2 and a forced 100% width below it. */
+  .nc-of .nc-of-bar-meta{gap:10px; flex:none; order:1}
+  .nc-of .nc-of-bar-count{display:none}
+  /* obs.C.36 — the segmented control used to share the title's row and
+     shrink into whatever space was left, so it scrolled internally rather
+     than growing; Decisions and Job board were reachable only by finding a
+     horizontal scrollbar. Its own full-width row and equal thirds put all
+     three tabs on screen without any scrolling — visible navigation beats
+     hidden navigation. */
+  .nc-of .nc-of-seg{order:2; flex:0 0 100%; width:100%; overflow-x:visible}
+  .nc-of .nc-of-seg-btn{flex:1; min-width:0; padding:0 4px; font-size:11.5px}
+}
+
+/* ─── The card, and the one table inside it ──────────────────────────────── */
+/* Every section below the office is the SAME card: hairline border, one head
+   line, hairline row dividers, no nested boxes. */
+.nc-of .nc-of-card{
+  background:var(--card-2); border:1px solid var(--line); border-radius:var(--r);
+  overflow:hidden; margin-bottom:12px;
+}
+.nc-of .nc-of-card-head{
+  display:flex; align-items:baseline; gap:10px; padding:11px 14px;
+  border-bottom:1px solid var(--line);
+}
+.nc-of .nc-of-card-title{font-size:13px; font-weight:600; color:var(--ink)}
+.nc-of .nc-of-card-meta{
+  font-size:12px; color:var(--ink-3); font-variant-numeric:tabular-nums;
+  min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.nc-of .nc-of-card-head .nc-of-clearfilter{margin-left:auto; flex:none}
+
+/* Claims and schedule sit side by side under the job table, and stack the
+   moment either one would have to squeeze its own columns. */
+.nc-of .nc-of-twoup{display:grid; grid-template-columns:minmax(0,1fr); gap:12px}
+@media (min-width:1100px){
+  .nc-of .nc-of-twoup{grid-template-columns:minmax(0,1fr) minmax(0,470px)}
+  .nc-of .nc-of-twoup > *{margin-bottom:0}
+}
+
+/* The job board's slice control: a tab row, with the slice's own sentence
+   right-aligned on the same line so the count never has to explain itself. */
+.nc-of .nc-of-tabs{
+  display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+  padding:11px 14px 0; border-bottom:1px solid var(--line);
+}
+.nc-of .nc-of-tab{
+  appearance:none; border:0; background:none; cursor:pointer; font:500 13px/1 inherit;
+  color:var(--ink-2); padding:0 0 10px; margin-bottom:-1px;
+  border-bottom:2px solid transparent; white-space:nowrap;
+}
+.nc-of .nc-of-tab:hover{color:var(--ink)}
+.nc-of .nc-of-tab:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+.nc-of .nc-of-tab.on{color:var(--ink); border-bottom-color:var(--accent)}
+.nc-of .nc-of-tab-n{color:var(--ink-3); font-variant-numeric:tabular-nums}
+.nc-of .nc-of-tab-hint{margin-left:auto; padding-bottom:10px; font-size:12px; color:var(--ink-3)}
+/* A freeze, and whatever is holding it, stated on the board itself. */
+.nc-of .nc-obs-release-moratorium{
+  padding:9px 14px; border-bottom:1px solid var(--line);
+  font-size:12.5px; font-weight:600; color:var(--stop);
+}
+.nc-of .nc-obs-release-holds{
+  display:flex; flex-wrap:wrap; gap:8px; padding:9px 14px; border-bottom:1px solid var(--line);
+}
+.nc-of .nc-obs-release-hold{
+  font-size:11.5px; color:var(--ink-2); background:rgba(35,32,27,.06);
+  border-radius:0; padding:2px 7px;
+}
+
+/* ONE grammar on every row, in both the queue and the job board:
+   id | title | state | owner | room | age. The columns share an edge so the
+   list reads down as well as across. */
+.nc-of .nc-obs-ledger{display:flex; flex-direction:column}
+.nc-of .nc-obs-ledger-empty{
+  font-size:12.5px; color:var(--ink-3); font-style:italic; padding:12px 14px;
+}
+
+.nc-of .nc-obs-ledger-head,.nc-of .nc-obs-ledger-btn{
+  display:grid; grid-template-columns:116px minmax(0,1fr) 124px 92px 108px 46px;
+  gap:12px; align-items:center;
+}
+.nc-of .nc-obs-ledger-head{
+  padding:9px 14px; border-bottom:1px solid var(--line);
+  font-size:11.5px; color:var(--ink-3);
+}
+.nc-of .nc-obs-ledger-head > *:last-child{text-align:right}
+.nc-of .nc-obs-ledger-rows{list-style:none; margin:0; padding:0}
+.nc-of .nc-obs-ledger-row + .nc-obs-ledger-row{border-top:1px solid var(--line)}
+.nc-of .nc-obs-ledger-btn{
+  appearance:none; background:none; border:0; margin:0; width:100%; font:inherit; color:var(--ink);
+  padding:10px 14px; min-height:44px; text-align:left; cursor:pointer;
+}
+.nc-of .nc-obs-ledger-btn:hover{background:rgba(35,32,27,.03)}
+.nc-of .nc-obs-ledger-btn:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
+.nc-of .nc-obs-ledger-id{
+  font-size:12px; color:var(--ink-3); overflow-wrap:anywhere; white-space:normal;
+}
+/* Every cell must be allowed to shrink, or one long title sets the row's
+   min-content width and the whole board grows past the viewport. */
+.nc-of .nc-obs-ledger-btn > *{min-width:0}
+.nc-of .nc-obs-ledger-title{overflow-wrap:anywhere; font-weight:500}
+/* The state dot is the ONLY urgency encoding on the row — no bar, no row tint,
+   no coloured title stacked on top of it. */
+.nc-of .nc-obs-ledger-state{
+  display:inline-flex; align-items:center; gap:6px; min-width:0;
+  font-size:12px; color:var(--ink-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.nc-of .nc-obs-dot{width:6px; height:6px; border-radius:50%; flex:none; background:currentColor}
+.nc-of .nc-obs-ledger-state.breached,.nc-of .nc-obs-ledger-state.unowned{color:var(--stop)}
+.nc-of .nc-obs-ledger-state.due-soon{color:var(--warn)}
+.nc-of .nc-obs-ledger-state.on-track{color:var(--go)}
+.nc-of .nc-obs-ledger-state.undated{color:var(--ink-3)}
+/* Rides the title line, not the state column: it is an orthogonal fact, and
+   the state column has to hold one shape on every row or the list loses its
+   beat between the rows that carry it and the rows that do not. */
+.nc-of .nc-obs-ledger-blocks{
+  font-size:10px; font-weight:600; letter-spacing:.01em; white-space:nowrap;
+  background:rgba(176,80,63,.13); color:var(--stop); border-radius:0; padding:1px 5px;
+  margin-right:7px;
+}
+/* Two lines before it truncates. The title is the content; ellipsing it at one
+   line to protect a fixed metadata column that is empty on most rows was the
+   wrong trade, and it is what made the narrow column unreadable. */
+.nc-of .nc-obs-ledger-title{
+  font-size:13px; min-width:0; line-height:1.35;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;
+}
+.nc-of .nc-obs-ledger-owner,.nc-of .nc-obs-ledger-room,.nc-of .nc-obs-ledger-age{
+  font-size:11.5px; color:var(--ink-3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.nc-of .nc-obs-ledger-age{text-align:right; font-variant-numeric:tabular-nums}
+/* Decisions: the ask, on the row. It sits under the row button rather than
+   inside its grid so a whole sentence may wrap without a column setting the
+   board's min width. Weighted, not coloured — the state dot is still the only
+   urgency encoding on a row. */
+.nc-of .nc-obs-decide-line{
+  /* 14 padding + 116 id column + 12 gap — the ask starts where the title does. */
+  display:flex; gap:12px; align-items:flex-start; padding:0 14px 11px 142px;
+}
+.nc-of .nc-obs-decide-ask{
+  margin:0; font-size:12.5px; font-weight:500;
+  line-height:1.45; color:var(--ink); overflow-wrap:anywhere;
+}
+/* The ship button. Accent, because it IS the act — the same weight `send`
+   wears inside the composer it opens. Mono for the instruction only. */
+.nc-of .nc-obs-ship{
+  flex:none; margin-left:auto; font:inherit; font-size:12px; font-weight:600;
+  color:#fff; background:var(--accent); border:0; border-radius:0;
+  padding:5px 10px; min-height:28px; cursor:pointer; white-space:nowrap;
+}
+.nc-of .nc-obs-ship:hover{filter:brightness(1.08)}
+.nc-of .nc-obs-ship:focus-visible{outline:2px solid var(--ink); outline-offset:1px}
+.nc-of .nc-obs-ledger-detail{padding:0 14px 12px; font-size:12.5px; color:var(--ink-2)}
+.nc-of .nc-obs-ledger-next{font-weight:600; color:var(--ink); margin-bottom:3px}
+.nc-of .nc-obs-ledger-meta{font-size:11.5px; color:var(--ink-3); margin-top:3px}
+/* The one thing a person's own item offers: where to answer it. No control —
+   routing it to an agent is the move this row exists to say is wrong. */
+.nc-of .nc-obs-needsyou{margin-top:9px; font-size:12.5px; color:var(--ink-2)}
+.nc-of .nc-obs-ledger-more{
+  appearance:none; background:none; border:0; cursor:pointer; font:inherit; color:var(--accent);
+  font-size:12.5px; font-weight:600; padding:10px 14px; min-height:44px; text-align:left; align-self:flex-start;
+}
+.nc-of .nc-obs-ledger-more:hover{text-decoration:underline}
+
+/* Assign: one select, one verb. The button names the destination because the
+   destination is the decision — work starts in the item's own room. */
+/* The claims-board push shares assign's visual language exactly — same accent
+   button, same inline done/error line. It is the same act, one row over. */
+/* obs.C.11 / obs.C.10 — ONE filter grammar, on the claims card and on the
+   queue: chips narrow by a fixed vocabulary, a native select narrows by a name
+   the data supplies. Same chip the floor's own controls use, so a filter
+   looks the same everywhere on this page. */
+.nc-of .nc-of-filters{
+  display:flex; gap:7px; align-items:center; flex-wrap:wrap;
+  padding:9px 14px; border-bottom:1px solid var(--line);
+}
+.nc-of .nc-of-filters select{
+  font:inherit; font-size:11.5px; color:var(--ink); background:var(--card-2);
+  border:1px solid var(--line-2); border-radius:0; padding:0 8px; min-height:44px;
+}
+.nc-of .nc-of-filters .nc-of-clearfilter{margin-left:auto}
+
+/* The one action row — thread, steer, hand it over. Wraps rather than scrolls,
+   because it sits inside a dense held-claims list at 390px as well as on a
+   full-width table row. */
+.nc-of .nc-obs-actions{margin-top:9px; min-width:0}
+.nc-of .nc-obs-actions-row{display:flex; gap:8px; align-items:center; flex-wrap:wrap; min-width:0}
+/* One control grammar for both selects on the row — which room, then who. */
+.nc-of .nc-obs-actions-who,
+.nc-of .nc-obs-actions-room{
+  font:inherit; font-size:12.5px; color:var(--ink); background:var(--card-2);
+  border:1px solid var(--line-2); border-radius:0; padding:5px 8px; min-height:44px; max-width:100%;
+}
+.nc-of .nc-obs-actions button{
+  font:inherit; font-size:12.5px; font-weight:600; color:var(--card); background:var(--ink);
+  border:1px solid var(--ink); border-radius:0; padding:6px 12px; min-height:44px; cursor:pointer;
+}
+/* Steer only OPENS the composer — it is not the act, so it does not wear the
+   accent the acts wear. */
+.nc-of .nc-obs-actions .nc-obs-actions-steer{
+  color:var(--ink-2); background:var(--card-2); border:1px solid var(--line-2); font-weight:500;
+}
+.nc-of .nc-obs-actions button:disabled{opacity:.45; cursor:default}
+.nc-of .nc-obs-actions button:not(:disabled):hover{filter:brightness(1.08)}
+/* An item already shipped states the fact, not another button. The escape
+   hatch beside it is deliberately quiet — it is the rarer move. */
+.nc-of .nc-obs-ship-sent{
+  display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap;
+  font-size:12.5px; font-weight:600; color:var(--go);
+}
+.nc-of .nc-obs-decide-line .nc-obs-ship-again{
+  font:inherit; font-size:12px; font-weight:500; color:var(--ink-2); background:var(--card-2);
+  border:1px solid var(--line-2); border-radius:0; padding:3px 9px; cursor:pointer;
+}
+.nc-of .nc-obs-decide-line .nc-obs-ship-again:disabled{opacity:.45; cursor:default}
+.nc-of .nc-obs-actions-none{font-size:12px; color:var(--ink-3); font-style:italic}
+.nc-of .nc-obs-actions-err{font-size:12px; color:var(--stop)}
+.nc-of .nc-obs-actions-done{margin-top:7px; font-size:12.5px; font-weight:600; color:var(--go)}
+
+.nc-of .nc-obs-steer-target{margin:8px 0 0; font-size:12px; color:var(--ink-3)}
+/* The one-tap answers. Ordinary chips, in the composer rather than a filter
+   bar, so they carry no border-bottom and no card padding of their own. They
+   only FILL the box — the accent belongs to send, which is the act, so the
+   chip look has to be restored over `.nc-obs-actions button`. */
+.nc-of .nc-obs-steer-chips{display:flex; gap:7px; flex-wrap:wrap; margin-top:7px}
+.nc-of .nc-obs-steer-chips .nc-of-chip{
+  height:28px; min-height:0; padding:0 10px; font-weight:500;
+  color:var(--ink); background:var(--card-2); border:1px solid var(--line-2);
+}
+/* The conversation, above the box. Capped and scrollable so a long thread
+   cannot push send off the screen — the pane is context, the composer is the
+   point. Bottom-anchored by the component; the cap is what makes that scroll. */
+.nc-of .nc-obs-steer-thread{
+  max-height:40vh; overflow-y:auto; overscroll-behavior:contain;
+  margin-top:7px; padding:8px 9px;
+  background:var(--card-2); border:1px solid var(--line-2); border-radius:0;
+}
+.nc-of .nc-obs-steer-nopane{margin:7px 0 0; font-size:12px; font-style:italic; color:var(--ink-3)}
+.nc-of .nc-obs-steer{display:flex; gap:8px; align-items:flex-end; margin-top:6px; min-width:0}
+.nc-of .nc-obs-steer textarea{
+  flex:1 1 auto; min-width:0; font:inherit; font-size:12.5px; line-height:1.45; color:var(--ink);
+  background:var(--card-2); border:1px solid var(--line-2); border-radius:0; padding:7px 9px; resize:vertical;
+}
+.nc-of .nc-obs-steer textarea:focus{outline:2px solid var(--accent); outline-offset:1px}
+
+/* Anything that leaves the page. Sentence case, accent, 44px tall — the
+   uppercase-letterspaced-mono version this replaced shouted louder than the
+   rows it sat under. */
+.nc-of .nc-of-link{
+  display:inline-flex; align-items:center; min-height:44px; padding:4px 0;
+  font-size:12.5px; font-weight:500; color:var(--accent-text); text-decoration:underline;
+}
+.nc-of .nc-of-link:hover{text-decoration:underline}
+
+/* ─── Work claims ────────────────────────────────────────────────────────── */
+/* Same card, same dividers, same right-edge age column as the job table. */
+.nc-of .nc-obs-claim-rows{list-style:none; margin:0; padding:0}
+.nc-of .nc-obs-claim-row + .nc-obs-claim-row{border-top:1px solid var(--line)}
+.nc-of .nc-obs-claim-toggle{
+  appearance:none; background:none; border:0; margin:0; width:100%; font:inherit; color:var(--ink);
+  padding:10px 14px; min-height:44px; text-align:left; cursor:pointer;
+  display:grid; grid-template-columns:minmax(0,1fr) 92px 116px; gap:12px; align-items:center;
+}
+.nc-of .nc-obs-claim-toggle > *{min-width:0}
+.nc-of .nc-obs-claim-toggle:hover{background:rgba(35,32,27,.03)}
+.nc-of .nc-obs-claim-toggle:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
+.nc-of .nc-obs-claim-title{display:flex; align-items:center; gap:7px; min-width:0; flex-wrap:wrap}
+.nc-of .nc-obs-claim-slug{font-size:12.5px; overflow-wrap:anywhere}
+.nc-of .nc-obs-claim-tag{
+  font-size:10px; font-weight:600; white-space:nowrap; color:var(--ink-2);
+  background:rgba(35,32,27,.06); border-radius:0; padding:1px 5px;
+}
+.nc-of .nc-obs-claim-owner,.nc-of .nc-obs-claim-age{
+  font-size:11.5px; color:var(--ink-3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.nc-of .nc-obs-claim-age{text-align:right; font-variant-numeric:tabular-nums}
+.nc-of .nc-obs-claim-age.stop{color:var(--stop)}
+.nc-of .nc-obs-claim-age.warn{color:var(--warn)}
+.nc-of .nc-obs-claim-detail{padding:0 14px 12px; font-size:12.5px; color:var(--ink-2)}
+.nc-of .nc-obs-claim-note{line-height:1.5}
+
+/* ─── Scheduled jobs ─────────────────────────────────────────────────────── */
+/* name · cron · next fire. Monospace on the two identifiers only. */
+.nc-of .nc-of-sched-rows{list-style:none; margin:0; padding:0}
+.nc-of .nc-of-sched-row + .nc-of-sched-row{border-top:1px solid var(--line)}
+.nc-of .nc-of-sched-open{
+  appearance:none; background:none; border:0; margin:0; width:100%; font:inherit; color:var(--ink);
+  padding:10px 14px; min-height:44px; text-align:left; cursor:pointer;
+  display:grid; grid-template-columns:minmax(0,1fr) auto 66px; gap:12px; align-items:center;
+}
+.nc-of .nc-of-sched-open > *{min-width:0}
+.nc-of .nc-of-sched-open:hover{background:rgba(35,32,27,.03)}
+.nc-of .nc-of-sched-open:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
+.nc-of .nc-of-sched-name{display:flex; flex-direction:column; gap:2px; min-width:0}
+.nc-of .nc-of-sched-id{font-size:12.5px; overflow-wrap:anywhere}
+.nc-of .nc-of-sched-who{font-size:11.5px; color:var(--ink-3)}
+.nc-of .nc-of-sched-cron{
+  font-size:12px; color:var(--ink-2); white-space:nowrap;
+}
+.nc-of .nc-of-sched-when{
+  font-size:11.5px; color:var(--ink-3); text-align:right; font-variant-numeric:tabular-nums;
+  white-space:nowrap;
+}
+
+/* The workgroup picker reads as chrome here, not as a tiny mono caption. */
+.nc-of .nc-group-title-trigger{
+  font-family:inherit; font-size:12.5px; letter-spacing:0; text-transform:none;
+  color:var(--ink-2); background:none; border:1px solid var(--line); border-radius:0;
+  padding:4px 9px; min-height:32px; cursor:pointer; display:inline-flex; align-items:center; gap:6px;
+}
+.nc-of .nc-group-title-trigger:hover{border-color:var(--line-2); color:var(--ink)}
+.nc-of .nc-group-title-chev{color:var(--ink-3); font-size:9px}
+/* Phone: the metadata columns fold under the title rather than crushing it. */
+@media (max-width:720px){
+  /* Six columns do not fit a phone. The row folds into three lines — id+age,
+     title, then state+owner — and the column header, which only makes sense
+     over aligned columns, drops out entirely. */
+  .nc-of .nc-obs-ledger-head{display:none}
+  .nc-of .nc-obs-ledger-btn{grid-template-columns:minmax(0,1fr) auto; gap:4px 10px; padding:11px 14px}
+  /* No id column to hang off once the row stacks, and no room beside the ask
+     for the button — it drops to its own line rather than squeezing both. */
+  .nc-of .nc-obs-decide-line{padding-left:14px; flex-wrap:wrap; gap:8px}
+  .nc-of .nc-obs-ledger-id{grid-column:1; grid-row:1}
+  .nc-of .nc-obs-ledger-age{grid-column:2; grid-row:1}
+  .nc-of .nc-obs-ledger-title{grid-column:1 / -1; white-space:normal}
+  .nc-of .nc-obs-ledger-state{grid-column:1}
+  .nc-of .nc-obs-ledger-owner{grid-column:2; text-align:right}
+  .nc-of .nc-obs-ledger-room{grid-column:1 / -1}
+  .nc-of .nc-obs-claim-toggle,.nc-of .nc-of-sched-open{
+    grid-template-columns:minmax(0,1fr) auto; gap:4px 10px;
+  }
+  .nc-of .nc-obs-claim-title{grid-column:1 / -1}
+  .nc-of .nc-of-sched-name{grid-column:1 / -1}
+}
+
+/* ─── The room sheet ─────────────────────────────────────────────────────── */
+/* Steering an agent lives HERE, next to the room it is standing in — not on a
+   separate page. Detail opens over the floor, never away from it. */
+.nc-of .nc-of-sheet{
+  background:var(--card-2); border:1px solid var(--line); border-radius:var(--r);
+  margin-bottom:12px; overflow:hidden;
+}
+.nc-of .nc-of-sheet > header{
+  display:flex; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--line);
+}
+.nc-of .nc-of-sheet-title{font-size:13px; font-weight:600}
+.nc-of .nc-of-sheet-x{
+  margin-left:auto; appearance:none; background:none; border:0; cursor:pointer;
+  color:var(--ink-3); font-size:13px; width:32px; height:32px; border-radius:0;
+}
+.nc-of .nc-of-sheet-x:hover{background:rgba(35,32,27,.05); color:var(--ink)}
+.nc-of .nc-of-sheet-empty{margin:0; padding:12px 14px; font-size:12.5px; color:var(--ink-3); font-style:italic}
+.nc-of .nc-of-sheet-list{list-style:none; margin:0; padding:0}
+.nc-of .nc-of-sheet-list li{
+  display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+  padding:10px 14px; min-height:44px; font-size:12.5px;
+}
+.nc-of .nc-of-sheet-list li + li{border-top:1px solid var(--line)}
+/* obs.10 — you clicked a PERSON, so the sheet says which one. The same quiet
+   ink wash the rest of the chrome hovers with, plus the accent rule that marks
+   interaction everywhere else. No new colour, and no status colour: the dot
+   still owns state. */
+.nc-of .nc-of-sheet-list li.on{background:rgba(35,32,27,.05); box-shadow:inset 2px 0 0 var(--accent)}
+.nc-of .nc-of-sheet-who{display:inline-flex; align-items:center; gap:7px; font-weight:600; min-width:120px}
+/* obs.C.4 — the same face the floor draws, at name scale. Round and hairlined
+   like every other avatar on the page; `flex:none` so a slow image can't shove
+   the name around as it loads. */
+.nc-of .nc-of-sheet-face{
+  width:20px; height:20px; border-radius:50%; flex:none;
+  object-fit:cover; background:var(--line); border:1px solid var(--line);
+}
+.nc-of .nc-of-sd{width:7px; height:7px; border-radius:50%; background:var(--idle); flex:none}
+.nc-of .nc-of-sd.blocked{background:var(--stop)}
+.nc-of .nc-of-sd.waiting{background:var(--warn)}
+.nc-of .nc-of-sd.working{background:var(--go)}
+.nc-of .nc-of-sheet-holding{color:var(--ink-3); flex:1 1 160px; min-width:0}
+
+/* obs.3 — steer the work, not the worker: one row per held claim. The old
+   per-agent steer link (.nc-of-sheet-steer / .nc-of-sheet-nosession) is gone;
+   these replace it. Divs, not a nested <ul>, so the sheet's own
+   `.nc-of-sheet-list li` rules don't bleed onto each held row. */
+.nc-of .nc-of-sheet-held{flex:1 1 220px; min-width:0; display:flex; flex-direction:column}
+/* Every row is one 44px tap target whether or not it carries a link — .nc-of-link
+   already sets that floor, and matching it keeps the stack evenly spaced instead
+   of clumping the linkless rows together. */
+.nc-of .nc-of-sheet-held-row{display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0; min-height:44px}
+/* A floor is a column of rows: the actions start at one x, not wherever each
+   slug happens to end. Only a FLOOR, so a long slug still takes the width it
+   needs and the row wraps instead of truncating. */
+.nc-of .nc-of-sheet-held-slug{flex:0 1 auto; min-width:min(230px, 100%); overflow-wrap:anywhere}
+.nc-of .nc-of-sheet-nothread{color:var(--ink-3); font-style:italic}
+/* A holder's stack can run ten rows tall; the row's inherited align-items:center
+   would then float the name into the middle of it. */
+.nc-of .nc-of-sheet-list li:has(.nc-of-sheet-held){align-items:flex-start}
+
+/* The provenance line. It is a footnote about where the numbers came from, so
+   it reads as one — quiet sentence case, not a stamped uppercase banner. */
+.nc-of .nc-obs-footer {
+  padding: 12px 16px 20px; text-align: center; font-size: 11.5px; color: var(--ink-3);
+}
+.nc-of .nc-obs-stale { color: var(--stop); }
+
+/* ─── The session page: the steer destination ────────────────────────────── */
+/* Reached from the Observatory's room sheet, so it inherits `.nc-of`'s atrium
+   tokens and adds only what a one-conversation page needs. Everything below is
+   scoped to `.nc-sd` — the shared transcript/composer CSS above is still the
+   dark-board version for any surface that keeps it. */
+
+.nc-sd .nc-sd-back{
+  color:var(--accent); font-weight:600; font-size:12.5px;
+  display:inline-flex; align-items:center; min-height:32px;
+}
+.nc-sd .nc-sd-back:hover{color:var(--accent); text-decoration:underline}
+.nc-sd .mono{font-family:var(--font-mono)}
+.nc-sd .nc-of-bar-meta .nc-of-live{text-transform:none}
+
+.nc-sd .nc-sd-body{max-width:880px; margin:0 auto; padding:14px 16px 24px}
+
+/* Who is talking, where, and which session — three lines, no chrome. */
+.nc-sd .nc-sd-head{
+  background:var(--card-2); border:1px solid var(--line); border-radius:var(--r);
+  padding:14px 16px; margin-bottom:12px;
+}
+.nc-sd .nc-sd-head h1{
+  margin:0 0 6px; font-size:19px; font-weight:600; letter-spacing:-.012em; line-height:1.3;
+}
+.nc-sd .nc-sd-who{margin:0; font-size:13px; color:var(--ink-2)}
+.nc-sd .nc-sd-who b{color:var(--ink); font-weight:600}
+.nc-sd .nc-sd-facts{
+  margin:9px 0 0; padding-top:9px; border-top:1px solid var(--line);
+  display:flex; flex-wrap:wrap; gap:4px 16px; font-size:11.5px; color:var(--ink-3);
+}
+
+.nc-sd .nc-sd-convo{
+  background:var(--card-2); border:1px solid var(--line); border-radius:var(--r);
+  padding:12px 16px 16px;
+}
+.nc-sd .nc-sd-convo h2{
+  margin:0 0 10px; font-size:12.5px; font-weight:600; color:var(--ink-2);
+  letter-spacing:0; text-transform:none;
+}
+
+/* Transcript, relit for paper — shared by the session page and by the
+   Observatory's inline steer pane. The base rules above paint a dark plate
+   (they date from the dark board) and are invisible on either light surface,
+   so both scopes carry the same overrides: one thread, one look, two places.
+   Rows are hairline-separated on the card, not a stack of individually
+   bordered dark boxes; the side rule is the only direction cue. */
+.nc-sd .nc-transcript, .nc-obs-steer-thread .nc-transcript{gap:0}
+.nc-sd .nc-transcript-row, .nc-obs-steer-thread .nc-transcript-row{
+  background:none; border:0; border-radius:0; border-left:2px solid var(--line-2);
+  padding:9px 0 9px 12px;
+}
+.nc-sd .nc-transcript-row + .nc-transcript-row, .nc-obs-steer-thread .nc-transcript-row + .nc-transcript-row{border-top:1px solid var(--line)}
+.nc-sd .nc-transcript-row.inbound, .nc-obs-steer-thread .nc-transcript-row.inbound{border-left-color:var(--accent)}
+.nc-sd .nc-transcript-row.outbound, .nc-obs-steer-thread .nc-transcript-row.outbound{border-left-color:var(--line-2)}
+.nc-sd .nc-transcript-dir, .nc-obs-steer-thread .nc-transcript-dir{
+  font-size:11px; font-weight:600; color:var(--ink-2);
+  display:inline-flex; align-items:center; gap:4px;
+}
+.nc-sd .nc-transcript-tag, .nc-obs-steer-thread .nc-transcript-tag{font-size:11px; color:var(--ink-3)}
+.nc-sd .nc-transcript-text, .nc-obs-steer-thread .nc-transcript-text{color:var(--ink); font-size:13px; line-height:1.5}
+.nc-sd .nc-transcript-more, .nc-obs-steer-thread .nc-transcript-more{
+  color:var(--accent); font-family:inherit; font-size:11.5px; font-weight:600;
+}
+.nc-sd .nc-truncate-ellipsis, .nc-obs-steer-thread .nc-truncate-ellipsis{color:var(--ink-3)}
+.nc-sd .nc-transcript-thinking summary::before, .nc-obs-steer-thread .nc-transcript-thinking summary::before{color:var(--ink-3); font-family:inherit}
+.nc-sd .nc-thinking-list, .nc-obs-steer-thread .nc-thinking-list{border-left:1px solid var(--line)}
+.nc-sd .nc-empty, .nc-obs-steer-thread .nc-empty{
+  border:1px dashed var(--line-2); border-radius:0; color:var(--ink-3);
+  font-family:inherit; font-size:12.5px; letter-spacing:0; text-transform:none; margin:0;
+}
+
+/* Markdown bodies: the dark-board rules paint near-black plates on paper. */
+.nc-sd .nc-md code, .nc-obs-steer-thread .nc-md code{background:rgba(35,32,27,.06); color:var(--ink)}
+.nc-sd .nc-md pre, .nc-obs-steer-thread .nc-md pre{background:var(--page); border:1px solid var(--line)}
+.nc-sd .nc-md a, .nc-obs-steer-thread .nc-md a{color:var(--accent)}
+.nc-sd .nc-md blockquote, .nc-obs-steer-thread .nc-md blockquote{border-left-color:var(--line-2); color:var(--ink-2)}
+.nc-sd .nc-md thead, .nc-obs-steer-thread .nc-md thead{background:var(--page)}
+.nc-sd .nc-md th, .nc-sd .nc-md td, .nc-obs-steer-thread .nc-md th, .nc-obs-steer-thread .nc-md td{border-color:var(--line)}
+.nc-sd .nc-md tbody tr:nth-child(even), .nc-obs-steer-thread .nc-md tbody tr:nth-child(even){background:rgba(35,32,27,.03)}
+.nc-sd .nc-md hr, .nc-obs-steer-thread .nc-md hr{border-top-color:var(--line)}
+
+/* The composer is the page's other half — it sits on paper, not on a dark
+   gradient, and its counter/button stop shouting in uppercase mono. */
+/* The fade does the separating. A hairline here spans the composer's own
+   width, not the page's, so it stopped short of both card edges and read as a
+   misdrawn rule rather than as an edge. */
+.nc-sd .nc-composer{
+  background:linear-gradient(180deg,rgba(246,244,240,0) 0%,var(--page) 30%);
+  border-top:0; padding:14px 16px 14px;
+}
+.nc-sd .nc-composer .field{
+  background:var(--card-2); border:1px solid var(--line-2); border-radius:0;
+}
+.nc-sd .nc-composer .field:focus-within{border-color:var(--accent)}
+.nc-sd .nc-composer .field.over{border-color:var(--stop)}
+.nc-sd .nc-composer form,.nc-sd .nc-composer{max-width:880px; margin:0 auto}
+.nc-sd .nc-composer textarea{color:var(--ink); font-family:inherit}
+.nc-sd .nc-composer textarea::placeholder{color:var(--ink-3)}
+.nc-sd .nc-composer .row{
+  font-family:var(--font-mono); font-size:11px;
+  letter-spacing:0; text-transform:none; color:var(--ink-3);
+}
+.nc-sd .nc-composer .row .over{color:var(--stop)}
+.nc-sd .nc-composer .send{
+  background:var(--accent); color:#fff; border-radius:0; padding:7px 14px; min-height:34px;
+  font-family:inherit; font-size:12.5px; font-weight:600; letter-spacing:0; text-transform:none;
+}
+.nc-sd .nc-composer .send:disabled{opacity:.45}
+.nc-sd .nc-error{
+  color:var(--stop); font-family:inherit; font-size:12px; letter-spacing:0;
+}
+
+@media (max-width:700px){
+  .nc-sd .nc-sd-body{padding:11px 12px 20px}
+  .nc-sd .nc-sd-head{padding:12px 13px}
+  .nc-sd .nc-sd-head h1{font-size:17px}
+  .nc-sd .nc-sd-convo{padding:11px 13px 13px}
+  .nc-sd .nc-sd-facts{gap:3px 12px}
+  .nc-sd .nc-composer{padding:12px 12px}
+}
+
+/* ── Issue brief (Decisions view expanded row) ─────────────────────────── */
+.nc-of .nc-obs-brief{margin-top:10px; padding:10px 12px; border:1px solid var(--line); border-radius:0; display:flex; flex-direction:column; gap:8px}
+.nc-of .nc-obs-brief-empty{margin-top:10px; font-size:12.5px; color:var(--ink-3); font-style:italic}
+.nc-of .nc-obs-brief-labels{display:flex; flex-wrap:wrap; gap:6px; align-items:center}
+.nc-of .nc-obs-brief-state{font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:1px 7px; border-radius:0; border:1px solid var(--line); color:var(--ink-2)}
+.nc-of .nc-obs-brief-state.open{color:var(--go); border-color:var(--go)}
+.nc-of .nc-obs-brief-label{font-size:11px; padding:1px 7px; border-radius:0; background:var(--bg-inset); color:var(--ink-2)}
+.nc-of .nc-obs-brief-body{font-size:12.5px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; max-height:180px; overflow-y:auto; color:var(--ink-2)}
+.nc-of .nc-obs-brief-comments{display:flex; flex-direction:column; gap:6px; border-top:1px dashed var(--line); padding-top:8px}
+.nc-of .nc-obs-brief-more{font-size:11px; color:var(--ink-3)}
+.nc-of .nc-obs-brief-comment p{margin:2px 0 0; font-size:12.5px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; max-height:120px; overflow-y:auto}
+.nc-of .nc-obs-brief-author{font-size:11px; font-weight:600; color:var(--ink-3)}

@@ -1,0 +1,318 @@
+# Read the refs Git will push and gate their committed trees, not any later
+# worktree edits. Linked worktrees use the main checkout's installed tooling.
+set -e
+repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
+worktree_root=$(git rev-parse --show-toplevel)
+git_local_env=$(git rev-parse --local-env-vars)
+# Git hooks export the invoking checkout's repository selection variables.
+# Keep command-scoped `git -c` configuration so remote access still inherits it.
+for git_env in $git_local_env; do
+  case "$git_env" in
+    GIT_CONFIG*) ;;
+    *) unset "$git_env" ;;
+  esac
+done
+# Pack transfer sends original objects, even when local replacement refs exist.
+export GIT_NO_REPLACE_OBJECTS=1
+remote_name=$1
+remote_url=$2
+case "$(git -C "$worktree_root" rev-parse --show-object-format)" in
+  sha1) zero_sha=$(printf '%040d' 0) ;;
+  sha256) zero_sha=$(printf '%064d' 0) ;;
+  *) echo "pre-push: unsupported repository object format" >&2; exit 1 ;;
+esac
+refs_file=''
+seen_objects=''
+advertised_refs=''
+known_remote_tips=''
+object_list=''
+commit_message=''
+snapshot_parent=''
+snapshot_root=''
+allowlist_path=''
+ref_allowlist_file=''
+
+remove_file() {
+  if [ -n "$1" ] && [ -e "$1" ] && ! rm -f "$1"; then
+    echo "pre-push: failed to remove temporary file" >&2
+  fi
+}
+
+cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  if [ -n "$snapshot_root" ] && [ -d "$snapshot_root" ]; then
+    if ! git -C "$worktree_root" worktree remove "$snapshot_root"; then
+      echo "pre-push: failed to remove temporary snapshot" >&2
+    fi
+  fi
+  remove_file "$commit_message"
+  if [ -n "$snapshot_parent" ] && [ -d "$snapshot_parent" ] && ! rmdir "$snapshot_parent"; then
+    echo "pre-push: failed to remove temporary snapshot directory" >&2
+  fi
+  remove_file "$object_list"
+  remove_file "$ref_allowlist_file"
+  remove_file "$advertised_refs"
+  remove_file "$known_remote_tips"
+  remove_file "$seen_objects"
+  remove_file "$refs_file"
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+refs_file=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-refs.XXXXXX")
+seen_objects=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-seen.XXXXXX")
+cat > "$refs_file"
+
+# The fork's main changes only through merged pull requests. A direct push
+# skips CI and review, and nothing server-side refuses one on this repository,
+# so refuse any update or deletion of a remote main here, before any other
+# work. For an emergency, NANOCLAW_ALLOW_MAIN_PUSH=1 lets the push through and
+# the boundary scan below still runs; --no-verify would skip that scan too.
+# The refusal below does not name that override: printing it hands the next
+# reader (agent or human) a ready-made bypass for a guard that exists to make
+# them stop and open a PR instead.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [ "$remote_ref" = refs/heads/main ] && [ "${NANOCLAW_ALLOW_MAIN_PUSH:-}" != 1 ]; then
+    echo "pre-push: refusing to push to main on $remote_name. main takes changes through pull requests only: push a branch and open a PR." >&2
+    exit 1
+  fi
+done < "$refs_file"
+
+needs_remote_tips=''
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero_sha" ] && continue
+  if [ "$remote_sha" = "$zero_sha" ] || ! git -C "$worktree_root" cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    needs_remote_tips=1
+    break
+  fi
+done < "$refs_file"
+
+# Always learn the live advertised tips, not only when a ref is new or its
+# remote_sha is unknown locally. An EXISTING ref's own remote_sha only tells
+# us what that one ref pointed to; other refs (main, chiefly) routinely carry
+# history this branch already merged. Scoping the scan to remote_sha..local_sha
+# alone re-walks commits that are already on the remote through those other
+# refs, and since the install's identifier registry grows over time, a commit
+# that passed when first pushed can start failing a later, unrelated push that
+# merely rev-lists over it again. Re-scanning published commits protects
+# nothing, so every known remote tip is excluded below, not just this ref's.
+advertised_refs=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-remote.XXXXXX")
+known_remote_tips=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-known.XXXXXX")
+# $remote_url ($2) is not a literal argument by the time this hook sees it:
+# git push has already resolved it through any url.<base>.pushInsteadOf or
+# url.<base>.insteadOf rule that matches (for example an identity
+# pushInsteadOf), so $remote_url IS the rewritten URL. `ls-remote --get-url`
+# reports what ls-remote would itself resolve that same string to under its
+# own (fetch-side) insteadOf rules, which can differ from the push-side ones
+# — a local mirror, say. A mismatch means the ls-remote call below would not
+# be asking the actual push target, so treat it exactly like "no remote_url"
+# and fall into the failure branch below. A failing --get-url itself prints
+# nothing, so it differs from $remote_url (non-empty) and takes the same
+# fail-closed branch; set -e does not abort here because the substitution
+# sits inside an `if` condition.
+if [ -n "$remote_url" ] && [ "$(git -C "$worktree_root" ls-remote --get-url "$remote_url")" != "$remote_url" ]; then
+  echo "pre-push: fetch-side URL rewriting applies to $remote_url; ls-remote would not query the push target" >&2
+  remote_url=""
+fi
+if [ -z "$remote_url" ] || ! git -C "$worktree_root" ls-remote "$remote_url" > "$advertised_refs"; then
+  if [ -n "$needs_remote_tips" ]; then
+    echo "pre-push: failed to list advertised refs for $remote_name" >&2
+    exit 1
+  fi
+  # Every pushed ref is existing with a locally known remote_sha: fall back to
+  # each ref's own remote_sha..local_sha range, without the extra exclusion of
+  # other known remote tips. That scans at least as many commits as the
+  # live-tips path would have, never fewer, so it stays fail-closed.
+  echo "pre-push: failed to list advertised refs for $remote_name; falling back to each ref's own remote-tracking range" >&2
+else
+  # A per-tip `git cat-file -e` loop is one process per advertised ref; origin
+  # alone advertises in the hundreds, and that loop is measurably slow. Ask
+  # for all of them in one batch instead, peeling through tags exactly like
+  # the old per-tip `$tip^{commit}` check did. Each input line pairs the peel
+  # expression with the ORIGINAL tip SHA so `%(rest)` echoes that original
+  # SHA back on a hit; a miss instead prints the peel expression itself
+  # followed by `missing` (verified: `printf '%s^{commit} %s\n' sha sha |
+  # git cat-file --batch-check='%(rest)'` emits the bare sha on a hit, and
+  # `sha^{commit} missing` on a miss). Filter FOR the hit shape — a bare
+  # full-length hex object id, sha1 (40) or sha256 (64) — rather than
+  # filtering out the miss suffix: an allowlist fails closed if cat-file's
+  # missing-line format ever changes, where a denylist would silently start
+  # trusting unknown tips again (#612). `|| true` covers the case where every
+  # tip is unknown/non-commit: grep then finds nothing to print and exits 1,
+  # which must not be mistaken by `set -e` for a real failure — an empty
+  # known_remote_tips is already handled as "no known tips" and only means
+  # more scanning, never less.
+  while read -r remote_tip remote_ref; do
+    printf '%s^{commit} %s\n' "$remote_tip" "$remote_tip"
+  done < "$advertised_refs" \
+    | git -C "$worktree_root" cat-file --batch-check='%(rest)' 2>/dev/null \
+    | grep -xE '[0-9a-f]{40}|[0-9a-f]{64}' > "$known_remote_tips" || true
+fi
+remove_file "$advertised_refs"
+advertised_refs=''
+
+scan_message() {
+  # Run the main checkout's checker from the main checkout, as the snapshot scan
+  # below does. Hooks run from there (scripts/pin-git-hooks-path.sh pins
+  # core.hooksPath to it), so that is the checker version this hook expects, and
+  # its better-sqlite3 import resolves there. A linked worktree's own
+  # node_modules may be absent or a partial real directory (a stray .cache), so
+  # it is never used; linking into it used to fail with "tsx: not found".
+  (cd "$repo_root" && "$repo_root/node_modules/.bin/tsx" "$repo_root/scripts/check-public-boundary.ts" --root "$1" --message "$2" --message-raw --allowlist "$allowlist_path") </dev/null
+}
+
+scan_tag() {
+  snapshot_parent=$(mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX")
+  commit_message="$snapshot_parent/TAG_EDITMSG"
+  # Keep the raw object on disk until its separator has been validated. Command
+  # substitution drops trailing newlines, including a valid empty annotation.
+  git -C "$worktree_root" cat-file tag "$1" > "$commit_message"
+  if ! awk '
+    NR == 1 { if ($0 !~ /^object /) exit 1; next }
+    NR == 2 { if ($0 !~ /^type /) exit 1; next }
+    NR == 3 { if ($0 !~ /^tag /) exit 1; next }
+    NR == 4 && /^tagger / { next }
+    /^$/ { found = 1; exit }
+    { exit 1 }
+    END { exit !found }
+  ' "$commit_message"; then
+    echo "pre-push: malformed annotated tag object: expected header separator" >&2
+    exit 1
+  fi
+  # Tagger identity is object metadata; only the annotation is published prose.
+  tag_annotation=$(sed '1,/^$/d' "$commit_message")
+  printf '%s\n' "$tag_annotation" > "$commit_message"
+  scan_message "$worktree_root" "$commit_message"
+  remove_file "$commit_message"
+  commit_message=''
+  rmdir "$snapshot_parent"
+  snapshot_parent=''
+}
+
+# This hook carries ONLY the check CI cannot run.
+#
+# It used to also run eslint and both tsc invocations against every pushed
+# commit's snapshot. Those were the expensive half: .github/workflows/ci.yml
+# runs both tsc invocations on every PR, and lint runs nightly in ci-full.yml
+# (since 2026-09-17 the author lints before pushing — CLAUDE.md, Development;
+# `prebuild` still refuses a lint failure at build time). Measured on this
+# host at load 1.15: eslint 68.1s and tsc 23.4s against the boundary check's
+# 27.8s, and `objects_for_ref` pays that per PUSHED COMMIT, so a five-commit
+# branch cost ~10 minutes.
+#
+# That was survivable while this hook only ever ran for a deployer pushing from
+# the main checkout. It is not survivable now that it runs for every agent
+# worktree push (scripts/pin-git-hooks-path.sh), on a shared box where CPU
+# starvation is a recurring failure and where push latency in the tens of
+# minutes trips agent-side timeouts and provokes retries.
+#
+# The public-boundary check stays, because CI structurally cannot do it: the CI
+# step runs `--portable` (ci.yml:34), structural patterns only, since a runner
+# has no `data/v2.db` and shipping it the identifier registry would publish the
+# thing the registry protects. It stays PER COMMIT for the same reason the loop
+# exists — an identifier in an intermediate commit's tree is published to the
+# remote just as surely as one in the tip — and it now runs niced, so a push
+# yields to the fleet rather than competing with it.
+snapshot_commit() {
+  snapshot_parent=$(mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX")
+  snapshot_root="$snapshot_parent/tree"
+  git -C "$worktree_root" -c core.hooksPath=/dev/null worktree add --detach --quiet "$snapshot_root" "$1" </dev/null
+
+  commit_message="$snapshot_parent/COMMIT_EDITMSG"
+  git -C "$worktree_root" show --no-patch --format=%B "$1" > "$commit_message"
+  scan_message "$snapshot_root" "$commit_message"
+  remove_file "$commit_message"
+  commit_message=''
+  # The snapshot needs no node_modules of its own: this runs from $repo_root and
+  # reads the snapshot only through `git ls-files`/`git show` on its index.
+  # Leaving the tree free of untracked files is also what lets the plain
+  # `worktree remove` below succeed without --force.
+  if command -v ionice >/dev/null 2>&1; then
+    (cd "$repo_root" && ionice -c3 nice -n 10 pnpm run check:public-boundary -- --root "$snapshot_root" --index --allowlist "$allowlist_path") </dev/null
+  else
+    (cd "$repo_root" && nice -n 10 pnpm run check:public-boundary -- --root "$snapshot_root" --index --allowlist "$allowlist_path") </dev/null
+  fi
+
+  git -C "$worktree_root" worktree remove "$snapshot_root"
+  rmdir "$snapshot_parent"
+  snapshot_parent=''
+  snapshot_root=''
+}
+
+objects_for_ref() {
+  local_ref=$1
+  local_sha=$2
+  remote_sha=$3
+  object_list=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-commits.XXXXXX")
+  ref_allowlist_file=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-allowlist.XXXXXX")
+  # Read the allowlist from $local_sha's own committed tree, not the pushing
+  # worktree's working copy: the working copy can hold an uncommitted entry
+  # that exempts a value nothing on the remote actually backs (#651). A ref
+  # whose tip carries no .public-boundary-allowlist.json at all — the
+  # long-lived channels/providers sibling branches, most local tags — is not
+  # refused for that: it gets an empty allowlist, which exempts nothing and
+  # is still the strictest outcome. The pushed commit's own committed
+  # entries govern every commit objects_for_ref scans below, including
+  # older ones this ref's history carries; changes to that file are
+  # reviewed when they merge, because it is risk:high.
+  if ! git -C "$worktree_root" show "$local_sha:.public-boundary-allowlist.json" > "$ref_allowlist_file" 2>/dev/null; then
+    printf '{"entries": []}\n' > "$ref_allowlist_file"
+    # Non-fatal, and it does not change the scan's outcome (empty exempts
+    # nothing either way), but a later alert about a finding on this ref
+    # should explain itself rather than leave "why wasn't this exempted?"
+    # unanswered.
+    echo "pre-push: $local_ref ($local_sha) has no committed .public-boundary-allowlist.json — scanning with an empty allowlist" >&2
+  fi
+  allowlist_path="$ref_allowlist_file"
+  # Exclude this ref's own remote_sha (when known) AND every other known
+  # remote tip, so a commit already reachable from the remote through another
+  # ref (main, chiefly) is not re-scanned just because it also sits behind
+  # this ref's own baseline. A commit already on the remote is already
+  # published; re-walking it here protects nothing and only risks a stale
+  # pass turning into a spurious failure as the identifier registry grows.
+  set --
+  if [ "$remote_sha" != "$zero_sha" ] && git -C "$worktree_root" cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    set -- "$remote_sha"
+  fi
+  # known_remote_tips is always a real path by this point (see above), so no
+  # existence guard is needed here — an empty file just contributes no args.
+  while read -r remote_tip; do
+    set -- "$@" "$remote_tip"
+  done < "$known_remote_tips"
+  if [ "$#" -eq 0 ]; then
+    git -C "$worktree_root" rev-list --objects --no-object-names --filter=tree:0 "$local_sha" > "$object_list"
+  else
+    git -C "$worktree_root" rev-list --objects --no-object-names --filter=tree:0 "$local_sha" --not "$@" > "$object_list"
+  fi
+  # Keep annotated tag objects (including nested tags), not just peeled commits.
+  # Commit snapshots cover their trees, so omit tree/blob traversal here.
+  while read -r object_sha; do
+    if grep -Fqx "$object_sha" "$seen_objects"; then
+      continue
+    fi
+    printf '%s\n' "$object_sha" >> "$seen_objects"
+    case "$(git -C "$worktree_root" cat-file -t "$object_sha")" in
+      commit) snapshot_commit "$object_sha" ;;
+      tag) scan_tag "$object_sha" ;;
+      *) echo "pre-push: unsupported pushed object type" >&2; exit 1 ;;
+    esac
+  done < "$object_list"
+  remove_file "$object_list"
+  object_list=''
+  remove_file "$ref_allowlist_file"
+  ref_allowlist_file=''
+  allowlist_path=''
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero_sha" ] && continue
+  if ! git -C "$worktree_root" cat-file -e "$local_sha^{commit}" 2>/dev/null; then
+    echo "pre-push: unsupported ref target; expected a commit or tag pointing to a commit" >&2
+    exit 1
+  fi
+  objects_for_ref "$local_ref" "$local_sha" "$remote_sha"
+done < "$refs_file"

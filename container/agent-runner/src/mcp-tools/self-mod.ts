@@ -1,0 +1,302 @@
+/**
+ * Self-modification MCP tools: install_packages, add_mcp_server.
+ *
+ * Both are fire-and-forget — the tool writes a system action row and returns
+ * immediately. The host processes the request (including admin approval)
+ * and notifies the agent via a chat message when complete. Admin approval
+ * is approval to apply the change: `install_packages` auto-rebuilds the
+ * per-agent image and restarts the container; `add_mcp_server` just
+ * updates `container.json` and restarts (bun runs TS directly — no build
+ * step needed for a pure MCP wiring change).
+ *
+ * The container is untrusted, so neither tool validates its input beyond what
+ * it needs to build the request: the host's precheck validates it before any
+ * approval card and reports a rejection to the agent as a message.
+ */
+import { getCentralDb } from '../central-db.js';
+import { writeMessageOut } from '../db/messages-out.js';
+import { setStickyModel, setStickyEffort } from '../modules/mailbox/index.js';
+import { getConfig } from '../config.js';
+import { providerContract } from '../providers/contract.js';
+import { resolveFamilyModel } from '../providers/model-vocabulary.js';
+import { registerTools } from './server.js';
+import { err, generateId, log, ok } from './tool-helpers.js';
+import type { McpToolDefinition } from './types.js';
+
+/**
+ * Forwarded unvalidated: the container is untrusted and the host's precheck validates before any approval card.
+ * Deliberately a subset of what `parseMcpServerConfig` accepts: `cwd` has no self-mod form the host would keep.
+ */
+const MCP_SERVER_FIELDS = ['type', 'command', 'args', 'env', 'url', 'headers', 'instructions'] as const;
+
+export const installPackages: McpToolDefinition = {
+  tool: {
+    name: 'install_packages',
+    description:
+      'Install apt and/or npm packages into YOUR per-agent container image so they persist for all future turns — use this over a workspace `pnpm install` (which only lasts the current turn) whenever the user asks you to add a capability for good. Requires admin approval; fire-and-forget. The host validates the request (package names: lowercase letters, digits and ._+- for apt, a plain or @scoped name for npm, no version specs; at most 20 packages); a rejection or an approval decision arrives later as a message. On approval, the image is rebuilt and the container is restarted automatically.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        apt: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'apt packages to install (names only, no version specs or flags)',
+        },
+        npm: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'npm packages to install globally (names only, no version specs)',
+        },
+        reason: { type: 'string', description: 'Why these packages are needed' },
+      },
+    },
+  },
+  async handler(args) {
+    const hasPackages = (value: unknown) => Array.isArray(value) && value.length > 0;
+    if (!hasPackages(args.apt) && !hasPackages(args.npm)) {
+      return err('Provide at least one package in apt or npm');
+    }
+
+    const requestId = generateId();
+    await writeMessageOut({
+      id: requestId,
+      kind: 'system',
+      content: JSON.stringify({
+        action: 'install_packages',
+        apt: args.apt ?? [],
+        npm: args.npm ?? [],
+        reason: typeof args.reason === 'string' ? args.reason : '',
+      }),
+    });
+
+    log(`install_packages: ${requestId}`);
+    return ok(
+      'Package install request submitted. The host validates it; you will get a message if it is rejected, and when admin approves or denies it.',
+    );
+  },
+};
+
+export const addMcpServer: McpToolDefinition = {
+  tool: {
+    name: 'add_mcp_server',
+    description:
+      'Wire an EXISTING third-party MCP server into YOUR per-agent runtime config. Provide EITHER the local `command` + optional `args`/`env` (e.g. `npx @modelcontextprotocol/server-github`; browse options at https://mcp.so), OR the remote Streamable HTTP `url` of a hosted server (HTTPS; plain HTTP only for localhost / host.docker.internal) with optional `headers`. Requires admin approval; fire-and-forget. The host validates the request before any approval card (server name, transport fields, no credentials in the url, headers limited to known configuration headers or the OneCLI placeholder); a rejection arrives later as a message, as does the approval decision. Never ask the user for credentials or fabricate credential-setup instructions — OneCLI handles them: use `"onecli-managed"` as the placeholder value for any credential env var, header, or config field the server needs (e.g. `headers: { "Authorization": "Bearer onecli-managed" }`). After the server is installed and the container restarts, load the `onecli-gateway` skill for the full credential-handling flow (connect URLs, stubs, error recovery).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        name: {
+          type: 'string',
+          description: 'MCP server name (unique identifier): 1-64 letters, digits, "_" or "-"',
+        },
+        type: { type: 'string', description: 'Optional transport: "stdio" (with command) or "http" (with url)' },
+        command: { type: 'string', description: 'Command to run a local stdio MCP server' },
+        args: { type: 'array', items: { type: 'string' }, description: 'Command arguments (command only)' },
+        env: { type: 'object', description: 'Environment variables for the server (command only)' },
+        url: {
+          type: 'string',
+          description:
+            'Streamable HTTP MCP endpoint (HTTPS; plain HTTP only for localhost / host.docker.internal). Mutually exclusive with command.',
+        },
+        headers: {
+          type: 'object',
+          description:
+            'HTTP headers for a remote server (url only). Credential headers must use the "onecli-managed" placeholder — the gateway substitutes the real secret at the proxy boundary.',
+        },
+        instructions: { type: 'string', description: 'Optional usage notes for agents that use this server' },
+      },
+      required: ['name'],
+    },
+  },
+  async handler(args) {
+    const name = typeof args.name === 'string' ? args.name : '';
+    if (!name) return err('name is required');
+
+    const fields = Object.fromEntries(
+      MCP_SERVER_FIELDS.filter((key) => args[key] !== undefined).map((key) => [key, args[key]]),
+    );
+    const requestId = generateId();
+    await writeMessageOut({
+      id: requestId,
+      kind: 'system',
+      content: JSON.stringify({ action: 'add_mcp_server', name, ...fields }),
+    });
+
+    log(`add_mcp_server: ${requestId} → "${name}"`);
+    return ok(
+      'MCP server request submitted. The host validates it; you will get a message if it is rejected, and when admin approves or denies it.',
+    );
+  },
+};
+
+export function unavailableModelInventory(provider: string) {
+  if (providerContract(provider).modelListing) return null;
+  return ok(
+    `This is a ${provider} session. \`list_models\` inventories OpenCode slugs only and is not a ${provider} model catalog. ` +
+      'For an authorized request to change this channel default, call `set_channel_model` directly; the host validates the provider-specific model.',
+  );
+}
+
+export const listModels: McpToolDefinition = {
+  tool: {
+    name: 'list_models',
+    description:
+      "OpenCode-only model inventory for the session-scoped `change_model` tool. It returns OpenCode slugs reachable from this container's auth.json + env, grouped by upstream provider prefix (opencode-go/*, opencode/*, nvidia/*, etc.), minus any operator-denied slugs. Do NOT use it to validate or reject a channel-default request (`set_channel_model`): that host-side tool is provider-aware and must be called directly for an authorized request. Read-only, no approval needed.",
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  async handler() {
+    const provider = getConfig().provider;
+    const unavailable = unavailableModelInventory(provider);
+    if (unavailable) return unavailable;
+
+    // `opencode models` is the live source of truth; the operator deny list is subtracted from it.
+    let opencodeOut: string;
+    try {
+      const proc = Bun.spawn(['opencode', 'models'], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      opencodeOut = await new Response(proc.stdout).text();
+      const exitCode = await proc.exited;
+      if (exitCode !== 0) {
+        const stderr = await new Response(proc.stderr).text();
+        return err(`opencode models exited ${exitCode}: ${stderr.trim() || 'no stderr'}`);
+      }
+    } catch (e) {
+      return err(`Failed to run opencode models: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    const slugs = opencodeOut
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && !l.startsWith('#'));
+
+    const central = getCentralDb();
+    const agentGroupId = getConfig().agentGroupId;
+    if (!agentGroupId) return err('No agent group ID — container not properly initialized.');
+
+    // Missing projection tables on an older session must not kill the tool.
+    let config: { provider: string | null; model: string | null; effort: string | null } | undefined;
+    let deniedSet = new Set<string>();
+    if (central) {
+      try {
+        config = central
+          .prepare('SELECT provider, model, effort FROM container_configs WHERE agent_group_id = ?')
+          .get(agentGroupId) as typeof config;
+      } catch (e) {
+        log(`list_models: container_configs unavailable (${e instanceof Error ? e.message : String(e)})`);
+      }
+      if (config?.provider) {
+        try {
+          const deniedRows = central
+            .prepare('SELECT slug FROM denied_models WHERE provider = ?')
+            .all(config.provider) as Array<{ slug: string }>;
+          deniedSet = new Set(deniedRows.map((r) => r.slug));
+        } catch (e) {
+          log(`list_models: denied_models unavailable (${e instanceof Error ? e.message : String(e)})`);
+        }
+      }
+    }
+
+    const grouped: Record<string, string[]> = {};
+    let denied = 0;
+    for (const slug of slugs) {
+      if (deniedSet.has(slug)) {
+        denied++;
+        continue;
+      }
+      const sep = slug.indexOf('/');
+      const prefix = sep > 0 ? slug.slice(0, sep) : '(unknown)';
+      if (!grouped[prefix]) grouped[prefix] = [];
+      grouped[prefix].push(slug);
+    }
+
+    const payload = {
+      provider: config?.provider ?? null,
+      current: { model: config?.model ?? null, effort: config?.effort ?? null },
+      total: slugs.length - denied,
+      denied,
+      grouped,
+    };
+    return ok(JSON.stringify(payload, null, 2));
+  },
+};
+
+export const changeModel: McpToolDefinition = {
+  tool: {
+    name: 'change_model',
+    description:
+      "Switch the model for YOUR session — exactly like the user's `-m <slug>` flag. Takes effect on your NEXT turn with NO container restart; this turn finishes on the current model. Session-scoped (does NOT change the group default — that's `ncl groups config update`). Use list_models first for valid slugs. Optional effort: low|medium|high|max (max only on models that support it, e.g. DeepSeek V4). The operator deny list is the only hard block.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        slug: {
+          type: 'string',
+          description:
+            'The model slug to switch to, e.g. "opencode-go/kimi-k2.7-code" (provider-prefixed for opencode). Run list_models for valid ids.',
+        },
+        effort: {
+          type: 'string',
+          enum: ['low', 'medium', 'high', 'max'],
+          description:
+            'Optional effort level (max is supported by some models, e.g. DeepSeek V4). Omit to keep current.',
+        },
+      },
+      required: ['slug'],
+    },
+  },
+  async handler(args) {
+    const slug = (args.slug as string)?.trim();
+    const effort = args.effort as string | undefined;
+    if (!slug) return err('slug is required');
+    if (effort && !['low', 'medium', 'high', 'max'].includes(effort)) {
+      return err('effort must be one of: low, medium, high, max');
+    }
+
+    const provider = getConfig().provider;
+    const listing = providerContract(provider).modelListing;
+    // The pattern mirrors the host flag-parser's OPENCODE_VALID_MODEL_RE exactly (the container can't import it): a
+    // looser check lets malformed slugs persist, after which splitModelSlug silently drops the model.
+    if (listing && !listing.slugPattern.test(slug)) {
+      return err(
+        `"${slug}" is not a valid opencode model slug — use the provider-prefixed form ` +
+          `(e.g. opencode-go/kimi-k2.7-code, nvidia/moonshotai/kimi-k2.6). Run list_models for exact ids.`,
+      );
+    }
+
+    // Deny-list match on the slug as typed, lowercased, and resolved: a family word runs its concrete id.
+    const central = getCentralDb();
+    if (central) {
+      try {
+        const lookup = central.prepare('SELECT reason FROM denied_models WHERE provider = ? AND slug = ?');
+        let denied: { reason?: string } | undefined;
+        for (const candidate of new Set([slug, slug.toLowerCase(), resolveFamilyModel(slug)])) {
+          denied = lookup.get(provider, candidate) as { reason?: string } | undefined;
+          if (denied) break;
+        }
+        if (denied) {
+          return err(
+            `"${slug}" is on the operator deny list${denied.reason ? ` (${denied.reason})` : ''} — cannot switch to it.`,
+          );
+        }
+      } catch {
+        // denied_models absent on an older session projection — skip the check.
+      }
+    }
+
+    // Same as the user's `-m`/`-e`: a session-sticky model applied from the NEXT turn, no restart.
+    setStickyModel(slug);
+    if (effort) setStickyEffort(effort);
+    log(`change_model: session sticky → ${slug}${effort ? ` (effort=${effort})` : ''}`);
+    return ok(
+      `Switched to \`${slug}\`${effort ? ` (effort \`${effort}\`)` : ''} for this session — takes effect on your next turn ` +
+        `(no restart; same as the \`-m\` flag). This turn finishes on the previous model.`,
+    );
+  },
+};
+
+// `list_models` shells out to OpenCode, so it is registered only for that provider, after config loads.
+registerTools([installPackages, addMcpServer, changeModel]);
+
+export function registerProviderSpecificSelfModTools(provider: string = getConfig().provider): void {
+  if (providerContract(provider).modelListing) registerTools([listModels]);
+}

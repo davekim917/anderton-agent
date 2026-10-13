@@ -1,0 +1,91 @@
+import ts from 'typescript';
+
+type CommentRule = 'inline-suppression' | 'file-line-citation' | 'pr-history';
+
+interface CommentFinding {
+  rule: CommentRule;
+  line: number;
+  excerpt: string;
+}
+
+const SUPPRESSION = /jscpd:ignore-|@(?:public|internal|beta|alias|lintignore)(?![A-Za-z0-9_])/;
+const LINE_BREAK = /\r\n|[\r\n\u2028\u2029]/;
+const PR_HISTORY = /(?<!&)#\d+\b|\bPR\s?\d+\b/;
+
+// `<name>:<digits>`, excluding a version such as `image:1.3.14`.
+const LOCATION = /(?<![\w./@-])([\w./@-]*\w):\d+(?!\d|\.\d)/g;
+const SOURCE_EXTENSION =
+  /\.(?:[cm]?[jt]sx?|json|sh|bash|py|md|ya?ml|toml|sql|rs|go|c|h|cpp|hpp|java|kt|rb|swift|css|html|txt)$/;
+const EXTENSIONLESS_FILE =
+  /^(?:Dockerfile|Containerfile|Makefile|GNUmakefile|Justfile|Procfile|Gemfile|Rakefile|Jenkinsfile)(?:\.[\w-]+)?$|^\.[A-Za-z][\w.-]*$/;
+
+/** Host:port (with or without a URL scheme), times and ids carry neither a path nor a file-like name. */
+function citesFileLine(line: string): boolean {
+  return [...line.matchAll(LOCATION)].some(([, name]) => {
+    if (name.startsWith('//')) return false;
+    const base = name.slice(name.lastIndexOf('/') + 1);
+    const pathQualified = name.includes('/') && /[A-Za-z]/.test(base);
+    return pathQualified || SOURCE_EXTENSION.test(base) || EXTENSIONLESS_FILE.test(base);
+  });
+}
+
+function isJSDocNode(node: ts.Node): boolean {
+  return node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode;
+}
+
+/**
+ * Comments are read only from the trivia around tokens, so text inside a string, template or regex
+ * literal is never mistaken for one. JSDoc is skipped as a subtree and read once, as the leading
+ * trivia of the token it documents.
+ */
+function commentRangesAndCodeLines(sourceFile: ts.SourceFile): { ranges: ts.CommentRange[]; codeLines: Set<number> } {
+  const text = sourceFile.text;
+  const byStart = new Map<number, ts.CommentRange>();
+  const codeLines = new Set<number>();
+  const lineOf = (position: number) => sourceFile.getLineAndCharacterOfPosition(position).line;
+  const add = (ranges: ts.CommentRange[] | undefined) => {
+    for (const range of ranges ?? []) byStart.set(range.pos, range);
+  };
+  const visit = (node: ts.Node) => {
+    if (isJSDocNode(node)) return;
+    const children = node.getChildren(sourceFile);
+    if (children.length === 0) {
+      add(ts.getLeadingCommentRanges(text, node.getFullStart()));
+      add(ts.getTrailingCommentRanges(text, node.getEnd()));
+      const start = node.getStart(sourceFile);
+      if (node.kind !== ts.SyntaxKind.EndOfFileToken && node.getEnd() > start) {
+        for (let line = lineOf(start); line <= lineOf(node.getEnd() - 1); line++) codeLines.add(line);
+      }
+      return;
+    }
+    for (const child of children) visit(child);
+  };
+  visit(sourceFile);
+  return { ranges: [...byStart.values()].sort((a, b) => a.pos - b.pos), codeLines };
+}
+
+export interface CommentScan {
+  findings: CommentFinding[];
+  commentOnlyLines: number;
+}
+
+export function scanComments(fileName: string, text: string): CommentScan {
+  const sourceFile = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, false);
+  const { ranges, codeLines } = commentRangesAndCodeLines(sourceFile);
+  const findings: CommentFinding[] = [];
+  const commentLines = new Set<number>();
+  for (const range of ranges) {
+    const comment = text.slice(range.pos, range.end);
+    const firstLine = sourceFile.getLineAndCharacterOfPosition(range.pos).line + 1;
+    comment.split(LINE_BREAK).forEach((lineText, offset) => {
+      commentLines.add(firstLine - 1 + offset);
+      const report = (rule: CommentRule) =>
+        findings.push({ rule, line: firstLine + offset, excerpt: lineText.trim().slice(0, 160) });
+      if (SUPPRESSION.test(lineText)) report('inline-suppression');
+      if (citesFileLine(lineText)) report('file-line-citation');
+      if (PR_HISTORY.test(lineText)) report('pr-history');
+    });
+  }
+  const commentOnlyLines = [...commentLines].filter((line) => !codeLines.has(line)).length;
+  return { findings, commentOnlyLines };
+}

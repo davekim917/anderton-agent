@@ -1,0 +1,415 @@
+/**
+ * Discord admin slash commands: /deploy, /update-container (dependency drift audit via an injected chat message that
+ * asks an agent to open PRs), /update-plugins.
+ * A dedicated discord.js Client beside the chat adapter, gated on ENABLE_DISCORD_SLASH_COMMANDS=1 and scoped by
+ * DISCORD_SLASH_CHANNEL_IDS so accidental invocations elsewhere cannot deploy. Bound to the PRIMARY DISCORD_BOT_TOKEN
+ * only.
+ */
+import { spawn } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+
+import {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  ThreadAutoArchiveDuration,
+  type ChatInputCommandInteraction,
+  type Interaction,
+  type TextChannel,
+} from 'discord.js';
+
+import { DATA_DIR, POST_DEPLOY_INBOUND_WINDOW_MS, REPO_ROOT } from '../config.js';
+import { startContainerRebuildWatcher, stopContainerRebuildWatcher } from '../container-rebuild-watcher.js';
+import { consumeDeployStatus, readDeployStatus, RECENT_DEPLOY_MS, type DeployStatus } from '../deploy-status.js';
+import { writeUpstreamPolicySnapshot } from '../container-updates.js';
+import { log } from '../log.js';
+import { runPluginUpdates } from '../plugin-updater.js';
+import { routeInbound } from '../router.js';
+
+const COMMANDS = [
+  { name: 'deploy', description: 'Pull, build, and restart NanoClaw v2 from main' },
+  { name: 'update-container', description: 'Audit stable dependency drift and open reviewed PRs' },
+  { name: 'update-plugins', description: 'Run git pull on all ~/plugins repos now' },
+];
+
+const DEPLOY_SCRIPT = path.resolve(REPO_ROOT, 'scripts', 'deploy.sh');
+const DEPLOY_LOG = path.resolve(REPO_ROOT, 'logs', 'deploy.log');
+let client: Client | null = null;
+
+async function registerCommands(botToken: string, clientId: string, guildId: string): Promise<void> {
+  const rest = new REST({ version: '10' }).setToken(botToken);
+  try {
+    await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: COMMANDS });
+    log.info('Discord slash commands registered', { guildId, count: COMMANDS.length });
+  } catch (err) {
+    log.error('Failed to register Discord slash commands', { err });
+  }
+}
+
+function allowedChannels(): Set<string> {
+  const raw = process.env.DISCORD_SLASH_CHANNEL_IDS || '';
+  return new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+}
+
+function channelIsAllowed(interaction: ChatInputCommandInteraction): boolean {
+  const ids = allowedChannels();
+  if (ids.size === 0) return false;
+  if (interaction.channelId && ids.has(interaction.channelId)) return true;
+  const ch = interaction.channel;
+  if (ch && 'isThread' in ch && typeof ch.isThread === 'function' && ch.isThread()) {
+    const parentId = (ch as { parentId?: string | null }).parentId;
+    if (parentId && ids.has(parentId)) return true;
+  }
+  return false;
+}
+
+function deployChannelId(): string | null {
+  const explicit = process.env.DISCORD_DEPLOY_CHANNEL_ID?.trim();
+  if (explicit) return explicit;
+  const ids = allowedChannels();
+  const first = ids.values().next().value;
+  return first ?? null;
+}
+
+/** Injected messages route to the parent channel: Discord threads are not first-class to the router here. */
+function getInteractionParentId(interaction: ChatInputCommandInteraction): string | null {
+  const ch = interaction.channel;
+  if (ch && 'isThread' in ch && typeof ch.isThread === 'function' && ch.isThread()) {
+    return (ch as { parentId?: string | null }).parentId ?? null;
+  }
+  return interaction.channelId ?? null;
+}
+
+function spawnDetachedLogged(script: string): void {
+  const logFd = fs.openSync(DEPLOY_LOG, 'a');
+  const child = spawn('bash', [script], {
+    cwd: REPO_ROOT,
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+  });
+  child.unref();
+  fs.closeSync(logFd);
+  log.info('Detached deploy spawned', { pid: child.pid });
+}
+
+function formatFailure(status: DeployStatus): string {
+  return `Deploy failed at **${status.step ?? 'unknown'}**: ${status.error ?? 'no detail'}`;
+}
+
+/**
+ * Catches failures before the restart; on success the service restarts mid-poll and announceDeployStatus reports it
+ * at next boot.
+ */
+function pollDeployStatus(interaction: ChatInputCommandInteraction): void {
+  const startTime = Date.now();
+  let stopped = false;
+
+  const poll = async (): Promise<void> => {
+    if (stopped) return;
+    const status = readDeployStatus();
+    if (status && status.mtimeMs >= startTime) {
+      if (status.status === 'failed') {
+        stopped = true;
+        await interaction.followUp({ content: formatFailure(status) });
+        consumeDeployStatus();
+        return;
+      }
+      if (status.status === 'ok') {
+        stopped = true;
+        return;
+      }
+    }
+    if (Date.now() - startTime > 120_000) {
+      stopped = true;
+      return;
+    }
+    setTimeout(() => void poll(), 2_000);
+  };
+  setTimeout(() => void poll(), 2_000);
+}
+
+/** One-shot at boot: posts the outcome of a deploy-status.json written in the last 5 minutes. */
+async function announceDeployStatus(): Promise<void> {
+  const status = readDeployStatus();
+  if (!status) return;
+  if (Date.now() - status.mtimeMs > RECENT_DEPLOY_MS) return;
+  const channelId = deployChannelId();
+  if (!channelId) return;
+  const textChannel = await getTextChannel(channelId);
+  if (!textChannel) return;
+  if (status.status === 'ok') {
+    await textChannel.send(
+      `Deploy complete — service is up. Inbound is not verified yet: the post-deploy check alerts the owner if any ` +
+        `platform is failing or unverified within ${Math.round(POST_DEPLOY_INBOUND_WINDOW_MS / 60_000)} min.`,
+    );
+  } else if (status.status === 'failed') {
+    await textChannel.send(formatFailure(status));
+  }
+  consumeDeployStatus();
+}
+
+async function getTextChannel(channelId: string): Promise<TextChannel | null> {
+  if (!client) return null;
+  try {
+    const ch = await client.channels.fetch(channelId);
+    if (!ch || !('send' in ch)) return null;
+    return ch as TextChannel;
+  } catch {
+    return null;
+  }
+}
+
+async function handleDeploy(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.reply({ content: 'Deploying v2: pulling main, building, restarting…' });
+  if (!fs.existsSync(DEPLOY_SCRIPT)) {
+    await interaction.followUp({ content: `Deploy script missing at ${DEPLOY_SCRIPT}` });
+    return;
+  }
+  spawnDetachedLogged(DEPLOY_SCRIPT);
+  pollDeployStatus(interaction);
+}
+
+async function handleUpdatePlugins(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.reply({ content: 'Running git pull on all ~/plugins…' });
+  try {
+    const results = await runPluginUpdates();
+    if (results.length === 0) {
+      await interaction.followUp({ content: 'No plugins found in ~/plugins.' });
+      return;
+    }
+    const lines = results.map((r) => {
+      if (r.error) return `✗ ${r.plugin}: ${r.error}`;
+      return r.changed ? `↑ ${r.plugin}: updated` : `· ${r.plugin}: up to date`;
+    });
+    const changedCount = results.filter((r) => r.changed).length;
+    const errCount = results.filter((r) => r.error).length;
+    const summary = `${changedCount} updated, ${errCount} failed, ${results.length - changedCount - errCount} up to date`;
+    const body = [summary, '', ...lines].join('\n').slice(0, 1900);
+    await interaction.followUp({ content: `\`\`\`\n${body}\n\`\`\`` });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await interaction.followUp({ content: `Plugin update failed: ${msg.slice(0, 1800)}` });
+  }
+}
+
+export const UPDATE_CONTAINER_PROMPT = [
+  'Run the deterministic repository update audit with:',
+  '`bun /workspace/project/scripts/container-updates.ts audit --format json`',
+  '',
+  'Treat the JSON as the source of truth. Do not parse Dockerfiles, package manifests, registries, or upstream tables yourself.',
+  'If every item is current, reply with one concise no-op result and stop.',
+  'If any item is unknown or blocked, report the exact diagnostic; never call it current and never apply it.',
+  '',
+  'Present outdated items grouped by activation boundary:',
+  '- host: host package.json/pnpm-lock changes; these require the host deploy flow after manual merge.',
+  '- container: Docker pins and agent-runner Bun dependencies; these require an image rebuild after manual merge.',
+  '- bootstrap: Codex-synced files; these belong in a separate bootstrap-repository PR.',
+  'Latest stable includes major versions. Show the exact item IDs and ask which IDs to update. This is the approval gate; do not clone, edit, branch, commit, push, or open a PR before the user answers.',
+  '',
+  // These reporting duties exist because a dependency major bump passed every other gate (only package files touched,
+  // tests green, same method names) while moving an HTTP path the gateway does not serve, taking the fleet down.
+  '`upstreamPin` and `heldByMerge` come from a host-computed snapshot, not from git run here: `/workspace/project` is a read-only bind-mount allowlist with no `.git`, so the container can never derive these itself. Read the fields — do not re-derive them with git:',
+  "- `upstreamPin` is that dependency's pin in `upstream/main`. Report it NEXT TO latest-stable and say explicitly when they differ. For anything exact-pinned, upstream parity is the DEFAULT recommendation and latest-stable is the exception: an exact pin is usually load-bearing, and upstream is the strongest evidence about what a version is compatible with. Never present latest-stable as the only option.",
+  '- `heldByMerge: true` means the last upstream merge resolved that dependency KEEP-OURS — it kept our pin over a different upstream one. That is a standing decision. Report it as HELD and do not propose moving past it without saying so explicitly and asking. It is stronger than upstream parity: in #135 upstream 2.2.1 was ALSO incompatible with our gateway, so parity alone would not have caught it.',
+  '- `pairedWith` names a locally-running component that must move in the SAME change. These CANNOT be validated by compiling — client and server share a wire contract no type or unit test sees, so a version-skewed pair type-checks perfectly and fails at the first real call. Treat the pair as one item, approved or skipped together; never bundle it into a bulk bump.',
+  '- `untestedLivePaths` lists the live I/O paths a package is on that have no real-library test. The CI dependency gate refuses that bump, so present the item as BLOCKED with those paths, never as an option to approve.',
+  "The JSON also carries `upstreamPolicy.source` (`git`, `snapshot`, or `unavailable`) and `upstreamPolicy.generatedAt`. Always report which source produced upstreamPin/heldByMerge: if `snapshot`, state the snapshot's age (now minus `generatedAt`) so staleness is visible; if `unavailable`, say the signal was unavailable rather than reporting parity — an absent field is not evidence of parity, it can equally mean no upstream remote, a shallow clone, or a snapshot older than 14 days.",
+  '',
+  'After approval, create writable clones. Never edit /workspace/project in place.',
+  'Keep host and container changes in separate NanoClaw PRs because their activation and rollback boundaries differ. Keep bootstrap changes in a separate bootstrap PR.',
+  'In each NanoClaw clone, rerun the audit, then apply only the approved IDs:',
+  '`bun scripts/container-updates.ts apply --repo <clone> --items <comma-separated-ids>`',
+  '',
+  'Behaviour-change ledger, required by the CI dependency gate (docs/dependency-updates.md):',
+  '- In each clone, after applying, run `pnpm exec tsx scripts/dependency-gate.ts check`. It names every package whose locked version moved and needs a ledger section, transitive ones included.',
+  '- Add `docs/dependency-changes/<YYYY-MM-DD>-<slug>.md` with one `## <name> <old> → <new>` section per named package, a `Source:` line naming the changelog or release notes you read for every version in between, and one bullet per behaviour change ending in `· test: <path>` or `· not covered: <reason>`. Read the actual changelog; never infer changes from the version number.',
+  '- When the gate says a package is on a live I/O path with no real-library test, that item is BLOCKED: report it as blocked, name the path, and do not open its PR. A mocked test does not unblock it.',
+  '',
+  'Validate before publishing:',
+  '- host: `pnpm install --frozen-lockfile && pnpm run build && pnpm test`, plus `pnpm run lint` and `pnpm run format:check` — CI runs format:check, and the pre-commit hook would otherwise leak an unrelated reformat into the next PR.',
+  '- client/server pairs: a LIVE call against the running service, not a compile. For the OneCLI SDK that means constructing the client the way `src/container-runner.ts` does and invoking a real method; a green build proves nothing about the wire contract. If you cannot make that call, say so and mark the item unverified rather than validated.',
+  '- container: `cd container/agent-runner && bun install --frozen-lockfile && bun test`, then from the repo root run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit`.',
+  // No models-cache reset: ~/.codex/models_cache.json has no client-version gate and revalidates by ETag.
+  '- Codex CLI: put the exact host-parity installation command in the PR checklist. Do not add a models-cache reset.',
+  'Show the final diff before committing. Commit and push only the validated, approved files, open the PR against davekim917/nanoclaw (or davekim917/bootstrap), verify the PR URL is in the intended repository, then stop.',
+  'Never merge, deploy, restart services, or build Docker from inside the agent container.',
+].join('\n');
+
+async function handleUpdateContainer(interaction: ChatInputCommandInteraction): Promise<void> {
+  if (interaction.channel && 'isThread' in interaction.channel && interaction.channel.isThread()) {
+    await interaction.reply({
+      content: 'Run /update-container in the parent channel, not inside a thread.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // Refresh the upstream-policy snapshot right before the audit. Log and continue: a stale snapshot degrades to
+  // "signal unavailable" and must never block the audit.
+  try {
+    await writeUpstreamPolicySnapshot(REPO_ROOT, path.join(DATA_DIR, 'upstream-policy.json'));
+  } catch (err) {
+    log.error('Upstream policy snapshot refresh failed before /update-container audit', { err });
+  }
+
+  await interaction.reply({ content: 'Auditing host and container dependency drift…' });
+  const reply = await interaction.fetchReply();
+
+  const parentChannelId = getInteractionParentId(interaction);
+  if (!parentChannelId) {
+    await interaction.followUp({ content: 'Could not resolve channel id for injection.' });
+    return;
+  }
+  const guildId = interaction.guildId;
+  if (!guildId) {
+    await interaction.followUp({ content: '/update-container must be run in a guild channel, not a DM.' });
+    return;
+  }
+  // The chat-sdk adapter requires encoded ids; bare snowflakes fail with "Invalid Discord thread ID".
+  const encodeId = (...parts: string[]): string => ['discord', guildId, parentChannelId, ...parts].join(':');
+  const platformId = encodeId();
+
+  // Mention-sticky engages in-thread without an @mention, so the user can reply "yes" in the audit thread.
+  let threadId: string | null = null;
+  try {
+    const thread = await reply.startThread({
+      name: 'Container update',
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+    });
+    threadId = encodeId(thread.id);
+  } catch (err) {
+    log.warn('Failed to open audit thread, falling back to channel root', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  const syntheticId = `slash-update-container-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const content = {
+    text: UPDATE_CONTAINER_PROMPT,
+    sender: interaction.user.username,
+    senderId: interaction.user.id,
+    senderName: interaction.user.username,
+    isMention: true,
+  };
+
+  try {
+    await routeInbound({
+      channelType: 'discord',
+      platformId,
+      threadId,
+      message: {
+        id: syntheticId,
+        kind: 'chat-sdk',
+        content: JSON.stringify(content),
+        timestamp: new Date().toISOString(),
+        isMention: true,
+      },
+    });
+  } catch (err) {
+    log.error('/update-container injection failed', { err });
+    await interaction.followUp({
+      content: `Failed to start audit: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
+}
+
+async function onInteraction(interaction: Interaction): Promise<void> {
+  if (!interaction.isChatInputCommand()) return;
+
+  if (!channelIsAllowed(interaction)) {
+    await interaction.reply({
+      content: 'This channel is not in `DISCORD_SLASH_CHANNEL_IDS`. Admin commands are scoped.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  try {
+    if (interaction.commandName === 'deploy') await handleDeploy(interaction);
+    else if (interaction.commandName === 'update-container') await handleUpdateContainer(interaction);
+    else if (interaction.commandName === 'update-plugins') await handleUpdatePlugins(interaction);
+    else {
+      await interaction.reply({ content: `Unknown command: ${interaction.commandName}`, ephemeral: true });
+    }
+  } catch (err) {
+    log.error('Slash command handler threw', { command: interaction.commandName, err });
+    try {
+      await interaction.followUp({
+        content: `Handler error: ${err instanceof Error ? err.message : String(err)}`,
+        ephemeral: true,
+      });
+    } catch {
+      /* already replied / no channel */
+    }
+  }
+}
+
+/**
+ * No-op unless ENABLE_DISCORD_SLASH_COMMANDS=1 and DISCORD_BOT_TOKEN is set. Also boots the container-rebuild
+ * watcher.
+ */
+export async function startDiscordSlashCommands(): Promise<boolean> {
+  if (process.env.ENABLE_DISCORD_SLASH_COMMANDS !== '1') {
+    log.debug('Discord slash commands disabled — ENABLE_DISCORD_SLASH_COMMANDS != 1');
+    return false;
+  }
+  const botToken = process.env.DISCORD_BOT_TOKEN;
+  if (!botToken) {
+    log.warn('Discord slash commands: DISCORD_BOT_TOKEN not set');
+    return false;
+  }
+
+  client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+  const handleClientReady = async (): Promise<void> => {
+    log.info('Discord slash-command client ready', { username: client?.user?.username });
+    const clientId = client?.user?.id;
+    if (clientId) {
+      for (const [guildId] of client?.guilds?.cache ?? new Map()) {
+        await registerCommands(botToken, clientId, guildId);
+      }
+    }
+    await announceDeployStatus();
+    startContainerRebuildWatcher(async (message: string) => {
+      const channelId = deployChannelId();
+      if (!channelId) return;
+      const textChannel = await getTextChannel(channelId);
+      if (textChannel) {
+        await textChannel.send(message);
+      }
+    });
+  };
+  client.once('clientReady', () => {
+    handleClientReady().catch((err) => {
+      log.error('Discord clientReady handler failed', { err });
+    });
+  });
+
+  client.on('interactionCreate', (interaction) => {
+    onInteraction(interaction).catch((err) => {
+      log.error('Unhandled slash-command error', { err });
+    });
+  });
+
+  await client.login(botToken);
+  return true;
+}
+
+export async function stopDiscordSlashCommands(): Promise<void> {
+  stopContainerRebuildWatcher();
+  if (client) {
+    try {
+      await client.destroy();
+    } catch {
+      /* ignore */
+    }
+    client = null;
+  }
+}

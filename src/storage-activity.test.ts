@@ -1,0 +1,667 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
+vi.mock('./log.js', () => ({
+  setLogScrubber: vi.fn(),
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
+}));
+
+import { log } from './log.js';
+import { openInboundDb } from './modules/mailbox/openers.js';
+import { ensureSchema } from './modules/mailbox/schema.js';
+
+import {
+  acquireStorageActivityLease,
+  clearStorageCleanupClaims,
+  plantStorageActivityMarker,
+  resetStorageActivityState,
+  tryRunWithStorageCleanupClaim,
+} from './storage-activity.js';
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+const roots: string[] = [];
+
+function tempRoot(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-storage-activity-'));
+  roots.push(root);
+  return root;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+/**
+ * What a reclaim actually reads: the MARKER COUNT under the active dir, with a
+ * missing directory counting as zero (tryRunWithStorageCleanupClaim swallows
+ * ENOENT). An empty directory left behind blocks nothing, so these cases assert
+ * on markers rather than on the directory's existence — a planter's discard
+ * deliberately no longer removes the shared directory, because doing so would
+ * mean discounting its own in-flight registration and that discount cannot tell
+ * itself apart from another planter's.
+ */
+function activeMarkers(root: string): string[] {
+  try {
+    return fs.readdirSync(path.join(root, '.nanoclaw-storage-active'));
+  } catch {
+    return [];
+  }
+}
+
+function sessionDirShape(dataDir: string, ag: string, sess: string): string {
+  return path.join(dataDir, 'v2-sessions', ag, sess);
+}
+
+describe('storage activity leases', () => {
+  it('prevents a planned cleanup from applying after a session becomes active', async () => {
+    const root = tempRoot();
+    const target = path.join(root, 'node_modules');
+    fs.mkdirSync(target);
+    const lease = await acquireStorageActivityLease(root, 'sess-live');
+
+    const applied = tryRunWithStorageCleanupClaim(root, () => fs.rmSync(target, { recursive: true }));
+
+    expect(applied).toBe(false);
+    expect(fs.existsSync(target)).toBe(true);
+    await lease.release();
+  });
+
+  it('allows cleanup after the final activity lease is released', async () => {
+    const root = tempRoot();
+    const target = path.join(root, '.cache');
+    fs.mkdirSync(target);
+    const first = await acquireStorageActivityLease(root, 'sess-a');
+    const second = await acquireStorageActivityLease(root, 'sess-b');
+
+    await first.release();
+    expect(tryRunWithStorageCleanupClaim(root, () => fs.rmSync(target, { recursive: true }))).toBe(false);
+
+    await second.release();
+    expect(tryRunWithStorageCleanupClaim(root, () => fs.rmSync(target, { recursive: true }))).toBe(true);
+    expect(fs.existsSync(target)).toBe(false);
+  });
+
+  it('keeps overlapping leases from the same holder independent', async () => {
+    const root = tempRoot();
+    const target = path.join(root, 'node_modules');
+    fs.mkdirSync(target);
+    const first = await acquireStorageActivityLease(root, 'sess-same');
+    const second = await acquireStorageActivityLease(root, 'sess-same');
+
+    await first.release();
+    expect(tryRunWithStorageCleanupClaim(root, () => fs.rmSync(target, { recursive: true }))).toBe(false);
+
+    await second.release();
+    expect(tryRunWithStorageCleanupClaim(root, () => fs.rmSync(target, { recursive: true }))).toBe(true);
+  });
+
+  it('removes an exclusive claim when writing its diagnostic payload fails', () => {
+    const root = tempRoot();
+    vi.spyOn(fs, 'writeFileSync').mockImplementationOnce(() => {
+      throw new Error('disk full');
+    });
+
+    expect(() => tryRunWithStorageCleanupClaim(root, () => {})).toThrow('disk full');
+    expect(fs.existsSync(path.join(root, '.nanoclaw-storage-cleanup'))).toBe(false);
+  });
+
+  it('resets stale activity markers and claims in both flat and nested thread layouts', () => {
+    const dataDir = tempRoot();
+    const flat = path.join(dataDir, 'v2-threads', 'thread-flat', 'worktrees');
+    const nested = path.join(dataDir, 'v2-threads', 'wg-example', 'thread-nested', 'worktrees');
+    const session = path.join(dataDir, 'v2-sessions', 'ag-example', 'sess-example');
+    const rootsToReset = [flat, nested, session];
+
+    for (const root of rootsToReset) {
+      fs.mkdirSync(path.join(root, '.nanoclaw-storage-active'), { recursive: true });
+      fs.writeFileSync(path.join(root, '.nanoclaw-storage-active', 'stale-holder'), '1234\n');
+      fs.writeFileSync(path.join(root, '.nanoclaw-storage-cleanup'), '{"pid":1234}');
+    }
+
+    clearStorageCleanupClaims(dataDir);
+    for (const root of rootsToReset) {
+      expect(fs.existsSync(path.join(root, '.nanoclaw-storage-cleanup'))).toBe(false);
+      expect(fs.existsSync(path.join(root, '.nanoclaw-storage-active'))).toBe(true);
+    }
+
+    resetStorageActivityState(dataDir);
+    for (const root of rootsToReset) {
+      expect(fs.existsSync(path.join(root, '.nanoclaw-storage-active'))).toBe(false);
+      expect(fs.existsSync(path.join(root, '.nanoclaw-storage-cleanup'))).toBe(false);
+    }
+  });
+
+  // container-runner leases topicWorktreesDir() on EVERY spawn, so a topic
+  // root missing from the reset keeps its markers across host restarts
+  // forever, and tryRunWithStorageCleanupClaim then refuses every cleanup on
+  // that topic because its marker directory is non-empty. On the production
+  // install that was 168 topics holding markers from 118 distinct host pids,
+  // 117 of them dead, oldest 2026-08-26.
+  it('resets stale activity markers and claims under topic worktrees', () => {
+    const dataDir = tempRoot();
+    const topic = path.join(dataDir, 'v2-topics', 'wg-example', 'thread-abc', 'worktrees');
+    fs.mkdirSync(path.join(topic, '.nanoclaw-storage-active'), { recursive: true });
+    fs.writeFileSync(path.join(topic, '.nanoclaw-storage-active', 'sess-x-4242-uuid'), '4242\n');
+    fs.writeFileSync(path.join(topic, '.nanoclaw-storage-cleanup'), '{"pid":4242}');
+
+    expect(activeMarkers(topic)).toHaveLength(1);
+
+    clearStorageCleanupClaims(dataDir);
+    expect(fs.existsSync(path.join(topic, '.nanoclaw-storage-cleanup'))).toBe(false);
+    // A claim sweep must never disturb a live lease, only the claim.
+    expect(activeMarkers(topic)).toHaveLength(1);
+
+    resetStorageActivityState(dataDir);
+    expect(activeMarkers(topic)).toHaveLength(0);
+    expect(fs.existsSync(path.join(topic, '.nanoclaw-storage-active'))).toBe(false);
+  });
+
+  it('leaves a topic directory that has no worktrees root alone', () => {
+    const dataDir = tempRoot();
+    const bare = path.join(dataDir, 'v2-topics', 'wg-example', 'conversation-none');
+    fs.mkdirSync(bare, { recursive: true });
+    // No worktrees/ under it: nothing to enumerate, and no throw.
+    expect(() => resetStorageActivityState(dataDir)).not.toThrow();
+    expect(fs.existsSync(bare)).toBe(true);
+  });
+
+  // Inbound message writes now take a lease on sessionDir() and wait for any
+  // claim there with no timeout, so a session root this sweep misses is a
+  // session whose stale claim is never cleared and whose messages never land.
+  // One unreadable group used to abandon every group after it.
+  it('clears later session roots when an earlier group directory is unreadable', () => {
+    const dataDir = tempRoot();
+    const sessions = path.join(dataDir, 'v2-sessions');
+    // Sorted order matters: `ag-a` is walked first and must not abort the rest.
+    const blocked = path.join(sessions, 'ag-a');
+    const reachable = path.join(sessions, 'ag-b', 'sess-live');
+    fs.mkdirSync(blocked, { recursive: true });
+    fs.mkdirSync(reachable, { recursive: true });
+    fs.writeFileSync(path.join(reachable, '.nanoclaw-storage-cleanup'), '{"pid":1234}');
+    fs.chmodSync(blocked, 0o000);
+
+    try {
+      resetStorageActivityState(dataDir);
+      expect(fs.existsSync(path.join(reachable, '.nanoclaw-storage-cleanup'))).toBe(false);
+    } finally {
+      fs.chmodSync(blocked, 0o755);
+    }
+  });
+
+  it('clears thread roots when the sessions root is unreadable entirely', () => {
+    const dataDir = tempRoot();
+    const sessions = path.join(dataDir, 'v2-sessions');
+    const thread = path.join(dataDir, 'v2-threads', 'thread-flat', 'worktrees');
+    fs.mkdirSync(sessions, { recursive: true });
+    fs.mkdirSync(thread, { recursive: true });
+    fs.writeFileSync(path.join(thread, '.nanoclaw-storage-cleanup'), '{"pid":1234}');
+    fs.chmodSync(sessions, 0o000);
+
+    try {
+      resetStorageActivityState(dataDir);
+      expect(fs.existsSync(path.join(thread, '.nanoclaw-storage-cleanup'))).toBe(false);
+    } finally {
+      fs.chmodSync(sessions, 0o755);
+    }
+  });
+
+  // The lease path and the cleanup path must agree on the shape of a session
+  // root, or the two sets silently diverge.
+  it('enumerates exactly the two-level shape sessionDir produces', () => {
+    const dataDir = tempRoot();
+    const sessPath = sessionDirShape(dataDir, 'ag-1', 'sess-1');
+    fs.mkdirSync(sessPath, { recursive: true });
+    fs.writeFileSync(path.join(sessPath, '.nanoclaw-storage-cleanup'), '{"pid":1}');
+    // One level too shallow and one too deep must both be left alone.
+    const shallow = path.join(dataDir, 'v2-sessions', 'ag-1');
+    const deep = path.join(sessPath, 'worktrees');
+    fs.mkdirSync(deep, { recursive: true });
+    fs.writeFileSync(path.join(shallow, '.nanoclaw-storage-cleanup'), '{"pid":2}');
+    fs.writeFileSync(path.join(deep, '.nanoclaw-storage-cleanup'), '{"pid":3}');
+
+    resetStorageActivityState(dataDir);
+
+    expect(fs.existsSync(path.join(sessPath, '.nanoclaw-storage-cleanup'))).toBe(false);
+    expect(fs.existsSync(path.join(shallow, '.nanoclaw-storage-cleanup'))).toBe(true);
+    expect(fs.existsSync(path.join(deep, '.nanoclaw-storage-cleanup'))).toBe(true);
+  });
+});
+
+describe('synchronous storage activity marker', () => {
+  it('blocks a concurrent cleanup for as long as the marker is held', () => {
+    const root = tempRoot();
+    const release = plantStorageActivityMarker(root, 'writer');
+    let acted = false;
+    expect(tryRunWithStorageCleanupClaim(root, () => (acted = true))).toBe(false);
+    expect(acted).toBe(false);
+    release();
+    expect(tryRunWithStorageCleanupClaim(root, () => (acted = true))).toBe(true);
+    expect(acted).toBe(true);
+  });
+
+  it('refuses to plant while a cleanup owns the claim, and leaves no marker', () => {
+    const root = tempRoot();
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, '.nanoclaw-storage-cleanup'), '{"pid":1}');
+
+    expect(() => plantStorageActivityMarker(root, 'writer')).toThrow(/being reclaimed/);
+    // A marker left behind here would block cleanup for this root forever.
+    expect(activeMarkers(root)).toHaveLength(0);
+  });
+
+  it('is idempotent on release', () => {
+    const root = tempRoot();
+    const release = plantStorageActivityMarker(root, 'writer');
+    release();
+    const other = plantStorageActivityMarker(root, 'other');
+    release(); // second call must not remove someone else's protection
+    expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(false);
+    other();
+  });
+
+  // The re-entrancy case: writeSessionMessage holds the async lease and then
+  // opens the inbound DB. Under an owned lease the inner planter must do
+  // NOTHING — planting is unnecessary, and re-checking the claim would throw
+  // inside the reclaim's create-claim-then-read-markers window and discard an
+  // accepted message.
+  it('is a no-op under a lease this process already holds', async () => {
+    const root = tempRoot();
+    const outer = await acquireStorageActivityLease(root, 'ingestion');
+
+    const inner = plantStorageActivityMarker(root, 'inbound-open');
+    inner();
+    expect(
+      tryRunWithStorageCleanupClaim(root, () => undefined),
+      'outer lease still holds',
+    ).toBe(false);
+
+    await outer.release();
+    expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(true);
+  });
+
+  it('does not throw under an owned lease even while a claim is present', async () => {
+    const root = tempRoot();
+    const outer = await acquireStorageActivityLease(root, 'ingestion');
+    // The reclaim has created its claim and has not yet read the markers that
+    // will make it abandon. Pre-fix the inner planter threw here, losing the
+    // message to a reclaim that never runs.
+    fs.writeFileSync(path.join(root, '.nanoclaw-storage-cleanup'), '{"pid":1}');
+
+    expect(() => plantStorageActivityMarker(root, 'inbound-open')()).not.toThrow();
+
+    fs.rmSync(path.join(root, '.nanoclaw-storage-cleanup'), { force: true });
+    await outer.release();
+  });
+
+  it('still refcounts overlapping leases so the first release does not free the second', async () => {
+    const root = tempRoot();
+    const a = await acquireStorageActivityLease(root, 'one');
+    const b = await acquireStorageActivityLease(root, 'two');
+
+    await a.release();
+    expect(plantStorageActivityMarker(root, 'inner'), 'b still holds, so still a no-op').toBeTypeOf('function');
+    expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(false);
+
+    await b.release();
+    expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(true);
+  });
+
+  it('survives a releasing holder rmdir-ing the active dir mid-plant', () => {
+    // `fs.promises.rmdir` in a lease release runs its syscall on the libuv
+    // threadpool, so it can land between this planter's mkdirSync and its
+    // writeFileSync and take the directory out from under it. The spy makes
+    // that interleaving deterministic. It is an ordinary race that says nothing
+    // about whether we may proceed, so it must not surface as an ENOENT that a
+    // caller reads as "the DB is missing".
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdir = fs.mkdirSync.bind(fs);
+    vi.spyOn(fs, 'mkdirSync').mockImplementationOnce(((dir: string, opts: object) => {
+      const result = realMkdir(dir, opts);
+      fs.rmdirSync(activeDir);
+      return result;
+    }) as typeof fs.mkdirSync);
+
+    const release = plantStorageActivityMarker(root, 'writer');
+
+    expect(fs.readdirSync(activeDir), 'the retry must actually leave a marker').toHaveLength(1);
+    expect(
+      tryRunWithStorageCleanupClaim(root, () => undefined),
+      'and it must protect the root',
+    ).toBe(false);
+    release();
+    expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(true);
+  });
+
+  it('still surfaces a non-ENOENT plant failure, leaving no marker behind', () => {
+    // The retry is only for the rmdir race. A full disk is real and must not be
+    // retried into silence — and it must not strand a marker that blocks this
+    // root's reclaim forever.
+    const root = tempRoot();
+    fs.mkdirSync(root, { recursive: true });
+    const err = Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+    vi.spyOn(fs, 'writeFileSync').mockImplementation(() => {
+      throw err;
+    });
+
+    expect(() => plantStorageActivityMarker(root, 'writer')).toThrow('no space left on device');
+    vi.restoreAllMocks();
+    expect(activeMarkers(root)).toHaveLength(0);
+  });
+
+  // Two independent SYNC holders, no lease involved: the original independence
+  // property still has to hold for them.
+  it('keeps two independent sync markers independent', () => {
+    const root = tempRoot();
+    const first = plantStorageActivityMarker(root, 'first');
+    const second = plantStorageActivityMarker(root, 'second');
+
+    first();
+    expect(
+      tryRunWithStorageCleanupClaim(root, () => undefined),
+      'second still holds',
+    ).toBe(false);
+    second();
+    expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(true);
+  });
+});
+
+describe('acquireStorageActivityLease retries the marker-dir ENOENT race', () => {
+  // The async counterpart of "survives a releasing holder rmdir-ing the
+  // active dir mid-plant" above: a releasing holder's rmdir can land between
+  // our mkdir(activeDir) and our writeFile(marker), same as the sync path,
+  // and this used to have no retry at all — any writeFile ENOENT was rethrown,
+  // failing an otherwise-healthy inbound write. Filter on the activeDir path
+  // rather than mockImplementationOnce because, unlike the sync planter, this
+  // function's first mkdir call is for resourceRoot, not activeDir.
+  it('retries once and still acquires the lease when the race clears it', async () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    let raced = false;
+    vi.spyOn(fs.promises, 'mkdir').mockImplementation(async (dir, opts) => {
+      const result = await realMkdir(dir as fs.PathLike, opts as fs.MakeDirectoryOptions);
+      if (!raced && dir === activeDir) {
+        raced = true;
+        await fs.promises.rmdir(activeDir);
+      }
+      return result;
+    });
+
+    const lease = await acquireStorageActivityLease(root, 'writer');
+
+    expect(fs.readdirSync(activeDir), 'the retry must actually leave a marker').toHaveLength(1);
+    await lease.release();
+  });
+
+  it('rethrows when a second consecutive ENOENT confirms this is not a one-off race', async () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    vi.spyOn(fs.promises, 'mkdir').mockImplementation(async (dir, opts) => {
+      const result = await realMkdir(dir as fs.PathLike, opts as fs.MakeDirectoryOptions);
+      if (dir === activeDir) await fs.promises.rmdir(activeDir);
+      return result;
+    });
+
+    await expect(acquireStorageActivityLease(root, 'writer')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(activeMarkers(root), 'no marker must be left behind').toHaveLength(0);
+  });
+
+  it('rethrows a non-ENOENT plant failure without retrying', async () => {
+    const root = tempRoot();
+    const err = Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+    vi.spyOn(fs.promises, 'writeFile').mockRejectedValueOnce(err);
+
+    await expect(acquireStorageActivityLease(root, 'writer')).rejects.toThrow('no space left on device');
+    expect(activeMarkers(root)).toHaveLength(0);
+  });
+});
+
+describe('openInboundDb guards the whole handle lifetime', () => {
+  function inboundIn(root: string): string {
+    fs.mkdirSync(root, { recursive: true });
+    const p = path.join(root, 'inbound.db');
+    ensureSchema(p, 'inbound');
+    return p;
+  }
+
+  it('blocks a reclaim from the open until the close', () => {
+    const root = tempRoot();
+    const dbPath = inboundIn(root);
+
+    const db = openInboundDb(dbPath);
+    // This is the C5 window: open, not yet written. Pre-fix the writer was
+    // invisible here and the reclaim would tar-and-unlink underneath it.
+    expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(false);
+    db.close();
+    expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(true);
+  });
+
+  it('refuses to open while a reclaim owns the claim', () => {
+    const root = tempRoot();
+    const dbPath = inboundIn(root);
+    fs.writeFileSync(path.join(root, '.nanoclaw-storage-cleanup'), '{"pid":1}');
+
+    expect(() => openInboundDb(dbPath)).toThrow(/being reclaimed/);
+  });
+
+  it('releases the marker when the open itself fails', () => {
+    const root = tempRoot();
+    fs.mkdirSync(root, { recursive: true });
+    // A directory where the DB file should be: better-sqlite3 throws.
+    fs.mkdirSync(path.join(root, 'inbound.db'), { recursive: true });
+
+    expect(() => openInboundDb(path.join(root, 'inbound.db'))).toThrow();
+    // The marker must not outlive the failed open, or this root is never
+    // reclaimable again.
+    expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(true);
+  });
+
+  it('reports a leaked handle instead of skipping the reclaim silently', () => {
+    const root = tempRoot();
+    const dbPath = inboundIn(root);
+    openInboundDb(dbPath); // deliberately never closed
+
+    expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(false);
+    expect(log.warn).toHaveBeenCalledWith(
+      'storage-activity: cleanup skipped, resource is in use',
+      expect.objectContaining({ resourceRoot: root, holders: 1 }),
+    );
+  });
+});
+
+describe('acquireStorageActivityLease is observable and bounded', () => {
+  // Real timers, faked clock. The loop awaits fs.promises.access, which
+  // resolves on the threadpool and so is not driven by fake timers at all —
+  // but the warn/cap thresholds are pure Date.now() arithmetic, so moving the
+  // clock is enough and the loop still turns at its real 25ms.
+  // Returns the jumper and its own restore; the suite-level restoreAllMocks
+  // would also catch it, but a Date.now spy outliving its test poisons every
+  // timing assertion after it and that is not worth leaving to a hook.
+  let restoreClock: (() => void) | null = null;
+  function clockJumper(): (ms: number) => void {
+    const base = Date.now();
+    let offset = 0;
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => base + offset);
+    restoreClock = () => spy.mockRestore();
+    return (ms: number) => {
+      offset += ms;
+    };
+  }
+  afterEach(() => {
+    restoreClock?.();
+    restoreClock = null;
+  });
+
+  const settle = (ms = 120) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function waitWarnCount(): number {
+    return (log.warn as unknown as { mock: { calls: unknown[][] } }).mock.calls.filter(
+      (c) => c[0] === 'storage-activity: still waiting on a cleanup claim',
+    ).length;
+  }
+
+  it('warns once after waiting, then still acquires when the claim clears', async () => {
+    const root = tempRoot();
+    fs.mkdirSync(root, { recursive: true });
+    const claim = path.join(root, '.nanoclaw-storage-cleanup');
+    fs.writeFileSync(claim, '{"pid":1}');
+    const jump = clockJumper();
+
+    const pending = acquireStorageActivityLease(root, 'ingestion');
+    // `startedAt` is captured after the function's first await, so the clock
+    // must not move until the loop is actually running.
+    await settle(50);
+    jump(12_000);
+    await settle();
+    expect(waitWarnCount(), 'should have warned once past the threshold').toBe(1);
+
+    jump(5_000);
+    await settle();
+    expect(waitWarnCount(), 'warns once, not every 25ms').toBe(1);
+
+    fs.rmSync(claim, { force: true });
+    const lease = await pending;
+    expect(lease.release).toBeTypeOf('function');
+    await lease.release();
+  });
+
+  it('keeps waiting and keeps escalating rather than discarding the write', async () => {
+    const root = tempRoot();
+    fs.mkdirSync(root, { recursive: true });
+    const claim = path.join(root, '.nanoclaw-storage-cleanup');
+    fs.writeFileSync(claim, '{"pid":1}');
+    const jump = clockJumper();
+
+    let settled: string | null = null;
+    const pending = acquireStorageActivityLease(root, 'ingestion').then(
+      () => (settled = 'resolved'),
+      (err: Error) => (settled = err.message),
+    );
+    await settle(50);
+
+    // Two hours: past any plausible cap, including both of archival's
+    // independently bounded 60-minute phases back to back.
+    jump(10_000);
+    await settle();
+    jump(2 * 60 * 60 * 1000);
+    await settle();
+
+    expect(settled, 'an accepted message must never be discarded on a timer').toBeNull();
+    expect(waitWarnCount(), 'silence is what is bounded, so it keeps reporting').toBeGreaterThan(1);
+
+    fs.rmSync(claim, { force: true });
+    await pending;
+    expect(settled).toBe('resolved');
+  });
+});
+
+describe('the marker mkdir itself loses the release race', () => {
+  // The incident (2026-09-04, the stranded session). The retry above only
+  // ever covered writeFile, because the mkdir sat OUTSIDE the try. But a
+  // recursive mkdir is not one atomic syscall — Node walks the path — so a
+  // releasing holder's rmdir of the same leaf can surface as ENOENT out of the
+  // MKDIR. That ENOENT escaped acquireStorageActivityLease, propagated through
+  // writeSessionMessage into the router, and aborted the route BEFORE the
+  // inbound row was written: an accepted Slack message dropped on the floor.
+  //
+  // `mockRejectedValueOnce` is not enough on the async path: its first mkdir
+  // call is for resourceRoot, not activeDir. Both tests therefore fail the
+  // FIRST activeDir mkdir and let every later one through, which is exactly
+  // the shape of a single lost race.
+  function enoent(dir: string): NodeJS.ErrnoException {
+    return Object.assign(new Error(`ENOENT: no such file or directory, mkdir '${dir}'`), { code: 'ENOENT' });
+  }
+
+  it('acquireStorageActivityLease survives it and still plants a marker', async () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    let failed = false;
+    vi.spyOn(fs.promises, 'mkdir').mockImplementation(async (dir, opts) => {
+      if (!failed && dir === activeDir) {
+        failed = true;
+        throw enoent(activeDir);
+      }
+      return realMkdir(dir as fs.PathLike, opts as fs.MakeDirectoryOptions);
+    });
+
+    const lease = await acquireStorageActivityLease(root, 'writer');
+
+    expect(failed, 'the mkdir race must actually have fired').toBe(true);
+    expect(fs.readdirSync(activeDir), 'the retry must leave a marker').toHaveLength(1);
+    await lease.release();
+  });
+
+  it('plantStorageActivityMarker survives it and still plants a marker', () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdirSync = fs.mkdirSync.bind(fs);
+    let failed = false;
+    vi.spyOn(fs, 'mkdirSync').mockImplementation((dir, opts) => {
+      if (!failed && dir === activeDir) {
+        failed = true;
+        throw enoent(activeDir);
+      }
+      return realMkdirSync(dir as fs.PathLike, opts as fs.MakeDirectoryOptions);
+    });
+
+    const release = plantStorageActivityMarker(root, 'writer');
+
+    expect(failed, 'the mkdir race must actually have fired').toBe(true);
+    expect(fs.readdirSync(activeDir), 'the retry must leave a marker').toHaveLength(1);
+    release();
+  });
+
+  it('rethrows once the bound is exhausted, leaving nothing behind', async () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    let activeDirAttempts = 0;
+    vi.spyOn(fs.promises, 'mkdir').mockImplementation(async (dir, opts) => {
+      if (dir === activeDir) {
+        activeDirAttempts++;
+        throw enoent(activeDir);
+      }
+      return realMkdir(dir as fs.PathLike, opts as fs.MakeDirectoryOptions);
+    });
+
+    await expect(acquireStorageActivityLease(root, 'writer')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(activeDirAttempts, 'bounded at three attempts, never an unbounded spin').toBe(3);
+    expect(fs.existsSync(activeDir)).toBe(false);
+  });
+});
+
+describe('concurrent acquire/release on one root', () => {
+  // The production interleave with no mocks at all: two deliveries of the same
+  // Slack message racing on one session root, each acquiring and releasing.
+  // Before the fix this failed intermittently — the loser's mkdir or writeFile
+  // hit the winner's rmdir. Every acquisition must succeed; a lost race is a
+  // dropped inbound message, never an error the caller has to handle.
+  it('never surfaces a race to the caller', async () => {
+    const root = tempRoot();
+    const cycle = async (id: string): Promise<void> => {
+      for (let i = 0; i < 40; i++) {
+        const lease = await acquireStorageActivityLease(root, id);
+        await lease.release();
+      }
+    };
+
+    await Promise.all([cycle('a'), cycle('b'), cycle('c'), cycle('d')]);
+
+    expect(fs.existsSync(path.join(root, '.nanoclaw-storage-active'))).toBe(false);
+  });
+});

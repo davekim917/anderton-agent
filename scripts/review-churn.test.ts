@@ -1,0 +1,1457 @@
+// The pr-review-loop churn gate: does a finding CLASS that has survived three
+// rounds actually stop the next site patch?
+//
+// The classifier ships with the skill as dependency-free ESM
+// (`.claude/skills/pr-review-loop/scripts/review-churn.mjs`) because it also
+// runs inside an agent container, where nothing is installed. So this suite
+// drives it the way the loop does: as a subprocess, payload on stdin, decision
+// on stderr and `--json` on stdout, and the exit code as the gate itself.
+// Every fixture carries its own `sources`, so no case reads the checkout.
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { describe, expect, it } from 'vitest';
+
+import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
+
+allowSubprocess(['node', 'bun', 'git']);
+enforceHermeticity();
+
+const SCRIPT = path.resolve('.claude/skills/pr-review-loop/scripts/review-churn.mjs');
+const CONTAINER_SCRIPT = path.resolve('container/skills/pr-review-loop/scripts/review-churn.mjs');
+const FIXTURES = path.resolve('scripts/__fixtures__/review-churn');
+
+// The classifier runs on the host under node and inside agent containers under
+// bun, so the cross-runtime case needs both. Missing bun is an error, not a
+// skip: the property it checks — that the two runtimes decide identically — is
+// the whole reason the deny set is a frozen list.
+function bunBinary(): string {
+  const candidates = [
+    ...(process.env.PATH ?? '')
+      .split(path.delimiter)
+      .filter(Boolean)
+      .map((dir) => path.join(dir, 'bun')),
+    path.join(process.env.HOME ?? '', '.bun/bin/bun'),
+    '/usr/local/bin/bun',
+  ];
+  const found = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!found) throw new Error('bun is required for the cross-runtime case; install it or put it on PATH');
+  return found;
+}
+
+interface Site {
+  file: string;
+  line: number | null;
+  title?: string;
+}
+interface ClassRow {
+  key: string;
+  signature: string;
+  seam: string | null;
+  place?: string | null;
+  seamSubstantiated?: boolean;
+  primitives: string[];
+  rounds: number;
+  findings: number;
+  sites: Site[];
+}
+interface SeamRow {
+  seam: string;
+  rounds: number;
+  severityFalling: boolean;
+  seamSubstantiated?: boolean;
+}
+interface Report {
+  classes: ClassRow[];
+  seams: SeamRow[];
+  totalRounds: number;
+  totalFindings: number;
+}
+interface Decision {
+  status: 'pass' | 'refuse' | 'override';
+  flagged: (ClassRow & { lifted: boolean; liftedBy: string | null; reason: string })[];
+  unlifted: ClassRow[];
+  reported: { key: string; rounds: number; seam: string | null; reason: string }[];
+  report: Report;
+}
+
+interface Payload {
+  findings: unknown[];
+  sources?: Record<string, string>;
+  repoRoot?: string;
+  receipts?: { id: number; createdAt: string; body: string }[];
+  files?: string[];
+  commits?: {
+    sha: string;
+    date: string;
+    message: string;
+    files: string[];
+    before?: Record<string, string>;
+    after?: Record<string, string>;
+  }[];
+  worktree?: string[];
+}
+
+function fixture(name: string): Payload {
+  return JSON.parse(fs.readFileSync(path.join(FIXTURES, `${name}.json`), 'utf8')) as Payload;
+}
+
+function spawn(args: string[], payload: Payload, env: Record<string, string> = {}) {
+  // REVIEW_LOOP_ALLOW_SITE_PATCH must never leak in from the caller's shell:
+  // the override case has to be the one that sets it.
+  const base = { ...process.env };
+  delete base.REVIEW_LOOP_ALLOW_SITE_PATCH;
+  const res = spawnSync('node', [SCRIPT, ...args], {
+    input: JSON.stringify(payload),
+    encoding: 'utf8',
+    env: { ...base, ...env },
+  });
+  if (res.error) throw res.error;
+  return { status: res.status ?? -1, stdout: res.stdout, stderr: res.stderr };
+}
+
+function classify(payload: Payload): Report {
+  const out = spawn(['classify', '--json'], payload);
+  expect(out.status).toBe(0);
+  return JSON.parse(out.stdout) as Report;
+}
+
+/** The gate as the loop sees it: exit status, machine decision, human text. */
+function gate(payload: Payload, env: Record<string, string> = {}) {
+  const out = spawn(['gate', '--json'], payload, env);
+  return { status: out.status, decision: JSON.parse(out.stdout) as Decision, text: out.stderr };
+}
+
+function expectPlaceGate(payload: Payload, place: string) {
+  const { status, decision } = gate(payload);
+  expect(status).toBe(3);
+  const atPlace = decision.unlifted.filter((e) => e.seam === place);
+  expect(atPlace.length).toBeGreaterThan(0);
+  for (const e of atPlace) expect(e.primitives).toEqual([]);
+  return decision;
+}
+
+function withoutPaths(payload: Payload): Payload {
+  return { ...payload, findings: (payload.findings as object[]).map((f) => ({ ...f, path: null })) };
+}
+
+const AFTER = '2026-09-02T00:00:00Z'; // later than every finding in toctou-class
+const BEFORE = '2026-08-30T00:00:00Z'; // earlier than every finding in toctou-class
+
+describe('review-churn classifier', () => {
+  it('collapses one invariant reported at four call sites into one class', () => {
+    const report = classify(fixture('toctou-class'));
+
+    const churning = report.classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].signature).toBe('inv:race');
+    expect(churning[0].rounds).toBe(4);
+    expect(churning[0].findings).toBe(4);
+    expect(new Set(churning[0].sites.map((s) => s.file))).toEqual(
+      new Set(['src/router.ts', 'src/delivery.ts', 'src/tasks.ts', 'src/dashboard/close.ts']),
+    );
+  });
+
+  it('names the seam those sites share and the primitives they call', () => {
+    const churning = classify(fixture('toctou-class')).classes.find((c) => c.rounds >= 3)!;
+    expect(churning.seam).toBe('src/mailbox/write.ts');
+    expect(churning.primitives).toContain('writeSessionMessage');
+    expect(churning.primitives).toContain('wakeContainer');
+  });
+
+  it('sees churn the file-level detector cannot: no file reaches three rounds', () => {
+    const payload = fixture('toctou-class');
+    const roundsPerFile = new Map<string, Set<string>>();
+    for (const f of payload.findings as { path: string; reviewId: string }[]) {
+      if (!roundsPerFile.has(f.path)) roundsPerFile.set(f.path, new Set());
+      roundsPerFile.get(f.path)!.add(f.reviewId);
+    }
+    expect(Math.max(...[...roundsPerFile.values()].map((s) => s.size))).toBeLessThan(3);
+
+    expect(classify(payload).classes.some((c) => c.rounds >= 3)).toBe(true);
+  });
+
+  it('keeps an unrelated finding out of the churning class', () => {
+    const report = classify(fixture('toctou-class'));
+    const nullability = report.classes.find((c) => c.signature === 'inv:nullability');
+    expect(nullability?.rounds).toBe(1);
+    expect(report.classes.find((c) => c.rounds >= 3)!.sites.map((s) => s.title)).not.toContain(
+      'Treat an absent config value as empty',
+    );
+  });
+
+  it('splits one invariant at two unrelated seams into two classes', () => {
+    const churning = classify(fixture('two-seams')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(2);
+    expect(new Set(churning.map((c) => c.seam))).toEqual(new Set(['src/mailbox/write.ts', 'src/db/tasks.ts']));
+    for (const c of churning) {
+      expect(c.findings).toBe(3);
+      expect(c.primitives).toHaveLength(1);
+    }
+  });
+
+  it('reports a class whose sites share no seam, with no seam to name, at the place they share', () => {
+    const churning = classify(fixture('seamless-class')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].seam).toBeNull();
+    expect(churning[0].place).toBe('src/');
+    expect(churning[0].primitives).toEqual([]);
+  });
+
+  it('never seams a class on a Node builtin, bare, prefixed, or prefix-only', () => {
+    // A builtin is shared by nearly every file in the tree and owns no
+    // write/wake/read primitive, so it is the specifier the seam ranking would
+    // reward and the one answer that can never be right. The fixture's sites
+    // share `path` (bare), `node:fs` (prefixed, in builtinModules) and
+    // `node:test` (prefixed, in builtinModules on neither runtime) — so the
+    // `node:` prefix has to be rejected outright, not looked up in the list.
+    const churning = classify(fixture('builtin-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].seam).toBeNull();
+    expect(churning[0].primitives).toEqual([]);
+  });
+
+  it('prefers the module that owns the primitive over the builtins every file shares', () => {
+    const churning = classify(fixture('builtin-with-real-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning[0].seam).toBe('src/mailbox/write.ts');
+    expect(churning[0].primitives).toContain('writeSessionMessage');
+  });
+
+  it("never seams a class on Node's underscore-prefixed internals", () => {
+    // `_http_agent` and friends are bare-loadable on both runtimes. npm forbids
+    // package names starting with `_`, so a bare `_`-specifier is always a core
+    // internal — a rule, rather than an enumeration of the `_http_*`,
+    // `_stream_*` and `_tls_*` families that invites the next omission.
+    const churning = classify(fixture('internal-builtin-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].seam).toBeNull();
+  });
+
+  it('still seams on an in-repo module whose name starts with an underscore', () => {
+    // The rule is about package specifiers, not about the character: a relative
+    // import resolves to a path in this repo, which a diff can touch.
+    const churning = classify(fixture('underscore-module-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning[0].seam).toBe('src/_shared.ts');
+    expect(churning[0].primitives).toContain('writeThing');
+  });
+
+  it('keeps a real dependency seam-eligible, builtins around it notwithstanding', () => {
+    // `undici` is a direct dependency of this repo AND a name bun reports as a
+    // builtin. Its sites here also share `fs` and `node:test`, so the two
+    // categories are exercised together.
+    const churning = classify(fixture('undici-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].seam).toBe('undici');
+    expect(churning[0].primitives).toContain('requestWithPool');
+  });
+
+  it('decides identically under node and under bun', () => {
+    // The deny set is a frozen list of Node core specifiers, never the
+    // executing runtime's `builtinModules`: bun reports `undici`, `ws` and
+    // `bun` as builtins and node does not, so a runtime-derived set gave one
+    // payload two verdicts — a class seamed on `undici` refused a push on the
+    // host and passed in a container.
+    const bun = bunBinary();
+    for (const name of [
+      'undici-seam',
+      'builtin-seam',
+      'builtin-with-real-seam',
+      'internal-builtin-seam',
+      'underscore-module-seam',
+    ]) {
+      const payload = fixture(name);
+      const underNode = spawn(['classify', '--json'], payload);
+      const underBun = spawnSync(bun, [SCRIPT, 'classify', '--json'], {
+        input: JSON.stringify(payload),
+        encoding: 'utf8',
+      });
+      expect(underNode.status, `node failed on ${name}`).toBe(0);
+      expect(underBun.status, `bun failed on ${name}: ${underBun.stderr}`).toBe(0);
+      expect(JSON.parse(underBun.stdout), `${name} classifies differently under bun`).toEqual(
+        JSON.parse(underNode.stdout),
+      );
+    }
+  });
+
+  it('does not derive the deny set from whatever runtime is executing it', () => {
+    // A structural guard, because the cross-runtime case above can only catch
+    // the disagreements those two runtimes happen to have today.
+    const source = fs.readFileSync(SCRIPT, 'utf8');
+    const code = source.replace(/^\s*(\/\/.*|\*.*|\/\*.*)$/gm, '');
+    expect(code).not.toContain('builtinModules');
+    expect(code).not.toContain("from 'node:module'");
+  });
+
+  it('marks a seam it had to guess at, and one it has evidence for', () => {
+    // With one flagged file there is no shared import to measure, so the seam
+    // is whichever import ranks first. The findings naming what that module
+    // exports is the only evidence left; without it the answer is a guess.
+    const guessed = classify(fixture('guessed-seam')).classes[0];
+    expect(guessed.rounds).toBe(3);
+    expect(guessed.seam).toBe('src/db/messages-out.ts');
+    expect(guessed.seamSubstantiated).toBe(false);
+
+    const named = classify(fixture('named-seam-single-file')).classes[0];
+    expect(named.rounds).toBe(3);
+    expect(named.seam).toBe('src/gate.ts');
+    expect(named.seamSubstantiated).toBe(true);
+
+    // Two flagged files sharing the module is evidence on its own.
+    expect(classify(fixture('toctou-class')).classes[0].seamSubstantiated).toBe(true);
+  });
+
+  it('reads imports at line starts, so neither a doc example nor a string blinds it', () => {
+    // The classifier's own header contains ` *   import { a, b } from '…'`,
+    // which is not an import; a file may equally contain `const marker = "/*"`
+    // above its imports, which does not open a comment. Anchoring to the line
+    // start answers both without a lexer.
+    const payload = fixture('toctou-class');
+    payload.sources = {
+      ...payload.sources,
+      'src/router.ts':
+        "/**\n *   import { fake } from './not-real.js';\n */\n" +
+        'const marker = "/*";\n' +
+        "import { writeSessionMessage, wakeContainer } from './mailbox/write.js';\n",
+    };
+    const report = JSON.parse(spawn(['classify', '--json'], payload).stdout) as Report;
+    const churning = report.classes.find((c) => c.rounds >= 3)!;
+    expect(churning.seam).toBe('src/mailbox/write.ts');
+  });
+
+  it('resolves an extensionless import the way a resolver would', () => {
+    // `from './gate'` is valid and used in this tree; the existence rule must
+    // not delete a real seam because the specifier carried no extension.
+    const churning = classify(fixture('extensionless-import-seam')).classes[0];
+    expect(churning.seam).toBe('src/gate');
+    expect(churning.seamSubstantiated).toBe(true);
+    expect(gate(fixture('extensionless-import-seam')).status).toBe(3);
+  });
+
+  it('will not seam on an import that is inside a comment, real module or not', () => {
+    // Two shapes in one fixture, because existence only settles the first: a
+    // module that does not exist, and a REAL module named by every finding.
+    // Comment context decides the second, with delimiters located after
+    // single-line quoted spans are blanked — which is what keeps
+    // `const marker = "/*"` from opening a comment and swallowing the imports
+    // below it.
+    const churning = classify(fixture('commented-import-seam')).classes[0];
+    expect(churning.rounds).toBe(3);
+    expect(churning.seam).toBe('src/db/messages-out.ts');
+    expect(churning.seamSubstantiated).toBe(false);
+    expectPlaceGate(fixture('commented-import-seam'), 'src/');
+  });
+
+  it('will not seam on a module that does not exist', () => {
+    // A block comment carrying `import { evaluateGate } from './fake.js'` is
+    // read as an import by any line-anchored scan, and the findings name
+    // `evaluateGate`, so the fake module would substantiate and the gate would
+    // refuse naming a module nobody can open. Existence settles what comment
+    // detection cannot: the real import is chosen instead, unsubstantiated.
+    const churning = classify(fixture('commented-import-seam')).classes[0];
+    expect(churning.rounds).toBe(3);
+    expect(churning.seam).toBe('src/db/messages-out.ts');
+    expect(churning.seamSubstantiated).toBe(false);
+  });
+
+  it('substantiates a seam reached through a destructured dynamic import', () => {
+    // `const { evaluateGate } = await import('./gate.js')` binds the same name
+    // a static import would, and this tree prescribes that form for circular
+    // imports on the host, so it is how a named seam often arrives.
+    const churning = classify(fixture('dynamic-import-seam')).classes[0];
+    expect(churning.seam).toBe('src/gate.ts');
+    expect(churning.primitives).toContain('evaluateGate');
+    expect(churning.seamSubstantiated).toBe(true);
+  });
+
+  it('substantiates a seam the findings name through an alias', () => {
+    // `import { evaluateGate as gate }` binds `gate`, which is the name a
+    // finding will use, while the module exports `evaluateGate`. Both spellings
+    // are what the module provides, so either one is evidence.
+    const aliased = classify(fixture('aliased-seam')).classes[0];
+    expect(aliased.seam).toBe('src/gate.ts');
+    expect(aliased.seamSubstantiated).toBe(true);
+  });
+
+  it('substantiates a rollup on its own files, never on a sibling class naming it', () => {
+    // The rollup exists to see signature drift across files that share a
+    // callee, where no single class can substantiate the seam alone. Its
+    // evidence is therefore its own: two or more flagged files importing the
+    // module, the same standard the class-level rule uses. One class's naming
+    // is evidence for that class only.
+    const report = classify(fixture('guessed-seam-with-named-sibling'));
+    expect(report.classes.find((c) => c.rounds === 3)!.seamSubstantiated).toBe(false);
+    // Two flagged FILES import it, which is the rollup's own evidence.
+    expect(report.seams[0].seamSubstantiated).toBe(true);
+
+    // One file, so no collective evidence exists: a sibling class naming the
+    // module substantiates only itself, and the guessed class's rounds are not
+    // carried behind it.
+    const sameFile = fixture('guessed-seam-with-named-sibling');
+    const findings = sameFile.findings as { path: string }[];
+    for (const f of findings) f.path = 'src/tool.ts';
+    const collapsed = JSON.parse(spawn(['classify', '--json'], sameFile).stdout) as Report;
+    expect(collapsed.seams.every((seam) => !seam.seamSubstantiated)).toBe(true);
+
+    // And with EVERY class a guess, the shared files still substantiate it —
+    // three signatures, three files, one import, nobody naming it.
+    const collective = classify(fixture('collective-seam'));
+    expect(collective.classes).toHaveLength(3);
+    expect(collective.classes.every((c) => c.rounds === 1 && !c.seamSubstantiated)).toBe(true);
+    expect(collective.seams[0].seam).toBe('src/mailbox/write.ts');
+    expect(collective.seams[0].rounds).toBe(3);
+    expect(collective.seams[0].seamSubstantiated).toBe(true);
+  });
+
+  it('does not count a bound name that only appears inside a longer word', () => {
+    // `get` must not be substantiated by a finding that said "target".
+    const churning = classify(fixture('substring-name-seam')).classes[0];
+    expect(churning.rounds).toBe(3);
+    expect(churning.seam).toBe('src/store.ts');
+    expect(churning.seamSubstantiated).toBe(false);
+  });
+
+  it('reads severity direction per seam, not per finding', () => {
+    const falling = classify(fixture('seam-drift-falling'));
+    const flat = classify(fixture('seam-drift-flat'));
+    expect(falling.seams[0].seam).toBe('src/mailbox/write.ts');
+    expect(falling.seams[0].rounds).toBe(3);
+    expect(falling.seams[0].severityFalling).toBe(true);
+    expect(flat.seams[0].severityFalling).toBe(false);
+  });
+});
+
+describe('review-churn gate', () => {
+  it('refuses a site patch once a class has run three rounds', () => {
+    const { status, decision, text } = gate(fixture('toctou-class'));
+    expect(status).toBe(3);
+    expect(decision.status).toBe('refuse');
+    expect(decision.unlifted).toHaveLength(1);
+    expect(text).toContain('REFRAME REQUIRED');
+    expect(text).toContain('inv:race @ src/mailbox/write.ts');
+    expect(text).toContain('src/mailbox/write.ts');
+    expect(text).toContain('writeSessionMessage');
+    expect(text).toContain('src/dashboard/close.ts');
+    expect(text).toContain('Reframe: <invariant> enforced in <primitive>');
+  });
+
+  it('lifts when a commit after the last finding touches the primitive', () => {
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      { sha: 'aaa1111', date: AFTER, message: 'fix(mailbox): guard the write', files: ['src/mailbox/write.ts'] },
+    ];
+    const { status, decision } = gate(payload);
+    expect(status).toBe(0);
+    expect(decision.status).toBe('pass');
+    expect(decision.flagged[0].liftedBy).toBe('diff touches the primitive');
+  });
+
+  it('lifts on the reframe trailer even when the diff is elsewhere', () => {
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      {
+        sha: 'bbb2222',
+        date: AFTER,
+        message:
+          'fix(mailbox): one guard for every caller\n\nReframe: session revalidation enforced in writeSessionMessage\n',
+        files: ['src/somewhere-else.ts'],
+      },
+    ];
+    const { status, decision } = gate(payload);
+    expect(status).toBe(0);
+    expect(decision.flagged[0].liftedBy).toBe('reframe trailer');
+  });
+
+  it('lifts on uncommitted work at the primitive, so the gate is runnable before committing', () => {
+    const payload = fixture('toctou-class');
+    payload.worktree = ['src/mailbox/write.ts'];
+    expect(gate(payload).status).toBe(0);
+  });
+
+  it('ignores uncommitted work under --committed-only, because a push sends commits', () => {
+    // The same evidence that lifts a pre-commit check must not lift a gate run
+    // in front of a push: an edit in the working tree never reaches the PR.
+    const payload = fixture('toctou-class');
+    payload.worktree = ['src/mailbox/write.ts'];
+    const out = spawn(['gate', '--json', '--committed-only'], payload);
+    expect(out.status).toBe(3);
+    expect((JSON.parse(out.stdout) as Decision).status).toBe('refuse');
+
+    // A commit at the primitive still lifts it.
+    payload.commits = [
+      { sha: 'jjj0000', date: AFTER, message: 'fix(mailbox): guard the write', files: ['src/mailbox/write.ts'] },
+    ];
+    expect(spawn(['gate', '--json', '--committed-only'], payload).status).toBe(0);
+  });
+
+  it('does not accept a seam commit that predates the finding as the reframe', () => {
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      { sha: 'ccc3333', date: BEFORE, message: 'chore: earlier work', files: ['src/mailbox/write.ts'] },
+    ];
+    const { status, decision } = gate(payload);
+    expect(status).toBe(3);
+    expect(decision.status).toBe('refuse');
+  });
+
+  it('does not accept a patch at another site as the reframe', () => {
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      { sha: 'ddd4444', date: AFTER, message: 'fix: revalidate in the task path', files: ['src/tasks.ts'] },
+    ];
+    expect(gate(payload).status).toBe(3);
+  });
+
+  it('lets the override through, loudly, still naming the class', () => {
+    const { status, decision, text } = gate(fixture('toctou-class'), { REVIEW_LOOP_ALLOW_SITE_PATCH: '1' });
+    expect(status).toBe(0);
+    expect(decision.status).toBe('override');
+    expect(decision.unlifted).toHaveLength(1);
+    expect(text).toContain('SITE PATCH OVERRIDE');
+    expect(text).toContain('REVIEW_LOOP_ALLOW_SITE_PATCH=1');
+    expect(text).toContain('inv:race @ src/mailbox/write.ts');
+  });
+
+  it('refuses three flat-severity rounds on one seam even when no class repeats', () => {
+    const flat = gate(fixture('seam-drift-flat'));
+    expect(flat.status).toBe(3);
+    expect(flat.decision.unlifted[0].key).toBe('seam src/mailbox/write.ts');
+    expect(flat.text).toContain('severity not falling');
+  });
+
+  it('passes three rounds on one seam when severity is falling', () => {
+    const falling = gate(fixture('seam-drift-falling'));
+    expect(falling.status).toBe(0);
+    expect(falling.decision.status).toBe('pass');
+    expect(falling.decision.flagged).toHaveLength(0);
+  });
+
+  it('gates a guessed seam on its place, never naming the guessed module', () => {
+    const decision = expectPlaceGate(fixture('guessed-seam'), 'src/');
+    expect(decision.unlifted[0].key).toBe('inv:race @ src/');
+    expect(decision.report.classes[0].seam).toBe('src/db/messages-out.ts');
+  });
+
+  it('still gates a single-file class when the findings name what the seam exports', () => {
+    const { status, decision } = gate(fixture('named-seam-single-file'));
+    expect(status).toBe(3);
+    expect(decision.unlifted[0].seam).toBe('src/gate.ts');
+  });
+
+  it('lifts on a trailer naming a primitive the commit declares, not only the classifier guess', () => {
+    // The classifier's candidates are a ranking, not a fact. An author who
+    // moved the invariant somewhere else says so, and the commit's own added
+    // lines are what back the claim.
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      {
+        sha: 'kkk1111',
+        date: AFTER,
+        message: 'fix: one guard for every caller\n\nReframe: race enforced in guardEveryWrite\n',
+        files: ['src/guard.ts'],
+        before: { 'src/guard.ts': '' },
+        after: { 'src/guard.ts': 'export function guardEveryWrite(session: Session) {}\n' },
+      },
+    ];
+    const { status, decision } = gate(payload);
+    expect(status).toBe(0);
+    expect(decision.flagged[0].liftedBy).toBe('reframe trailer');
+  });
+
+  it('lifts on a short primitive name, which is an ordinary name', () => {
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      {
+        sha: 'mmm3333',
+        date: AFTER,
+        message: 'fix: one guard\n\nReframe: race enforced in run\n',
+        files: ['src/guard.ts'],
+        before: { 'src/guard.ts': '' },
+        after: { 'src/guard.ts': 'export function run(session: Session) {}\n' },
+      },
+    ];
+    expect(gate(payload).status).toBe(0);
+  });
+
+  it('does not accept a declaration the commit merely touched the file of', () => {
+    // Otherwise a site patch edits that file for something unrelated, points
+    // its trailer at a helper that was already there, and the gate opens.
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      {
+        sha: 'nnn4444',
+        date: AFTER,
+        message: 'chore: unrelated edit\n\nReframe: race enforced in guardEveryWrite\n',
+        files: ['src/guard.ts'],
+        before: { 'src/guard.ts': 'export function guardEveryWrite() {}\n' },
+        after: { 'src/guard.ts': 'export function guardEveryWrite() {}\nlogger.debug("unrelated");\n' },
+      },
+    ];
+    expect(gate(payload).status).toBe(3);
+  });
+
+  it('does not lift on a trailer that names a phrase rather than a primitive', () => {
+    // `enforced in nonexistent guard function` names no single identifier, and
+    // treating each word as a candidate meant a commit adding the WORD
+    // `function` satisfied it. A trailer that cannot name its primitive lifts
+    // nothing.
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      {
+        sha: 'uuu1111',
+        date: AFTER,
+        message: 'fix: something\n\nReframe: race enforced in nonexistent guard function\n',
+        files: ['src/guard.ts'],
+        before: { 'src/guard.ts': '' },
+        after: { 'src/guard.ts': 'export function unrelated() {}\n' },
+      },
+    ];
+    expect(gate(payload).status).toBe(3);
+
+    // Naming one identifier, which the commit introduces, still lifts.
+    payload.commits[0].message = 'fix: something\n\nReframe: race enforced in the guardEveryWrite function\n';
+    payload.commits[0].after = { 'src/guard.ts': 'export function guardEveryWrite() {}\n' };
+    expect(gate(payload).status).toBe(0);
+  });
+
+  it('does not lift on a trailer whose primitive merely contains a candidate', () => {
+    // A candidate called `evaluateGate` must not be matched by a trailer about
+    // an `evaluateGateTarget`: that trailer is about something else, and
+    // matching it lifts the gate with no reframe behind it.
+    // The commit introduces nothing, so the declaration fallback cannot fire
+    // and the only thing that could lift this is the candidate match itself.
+    const gated = fixture('named-seam-single-file');
+    gated.commits = [
+      {
+        sha: 'ttt0000',
+        date: AFTER,
+        message: 'fix: something else\n\nReframe: race enforced in evaluateGateTarget\n',
+        files: ['src/elsewhere.ts'],
+        before: { 'src/elsewhere.ts': 'export function evaluateGateTarget() {}\n' },
+        after: { 'src/elsewhere.ts': 'export function evaluateGateTarget() {}\nlog("edit");\n' },
+      },
+    ];
+    expect(gate(gated).status).toBe(3);
+  });
+
+  it('does not lift on a trailer naming something the commit never declares', () => {
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      {
+        sha: 'lll2222',
+        date: AFTER,
+        message: 'fix: claim without a diff\n\nReframe: race enforced in someOtherPlace\n',
+        files: ['src/guard.ts'],
+        before: { 'src/guard.ts': '' },
+        after: { 'src/guard.ts': 'export function guardEveryWrite() {}\n' },
+      },
+    ];
+    expect(gate(payload).status).toBe(3);
+  });
+
+  it('does not let one declared primitive clear two classes at once', () => {
+    // Both classes were reframed into the same new function, so the classifier
+    // seams no longer separate them. The trailer has to say which invariant it
+    // fixed, and it only clears that one.
+    const payload = fixture('shared-primitive');
+    payload.commits = [
+      {
+        sha: 'ooo5555',
+        date: AFTER,
+        message: 'fix: one guard\n\nReframe: race enforced in guardEveryWrite\n',
+        files: ['src/guard.ts'],
+        before: { 'src/guard.ts': '' },
+        after: { 'src/guard.ts': 'export function guardEveryWrite(session: Session) {}\n' },
+      },
+    ];
+    const { status, decision } = gate(payload);
+    expect(status).toBe(3);
+    expect(decision.unlifted).toHaveLength(1);
+    expect(decision.unlifted[0].signature).toBe('inv:durability');
+  });
+
+  it('gates an aliased seam like any other substantiated one', () => {
+    expect(gate(fixture('aliased-seam')).status).toBe(3);
+  });
+
+  it('gates a seam its files collectively substantiate, and says so only once', () => {
+    // Two flagged files sharing the import is the rollup's own evidence, so
+    // the seam gates. The class table must not simultaneously report that
+    // class as "not gated" — two answers to one question.
+    const { status, decision, text } = gate(fixture('guessed-seam-with-named-sibling'));
+    expect(status).toBe(3);
+    expect(decision.flagged).toHaveLength(1);
+    expect(decision.flagged[0].key).toBe('seam src/db/messages-out.ts');
+    expect(decision.reported).toHaveLength(0);
+    expect(text).not.toContain('reported, not gated');
+  });
+
+  it('lifts a seam the rollup gates on a commit at its primitive, with no second refusal on the place', () => {
+    const payload = fixture('guessed-seam-with-named-sibling');
+    payload.commits = [
+      { sha: 'ddd4444', date: AFTER, message: 'fix: guard the write', files: ['src/db/messages-out.ts'] },
+    ];
+    expect(gate(payload).status).toBe(0);
+  });
+
+  it('gates signature drift no single class can substantiate', () => {
+    const { status, decision } = gate(fixture('collective-seam'));
+    expect(status).toBe(3);
+    expect(decision.unlifted[0].key).toBe('seam src/mailbox/write.ts');
+  });
+
+  it('does not gate a seam substantiated only by a substring of a finding', () => {
+    const decision = expectPlaceGate(fixture('substring-name-seam'), 'src/');
+    expect(decision.report.classes[0].seamSubstantiated).toBe(false);
+  });
+
+  it('accepts any shape the commit introduced, method or otherwise', () => {
+    // The check does not try to recognise declaration syntax, so a method on an
+    // existing class, an arrow in an object literal and a plain function all
+    // count without enumerating them.
+    const payload = fixture('toctou-class');
+    for (const introduced of [
+      'export function guardEveryWrite(session: Session) {}\n',
+      'class Guards {\n  async guardEveryWrite(session: Session) {}\n}\n',
+      'const guards = { guardEveryWrite: (session: Session) => {} };\n',
+    ]) {
+      payload.commits = [
+        {
+          sha: 'rrr8888',
+          date: AFTER,
+          message: 'fix: one guard\n\nReframe: race enforced in guardEveryWrite\n',
+          files: ['src/guard.ts'],
+          before: { 'src/guard.ts': '// nothing yet\n' },
+          after: { 'src/guard.ts': introduced },
+        },
+      ];
+      expect(gate(payload).status, introduced).toBe(0);
+    }
+  });
+
+  it('accepts a name introduced only in a comment — the documented trade', () => {
+    // Presence and absence, not "is this executable". Proving the latter with
+    // regexes took four review rounds and still leaked, so this weaker rule is
+    // deliberate: the trailer is already an explicit claim by the author on a
+    // file the commit changed, and the classifier's candidates remain the
+    // primary lift path. Encoded as a test so the trade stays visible rather
+    // than being rediscovered as a bug.
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      {
+        sha: 'sss9999',
+        date: AFTER,
+        message: 'docs: sketch it\n\nReframe: race enforced in guardEveryWrite\n',
+        files: ['src/guard.ts'],
+        before: { 'src/guard.ts': '// nothing yet\n' },
+        after: { 'src/guard.ts': '// export function guardEveryWrite() {}\n' },
+      },
+    ];
+    expect(gate(payload).status).toBe(0);
+  });
+
+  it('matches a binding containing a dollar sign as a whole identifier', () => {
+    // `$` is a regex metacharacter and not a word character, so the old
+    // `\b${name}\b` neither escaped it nor anchored where it appeared to.
+    const churning = classify(fixture('dollar-name-seam')).classes[0];
+    expect(churning.rounds).toBe(3);
+    expect(churning.seamSubstantiated).toBe(true);
+    expect(gate(fixture('dollar-name-seam')).status).toBe(3);
+  });
+
+  it('says so when a class at three rounds is reported rather than gated', () => {
+    // "no finding class has reached 3 rounds" would be false here, and these
+    // commands do not print the class table.
+    const { status, text } = gate(withoutPaths(fixture('guessed-seam')));
+    expect(status).toBe(0);
+    expect(text).toContain('reported, not gated');
+    expect(text).toContain('3 rounds; no finding names a file');
+    expect(text).not.toContain('no finding class has reached 3 rounds');
+  });
+
+  it('gates a class whose only shared import is a Node internal on its place, not the internal', () => {
+    expectPlaceGate(fixture('internal-builtin-seam'), 'src/');
+  });
+
+  it('gates a class whose only shared import is a builtin on its place, not the builtin', () => {
+    // Seamed on `path`, the refusal named `path` as the primitive: no diff
+    // could lift it, because the lift-by-diff path only matches in-repo
+    // modules.
+    expectPlaceGate(fixture('builtin-seam'), 'src/');
+  });
+
+  it('passes a PR whose worst class has run two rounds', () => {
+    const payload = fixture('toctou-class');
+    payload.findings = (payload.findings as { reviewId: string }[]).filter(
+      (f) => f.reviewId === 'PRR_1' || f.reviewId === 'PRR_2',
+    );
+    const { status, decision } = gate(payload);
+    expect(status).toBe(0);
+    expect(decision.status).toBe('pass');
+    expect(decision.report.classes.every((c) => c.rounds < 3)).toBe(true);
+  });
+
+  it('gates each seam separately when one invariant runs at two of them', () => {
+    const payload = fixture('two-seams');
+    const refused = gate(payload);
+    expect(refused.status).toBe(3);
+    expect(refused.decision.unlifted).toHaveLength(2);
+
+    payload.commits = [
+      { sha: 'eee5555', date: AFTER, message: 'fix: guard the mailbox write', files: ['src/mailbox/write.ts'] },
+    ];
+    const partial = gate(payload);
+    expect(partial.status).toBe(3);
+    expect(partial.decision.unlifted).toHaveLength(1);
+    expect(partial.decision.unlifted[0].seam).toBe('src/db/tasks.ts');
+  });
+
+  it('never gates a class whose findings name no file, because nothing places it', () => {
+    const { status, decision } = gate(withoutPaths(fixture('seamless-class')));
+    expect(status).toBe(0);
+    expect(decision.flagged).toHaveLength(0);
+    expect(decision.report.classes[0].rounds).toBe(3);
+  });
+
+  it('compares commit dates as instants, not strings, across UTC offsets', () => {
+    // The last finding is 15:00Z. 09:00-07:00 is 16:00Z — later, though it
+    // sorts earlier as a string.
+    const later = fixture('toctou-class');
+    later.commits = [
+      {
+        sha: 'fff6666',
+        date: '2026-09-01T09:00:00-07:00',
+        message: 'fix(mailbox): guard the write',
+        files: ['src/mailbox/write.ts'],
+      },
+    ];
+    expect(gate(later).status).toBe(0);
+
+    // 23:00+09:00 is 14:00Z — earlier, though it sorts later.
+    const earlier = fixture('toctou-class');
+    earlier.commits = [
+      {
+        sha: 'ggg7777',
+        date: '2026-09-01T23:00:00+09:00',
+        message: 'chore: earlier work',
+        files: ['src/mailbox/write.ts'],
+      },
+    ];
+    expect(gate(earlier).status).toBe(3);
+  });
+
+  it('requires the invariant in the trailer when two classes share a primitive', () => {
+    const named = fixture('shared-primitive');
+    named.commits = [
+      {
+        sha: 'hhh8888',
+        date: AFTER,
+        message: 'fix: one guard\n\nReframe: race enforced in writeSessionMessage\n',
+        files: ['src/elsewhere.ts'],
+      },
+    ];
+    const one = gate(named);
+    expect(one.status).toBe(3);
+    expect(one.decision.unlifted).toHaveLength(1);
+    expect(one.decision.unlifted[0].signature).toBe('inv:durability');
+
+    const vague = fixture('shared-primitive');
+    vague.commits = [
+      {
+        sha: 'iii9999',
+        date: AFTER,
+        message: 'fix: one guard\n\nReframe: the write path enforced in writeSessionMessage\n',
+        files: ['src/elsewhere.ts'],
+      },
+    ];
+    expect(gate(vague).decision.unlifted).toHaveLength(2);
+  });
+
+  it('reads seam sources from the pinned commit, not from the checkout', () => {
+    // Same-topic siblings share a worktree, so the checkout can change while
+    // the gate runs. With a commit pinned, the classifier must derive its seams
+    // from that commit's files — otherwise a sibling switching branches
+    // mid-verdict decides what the push is judged against.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-src-'));
+    const git = (...args: string[]) => {
+      const res = spawnSync('git', args, {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: '2026-09-01T16:00:00Z',
+          GIT_COMMITTER_DATE: '2026-09-01T16:00:00Z',
+          GIT_AUTHOR_NAME: 'test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+      });
+      if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr}`);
+      return res.stdout.trim();
+    };
+    const write = (file: string, body: string) => {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), body);
+    };
+    try {
+      git('init', '-q', '-b', 'main');
+      write('src/mailbox/write.ts', 'export function writeSessionMessage() {}\nexport function wakeContainer() {}\n');
+      for (const site of ['src/router.ts', 'src/delivery.ts', 'src/tasks.ts', 'src/dashboard/close.ts']) {
+        write(site, "import { writeSessionMessage, wakeContainer } from '../mailbox/write.js';\n");
+      }
+      // The sites' real imports, as the pinned commit has them.
+      write('src/router.ts', "import { writeSessionMessage, wakeContainer } from './mailbox/write.js';\n");
+      write('src/delivery.ts', "import { writeSessionMessage } from './mailbox/write.js';\n");
+      write('src/tasks.ts', "import { wakeContainer } from './mailbox/write.js';\n");
+      write('src/dashboard/close.ts', "import { writeSessionMessage } from '../mailbox/write.js';\n");
+      git('add', '-A');
+      git('commit', '-qm', 'the sites as the push will send them');
+      const pinned = git('rev-parse', 'HEAD');
+
+      // A sibling now empties every site in the CHECKOUT, which would leave the
+      // classifier with no imports to find and no seam to gate on.
+      for (const site of ['src/router.ts', 'src/delivery.ts', 'src/tasks.ts', 'src/dashboard/close.ts']) {
+        write(site, '// a sibling switched branches\n');
+      }
+
+      const payload = fixture('toctou-class');
+      delete payload.sources;
+      payload.repoRoot = root;
+      payload.commits = [];
+      payload.worktree = [];
+
+      // Unpinned, the checkout decides and the class has no seam to gate on.
+      const unpinned = JSON.parse(spawn(['classify', '--json'], payload).stdout) as Report;
+      expect(unpinned.classes.find((c) => c.rounds >= 3)!.seam).toBeNull();
+
+      // Pinned to the commit being pushed, the seam is the one that commit has.
+      const pinnedReport = JSON.parse(spawn(['classify', '--json', '--head', pinned], payload).stdout) as Report;
+      expect(pinnedReport.classes.find((c) => c.rounds >= 3)!.seam).toBe('src/mailbox/write.ts');
+      expect(spawn(['gate', '--json', '--committed-only', '--head', pinned], payload).status).toBe(3);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reads the history of the commit it is given, not of whatever HEAD points at', () => {
+    // A caller that has pinned which commit it is about to push passes --head.
+    // Without it the verdict is about the checkout, which a sibling can move:
+    // their newer commit at the primitive would lift a gate for a push that
+    // leaves it behind.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-head-'));
+    const git = (...args: string[]) => {
+      const res = spawnSync('git', args, {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: '2026-09-01T16:00:00Z',
+          GIT_COMMITTER_DATE: '2026-09-01T16:00:00Z',
+          GIT_AUTHOR_NAME: 'test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+      });
+      if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr}`);
+      return res.stdout.trim();
+    };
+    try {
+      git('init', '-q', '-b', 'main');
+      fs.writeFileSync(path.join(root, 'unrelated.txt'), 'base\n');
+      git('add', '-A');
+      git('commit', '-qm', 'base');
+      const pinned = git('rev-parse', 'HEAD');
+
+      // The reframe lands only on a side branch — reachable from that commit,
+      // not from the one the caller pinned.
+      git('checkout', '-q', '-b', 'sibling');
+      fs.mkdirSync(path.join(root, 'src/mailbox'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'src/mailbox/write.ts'), 'export function writeSessionMessage() {}\n');
+      git('add', '-A');
+      git('commit', '-qm', 'fix(mailbox): guard the write');
+      const sibling = git('rev-parse', 'HEAD');
+
+      const payload = fixture('toctou-class');
+      payload.repoRoot = root;
+      // HEAD is the sibling's branch, so an unpinned gate lifts on their work.
+      expect(spawn(['gate', '--json', '--committed-only'], payload).status).toBe(0);
+      // Pinned to what the push would send, the reframe is not there.
+      expect(spawn(['gate', '--json', '--committed-only', '--head', pinned], payload).status).toBe(3);
+      // Pinned to the commit that does carry it, it lifts.
+      expect(spawn(['gate', '--json', '--committed-only', '--head', sibling], payload).status).toBe(0);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reads the file either side of a real commit to judge a reframe trailer', () => {
+    // The payload can supply both images, so the tests above are hermetic; this
+    // one exercises the `git show` path they stand in for, including the rename
+    // case, where the pre-image lives at the OLD path and reading the new one
+    // would make every line in the file look newly introduced.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-blob-'));
+    const git = (date: string, ...args: string[]) => {
+      const res = spawnSync('git', args, {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: date,
+          GIT_COMMITTER_DATE: date,
+          GIT_AUTHOR_NAME: 'test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+      });
+      if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr}`);
+      return res.stdout.trim();
+    };
+    const BEFORE_FINDINGS = '2026-08-01T10:00:00Z';
+    const AFTER_FINDINGS = '2026-09-01T16:00:00Z';
+    try {
+      git(BEFORE_FINDINGS, 'init', '-q', '-b', 'main');
+      fs.writeFileSync(path.join(root, 'guard.ts'), '// nothing yet\n');
+      git(BEFORE_FINDINGS, 'add', '-A');
+      git(BEFORE_FINDINGS, 'commit', '-qm', 'base');
+
+      // The real introduction, after the findings: it lifts.
+      fs.writeFileSync(path.join(root, 'guard.ts'), 'export function guardEveryWrite() {}\n');
+      git(AFTER_FINDINGS, 'add', '-A');
+      git(AFTER_FINDINGS, 'commit', '-qm', 'fix\n\nReframe: race enforced in guardEveryWrite\n');
+      const payload = fixture('toctou-class');
+      payload.repoRoot = root;
+      expect(spawn(['gate', '--json'], payload).status).toBe(0);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+
+    // A commit that only renames the file claims nothing. Its own repository,
+    // so the introduction is outside the window and the rename stands alone.
+    const moved = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-rename-'));
+    const gitMoved = (date: string, ...args: string[]) => {
+      const res = spawnSync('git', args, {
+        cwd: moved,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: date,
+          GIT_COMMITTER_DATE: date,
+          GIT_AUTHOR_NAME: 'test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+      });
+      if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr}`);
+      return res.stdout.trim();
+    };
+    try {
+      gitMoved(BEFORE_FINDINGS, 'init', '-q', '-b', 'main');
+      fs.writeFileSync(path.join(moved, 'guard.ts'), 'export function guardEveryWrite() {}\n');
+      gitMoved(BEFORE_FINDINGS, 'add', '-A');
+      gitMoved(BEFORE_FINDINGS, 'commit', '-qm', 'the primitive, long before these findings');
+
+      gitMoved(AFTER_FINDINGS, 'mv', 'guard.ts', 'guard-renamed.ts');
+      gitMoved(AFTER_FINDINGS, 'commit', '-qm', 'chore: move it\n\nReframe: race enforced in guardEveryWrite\n');
+
+      const payload = fixture('toctou-class');
+      payload.repoRoot = moved;
+      expect(spawn(['gate', '--json'], payload).status).toBe(3);
+    } finally {
+      fs.rmSync(moved, { recursive: true, force: true });
+    }
+  });
+
+  it('reads commits back to the oldest finding, not a fixed history cap', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-git-'));
+    const git = (...args: string[]) => {
+      const res = spawnSync('git', args, {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: '2026-09-01T16:00:00Z',
+          GIT_COMMITTER_DATE: '2026-09-01T16:00:00Z',
+          GIT_AUTHOR_NAME: 'test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+      });
+      if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr}`);
+    };
+    try {
+      git('init', '-q', '-b', 'main');
+      fs.mkdirSync(path.join(root, 'src/mailbox'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'src/mailbox/write.ts'), 'export function writeSessionMessage() {}\n');
+      git('add', '-A');
+      git('commit', '-qm', 'fix(mailbox): guard the write');
+      // 34 later commits, so the reframe above falls outside any `-n 30` cap.
+      for (let i = 0; i < 34; i += 1) git('commit', '-q', '--allow-empty', '-m', `filler ${i}`);
+
+      const payload = fixture('toctou-class');
+      payload.repoRoot = root;
+      const { status, decision } = gate(payload);
+      expect(status).toBe(0);
+      expect(decision.flagged[0].liftedBy).toBe('diff touches the primitive');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('review-churn gate beyond the import graph', () => {
+  const INGEST = [
+    'tools/ingest/loader.py',
+    'tools/ingest/writer.py',
+    'tools/ingest/steps/merge.py',
+    'tools/export/sink.py',
+  ];
+  const SHA = 'a'.repeat(40);
+
+  function codexFinding(reviewId: string, file: string, title: string, createdAt: string, severity = 1) {
+    return {
+      reviewId,
+      path: file,
+      line: 10,
+      createdAt,
+      body: `**<sub><sub>![P${severity} Badge](https://img.shields.io/badge/P${severity}-orange?style=flat)</sub></sub>  ${title}**\n\n${title}.`,
+    };
+  }
+
+  function substituteReceipt(id: number, createdAt: string, outcome: string, finding: string) {
+    return {
+      id,
+      createdAt,
+      body:
+        `### Substitute review receipt\n\n- **Head:** \`${SHA}\`\n- **Reviewer and runtime:** gpt-6-sol high (codex exec)\n` +
+        `- **Outcome:** ${outcome}\n\nSubstitute review of the full diff.\n\n${finding}\n\nVERDICT: ${outcome}\n\n` +
+        `<!-- pr-review-loop:substitute-receipt head=${SHA} outcome=${outcome} -->`,
+    };
+  }
+
+  function independentReceipt(id: number, createdAt: string, verdict: string, blocking: number, prose: string) {
+    const json = JSON.stringify({ head: SHA, fresh_context: true, verdict, blocking_findings: blocking });
+    return { id, createdAt, body: `<!-- independent-review-receipt:v1 -->\n\`\`\`json\n${json}\n\`\`\`\n${prose}\n` };
+  }
+
+  const staleRounds = [
+    codexFinding(
+      'PRR_P1',
+      'tools/ingest/loader.py',
+      'Refresh the stale cached checkpoint before loading',
+      '2026-09-01T10:00:00Z',
+    ),
+    codexFinding(
+      'PRR_P2',
+      'tools/ingest/writer.py',
+      'Write from the reloaded state, not a stale snapshot',
+      '2026-09-01T12:00:00Z',
+    ),
+    codexFinding(
+      'PRR_P3',
+      'tools/ingest/steps/merge.py',
+      'Merge against fresh rows, not the cached snapshot',
+      '2026-09-01T14:00:00Z',
+    ),
+  ];
+
+  it('gates one invariant recurring in one Python directory, where no import names a seam', () => {
+    const payload: Payload = { findings: staleRounds, files: INGEST };
+    const decision = expectPlaceGate(payload, 'tools/ingest/');
+    expect(decision.unlifted[0].key).toBe('inv:staleness @ tools/ingest/');
+    const { text } = gate(payload);
+    expect(text).toContain('seam: tools/ingest/  (where the sites are; no import names a primitive)');
+    expect(text).toContain('it lifts on the\ntrailer alone');
+  });
+
+  it('gates a place whose sites an import spans only in part', () => {
+    const shared = "import { loadSnapshot } from './shared.js';\n";
+    const sources = {
+      'src/feature/a.ts': shared,
+      'src/feature/b.ts': shared,
+      'src/feature/c.ts': 'export const c = 1;\n',
+      'src/feature/shared.ts': 'export function loadSnapshot() {}\n',
+    };
+    const findings = staleRounds.map((f, i) => ({ ...f, path: `src/feature/${'abc'[i]}.ts` }));
+    const decision = expectPlaceGate({ findings, sources }, 'src/feature/');
+    expect(decision.unlifted[0].key).toBe('inv:staleness @ src/feature/');
+  });
+
+  it('keeps an invariant in two directories apart', () => {
+    const findings = [...staleRounds.slice(0, 2), { ...staleRounds[2], path: 'tools/export/sink.py' }];
+    expect(gate({ findings, files: INGEST }).status).toBe(0);
+  });
+
+  it('does not gate a directory whose rounds share no invariant', () => {
+    const findings = [
+      codexFinding('PRR_D1', 'tools/ingest/loader.py', 'Handle a null batch id', '2026-09-01T10:00:00Z'),
+      codexFinding(
+        'PRR_D2',
+        'tools/ingest/writer.py',
+        'Retry the upload without writing duplicates',
+        '2026-09-01T12:00:00Z',
+      ),
+      codexFinding('PRR_D3', 'tools/ingest/steps/merge.py', 'Stop the unbounded page scan', '2026-09-01T14:00:00Z'),
+    ];
+    const { status, decision } = gate({ findings, files: INGEST });
+    expect(status).toBe(0);
+    expect(decision.flagged).toHaveLength(0);
+  });
+
+  it('lifts a place only on a trailer naming a primitive the commit introduces', () => {
+    const after = '2026-09-02T00:00:00Z';
+    const patch = {
+      sha: 'bbb1111',
+      date: after,
+      message: 'fix: reload in the writer',
+      files: ['tools/ingest/writer.py'],
+    };
+    expect(gate({ findings: staleRounds, files: INGEST, commits: [patch] }).status).toBe(3);
+
+    const namesTheDirectory = { ...patch, message: 'fix: reload\n\nReframe: staleness enforced in ingest\n' };
+    expect(gate({ findings: staleRounds, files: INGEST, commits: [namesTheDirectory] }).status).toBe(3);
+
+    const reframe = {
+      sha: 'ccc2222',
+      date: after,
+      message: 'fix: one fresh read for every step\n\nReframe: staleness enforced in fresh_checkpoint\n',
+      files: ['tools/ingest/state.py'],
+      before: { 'tools/ingest/state.py': '' },
+      after: { 'tools/ingest/state.py': 'def fresh_checkpoint(store):\n    return store.reload()\n' },
+    };
+    const { status, decision } = gate({ findings: staleRounds, files: INGEST, commits: [reframe] });
+    expect(status).toBe(0);
+    expect(decision.flagged[0].liftedBy).toBe('reframe trailer');
+  });
+
+  it('counts findings from substitute receipts that asked for changes', () => {
+    const receipts = [
+      substituteReceipt(
+        11,
+        '2026-09-01T10:00:00Z',
+        'changes',
+        '- **P1 — [loader.py:40](/home/someone/wt-x/tools/ingest/loader.py:40):** Loads from a stale cached checkpoint.',
+      ),
+      substituteReceipt(
+        12,
+        '2026-09-01T12:00:00Z',
+        'changes',
+        '- **P1 — `ingest/writer.py:88`:** Writes from a stale snapshot after the reload.',
+      ),
+      substituteReceipt(
+        13,
+        '2026-09-01T14:00:00Z',
+        'changes',
+        '- **P2 — `merge.py`:** Merges against the stale cached rows.',
+      ),
+    ];
+    const decision = expectPlaceGate({ findings: [], receipts, files: INGEST }, 'tools/ingest/');
+    expect(decision.unlifted[0].sites.map((site) => site.file)).toEqual([
+      'tools/ingest/loader.py',
+      'tools/ingest/writer.py',
+      'tools/ingest/steps/merge.py',
+    ]);
+  });
+
+  it('resolves a cited path to the tracked file sharing its longest tail, and an ambiguous one to none', () => {
+    const files = ['writer.py', ...INGEST];
+    const cite = (id: number, at: string, where: string) =>
+      substituteReceipt(id, at, 'changes', `- **P1 — \`${where}\`:** Writes from a stale cached snapshot.`);
+    const partial = [11, 12, 13].map((id, i) => cite(id, `2026-09-01T1${i}:00:00Z`, 'ingest/writer.py:88'));
+    const decision = expectPlaceGate({ findings: [], receipts: partial, files }, 'tools/ingest/');
+    expect(new Set(decision.unlifted[0].sites.map((site) => site.file))).toEqual(new Set(['tools/ingest/writer.py']));
+
+    const bare = [11, 12, 13].map((id, i) => cite(id, `2026-09-01T1${i}:00:00Z`, 'writer.py'));
+    const { status, decision: none } = gate({ findings: [], receipts: bare, files });
+    expect(status).toBe(0);
+    expect(none.reported[0].reason).toBe('no finding names a file');
+  });
+
+  it('counts an independent receipt that is not clear, and nothing from one that is', () => {
+    const changes = independentReceipt(
+      21,
+      '2026-09-01T12:00:00Z',
+      'CHANGES',
+      1,
+      'One blocking finding.\n\n- R2-1: `tools/ingest/writer.py:88` writes from a stale cached snapshot.',
+    );
+    const findings = [staleRounds[0], staleRounds[2]];
+    expect(gate({ findings, receipts: [changes], files: INGEST }).status).toBe(3);
+
+    const clear = independentReceipt(
+      21,
+      '2026-09-01T12:00:00Z',
+      'CLEAR',
+      0,
+      'No blocking findings. `tools/ingest/writer.py` reads a stale snapshot, non-blocking.',
+    );
+    expect(gate({ findings, receipts: [clear], files: INGEST }).status).toBe(0);
+  });
+
+  it('places no finding from a receipt whose list items name no file, whatever its prose mentions', () => {
+    const receipts = [21, 22, 23].map((id, i) =>
+      substituteReceipt(
+        id,
+        `2026-09-01T1${i}:00:00Z`,
+        'changes',
+        'Read tools/ingest/writer.py; the snapshot is stale.',
+      ),
+    );
+    const { status, decision } = gate({ findings: [], receipts, files: INGEST });
+    expect(status).toBe(0);
+    expect(decision.reported[0].reason).toBe('no finding names a file');
+  });
+
+  it('keeps receipts with no comment id as separate rounds, even within one second', () => {
+    const receipts = staleRounds.map((f) => ({
+      ...substituteReceipt(
+        0,
+        '2026-09-01T10:00:00Z',
+        'changes',
+        `- **P1 — \`${f.path}\`:** Reads a stale cached snapshot.`,
+      ),
+      id: null as unknown as number,
+    }));
+    expectPlaceGate({ findings: [], receipts, files: INGEST }, 'tools/ingest/');
+  });
+
+  it('counts an independent receipt whose verdict key is given twice as not clear', () => {
+    const receipts = staleRounds.map((f, i) => ({
+      id: 60 + i,
+      createdAt: f.createdAt,
+      body:
+        '<!-- independent-review-receipt:v1 -->\n```json\n' +
+        '{"verdict":"CHANGES","blocking_findings":1,"verdict":"CLEAR","blocking_findings":0}\n```\n' +
+        `- \`${f.path}\` reads a stale cached snapshot.\n`,
+    }));
+    expectPlaceGate({ findings: [], receipts, files: INGEST }, 'tools/ingest/');
+  });
+
+  it('counts nothing from a substitute receipt that approves', () => {
+    const approve = substituteReceipt(
+      31,
+      '2026-09-01T12:00:00Z',
+      'approve',
+      '- **P3 — `tools/ingest/writer.py`:** A stale snapshot comment.',
+    );
+    expect(gate({ findings: [staleRounds[0], staleRounds[2]], receipts: [approve], files: INGEST }).status).toBe(0);
+  });
+
+  it('never refuses on how many receipts there are, only on a recurring class', () => {
+    const titles = [
+      'Handle a null batch id',
+      'Retry without writing duplicates',
+      'Stop the unbounded scan',
+      'Check tenant ownership',
+      'Order the steps before commit',
+    ];
+    const receipts = titles.map((title, i) =>
+      substituteReceipt(40 + i, `2026-09-01T1${i}:00:00Z`, 'changes', `- **P1 — \`${INGEST[i % 4]}\`:** ${title}.`),
+    );
+    const { status, decision } = gate({ findings: [], receipts, files: INGEST });
+    expect(decision.report.totalRounds).toBe(5);
+    expect(status).toBe(0);
+  });
+});
+
+describe('skill wiring', () => {
+  // The loop runs on the host AND inside agent containers, which mount
+  // container/skills/. There is exactly one copy — the host path is a symlink
+  // into the container tree — and a gate that exists in only one of them is a
+  // gate half the fleet does not have. This asserts the link, because turning
+  // it into a real directory is how the two would silently drift.
+  it('serves one copy to the host and the container', () => {
+    const host = path.resolve('.claude/skills/pr-review-loop');
+    expect(fs.lstatSync(host).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(host)).toBe('../../container/skills/pr-review-loop');
+    expect(fs.realpathSync(SCRIPT)).toBe(fs.realpathSync(CONTAINER_SCRIPT));
+  });
+
+  it('ships the classifier executable next to the helper', () => {
+    expect(fs.existsSync(CONTAINER_SCRIPT)).toBe(true);
+    expect(fs.statSync(CONTAINER_SCRIPT).mode & 0o111).toBeGreaterThan(0);
+  });
+
+  it('routes the push subcommand through the gate, and records the override only after the push', () => {
+    const helper = fs.readFileSync(path.resolve('container/skills/pr-review-loop/scripts/codex-review.sh'), 'utf8');
+    // gate → push → record, in that order. Recording is a claim that a site
+    // patch was pushed, so a refused push must not leave it in the PR body.
+    const push = helper.slice(helper.indexOf('  push)'));
+    const order = ['run_gate --committed-only', 'git push "$@"', 'record_site_patch_override'].map((m) =>
+      push.indexOf(m),
+    );
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    // A named BRANCH resolves the PR, never the mutable checkout.
+    expect(helper).toMatch(/BRANCH:-\}" \]; then\n[\s\S]*?PR_LIST=\$\(resolve_pr_list "\$BRANCH"/);
+    // The verdict is about the branch the push UPDATES. The checkout's branch
+    // and BRANCH can both name something else whose PRs are clean, so the
+    // refspec's destination re-resolves before the gate runs.
+    expect(push).toContain('PUSH_DEST="${BASH_REMATCH[2]}"');
+    expect(push).toMatch(/PUSH_DEST" != "\$\{BRANCH:-\}"/);
+    expect(push).toContain('PR_LIST=$(resolve_pr_list "$PUSH_DEST"');
+    // The PR lives in the base repository, which a fork clone does not point
+    // at, and the listing is bounded — a full page fails closed rather than
+    // gating a subset.
+    expect(helper).toContain('base_repo()');
+    expect(helper).toContain('--limit "$PR_LIST_LIMIT"');
+    expect(helper).toContain('the listing may be truncated');
+    // Never a bare push: `push.default=matching` and a configured
+    // `remote.<name>.push` both let one update several branches, so the
+    // refspec is built from the checkout when the caller gave none and git is
+    // never left to decide what a push means.
+    expect(push).toContain('push_refspecs" -eq 0');
+    expect(push).toContain('set -- "$@" "$push_oid:refs/heads/$push_branch"');
+    // A dry run updates no remote, so it must not write a claim that a site
+    // patch was pushed into any PR body.
+    expect(push).toContain('PUSH_DRY_RUN=1');
+    // PR resolution describes one repository, so a second remote is refused
+    // rather than resolved for: a push to `other` would otherwise be judged by
+    // the checkout repository's PRs.
+    expect(push).toContain('is not origin; the churn gate resolves PRs for one repository');
+    expect(push).toMatch(/PUSH_DRY_RUN" -eq 1 \]; then\n[\s\S]*?was NOT recorded/);
+    // And every PR the branch resolves to, not the first: one branch can have
+    // open PRs into two bases, a push updates both, and a verdict from one
+    // would let a held class on the other ride along. The loop is inside
+    // run_gate, which is the seam `gate` and `push` share.
+    const runGate = helper.slice(helper.indexOf('run_gate() {'), helper.indexOf('case "${1'));
+    expect(runGate).toContain('for pr in $PR_LIST');
+    expect(helper).not.toMatch(/\)\]\[0\]\.number/);
+    // `--head` filters by branch name only, so a fork PR with the same branch
+    // name is in the result set; the source repository is what separates them.
+    expect(helper).toContain('headRepositoryOwner.login ==');
+    expect(helper).toContain('headRepository.name ==');
+    // One verdict describes one destination, so the push shapes that send more
+    // than the judged ref are refused rather than gated on the wrong one. The
+    // mechanism is an allowlist, not a denylist: `--branches` is `--all` under
+    // another spelling, and a denylist misses the next alias git adds. Options
+    // are also required to be self-contained, since a separate value argument
+    // would be counted as the remote or a refspec.
+    for (const shape of ['--all', '--branches', '--mirror', '--tags', '--follow-tags', '--prune'])
+      expect(push).toContain(shape);
+    expect(push).toContain('is not known to the churn gate to leave the ref set alone');
+    expect(push).toContain('--push-option=*');
+    // `--repo=<remote>` supplies the repository itself, which makes the first
+    // bare word the refspec — a different positional grammar, so it is refused
+    // rather than special-cased.
+    expect(push).not.toContain('--repo=*');
+    expect(push).toContain('is not <sha>:refs/heads/<branch>');
+    expect(push).toMatch(/push_refspecs" -gt 1/);
+    // The refspec is validated by a positive grammar for the same reason the
+    // options are: counting arguments does not prove there is one destination,
+    // since `refs/heads/*:refs/heads/*` is one argument that pushes every
+    // branch, and a ref source can move between the verdict and the push.
+    expect(push).toMatch(/\[\[ "\$arg" =~ \^\(\[0-9a-f\]\{7,40\}\):refs\/heads\//);
+    // Evaluating the gate writes nothing at all.
+    const gateBranch = helper.slice(helper.indexOf('  gate)'), helper.indexOf('  push)'));
+    expect(gateBranch).not.toContain('record_site_patch_override');
+    expect(helper.slice(helper.indexOf('run_gate() {'), helper.indexOf('case "${1'))).not.toContain(
+      'record_site_patch_override',
+    );
+  });
+});

@@ -1,0 +1,91 @@
+/**
+ * Channel-config tools: set the wiring row's default_model / default_effort (overrides container.json and host
+ * defaults; overridden by per-session `-m`/`-e`). The host authorizes from the session's latest inbound message,
+ * not from anything the agent can fake.
+ */
+import { registerTools } from './server.js';
+import { emitSystemAction, ok } from './tool-helpers.js';
+import type { McpToolDefinition } from './types.js';
+
+// Deliberately broad (Codex's max/ultra); the host validates against the target provider before any mutation.
+const VALID_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+
+const setChannelModelTool: McpToolDefinition = {
+  tool: {
+    name: 'set_channel_model',
+    description:
+      'Set the default model for a specific channel (messaging group) wired to this agent. When an authorized user directly asks to change this channel default, call this tool immediately; do NOT preflight with `list_models`, `list_access`, or `change_model`. The host validates the requested value for this agent provider and replies with the authoritative outcome. Applies to every future turn on that channel unless the user passes `-m <model>` explicitly. Mutates messaging_group_agents.default_model. Claude models accept family aliases such as `opus`, `sonnet`, `haiku`, and `fable`; Codex models accept `luna`, `terra`, `sol`, or full `gpt-*` ids (for example `gpt-6-luna`); OpenCode Zen models use slugs such as `opencode/deepseek-v4-flash-free`. Pass model=null to clear the per-channel override and fall back to the agent / host defaults. Admin-only.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        channel: {
+          type: 'string',
+          description: 'Destination name for the channel to configure. Defaults to the channel this message came from.',
+        },
+        model: {
+          type: ['string', 'null'],
+          description:
+            'Model to pin. Use a provider-valid id or alias (`luna` / `gpt-6-luna` for Codex, `opencode/deepseek-v4-flash-free` for OpenCode Zen). Pass null to clear the per-channel override.',
+        },
+      },
+      required: ['model'],
+    },
+  },
+  handler: async (args: Record<string, unknown>) => {
+    const channel = typeof args.channel === 'string' ? args.channel.trim() : undefined;
+    const model = args.model === null ? null : typeof args.model === 'string' ? args.model.trim() : undefined;
+    if (model === undefined) {
+      return ok('Error: `model` is required. Pass a model id / alias, or null to clear.');
+    }
+    await emitSystemAction('chcfg', 'set_channel_model', { channel, model });
+    const action = model === null ? 'clear' : `set to ${model}`;
+    return ok(
+      `set_channel_model requested (channel=${channel ?? '(current)'}, action=${action}). Host will reply with the outcome.`,
+    );
+  },
+};
+
+const setChannelEffortTool: McpToolDefinition = {
+  tool: {
+    name: 'set_channel_effort',
+    description:
+      'Set the default reasoning effort for a specific channel (messaging group) wired to this agent. When an authorized user directly asks to change this channel default, call this tool immediately; do NOT preflight with `list_models`, `list_access`, or `change_model`. The host validates the requested effort for this agent provider and replies with the authoritative outcome. Applies until the user passes `-e <level>` explicitly. Values are provider-specific: Claude/OpenCode use low | medium | high | max (Claude may also use xhigh); Codex uses low | medium | high | xhigh | max | ultra. Pass null to clear. Admin-only. Mutates messaging_group_agents.default_effort.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        channel: {
+          type: 'string',
+          description: 'Destination name for the channel to configure. Defaults to the channel this message came from.',
+        },
+        effort: {
+          type: ['string', 'null'],
+          description:
+            'Provider-specific effort level (Codex: low | medium | high | xhigh | max | ultra) or null to clear the override.',
+        },
+      },
+      required: ['effort'],
+    },
+  },
+  handler: async (args: Record<string, unknown>) => {
+    const channel = typeof args.channel === 'string' ? args.channel.trim() : undefined;
+    const effort =
+      args.effort === null ? null : typeof args.effort === 'string' ? args.effort.trim().toLowerCase() : undefined;
+    if (effort === undefined) {
+      return ok('Error: `effort` is required. Pass a provider-supported level (for example max), or null to clear.');
+    }
+    if (effort !== null && !VALID_EFFORTS.has(effort)) {
+      return ok(
+        `Error: effort must be one of low, medium, high, xhigh, max, ultra (or null). Got ${JSON.stringify(args.effort)}.`,
+      );
+    }
+    await emitSystemAction('chcfg', 'set_channel_effort', { channel, effort });
+    const action = effort === null ? 'clear' : `set to ${effort}`;
+    return ok(
+      `set_channel_effort requested (channel=${channel ?? '(current)'}, action=${action}). Host will reply with the outcome.`,
+    );
+  },
+};
+
+const channelConfigTools: McpToolDefinition[] = [setChannelModelTool, setChannelEffortTool];
+
+registerTools(channelConfigTools);

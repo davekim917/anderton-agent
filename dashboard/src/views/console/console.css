@@ -1,0 +1,1175 @@
+/* Observatory console — "Terminal neutral" (DESIGN.md §7).
+ *
+ * Light-first; dark is a designed palette, not an inversion. Every rule below
+ * is scoped under `.ncc` so this file cannot reach the legacy Observatory /
+ * inbox / workgroup surfaces, which still run on theme.css's single light
+ * theme. Retiring those is Phase 4, not this file's business.
+ *
+ * DARK MODE HAS TWO TRIGGERS AND THEY ARE NOT INTERCHANGEABLE:
+ *
+ *   1. `@media (prefers-color-scheme: dark)`, guarded by
+ *      `:root:not([data-theme="light"])` — the system setting, which an
+ *      explicit LIGHT choice must be able to override.
+ *   2. `:root[data-theme="dark"]` — the explicit toggle, which must win in a
+ *      light system too.
+ *
+ * The FULL light palette is declared once on bare `:root`; the dark blocks
+ * redefine only the tokens that change. A colour whose only definition lives
+ * inside a media query has no value at all when that query does not match.
+ *
+ * Type (DESIGN §7): Public Sans for human prose, JetBrains Mono for every
+ * machine-produced value — timestamps, elapsed, tool names, counts, ids.
+ * Monospace for data is functional: it makes numbers comparable down a column.
+ * Both self-hosted; Inter / Roboto / Arial / Fraunces appear nowhere, fallback
+ * stacks included.
+ */
+@import '@fontsource-variable/public-sans';
+@import '@fontsource-variable/jetbrains-mono';
+
+:root {
+  --ncc-font-sans: 'Public Sans Variable', ui-sans-serif, system-ui, 'Segoe UI', 'Helvetica Neue', sans-serif;
+  --ncc-font-mono: 'JetBrains Mono Variable', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* Surfaces — true zero-hue grey. No warm cast, no blue cast (§7). */
+  --ncc-page: #f7f7f7;
+  --ncc-topbar: #f3f3f3;
+  --ncc-sidebar: #f0f0f0;
+  --ncc-wash: #ffe0da;
+  --ncc-border: #cecece;
+  --ncc-chip: #dedede;
+  --ncc-wash-chip: #eacfca;
+  --ncc-divider: #dfdfdf;
+
+  /* Ink. `--ncc-muted` is the FLOOR: at 4.47:1 on the chip surface it fails AA,
+     so chips carry `--ncc-secondary` and never muted. See §7.2 note below. */
+  --ncc-ink: #141414;
+  --ncc-secondary: #525252;
+  --ncc-muted: #636363;
+
+  /* Two functional signals only (§7.1): one "wants you", one "live". Never a
+     third status hue without amending DESIGN.md. */
+  --ncc-attention: #b32322;
+  --ncc-live: #006c24;
+
+  /* Decorative only — icon strokes. No text-contrast requirement. */
+  --ncc-decor: #808080;
+
+  /* Inverse-filled chip (verb button, triage button). */
+  --ncc-solid: #141414;
+  --ncc-solid-ink: #f7f7f7;
+
+  /* §7.2, THE RULE: text on an ACCENT-filled chip. White clears AA on the
+     light accents (6.16:1 / 6.18:1) and fails hard on the dark ones
+     (2.88:1 / 2.72:1), so dark flips this to near-black. It is a token, not a
+     per-component decision, precisely because it ships broken silently. */
+  --ncc-on-accent: #f7f7f7;
+
+  --ncc-focus: #141414;
+}
+
+/* Trigger 1 — the system setting, yielding to an explicit light choice. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --ncc-page: #0d0d0d;
+    --ncc-topbar: #141414;
+    --ncc-sidebar: #171717;
+    --ncc-wash: #2c110f;
+    --ncc-border: #292929;
+    --ncc-chip: #292929;
+    --ncc-wash-chip: #3a1a17;
+    --ncc-divider: #292929;
+    --ncc-ink: #dedede;
+    --ncc-secondary: #989898;
+    --ncc-muted: #868686;
+    --ncc-attention: #f66e5c;
+    --ncc-live: #45b164;
+    --ncc-solid: #dedede;
+    --ncc-solid-ink: #0d0d0d;
+    --ncc-on-accent: #0d0d0d;
+    --ncc-focus: #dedede;
+  }
+}
+
+/* Trigger 2 — the explicit toggle, which must win in a light system too. */
+:root[data-theme='dark'] {
+  --ncc-page: #0d0d0d;
+  --ncc-topbar: #141414;
+  --ncc-sidebar: #171717;
+  --ncc-wash: #2c110f;
+  --ncc-border: #292929;
+  --ncc-chip: #292929;
+  --ncc-wash-chip: #3a1a17;
+  --ncc-divider: #292929;
+  --ncc-ink: #dedede;
+  --ncc-secondary: #989898;
+  --ncc-muted: #868686;
+  --ncc-attention: #f66e5c;
+  --ncc-live: #45b164;
+  --ncc-solid: #dedede;
+  --ncc-solid-ink: #0d0d0d;
+  --ncc-on-accent: #0d0d0d;
+  --ncc-focus: #dedede;
+}
+
+/* ── Shell ─────────────────────────────────────────────────────────────── */
+
+.ncc {
+  /* index.html pins `color-scheme: light` for the legacy theme's first paint;
+     the console re-declares it on its own root so scrollbars and form controls
+     follow the palette actually on screen. */
+  color-scheme: light;
+  /*
+   * A FIXED-VIEWPORT APP SHELL, NOT A SCROLLING DOCUMENT.
+   *
+   * `min-height` here was the single defect behind three separate complaints —
+   * the sidebar scrolling away, the composer only reachable at the bottom of
+   * the page, and the transcript never sitting at its newest message. A
+   * min-height root grows to its content, so `.ncc-body`'s flex children never
+   * have to shrink, none of their `overflow-y: auto` regions ever engage, and
+   * the whole thing escapes to one page scroll. Every pane below scrolls on its
+   * own only because this is a HARD height.
+   *
+   * `dvh` rather than `vh`: mobile is the primary viewport (§8) and `vh` is
+   * measured against the browser chrome's largest state, so a `vh` shell hangs
+   * its last 60-90px below the fold on a phone. `100vh` stays as the fallback
+   * for anything without `dvh`.
+   */
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: var(--ncc-page);
+  color: var(--ncc-ink);
+  font-family: var(--ncc-font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .ncc { color-scheme: dark; }
+}
+:root[data-theme='dark'] .ncc { color-scheme: dark; }
+
+.ncc :focus-visible {
+  outline: 2px solid var(--ncc-focus);
+  outline-offset: 1px;
+}
+
+.ncc-mono {
+  font-family: var(--ncc-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Top bar */
+.ncc-top {
+  flex-shrink: 0;
+  min-height: 44px;
+  border-bottom: 1px solid var(--ncc-border);
+  background: var(--ncc-topbar);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 14px;
+}
+.ncc-brand {
+  font-size: 13.5px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--ncc-ink);
+  white-space: nowrap;
+}
+.ncc-spacer { flex-grow: 1; }
+
+/* Mobile-only (§8 breakpoint below) — opens the same `.ncc-side` sheet the
+   bottom bar's Filters tab used to raise. Hidden on desktop, where the
+   sidebar is already on screen. */
+.ncc-hamburger {
+  display: none;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  min-height: 28px;
+  background: transparent;
+  border: 1px solid var(--ncc-border);
+  border-radius: 0;
+  color: var(--ncc-ink);
+  cursor: pointer;
+}
+
+.ncc-select,
+.ncc-search {
+  font-family: var(--ncc-font-mono);
+  font-size: 12px;
+  color: var(--ncc-secondary);
+  background: var(--ncc-page);
+  border: 1px solid var(--ncc-border);
+  border-radius: 0;
+  padding: 4px 8px;
+  min-height: 28px;
+}
+.ncc-search { width: 214px; }
+.ncc-search::placeholder { color: var(--ncc-muted); }
+
+/* The one inverse-filled chip in the chrome. */
+.ncc-solid-btn {
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ncc-solid-ink);
+  background: var(--ncc-solid);
+  border: 1px solid var(--ncc-solid);
+  border-radius: 0;
+  padding: 5px 10px;
+  min-height: 28px;
+  cursor: pointer;
+}
+
+.ncc-body {
+  flex-grow: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+/* ── Sidebar ───────────────────────────────────────────────────────────── */
+
+.ncc-side {
+  width: 200px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--ncc-border);
+  background: var(--ncc-sidebar);
+  display: flex;
+  flex-direction: column;
+  padding: 13px 0;
+  overflow-y: auto;
+}
+.ncc-side-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--ncc-font-mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ncc-muted);
+  padding: 4px 14px 5px;
+  margin: 0;
+}
+.ncc-side-head .lbl { flex-grow: 1; }
+.ncc-side-gap { height: 13px; flex-shrink: 0; }
+
+.ncc-side-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 14px;
+  background: transparent;
+  border: 0;
+  border-left: 2px solid transparent;
+  border-radius: 0;
+  text-align: left;
+  font-family: inherit;
+  font-size: 12.5px;
+  color: var(--ncc-ink);
+  cursor: pointer;
+  text-decoration: none;
+}
+.ncc-side-item .lbl {
+  flex-grow: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ncc-side-item.channel .lbl {
+  font-family: var(--ncc-font-mono);
+  color: var(--ncc-secondary);
+}
+.ncc-side-item[aria-pressed='true'],
+.ncc-side-item[aria-current='true'] {
+  background: var(--ncc-page);
+  border-left-color: var(--ncc-ink);
+  font-weight: 650;
+}
+.ncc-side-item .n {
+  flex-shrink: 0;
+  font-family: var(--ncc-font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--ncc-muted);
+  min-width: 26px;
+  text-align: right;
+}
+.ncc-side-item .n.attention { color: var(--ncc-attention); font-weight: 700; min-width: 0; }
+.ncc-side-item .n.live { color: var(--ncc-live); font-weight: 600; }
+/* Triage, disabled on an empty queue or while already open — same reading as
+   the row verb's disabled state (§4, "no row anywhere offers a kill" applies
+   equally here: an entry that cannot succeed says so, it does not vanish). */
+.ncc-side-item:disabled { color: var(--ncc-muted); cursor: not-allowed; }
+
+/* The nav's footer item — the theme toggle, item 2's move out of the top bar.
+   `margin-top: auto` pins it to the bottom of `.ncc-side`'s column flex
+   whether that is the desktop sidebar or the mobile sheet; the same element
+   either way, per §12. */
+.ncc-side-foot {
+  margin-top: auto;
+  flex-shrink: 0;
+  padding: 10px 14px 0;
+  border-top: 1px solid var(--ncc-border);
+}
+.ncc-side-foot .ncc-solid-btn { width: 100%; }
+
+/* ── List pane ─────────────────────────────────────────────────────────── */
+
+/* `display: flex` outranks the `hidden` attribute's UA `display: none`, and
+   triage hides this pane with `hidden` so the list keeps its DOM — which is
+   what makes its scroll position restorable on exit. */
+.ncc-list-pane[hidden] { display: none; }
+.ncc-list-pane {
+  width: 492px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--ncc-border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+.ncc-list-head {
+  flex-shrink: 0;
+  padding: 13px 15px 11px;
+  border-bottom: 1px solid var(--ncc-border);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.ncc-list-head h2 { font-size: 15px; font-weight: 700; margin: 0; }
+.ncc-list-head .count { font-family: var(--ncc-font-mono); font-size: 11.5px; color: var(--ncc-muted); }
+.ncc-list { flex-grow: 1; min-height: 0; overflow-y: auto; list-style: none; margin: 0; padding: 0; }
+.ncc-empty {
+  font-family: var(--ncc-font-mono);
+  font-size: 12px;
+  color: var(--ncc-muted);
+  padding: 22px 15px;
+}
+
+/* ── Row (DESIGN §4) ───────────────────────────────────────────────────── */
+
+.ncc-row {
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--ncc-divider);
+  background: var(--ncc-page);
+}
+.ncc-row.attention { background: var(--ncc-wash); }
+.ncc-row.selected { box-shadow: inset 0 0 0 1px var(--ncc-border); }
+
+/* Status bar: 3px, full row height, colour = urgency. TRANSPARENT when the row
+   wants nothing (§4) — the artboards paint those grey; DESIGN wins. */
+.ncc-row-bar { width: 3px; flex-shrink: 0; background: transparent; }
+.ncc-row.attention .ncc-row-bar { background: var(--ncc-attention); }
+.ncc-row.live .ncc-row-bar { background: var(--ncc-live); }
+
+.ncc-row-inner { flex-grow: 1; min-width: 0; display: flex; flex-direction: column; }
+.ncc-row-cols { display: flex; align-items: flex-start; gap: 11px; padding: 12px 13px 11px; }
+
+/* The row's body is one real button so the whole row is keyboard-reachable;
+   the verb is a SIBLING button, never nested (nested buttons are invalid and
+   unreachable by keyboard). */
+.ncc-row-main {
+  flex-grow: 1;
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  /* §8: mobile tap targets, enforced with an explicit min-height. */
+  min-height: 44px;
+}
+.ncc-row-text { flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+
+.ncc-row-title {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.42;
+  color: var(--ncc-ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ncc-row-hybrid {
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ncc-row-hybrid .speaker { font-weight: 600; color: var(--ncc-secondary); }
+.ncc-row-hybrid .excerpt { color: var(--ncc-muted); }
+
+/* WHY this row is `needs_you` (operator report 2026-08-21). Same rule as
+   `.ncc-row-proposal` below (spelled out on the row, not just a `title`
+   tooltip a touch screen can never trigger — 390px is the primary viewport),
+   and the same reuse discipline: attention-red, matching `.ncc-state.attention`
+   and `.ncc-row.attention .ncc-row-step`, never a third status hue (§7). */
+.ncc-row-reason {
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ncc-attention);
+}
+/* Park age, LEADING the note it qualifies — a marker clipped off the end of a
+   390px ellipsis is a marker that does not exist. Mono because it is a
+   machine-produced value (§7), and `--ncc-secondary` rather than
+   `--ncc-attention`: the note is the alarm, this is the qualifier on it, and §7
+   allows exactly two functional hues. */
+.ncc-row-parkage {
+  font-family: var(--ncc-font-mono);
+  font-size: 11.5px;
+  color: var(--ncc-secondary);
+  margin-right: 6px;
+}
+/* Which attention source produced an ownerless row, and how old that source is.
+   Sits on the meta line, in the meta line's own colour — provenance, not a
+   status. Never a suppression signal; see ThreadRow.tsx. */
+.ncc-row-source {
+  font-family: var(--ncc-font-mono);
+  white-space: nowrap;
+}
+/* This row's OWN source has missed the cadence its install declared. Reuses
+   the attention hue — the same "wants you" signal as `.ncc-state.attention`
+   and `.ncc-row-reason`, never a third status hue (§7). The marker is a WORD
+   and it leads the span, because at 390px the meta line is the most-clipped
+   thing on the row and a marker lost to an ellipsis is a marker that does not
+   exist (the rule `.ncc-row-parkage` already follows). Nothing here hides the
+   row: the mark is the whole intervention. */
+.ncc-row-source.stale,
+.ncc-detail-source .when.stale {
+  color: var(--ncc-attention);
+}
+
+/* Thread-closure contract, item 1: the proposal's reason, spelled out on the
+   row (not just the badge's title tooltip — 390px is the primary viewport and
+   a touch screen never triggers one). Green, matching the badge and reusing
+   the existing "live" signal rather than a third status hue (§7). */
+.ncc-row-proposal {
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ncc-live);
+}
+.ncc-row-proposal .who { font-weight: 600; }
+
+.ncc-row-livelinerow { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.ncc-row-livedot { flex-shrink: 0; width: 5px; height: 5px; background: var(--ncc-muted); }
+.ncc-row.attention .ncc-row-livedot { background: var(--ncc-attention); }
+.ncc-row.live .ncc-row-livedot { background: var(--ncc-live); }
+.ncc-row-step {
+  font-family: var(--ncc-font-mono);
+  font-size: 11.5px;
+  color: var(--ncc-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ncc-row.attention .ncc-row-step { color: var(--ncc-attention); }
+.ncc-row.live .ncc-row-step { color: var(--ncc-live); }
+.ncc-row-elapsed {
+  flex-shrink: 0;
+  font-family: var(--ncc-font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  color: var(--ncc-muted);
+}
+
+.ncc-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  color: var(--ncc-muted);
+}
+.ncc-row-meta span { white-space: nowrap; }
+
+.ncc-row-side {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+.ncc-state {
+  font-family: var(--ncc-font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  padding: 1px 5px;
+  color: var(--ncc-secondary);
+  border: 1px solid var(--ncc-border);
+}
+.ncc-state.attention { color: var(--ncc-attention); border-color: var(--ncc-attention); }
+.ncc-state.live { color: var(--ncc-live); border-color: var(--ncc-live); }
+.ncc-verb {
+  font-family: var(--ncc-font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--ncc-solid-ink);
+  background: var(--ncc-solid);
+  border: 1px solid var(--ncc-solid);
+  border-radius: 0;
+  padding: 3px 8px;
+  min-height: 24px;
+  cursor: pointer;
+}
+/* No verb on a queue row is ever inert now — the word is a label over the ONE
+   send primitive, so a state that can render a word can always perform the
+   action behind it. This rule survives for the triage panel's verdict buttons,
+   which disable while a verdict is in flight. */
+.ncc-verb:disabled {
+  color: var(--ncc-secondary);
+  background: transparent;
+  border-color: var(--ncc-border);
+  cursor: not-allowed;
+}
+
+/* ── Avatar stack (§4: max 3 faces, 2px ring, −8px overlap, then +N) ────── */
+
+/* The faces are the shared `<AgentAvatar>` — real Slack avatars with its
+ * initials fallback (§11), re-skinned here rather than reimplemented. The
+ * wrapper owns size, ring and overlap; AgentAvatar owns "is there a real face
+ * or a letter", which is the part that must look identical everywhere.
+ * There is no pixelation: §11 removed it and real faces are the point. */
+.ncc-faces { flex-shrink: 0; display: flex; align-items: center; padding-top: 1px; }
+.ncc-face {
+  --ncc-face-size: 25px;
+  width: var(--ncc-face-size);
+  height: var(--ncc-face-size);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: var(--ncc-chip);
+  /* The ring reads as the surface the stack sits on, so an overlap never
+     smears two faces together on either ground. */
+  box-shadow: 0 0 0 2px var(--ncc-page);
+}
+.ncc-row.attention .ncc-face { box-shadow: 0 0 0 2px var(--ncc-wash); }
+.ncc-face + .ncc-face { margin-left: -8px; }
+/* AgentAvatar writes width/height as an inline style, which no class selector
+   can outrank — one documented `!important` beats threading a pixel size
+   through the tree for a breakpoint that changes it by 1px. */
+.ncc-face > .tm-avatar { width: 100% !important; height: 100% !important; }
+.ncc-face .tm-avatar-face { border: 0; }
+/* Initials sit on the CHIP surface, so they take `--ncc-secondary`: muted is
+   4.47:1 there and fails AA in light, 4.00:1 and fails in dark. */
+.ncc-face .tm-avatar-mark {
+  background: var(--ncc-chip);
+  font-family: var(--ncc-font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--ncc-secondary);
+}
+.ncc-face.orphan,
+.ncc-face.orphan .tm-avatar-mark { background: var(--ncc-wash-chip); }
+.ncc-face.more {
+  font-family: var(--ncc-font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--ncc-secondary);
+}
+
+/* ── The liveness rule (DESIGN §6) ─────────────────────────────────────── */
+/*
+ * ACTIVITY INDICATOR, NOT PROGRESS. The travelling segment's WIDTH ENCODES
+ * NOTHING: a tool call has a start time and no expected duration, so any
+ * percentage would be fabricated. An earlier draft shipped invented widths and
+ * they were correctly read as meaningful — that is the failure this avoids.
+ *
+ * Motion means a tool is running right now. A stalled thread's rule holds
+ * perfectly still. Motion = working, stillness = stuck.
+ */
+.ncc-track { position: relative; height: 2px; overflow: hidden; background: var(--ncc-divider); }
+.ncc-seg { position: absolute; top: 0; bottom: 0; left: 0; width: 26%; }
+.ncc-seg-live { animation: ncc-alive 2.4s linear infinite; background: var(--ncc-live); }
+.ncc-seg-still { width: 100%; opacity: 0.3; background: var(--ncc-attention); }
+@keyframes ncc-alive {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(385%); }
+}
+/* Reduced motion degrades to a static dimmed rule — the row keeps its
+   indicator, it simply stops moving. */
+@media (prefers-reduced-motion: reduce) {
+  .ncc-seg-live { animation: none; width: 100%; opacity: 0.3; }
+}
+
+/* ── Detail pane ───────────────────────────────────────────────────────── */
+
+.ncc-detail { flex-grow: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+.ncc-detail-head {
+  flex-shrink: 0;
+  padding: 14px 18px 13px;
+  border-bottom: 1px solid var(--ncc-border);
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+}
+.ncc-detail-title { font-size: 15.5px; font-weight: 700; letter-spacing: -0.01em; line-height: 1.3; margin: 0; }
+.ncc-detail-meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-family: var(--ncc-font-mono);
+  font-size: 11.5px;
+  color: var(--ncc-muted);
+  margin-top: 4px;
+}
+/* WHY this row is `needs_you`, in FULL — the row truncates a long claim note
+   to one line (`.ncc-row-reason`); this pane is where the operator reads all
+   of it. Wraps rather than clamping, and reuses the same attention-red the
+   row line and `.ncc-state.attention` already carry (§7: no third hue). */
+.ncc-detail-reason {
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--ncc-attention);
+  margin-top: 4px;
+}
+/* Same qualifier as `.ncc-row-parkage`, in the pane that wraps rather than
+   clamps. */
+.ncc-detail-parkage {
+  font-family: var(--ncc-font-mono);
+  font-size: 11.5px;
+  color: var(--ncc-secondary);
+  margin-right: 6px;
+}
+/* Board provenance in the detail pane: the source, its age, what to do, and a
+   link when the source named a real destination — never dead text pointing
+   nowhere (§12). */
+.ncc-detail-source {
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--ncc-secondary);
+  margin-top: 4px;
+}
+.ncc-detail-source .when {
+  font-family: var(--ncc-font-mono);
+}
+.ncc-detail-note {
+  flex-shrink: 0;
+  padding: 8px 18px;
+  background: var(--ncc-topbar);
+  border-bottom: 1px solid var(--ncc-border);
+  font-size: 11.5px;
+  color: var(--ncc-secondary);
+}
+/* The scroll box and the content box are deliberately two elements: a
+   ResizeObserver on the scroller itself never fires (its border box is fixed by
+   the shell), so the bottom-anchor in ThreadDetail observes `-inner`, whose
+   height is what actually changes when markdown, images and web fonts settle
+   after the commit. */
+.ncc-transcript {
+  flex-grow: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.ncc-transcript-inner {
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+.ncc-msg { display: flex; gap: 10px; }
+.ncc-msg-body { flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.ncc-msg-who { display: flex; align-items: baseline; gap: 7px; }
+/* A human's full name runs longer than an agent's, and at 390px the who-line
+   is ~317px wide. The name yields first so the age and the bot chip — the two
+   values the operator scans down the column — are never the ones pushed out. */
+.ncc-msg-who .name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ncc-ink);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ncc-msg-who .at { font-family: var(--ncc-font-mono); font-size: 11px; color: var(--ncc-muted); flex-shrink: 0; }
+/* Drawn ONLY when the platform said `isBot`. A sibling agent posting into the
+   room is inbound to this session but is not a person, and an unlabelled name
+   in a transcript reads as one. Sized below the name's line box so it costs no
+   row height. */
+.ncc-msg-who .kind {
+  flex-shrink: 0;
+  font-family: var(--ncc-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--ncc-secondary);
+  background: var(--ncc-chip);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+/* No resolvable author (a host-generated inbound, or a row written before the
+   metadata existed): the face column is held open but nothing is drawn. An
+   empty chip with its ring would read as an avatar that failed to load. */
+.ncc-face.empty { background: none; box-shadow: none; }
+/* NOT `white-space: pre-wrap` — the body is rendered markdown now, and `marked`
+   runs with `breaks: true`, so newlines are already `<br>`. Keeping pre-wrap
+   would double every line break. */
+.ncc-msg-text { font-size: 13px; line-height: 1.55; color: var(--ncc-secondary); overflow-wrap: anywhere; }
+.ncc-msg.out .ncc-msg-text { color: var(--ncc-ink); }
+
+/* A long message collapses behind its own preview, TranscriptList's shape. */
+.ncc-msg-expand > summary { cursor: pointer; list-style: none; }
+.ncc-msg-expand > summary::-webkit-details-marker { display: none; }
+.ncc-msg-expand[open] > summary { display: none; }
+.ncc-msg-more {
+  display: inline-block;
+  margin-top: 4px;
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  color: var(--ncc-secondary);
+  text-decoration: underline;
+}
+
+/* ── Rendered markdown (§7 tokens, not the legacy `nc-md` palette) ────────
+ *
+ * `.nc-md` in styles.css is styled with the legacy Observatory's tokens
+ * (`--st-running`, `--bg-card-2`, `--bd-2`) which have no value inside `.ncc`
+ * and no dark variant. So the console carries its own class rather than
+ * borrowing that one, and every rule here reads a `--ncc-*` token, which means
+ * both palettes get it for free.
+ */
+.ncc-md > *:first-child { margin-top: 0; }
+.ncc-md > *:last-child { margin-bottom: 0; }
+.ncc-md p { margin: 0 0 8px; }
+.ncc-md ul, .ncc-md ol { margin: 0 0 8px; padding-left: 20px; }
+.ncc-md li { margin: 2px 0; }
+.ncc-md li::marker { color: var(--ncc-muted); }
+.ncc-md h1, .ncc-md h2, .ncc-md h3, .ncc-md h4, .ncc-md h5, .ncc-md h6 {
+  margin: 12px 0 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ncc-ink);
+}
+.ncc-md strong { color: var(--ncc-ink); font-weight: 700; }
+.ncc-md code {
+  font-family: var(--ncc-font-mono);
+  font-size: 11.5px;
+  background: var(--ncc-chip);
+  color: var(--ncc-ink);
+  padding: 1px 4px;
+}
+/* Code blocks scroll INSIDE their own box. Without `min-width: 0` on the
+   flex-child ancestors a wide `<pre>` widens the whole detail pane instead. */
+.ncc-md pre {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  background: var(--ncc-topbar);
+  border: 1px solid var(--ncc-border);
+  overflow-x: auto;
+  max-width: 100%;
+}
+.ncc-md pre code { background: transparent; padding: 0; white-space: pre; }
+.ncc-md blockquote {
+  margin: 0 0 8px;
+  padding-left: 10px;
+  border-left: 2px solid var(--ncc-border);
+  color: var(--ncc-muted);
+}
+.ncc-md a { color: var(--ncc-ink); text-decoration: underline; text-underline-offset: 2px; }
+.ncc-md hr { border: 0; border-top: 1px solid var(--ncc-divider); margin: 10px 0; }
+.ncc-md table { border-collapse: collapse; margin: 0 0 8px; font-size: 12px; display: block; overflow-x: auto; }
+.ncc-md th, .ncc-md td { border: 1px solid var(--ncc-border); padding: 4px 7px; text-align: left; }
+.ncc-md thead { background: var(--ncc-topbar); }
+.ncc-md img { max-width: 100%; height: auto; }
+
+/* ── Actions: composer, snooze, triage (Phase 3) ────────────────────────── */
+
+.ncc-detail-wrap { flex-grow: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+.ncc-detail-actions {
+  flex-shrink: 0;
+  display: flex;
+  /* `wrap`, not `nowrap`: the close control can grow a Cancel/Confirm pair
+     plus a status line (§ thread-closure contract, item 3), and 390px is the
+     primary viewport (§8) — this is what lets that spill onto its own line
+     instead of forcing a horizontal scroll on the shell. */
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 8px 18px 0;
+}
+/* Desktop shows the list and the thread side by side, so there is nothing to
+   go back to. On mobile (§8) the same tap is a navigation and needs its
+   return. */
+.ncc-back { display: none; margin-right: auto; }
+
+/* The close control (thread-closure contract, item 2). Its buttons are the
+   same `.ncc-verb` / `.ncc-chip` every other action already uses — no new
+   button style for a destructive-looking action, per §7's "two functional
+   signals only" (there is no third, "danger" hue to spend here). */
+.ncc-close { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ncc-close-status {
+  /* Forces onto its own full-width line whenever the buttons above it do not
+     leave room — never truncated, never a tooltip-only explanation (§8: a
+     touch screen cannot trigger `title`). */
+  flex-basis: 100%;
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  color: var(--ncc-secondary);
+}
+
+/* The notice line every mutating action reports through. Visible AND
+   `aria-live`, so the confirmation is not screen-reader-only. */
+.ncc-notice {
+  flex-shrink: 0;
+  min-height: 20px;
+  padding: 4px 14px;
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  color: var(--ncc-secondary);
+}
+
+/*
+ * The reply composer. §10.3's whole reconciliation is the `select` in here:
+ * a thread is N sessions and the send goes into exactly ONE inbound queue, so
+ * the target is part of the request and is rendered as such.
+ */
+.ncc-composer {
+  flex-shrink: 0;
+  border-top: 1px solid var(--ncc-border);
+  background: var(--ncc-topbar);
+  padding: 10px 18px 12px;
+}
+.ncc-composer-target {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  color: var(--ncc-secondary);
+  margin-bottom: 8px;
+}
+.ncc-composer-hint { font-family: var(--ncc-font-mono); font-size: 11px; color: var(--ncc-muted); }
+.ncc-composer-note { font-size: 12px; color: var(--ncc-secondary); }
+
+/* Prefill chips. A chip SETS the box — it never sends — so it reads as an
+   outline, not as the filled send button beside it. 44px because a chip is a
+   real tap target and there is no smaller variant of "the operator meant it".
+   Nested INSIDE `.ncc-composer-target` now (item 3) rather than a sibling row
+   below it, which is what puts it on the SAME row as the agent selector on
+   desktop — no margin of its own, `.ncc-composer-target`'s own `gap` spaces it
+   from the selector and its `flex-wrap` is what lets a narrow width fold it
+   onto its own line without a dedicated element making that decision. */
+.ncc-composer-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.ncc-chip {
+  font-family: var(--ncc-font-sans);
+  font-size: 12px;
+  color: var(--ncc-ink);
+  background: transparent;
+  border: 1px solid var(--ncc-border);
+  border-radius: 0;
+  padding: 6px 10px;
+  min-height: 44px;
+  cursor: pointer;
+}
+.ncc-chip:hover { border-color: var(--ncc-solid); }
+.ncc-chip:disabled { color: var(--ncc-muted); cursor: not-allowed; }
+
+/* The mobile stand-in for the chip row (item 3): one compact `<select>`
+   instead of three 44px buttons, so the quick replies occupy no row of their
+   own on a phone. Hidden by default; the §8 breakpoint below flips which of
+   the two is shown. Both are always in the DOM — see the mobile block's own
+   note on why that beats a `matchMedia` branch. */
+.ncc-composer-quickmenu { display: none; }
+
+.ncc-composer-row { display: flex; align-items: flex-end; gap: 8px; }
+.ncc-composer-box {
+  flex-grow: 1;
+  min-width: 0;
+  font-family: var(--ncc-font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ncc-ink);
+  background: var(--ncc-page);
+  border: 1px solid var(--ncc-border);
+  border-radius: 0;
+  padding: 7px 9px;
+  resize: vertical;
+  min-height: 44px;
+}
+.ncc-composer-box::placeholder { color: var(--ncc-muted); }
+.ncc-composer-row .ncc-solid-btn { min-height: 44px; }
+.ncc-composer-row .ncc-solid-btn:disabled {
+  color: var(--ncc-secondary);
+  background: transparent;
+  border-color: var(--ncc-border);
+  cursor: not-allowed;
+}
+.ncc-composer-status {
+  min-height: 16px;
+  margin-top: 5px;
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  color: var(--ncc-attention);
+}
+
+/*
+ * Triage — a MODE over the filtered list (§11), one thread at a time. It takes
+ * the list AND the detail pane's width, because the whole point is that there
+ * is exactly one thread on screen.
+ */
+.ncc-triage {
+  flex-grow: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--ncc-page);
+}
+.ncc-triage:focus-visible { outline: 2px solid var(--ncc-focus); outline-offset: -2px; }
+/* One row: position, the snooze control, exit. Used to be three (a progress
+   bar row, a legend row, a button row with Answer beside Snooze) — too tall
+   for a phone. Answer is gone outright (it only jumped focus into the
+   composer; the operator called that pointless), which is most of what made
+   the old button row shrinkable into this one. */
+.ncc-triage-bar {
+  flex-shrink: 0;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--ncc-border);
+  background: var(--ncc-topbar);
+}
+.ncc-triage-bar .ncc-verb { min-height: 44px; padding: 6px 12px; }
+.ncc-triage-count { flex-shrink: 0; font-size: 12px; font-weight: 600; color: var(--ncc-ink); }
+.ncc-triage-keys { font-size: 11px; color: var(--ncc-muted); }
+/* POSITION, not progress: discrete cells, so this can never be misread as
+   §6's liveness rule, whose length deliberately encodes nothing. */
+.ncc-triage-rail { display: flex; align-items: center; gap: 2px; }
+.ncc-triage-dot { width: 6px; height: 6px; background: var(--ncc-chip); }
+.ncc-triage-dot.done { background: var(--ncc-border); }
+.ncc-triage-dot.now { background: var(--ncc-attention); }
+.ncc-triage-live {
+  flex-shrink: 0;
+  min-height: 20px;
+  padding: 4px 18px;
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  color: var(--ncc-secondary);
+}
+/* ── Schedule lens (§11) ───────────────────────────────────────────────────
+   The lens takes the whole body: it is a different thing to look at, not a
+   second column beside the queue. `ScheduledDrawer` is reused UNCHANGED and
+   still carries its own `nc-sched-*` classes from styles.css — restyling it
+   here is a CSS problem, and forking the component to solve it would fork the
+   verb×state contract with it. */
+
+.ncc [aria-label='Scheduled work'].ncc-list-pane {
+  width: auto;
+  flex-grow: 1;
+  border-right: 0;
+  position: relative;
+}
+.ncc-sched-list { padding-bottom: 20px; }
+.ncc-sched-row { border-bottom: 1px solid var(--ncc-divider); }
+.ncc-sched-open {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 11px 15px;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  min-height: 44px;
+}
+.ncc-sched-open:hover { background: var(--ncc-topbar); }
+.ncc-sched-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex-grow: 1; }
+.ncc-sched-who { font-size: 11.5px; color: var(--ncc-muted); }
+.ncc-sched-cron { font-size: 11.5px; color: var(--ncc-secondary); flex-shrink: 0; }
+.ncc-sched-when {
+  font-family: var(--ncc-font-mono);
+  font-size: 11.5px;
+  color: var(--ncc-muted);
+  flex-shrink: 0;
+  min-width: 72px;
+  text-align: right;
+}
+
+/* ── Bottom bar (§8) ───────────────────────────────────────────────────────
+ *
+ * Four destinations, each with a distinct icon, and the phone's only chrome
+ * below the queue. Hidden outright above the breakpoint: on desktop the
+ * sidebar is already on screen and a second copy of the same controls would be
+ * the "three near-identical controls" §12 warns about.
+ */
+.ncc-bottom {
+  display: none;
+  flex-shrink: 0;
+  height: 56px;
+  border-top: 1px solid var(--ncc-border);
+  background: var(--ncc-topbar);
+}
+.ncc-bottom-item {
+  flex: 1 1 0;
+  min-width: 0;
+  /* §7.2: an explicit min-height, not a height that padding happens to reach. */
+  min-height: 56px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  background: none;
+  border: 0;
+  border-top: 2px solid transparent;
+  border-radius: 0;
+  padding: 0;
+  font-family: var(--ncc-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  text-decoration: none;
+  color: var(--ncc-secondary);
+  cursor: pointer;
+}
+.ncc-bottom-item[aria-current='page'],
+.ncc-bottom-item[aria-expanded='true'] {
+  color: var(--ncc-ink);
+  border-top-color: var(--ncc-ink);
+}
+.ncc-bottom-item:disabled { color: var(--ncc-muted); cursor: not-allowed; }
+
+/* ── Mobile — 390px is the primary viewport (§8) ─────────────────────────────
+ *
+ * LAST IN THE FILE ON PURPOSE. Every rule below has to beat a base rule of the
+ * same specificity (`.ncc-list-pane`, `.ncc-triage`, `.ncc-side`), and at equal
+ * specificity source order decides. The previous revision sat in the middle of
+ * the file and only worked because it used `display: none`, which nothing else
+ * set.
+ *
+ * What it replaces: that revision hid `.ncc-side`, `.ncc-detail-wrap` and
+ * `.ncc-detail` outright, so a narrow window lost the queue lanes, the channel
+ * filter, the lenses AND the thread itself — every control except the list.
+ * This is the mobile-first pass, so nothing is deleted at the breakpoint; it
+ * moves.
+ */
+@media (max-width: 899px) {
+  /* One pane at a time — a phone navigates, it does not sit side by side.
+     `visibility` rather than `display: none` is load-bearing: the list must
+     come back at the scroll offset it left at, and a display-toggled box
+     returns at scrollTop 0. */
+  .ncc-body { position: relative; }
+  .ncc-list-pane,
+  .ncc-detail-wrap,
+  .ncc-triage {
+    position: absolute;
+    inset: 0;
+    width: auto;
+    border-right: 0;
+  }
+  .ncc[data-pane='detail'] .ncc-list-pane { visibility: hidden; }
+  .ncc[data-pane='list'] .ncc-detail-wrap { visibility: hidden; }
+  .ncc-back { display: inline-flex; }
+
+  /* The sidebar becomes a sheet over the queue, opened from the header's
+     hamburger button (item 2 moved this off the bottom bar's old Filters
+     tab). Same `<nav>`, same lane / channel / lens controls, same theme
+     toggle footer, same state — only where it sits changes, so there is
+     exactly one of each control in the DOM.
+
+     `inset: 0` — the FULL area under the top bar, not just a bottom-anchored
+     slice. A `bottom: 0` + `max-height` sheet left a gap at the top of
+     `.ncc-body` the queue showed through, and read as a translucent overlay
+     fragment rather than a menu. This box is opaque (`--ncc-sidebar`,
+     inherited from the base rule) and z-indexed above both the list and the
+     detail pane, so nothing beneath it is visible or reachable while open. */
+  .ncc-side {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    width: auto;
+    display: none;
+    border-right: 0;
+  }
+  .ncc[data-nav='open'] .ncc-side { display: flex; }
+  /* §7.2: every tap target ≥ 44px, with an explicit min-height. */
+  .ncc-side-item { min-height: 44px; }
+
+  .ncc-bottom { display: flex; }
+
+  /* The chrome wraps rather than overflowing — a horizontal page scroll is
+     never an acceptable answer at 390px. In practice this single row (item 1)
+     fits without wrapping at 390px; the rule stays as the safety net for
+     anything narrower. */
+  .ncc-top { flex-wrap: wrap; padding: 7px 12px; }
+  .ncc-hamburger { display: inline-flex; }
+  /* The label may drop before the workgroup selector does — that selector is
+     DESIGN §3.5's primary filter axis and must always stay visible; the brand
+     is decoration a phone has no room for once the hamburger is on screen. */
+  .ncc-brand { display: none; }
+  .ncc-select,
+  .ncc-search,
+  .ncc-solid-btn,
+  .ncc-hamburger { min-height: 44px; }
+  .ncc-search { width: auto; flex-grow: 1; min-width: 128px; }
+
+  /* Item 3: the quick-reply row becomes a single dropdown instead of three
+     44px buttons, so it occupies no row of its own. */
+  .ncc-composer-chips { display: none; }
+  .ncc-composer-quickmenu { display: inline-flex; }
+
+  .ncc-face { --ncc-face-size: 24px; }
+  .ncc-row-title { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  /* The always-visible verb does not survive: it stays as a 44px button only on
+     rows that want something. Every other row is tappable, and says so with a
+     chevron rather than leaving a blank column. */
+  .ncc-row-side .ncc-verb { min-height: 44px; padding: 6px 12px; }
+  .ncc-row:not(.attention) .ncc-verb { display: none; }
+  .ncc-row:not(.attention) .ncc-row-side::after {
+    content: '›';
+    font-size: 17px;
+    line-height: 1;
+    color: var(--ncc-muted);
+  }
+  /* §8: the meta line collapses to `channel · age`. */
+  .ncc-row-meta .agents,
+  .ncc-row-meta .sep-agents { display: none; }
+
+  /* The triage bar keeps only what a phone needs to act: position, snooze,
+     exit. The dot rail is a nicety the numeric count already covers, and the
+     "Esc exit" hint names a key a phone doesn't have. */
+  .ncc-triage-rail,
+  .ncc-triage-keys { display: none; }
+}

@@ -1,0 +1,230 @@
+import Database from 'better-sqlite3';
+import fs from 'fs';
+import path from 'path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { TEST_ROOT } = vi.hoisted(() => ({ TEST_ROOT: uniqueTmpRoot('create-agent-test') }));
+const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
+const DATA_DIR = path.join(TEST_ROOT, 'data');
+const TEMPLATES_DIR = path.join(TEST_ROOT, 'templates');
+
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
+  GROUPS_DIR: `${TEST_ROOT}/groups`,
+  DATA_DIR: `${TEST_ROOT}/data`,
+  TEMPLATES_DIR: `${TEST_ROOT}/templates`,
+}));
+
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
+vi.mock('../log.js', () => ({
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+  setLogScrubber: vi.fn(),
+  isSurvivableIoError: vi.fn(() => false),
+}));
+
+import { CONTAINER_PLUGINS_DIR } from '../container-config.js';
+import { closeDb, getAllAgentGroups, initMigratedTestDb } from '../db/index.js';
+import { getContainerConfig } from '../db/container-configs.js';
+import { findTaskSessions } from '../db/sessions.js';
+import { STANDING_INSTRUCTIONS_FILE } from '../group-persona.js';
+import { inboundDbPath } from '../mailbox/sqlite/paths.js';
+import { createAgentFromTemplate } from './create-agent.js';
+import { NANOCLAW_EXTENSION_NS } from './extension.js';
+import { MCP_SCHEMA_URL, PLUGIN_SCHEMA_URL } from './manifest.js';
+
+const TEMPLATE_DIR = path.join(TEMPLATES_DIR, 'sales', 'sdr');
+
+/** The stamp fixture, as an Agent Plugins 1.0.0 plugin directory. */
+function writeTemplate(): void {
+  const t = TEMPLATE_DIR;
+  const ctx = path.join(t, NANOCLAW_EXTENSION_NS, 'context');
+  fs.mkdirSync(path.join(ctx, 'additional_context'), { recursive: true });
+  fs.writeFileSync(path.join(t, 'plugin.json'), JSON.stringify({ $schema: PLUGIN_SCHEMA_URL, name: 'sdr' }));
+  fs.writeFileSync(path.join(ctx, 'instructions.md'), 'You are an SDR agent.\n');
+  fs.writeFileSync(path.join(ctx, 'playbook.md'), '# Playbook\n');
+  fs.writeFileSync(path.join(ctx, 'additional_context', 'faq.md'), '# FAQ\n');
+  fs.writeFileSync(
+    path.join(t, 'mcp.json'),
+    JSON.stringify({
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: { hubspot: { type: 'stdio', command: 'npx', args: ['-y', '@hubspot/mcp-server'] } },
+    }),
+  );
+  const skillDir = path.join(t, 'skills', 'widget');
+  fs.mkdirSync(skillDir, { recursive: true });
+  fs.writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: widget\ndescription: does widget things\n---\n');
+}
+
+function writeTask(name: string, schedule: string, prompt: string, script?: string): void {
+  const dir = path.join(TEMPLATE_DIR, NANOCLAW_EXTENSION_NS, 'tasks');
+  fs.mkdirSync(dir, { recursive: true });
+  const scriptBlock = script
+    ? `script: |\n${script
+        .split('\n')
+        .map((line) => `  ${line}`)
+        .join('\n')}\n`
+    : '';
+  fs.writeFileSync(path.join(dir, `${name}.md`), `---\nschedule: "${schedule}"\n${scriptBlock}---\n\n${prompt}\n`);
+}
+
+beforeEach(async () => {
+  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  fs.mkdirSync(TEST_ROOT, { recursive: true });
+  await initMigratedTestDb();
+  writeTemplate();
+});
+
+afterEach(async () => {
+  await closeDb();
+  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+});
+
+describe('createAgentFromTemplate', () => {
+  it('writes the persona prepend verbatim — no injected context refs, no .seed.md', async () => {
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR Test' });
+
+    const groupDir = path.join(GROUPS_DIR, g.folder);
+    const prepend = fs.readFileSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE), 'utf-8');
+    expect(prepend).toBe('You are an SDR agent.\n');
+    expect(fs.existsSync(path.join(groupDir, '.seed.md'))).toBe(false);
+  });
+
+  it('copies template skills into the group-private Claude-plane skills dir', async () => {
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR Skills' });
+
+    const skill = path.join(DATA_DIR, 'v2-sessions', g.id, '.claude-shared', 'skills', 'widget', 'SKILL.md');
+    expect(fs.existsSync(skill)).toBe(true);
+  });
+
+  it('writes MCP servers to the container config and context extras at their template-relative paths', async () => {
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR Mcp' });
+
+    const cfg = await getContainerConfig(g.id);
+    expect(cfg).toBeTruthy();
+    expect(JSON.parse(cfg!.mcp_servers)).toHaveProperty('hubspot');
+    // Extras land relative to the group root, exactly as they sit relative to
+    // instructions.md in the template — no context/ prefix in between.
+    const groupDir = path.join(GROUPS_DIR, g.folder);
+    expect(fs.existsSync(path.join(groupDir, 'playbook.md'))).toBe(true);
+    expect(fs.existsSync(path.join(groupDir, 'additional_context', 'faq.md'))).toBe(true);
+    expect(fs.existsSync(path.join(groupDir, 'context'))).toBe(false);
+  });
+
+  it('creates template tasks paused through the normal isolated task-session path', async () => {
+    writeTask('weekday-briefing', '0 9 * * 1-5', 'Send the weekday briefing.');
+
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR Tasks' });
+    const sessions = await findTaskSessions(g.id);
+    expect(sessions).toHaveLength(1);
+
+    const db = new Database(inboundDbPath(g.id, sessions[0].id), { readonly: true });
+    const row = db
+      .prepare("SELECT status, recurrence, process_after, content FROM messages_in WHERE kind = 'task'")
+      .get() as { status: string; recurrence: string; process_after: string; content: string };
+    db.close();
+
+    expect(row.status).toBe('paused');
+    expect(row.recurrence).toBe('0 9 * * 1-5');
+    expect(new Date(row.process_after).getTime()).toBeGreaterThan(Date.now());
+    expect(JSON.parse(row.content)).toMatchObject({
+      prompt: 'Send the weekday briefing.',
+      script: null,
+      originSessionId: null,
+    });
+    expect(fs.existsSync(path.join(GROUPS_DIR, g.folder, 'tasks', 'weekday-briefing.md'))).toBe(false);
+  });
+
+  it('stamps a valid timezone onto the config row, container.json, and template first runs', async () => {
+    writeTask('daily-digest', '0 9 * * *', 'Send the digest.');
+
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR TZ', timezone: 'Asia/Tokyo' });
+    expect((await getContainerConfig(g.id))?.timezone).toBe('Asia/Tokyo');
+    // Mirrored to the file the spawn path reads for the container's TZ env.
+    const fileConfig = JSON.parse(fs.readFileSync(path.join(GROUPS_DIR, g.folder, 'container.json'), 'utf8')) as {
+      timezone?: string;
+    };
+    expect(fileConfig.timezone).toBe('Asia/Tokyo');
+
+    const sessions = await findTaskSessions(g.id);
+    const db = new Database(inboundDbPath(g.id, sessions[0].id), { readonly: true });
+    const row = db.prepare("SELECT process_after FROM messages_in WHERE kind = 'task'").get() as {
+      process_after: string;
+    };
+    db.close();
+
+    // 09:00 in Tokyo (no DST) is always 00:00 UTC. A first run computed in the
+    // install-global timezone would only produce this if the test host itself
+    // ran in JST.
+    expect(row.process_after).toMatch(/T00:00:00/);
+  });
+
+  it('ignores an invalid timezone — the group follows the install default', async () => {
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR Bad TZ', timezone: 'Not/AZone' });
+    expect((await getContainerConfig(g.id))?.timezone).toBeNull();
+  });
+
+  it('writes template MCP servers into container.json, not only the DB projection', async () => {
+    // The spawn path reads container.json; a DB-only write left a stamped
+    // template's servers unwired, since the absent file materializes empty.
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR MCP' });
+    const fileConfig = JSON.parse(fs.readFileSync(path.join(GROUPS_DIR, g.folder, 'container.json'), 'utf8')) as {
+      mcpServers: Record<string, Record<string, unknown>>;
+    };
+    // Marked for the container: an explicit `cwd` (the spec's plugin-root
+    // default, materialized once at stamp time) and the `pluginRoot` the
+    // agent-runner expands ${PLUGIN_ROOT}/${PLUGIN_DATA} against.
+    expect(fileConfig.mcpServers).toEqual({
+      hubspot: {
+        cwd: '${PLUGIN_ROOT}',
+        command: 'npx',
+        args: ['-y', '@hubspot/mcp-server'],
+        env: {},
+        pluginRoot: `${CONTAINER_PLUGINS_DIR}/sdr`,
+        plugin: 'sdr',
+      },
+    });
+    // BOTH stores carry the ownership marker: every mutation guard reads the
+    // FILE, so a DB-only marker would guard nothing (Codex on #500). The
+    // runner strips `plugin` and `pluginRoot` before any provider sees them.
+    expect(fileConfig.mcpServers.hubspot).toMatchObject({ plugin: 'sdr' });
+    expect(JSON.parse((await getContainerConfig(g.id))!.mcp_servers)).toEqual(fileConfig.mcpServers);
+  });
+
+  it('forwards multiline scripts unchanged through the shared task creation path', async () => {
+    const script = 'count=2\necho \'{"wakeAgent": true, "data": {"count": 2}}\'';
+    writeTask('alert-watch', '*/15 * * * *', 'Investigate new alerts.', script);
+
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'Scripted Tasks' });
+    const sessions = await findTaskSessions(g.id);
+    expect(sessions).toHaveLength(1);
+
+    const db = new Database(inboundDbPath(g.id, sessions[0].id), { readonly: true });
+    const row = db.prepare("SELECT status, recurrence, content FROM messages_in WHERE kind = 'task'").get() as {
+      status: string;
+      recurrence: string;
+      content: string;
+    };
+    db.close();
+
+    expect(row.status).toBe('paused');
+    expect(row.recurrence).toBe('*/15 * * * *');
+    expect(JSON.parse(row.content)).toMatchObject({
+      script: `${script}\n`,
+      originSessionId: null,
+    });
+  });
+
+  it.each([
+    ['invalid cron', 'not a cron', /invalid --recurrence/],
+    ['too-frequent cron', '* * * * *', /has not been scheduled/],
+  ])('rejects %s before creating the agent group', async (_case, schedule, expected) => {
+    writeTask('broken', schedule, 'Never created.');
+
+    await expect(createAgentFromTemplate('sales/sdr', { name: 'Broken Tasks' })).rejects.toThrow(expected);
+    expect(await getAllAgentGroups()).toEqual([]);
+    expect(fs.existsSync(path.join(GROUPS_DIR, 'broken-tasks'))).toBe(false);
+  });
+});

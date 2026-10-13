@@ -1,0 +1,77 @@
+import { addDeniedModel, getDeniedModel, listDeniedModels, removeDeniedModel } from '../../db/denied-models.js';
+import { registerResource } from '../crud.js';
+
+/**
+ * Operator blocklist of (provider, slug) pairs subtracted from the live model set. The composite key does not fit the
+ * generic single-`id` verbs, hence customOperations.
+ */
+registerResource({
+  name: 'denied-model',
+  plural: 'denied-models',
+  table: 'denied_models',
+  description:
+    'Blocklist of model slugs the agent must never use. Validated when a group config is updated, when an agent invokes change_model, and applied as a filter inside list_models. Empty by default — operator adds entries to forbid specific slugs (e.g. anthropic/claude-opus-4-7 to prevent wrong-subscription bills).',
+  idColumn: 'slug',
+  columns: [
+    {
+      name: 'provider',
+      type: 'string',
+      description: 'Matches container_configs.provider (e.g. opencode, codex, claude).',
+    },
+    {
+      name: 'slug',
+      type: 'string',
+      description:
+        'Runtime model identifier WITH prefix, exactly as the container would set it (e.g. anthropic/claude-opus-4-7, opencode-go/kimi-k2.6).',
+    },
+    { name: 'reason', type: 'string', description: 'Operator note shown in the error when denied.' },
+    { name: 'created_at', type: 'string', description: 'Auto-set.' },
+  ],
+  operations: { list: 'open', get: 'open' },
+  customOperations: {
+    add: {
+      access: 'approval',
+      description:
+        'Add a slug to the deny list. Use --provider <name> --slug <slug> [--reason <text>]. Reason is shown to whoever tries to use the slug.',
+      handler: async (args) => {
+        const provider = args.provider as string;
+        const slug = args.slug as string;
+        if (!provider) throw new Error('--provider is required');
+        if (!slug) throw new Error('--slug is required');
+
+        if (await getDeniedModel(provider, slug)) {
+          throw new Error(`Already denied: ${provider} / ${slug}`);
+        }
+
+        await addDeniedModel(provider, slug, (args.reason as string | undefined) ?? null);
+        return { added: { provider, slug, reason: (args.reason as string | undefined) ?? null } };
+      },
+    },
+    remove: {
+      access: 'approval',
+      description: 'Remove a slug from the deny list. Use --provider <name> --slug <slug>.',
+      handler: async (args) => {
+        const provider = args.provider as string;
+        const slug = args.slug as string;
+        if (!provider) throw new Error('--provider is required');
+        if (!slug) throw new Error('--slug is required');
+
+        const existing = await getDeniedModel(provider, slug);
+        if (!existing) throw new Error(`Not denied: ${provider} / ${slug}`);
+
+        await removeDeniedModel(provider, slug);
+        return { removed: { provider, slug } };
+      },
+    },
+    'list-by-provider': {
+      access: 'open',
+      description: 'List denials for a specific provider. Use --provider <name>.',
+      handler: async (args) => {
+        const provider = args.provider as string;
+        if (!provider) throw new Error('--provider is required');
+        const denied = await listDeniedModels(provider);
+        return { provider, count: denied.length, denied };
+      },
+    },
+  },
+});

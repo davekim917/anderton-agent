@@ -1,0 +1,426 @@
+/**
+ * Tests for `handleRecurrence` — specifically the timezone-aware cron
+ * interpretation ported from v1 (src/v1/task-scheduler.ts).
+ *
+ * Core invariant: cron expressions are interpreted in the user's TIMEZONE,
+ * not UTC. Without this, `"0 9 * * *"` fires at 09:00 UTC instead of 09:00
+ * user-local — a recurring scheduling bug users can't diagnose.
+ */
+import fs from 'fs';
+import path from 'path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { openInboundDb } from '../mailbox/openers.js';
+import { ensureSchema } from '../mailbox/schema.js';
+import { composeNanoclawSession } from '../mailbox/index.js';
+import { insertTaskRow } from './db.js';
+import { handleRecurrence, scriptBackoffMinutes } from './recurrence.js';
+import type { Session } from '../../types.js';
+
+// Pin a non-UTC zone so the tz-interpretation test is exact even on UTC CI.
+// Asia/Tokyo is UTC+9 with no DST: "0 9 * * *" must land at 00:00:00Z sharp.
+vi.mock('../../config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../config.js')>();
+  return {
+    ...actual,
+    TIMEZONE: 'Asia/Tokyo',
+    GROUPS_DIR: `${TEST_DIR}/groups`,
+  };
+});
+
+// The auto-pause note goes through the shared appendRunLog helper, which
+// resolves the group folder from the central DB — mock it to a fixed folder.
+vi.mock('../../db/agent-groups.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../db/agent-groups.js')>()),
+  getAgentGroup: (id: string) => (id === 'ag-test' ? { id, folder: 'g-test' } : undefined),
+}));
+
+// The re-arm is a due-ness write, so it goes through `withQuietInvalidationSync`
+// — a central-DB write, and this file's fixture deliberately never initializes
+// that singleton. Record the call and pass through; what the real bracket does
+// on each side is asserted against real SQLite in
+// src/db/migrations/068-sessions-sweep-quiet-until.test.ts.
+const invalidated = vi.hoisted(() => [] as string[]);
+vi.mock('../../db/sessions.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../db/sessions.js')>();
+  return {
+    ...real,
+    withQuietInvalidationSync: <T>(id: string, write: () => T): T => {
+      invalidated.push(id);
+      return write();
+    },
+  };
+});
+
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('recurrence-test') }));
+
+// resolveGroupTimezone reads the group's config row from the central DB
+// (not initialized here). Default: no override → falls back to the mocked
+// install TIMEZONE; individual tests set an override to test precedence.
+const containerConfigState = vi.hoisted(() => ({ timezone: null as string | null, speed: null as string | null }));
+vi.mock('../../db/container-configs.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../db/container-configs.js')>()),
+  getContainerConfig: () => ({ timezone: containerConfigState.timezone }),
+}));
+const DB_PATH = path.join(TEST_DIR, 'inbound.db');
+
+function freshDb() {
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  fs.mkdirSync(TEST_DIR, { recursive: true });
+  ensureSchema(DB_PATH, 'inbound');
+  return openInboundDb(DB_PATH);
+}
+
+/**
+ * The mailbox session the sweep hands `handleRecurrence`.
+ *
+ * Built with the module's own `composeNanoclawSession` over the fixture's
+ * inbound handle, so the recurrence ops under test are the production ones
+ * (invariant I-2). No real mailbox is provisioned — a unit test must not go
+ * through `prepare()`.
+ *
+ * Recurrence is an inbound-only path, so the outbound accessor throws and
+ * `outboundPresent` is false: an accidental outbound read fails loudly.
+ */
+function sessionFor(db: ReturnType<typeof openInboundDb>) {
+  return composeNanoclawSession(
+    db,
+    () => {
+      throw new Error('recurrence must not touch outbound.db');
+    },
+    undefined,
+    false,
+  );
+}
+
+function fakeSession(): Session {
+  return {
+    id: 'sess-test',
+    agent_group_id: 'ag-test',
+    messaging_group_id: 'mg-test',
+    thread_id: null,
+    status: 'active',
+    created_at: new Date().toISOString(),
+    last_active: new Date().toISOString(),
+    container_status: 'stopped',
+  } as Session;
+}
+
+afterEach(() => {
+  containerConfigState.timezone = null;
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+});
+
+describe('handleRecurrence', () => {
+  it('clones a completed recurring task with a next-run in the future', async () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-1',
+      seriesId: 'task-1',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '0 9 * * *', // every day at 09:00 (user TZ)
+      content: JSON.stringify({ prompt: 'daily digest' }),
+    });
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-1'`).run();
+
+    await handleRecurrence(sessionFor(db), fakeSession());
+
+    const rows = db
+      .prepare(`SELECT id, status, process_after, recurrence, series_id FROM messages_in ORDER BY seq`)
+      .all() as Array<{
+      id: string;
+      status: string;
+      process_after: string;
+      recurrence: string | null;
+      series_id: string;
+    }>;
+    expect(rows).toHaveLength(2);
+    const original = rows.find((r) => r.id === 'task-1')!;
+    const follow = rows.find((r) => r.id !== 'task-1')!;
+    expect(original.recurrence).toBeNull();
+    expect(follow.status).toBe('pending');
+    expect(follow.recurrence).toBe('0 9 * * *');
+    expect(follow.series_id).toBe('task-1');
+    expect(new Date(follow.process_after).getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it('invalidates the session quiet mark as it arms the successor', async () => {
+    // The re-arm moves `process_after` in the session DB, where the host sweep's
+    // quiet cache cannot see it — the central-DB invalidation is what makes the
+    // successor visible before its slot.
+    invalidated.length = 0;
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-inv',
+      seriesId: 'task-inv',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily digest' }),
+    });
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-inv'`).run();
+
+    await handleRecurrence(sessionFor(db), fakeSession());
+
+    expect(invalidated, 'the successor was armed without invalidating the mark').toEqual(['sess-test']);
+  });
+
+  // Codex round 2, H1 (b). Fail-closed: a refused invalidation must leave the
+  // series ARMED for the next tick rather than write a successor the quiet
+  // cache cannot see.
+  it('arms nothing when the quiet-mark invalidation fails, leaving the series for the next tick', async () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-faulted',
+      seriesId: 'task-faulted',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily digest' }),
+    });
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-faulted'`).run();
+
+    const sessionsModule = await import('../../db/sessions.js');
+    const spy = vi.spyOn(sessionsModule, 'withQuietInvalidationSync').mockImplementation((id: string) => {
+      throw new sessionsModule.QuietInvalidationError(id, new Error('central DB is read-only'));
+    });
+    await handleRecurrence(sessionFor(db), fakeSession());
+    spy.mockRestore();
+
+    const rows = db.prepare(`SELECT id, recurrence FROM messages_in ORDER BY seq`).all() as Array<{
+      id: string;
+      recurrence: string | null;
+    }>;
+    expect(rows, 'a successor was armed behind a mark nothing will clear').toHaveLength(1);
+    // The predecessor keeps its recurrence, so the next tick re-attempts the arm
+    // instead of dropping the series.
+    expect(rows[0]!.recurrence).toBe('0 9 * * *');
+  });
+
+  it('interprets the cron expression in TIMEZONE, not UTC (the v1 regression)', async () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-tz',
+      seriesId: 'task-tz',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '0 9 * * *', // 09:00 Asia/Tokyo === 00:00 UTC, exactly
+      content: JSON.stringify({ prompt: 'daily digest' }),
+    });
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-tz'`).run();
+
+    await handleRecurrence(sessionFor(db), fakeSession());
+
+    const follow = db.prepare(`SELECT process_after FROM messages_in WHERE id != 'task-tz'`).get() as {
+      process_after: string;
+    };
+    // Drop the `{ tz }` option in recurrence.ts and this reads
+    // T09:00:00 (09:00 UTC) instead — red, even on a UTC CI runner.
+    expect(follow.process_after).toMatch(/T00:00:00/);
+  });
+
+  it('re-arms in the group timezone override, not the install TIMEZONE', async () => {
+    // Install tz is pinned to Asia/Tokyo above; the group override must win.
+    // Asia/Kolkata is UTC+5:30 with no DST: 09:00 local === 03:30 UTC, exactly.
+    containerConfigState.timezone = 'Asia/Kolkata';
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-group-tz',
+      seriesId: 'task-group-tz',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily digest' }),
+    });
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-group-tz'`).run();
+
+    await handleRecurrence(sessionFor(db), fakeSession());
+
+    const follow = db.prepare(`SELECT process_after FROM messages_in WHERE id != 'task-group-tz'`).get() as {
+      process_after: string;
+    };
+    expect(follow.process_after).toMatch(/T03:30:00/);
+  });
+
+  // CLAUDE.md: "an already-armed occurrence keeps the absolute instant it was
+  // armed at — a live series moves onto the new grid at its next re-arm, so a
+  // daily task can fire once more at the old local time." `handleRecurrence`
+  // only ever reads COMPLETED rows (`getCompletedRecurringRows`), so a live
+  // PENDING successor is simply never touched by a later sweep tick — this
+  // pins that the timezone change does not reach into it.
+  it('keeps an already-armed occurrence at its instant across a group timezone change; the next re-arm uses the new grid', async () => {
+    // Zone A: no override → falls back to the mocked install TIMEZONE (Asia/Tokyo).
+    containerConfigState.timezone = null;
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-cross-tz',
+      seriesId: 'task-cross-tz',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily digest' }),
+    });
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-cross-tz'`).run();
+
+    // Arm the first successor under zone A (Asia/Tokyo: 09:00 local === 00:00 UTC).
+    await handleRecurrence(sessionFor(db), fakeSession());
+    const armedUnderA = db.prepare(`SELECT id, process_after FROM messages_in WHERE id != 'task-cross-tz'`).get() as {
+      id: string;
+      process_after: string;
+    };
+    expect(armedUnderA.process_after).toMatch(/T00:00:00/);
+
+    // Change the group's override to zone B (Asia/Kolkata) with the successor
+    // still PENDING — no re-arm has run on it yet.
+    containerConfigState.timezone = 'Asia/Kolkata';
+    await handleRecurrence(sessionFor(db), fakeSession());
+    const stillPending = db
+      .prepare(`SELECT process_after, status FROM messages_in WHERE id = ?`)
+      .get(armedUnderA.id) as { process_after: string; status: string };
+    expect(stillPending.status).toBe('pending');
+    expect(stillPending.process_after, 'the armed occurrence must keep its instant').toBe(armedUnderA.process_after);
+
+    // Only once that occurrence itself completes does the NEXT re-arm land on
+    // the new grid (Asia/Kolkata: 09:00 local === 03:30 UTC).
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id = ?`).run(armedUnderA.id);
+    await handleRecurrence(sessionFor(db), fakeSession());
+    const armedUnderB = db
+      .prepare(`SELECT process_after FROM messages_in WHERE id NOT IN ('task-cross-tz', ?)`)
+      .get(armedUnderA.id) as { process_after: string };
+    expect(armedUnderB.process_after).toMatch(/T03:30:00/);
+  });
+
+  it('does not clone rows whose recurrence is already cleared', async () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-1',
+      seriesId: 'task-1',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'one-off' }),
+    });
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-1'`).run();
+
+    await handleRecurrence(sessionFor(db), fakeSession());
+
+    const count = (db.prepare(`SELECT COUNT(*) AS c FROM messages_in`).get() as { c: number }).c;
+    expect(count).toBe(1);
+  });
+});
+
+describe('handleRecurrence — script-failure backoff (streak derived from failed runs)', () => {
+  // A series whose last `fails` occurrences all landed as FAILED (script-skip:error
+  // runs, as synced by syncProcessingAcks). Only the newest row keeps recurrence —
+  // older occurrences had theirs cleared when they were re-armed. fails=0 seeds one
+  // healthy completed run.
+  function seedFailedStreak(db: ReturnType<typeof freshDb>, fails: number) {
+    const rows = Math.max(fails, 1);
+    for (let i = 0; i < rows; i++) {
+      insertTaskRow(db, {
+        id: `task-s-${i}`,
+        seriesId: 'task-s-0',
+        processAfter: '2020-01-01T00:00:00.000Z',
+        recurrence: i === rows - 1 ? '* * * * *' : null, // every minute — raw cron next is ~+1min
+        content: JSON.stringify({ prompt: 'monitor', script: 'exit 1' }),
+      });
+      db.prepare(`UPDATE messages_in SET status = ? WHERE id = ?`).run(
+        fails === 0 ? 'completed' : 'failed',
+        `task-s-${i}`,
+      );
+    }
+    return `task-s-${rows - 1}`; // the row carrying recurrence
+  }
+
+  const clone = (db: ReturnType<typeof freshDb>) =>
+    db.prepare(`SELECT status, process_after, recurrence FROM messages_in WHERE id NOT LIKE 'task-s-%'`).get() as {
+      status: string;
+      process_after: string;
+      recurrence: string | null;
+    };
+
+  it('exports the documented 2,4,8,…,60 progression', () => {
+    expect([1, 2, 3, 4, 5, 6, 7].map(scriptBackoffMinutes)).toEqual([2, 4, 8, 16, 32, 60, 60]);
+  });
+
+  it('pushes the clone past raw cron cadence while the script is failing', async () => {
+    const db = freshDb();
+    seedFailedStreak(db, 3); // streak 3 → backoff 8 min; cron next ≈ +1 min
+    await handleRecurrence(sessionFor(db), fakeSession());
+
+    const next = clone(db);
+    expect(next.status).toBe('pending');
+    const deltaMin = (new Date(next.process_after).getTime() - Date.now()) / 60_000;
+    expect(deltaMin).toBeGreaterThan(7); // backoff won over the 1-min cron grid
+  });
+
+  it('a healthy series (trailing run completed) re-arms on the raw cron grid', async () => {
+    const db = freshDb();
+    seedFailedStreak(db, 0);
+    await handleRecurrence(sessionFor(db), fakeSession());
+
+    const next = clone(db);
+    expect(next.status).toBe('pending');
+    const deltaMin = (new Date(next.process_after).getTime() - Date.now()) / 60_000;
+    expect(deltaMin).toBeLessThan(2); // no backoff applied
+  });
+
+  it('auto-pauses the series at the cap instead of re-arming', async () => {
+    const db = freshDb();
+    const liveId = seedFailedStreak(db, 8);
+    await handleRecurrence(sessionFor(db), fakeSession());
+
+    const next = clone(db);
+    expect(next.status).toBe('paused'); // `ncl tasks resume` revives in place
+    expect(next.recurrence).toBe('* * * * *');
+    const original = db.prepare(`SELECT recurrence FROM messages_in WHERE id = ?`).get(liveId) as {
+      recurrence: string | null;
+    };
+    expect(original.recurrence).toBeNull(); // not re-cloned next sweep
+  });
+
+  it('writes the auto-pause note into the series run log via the shared appendRunLog', async () => {
+    const db = freshDb();
+    seedFailedStreak(db, 8);
+    await handleRecurrence(sessionFor(db), fakeSession());
+
+    // Same file + format appendRunLog owns: groups/<folder>/tasks/<series>.md
+    const logFile = path.join(TEST_DIR, 'groups', 'g-test', 'tasks', 'task-s-0.md');
+    expect(fs.existsSync(logFile)).toBe(true);
+    const content = fs.readFileSync(logFile, 'utf8');
+    expect(content).toContain('auto-paused after 8 consecutive script failures');
+    expect(content).toContain('ncl tasks resume task-s-0');
+    expect(content).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} — /m); // appendRunLog's local-time stamp
+  });
+
+  // A paused series is an absorbing state: it stops firing, so it stops being
+  // the reason anyone looks at it. The run-log line above is written where
+  // nobody reads it, which is exactly how one series sat dead for 15 days.
+  it('leaves the owning agent an obligation, due now rather than on-wake', async () => {
+    const db = freshDb();
+    seedFailedStreak(db, 8);
+    await handleRecurrence(sessionFor(db), fakeSession());
+
+    const note = db.prepare(`SELECT * FROM messages_in WHERE id = ?`).get('task-paused-task-s-0') as
+      | { content: string; process_after: string | null; on_wake: number; kind: string }
+      | undefined;
+    expect(note).toBeTruthy();
+    // Due immediately: an on-wake note is only read when something ELSE wakes
+    // the container, and the series that just paused may have been the only
+    // thing that ever did.
+    expect(note!.on_wake).toBe(0);
+    expect(note!.process_after).toBeTruthy();
+    expect(new Date(note!.process_after!).getTime()).toBeLessThanOrEqual(Date.now() + 1000);
+
+    const text = JSON.parse(note!.content).text as string;
+    expect(text).toContain('task-s-0');
+    expect(text).toContain('ncl tasks resume task-s-0');
+    expect(text).toContain('is NOT running');
+  });
+
+  it('raises one notice per pause, not one per sweep', async () => {
+    const db = freshDb();
+    seedFailedStreak(db, 8);
+    await handleRecurrence(sessionFor(db), fakeSession());
+    await handleRecurrence(sessionFor(db), fakeSession());
+
+    const n = db.prepare(`SELECT COUNT(*) c FROM messages_in WHERE id = ?`).get('task-paused-task-s-0') as {
+      c: number;
+    };
+    expect(n.c).toBe(1);
+  });
+});

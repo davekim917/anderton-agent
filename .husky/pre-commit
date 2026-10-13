@@ -1,0 +1,88 @@
+set -e
+
+# Formatting gate.
+#
+# The old version ran `format:fix` over ALL of src/ and then `git add`-ed every
+# staged file. Both halves were destructive in a tree where more than one
+# session is working: `git add <file>` stages the file's WHOLE working-tree
+# content, so a deliberately partial stage silently grew to include another
+# session's uncommitted edits (observed 2026-08-13: a 212-line commit became
+# 297), and the blanket `--write` reformatted files the committer never touched.
+#
+# So: a file with nothing unstaged is safe to format and restage. A partially
+# staged file is never restaged — its staged content is verified instead.
+
+# Filter in the shell, not with a pathspec: git's `src/**/*.ts` matches NOTHING
+# at the top level of src/, so `src/router.ts` and friends were silently skipped
+# by the old hook while `src/channels/slack.ts` was not. prettier's own glob
+# does match both, which is why `format:fix` and this list disagreed.
+staged=$(git diff --cached --name-only --diff-filter=ACM -- src/ | grep '\.ts$' || true)
+
+# Resolve tooling from the MAIN checkout, not $PWD.
+#
+# A worktree's own install is optional (CLAUDE.md, Development), so
+# `$PWD/node_modules/.bin/prettier` need not exist in one. The old
+# hardcoded path made this hook unrunnable from a worktree, and workers
+# improvised their way around it — on 2026-08-23 one `cp`-ed over a symlink and
+# wrote THROUGH it into the shared pnpm store, replacing prettier's real CLI
+# with a shell shim across 18 hardlinks and breaking formatting for every
+# session on the machine. Resolve properly instead: `--git-common-dir` points at
+# the main checkout's .git even from a linked worktree.
+repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
+prettier="$repo_root/node_modules/.bin/prettier"
+if [ ! -x "$prettier" ]; then
+  echo "pre-commit: prettier not found at $prettier — run 'pnpm install' in $repo_root" >&2
+  exit 1
+fi
+export PATH="$repo_root/node_modules/.bin:$PATH"
+
+clean=""
+partial=""
+for f in $staged; do
+  if git diff --quiet -- "$f"; then
+    clean="$clean $f"
+  else
+    partial="$partial $f"
+  fi
+done
+
+if [ -n "$clean" ]; then
+  # shellcheck disable=SC2086
+  "$prettier" --write --log-level warn $clean
+  # shellcheck disable=SC2086
+  git add $clean
+fi
+
+if [ -n "$partial" ]; then
+  # Check the staged blobs, never the working tree — the unstaged remainder is
+  # somebody else's business and must survive this commit untouched.
+  tmp=$(mktemp -d)
+  for f in $partial; do
+    mkdir -p "$tmp/$(dirname "$f")"
+    git show ":$f" > "$tmp/$f"
+  done
+  [ -f .prettierrc ] && cp .prettierrc "$tmp/"
+
+  # shellcheck disable=SC2086
+  if ! (cd "$tmp" && "$prettier" --check --log-level warn $partial); then
+    rm -rf "$tmp"
+    echo ""
+    echo "A partially staged file is not formatted, and this hook will not"
+    echo "restage it for you — that would sweep in the unstaged changes you"
+    echo "deliberately left out. Run 'pnpm format:fix', then restage only your"
+    echo "own hunks (git add -p) and commit again."
+    exit 1
+  fi
+  rm -rf "$tmp"
+fi
+
+# Run from the main checkout so tsx resolves there, but scan THIS tree.
+#
+# `--root` is not optional. Without it the script defaults to process.cwd(),
+# which the `cd` has just made the main checkout — so a commit from a linked
+# worktree scanned main's index, entirely different content, and printed
+# "passed" about work it never saw. Every commit made from an agent worktree
+# was ungated until 2026-08-26. The registry itself still resolves through the
+# main checkout via findMainCheckoutRoot's fallback.
+worktree_root=$(git rev-parse --show-toplevel)
+(cd "$repo_root" && pnpm run check:public-boundary -- --root "$worktree_root" --staged)
