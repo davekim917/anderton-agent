@@ -29,37 +29,13 @@ describe('buildDeps', () => {
       publicRemote: undefined,
       install: { installRoot: dir, dbPath: '', identifiersPath: '', allowlistPath: '' },
       aiMaxChars: 1000,
+      aiMaxCalls: 15,
       ai: { model: 'claude-opus-5-5', timeoutMs: 1000 },
       operatorNames: [],
       redact: [],
     });
     deps.writeHeldDetail({ sha: 'abc', aiFindings: [] });
     expect(fs.statSync(heldDir).mode & 0o777).toBe(0o700);
-  });
-
-  it('deletes the AI pass cache from the install policy directory when asked after a publish', () => {
-    const config = {
-      workDir: dir,
-      statusFile: path.join(dir, 'logs', 'status.json'),
-      heldDetailFile: path.join(dir, 'logs', 'public-export', 'held.json'),
-      acceptedDetailFile: path.join(dir, 'logs', 'public-export', 'accepted.json'),
-      publicRemote: undefined,
-      install: { installRoot: dir, dbPath: '', identifiersPath: '', allowlistPath: '' },
-      aiMaxChars: 1000,
-      ai: { model: 'claude-opus-5-5', timeoutMs: 1000 },
-      operatorNames: [],
-      redact: [],
-    };
-    const cache = path.join(policyDir(dir), 'public-export-ai-pass-cache.txt');
-    const policy = path.join(policyDir(dir), 'public-export-public-names.txt');
-    fs.mkdirSync(policyDir(dir), { recursive: true });
-    fs.writeFileSync(cache, `${'a'.repeat(64)}\n`);
-    fs.writeFileSync(policy, 'PublicCo\n');
-    const deps = buildDeps(config);
-    deps.clearAiCache();
-    expect(fs.existsSync(cache)).toBe(false);
-    expect(fs.existsSync(policy)).toBe(true);
-    expect(() => deps.clearAiCache()).not.toThrow();
   });
 
   it('writes accepted findings for audit as a private file in a private directory', () => {
@@ -72,6 +48,7 @@ describe('buildDeps', () => {
       publicRemote: undefined,
       install: { installRoot: dir, dbPath: '', identifiersPath: '', allowlistPath: '' },
       aiMaxChars: 1000,
+      aiMaxCalls: 15,
       ai: { model: 'claude-opus-5-5', timeoutMs: 1000 },
       operatorNames: [],
       redact: [],
@@ -95,6 +72,7 @@ describe('buildDeps', () => {
       publicRemote: undefined,
       install: { installRoot: dir, dbPath: '', identifiersPath: '', allowlistPath: '' },
       aiMaxChars: 1000,
+      aiMaxCalls: 15,
       ai: { model: 'claude-opus-5-5', timeoutMs: 1000 },
       operatorNames: [],
       redact: [],
@@ -127,6 +105,7 @@ describe('buildDeps', () => {
         allowlistPath: path.join(dir, 'missing-allowlist.json'),
       },
       aiMaxChars: 1000,
+      aiMaxCalls: 15,
       ai: { model: 'claude-opus-5-5', timeoutMs: 1000 },
       operatorNames: [],
       redact: [],
@@ -238,6 +217,7 @@ describe('export policy comes from the install, never from the tree being judged
           aiMaxChars: 10_000,
           approvedBinaries: policy.approvedBinaries,
           acceptedFindings: policy.acceptedFindings,
+          aiBudget: { cap: 15, spent: 0 },
         },
       );
       expect(verdict).toMatchObject({ verdict: 'hold', aiFindings: [finding] });

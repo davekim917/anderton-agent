@@ -7,13 +7,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { failedStatus, runExport, type ExportDeps, type Status, type StatusFields } from './export-flow.js';
 import {
   gateCommits,
-  aiReadContext,
   knownPrivateNames,
   loadAcceptedFindings,
-  loadAiPassCache,
   loadApprovedBinaries,
   loadPublicNames,
   loadStagingCommit,
+  stagingCommitDiff,
   realAiRead,
   realScanners,
   type AcceptedFinding,
@@ -25,6 +24,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_AI_MAX_CHARS = 400_000;
 const DEFAULT_AI_MODEL = 'claude-opus-5-5';
 const DEFAULT_AI_TIMEOUT_MS = 10 * 60_000;
+const DEFAULT_AI_MAX_CALLS = 15;
 
 export function imageTag(dockerfile: string): string {
   return `nanoclaw-public-export:${createHash('sha256').update(dockerfile).digest('hex').slice(0, 16)}`;
@@ -41,12 +41,6 @@ function headOf(gitDir: string): string | null {
     encoding: 'utf8',
   });
   return result.status === 0 ? result.stdout.trim() : null;
-}
-
-function claudeVersion(): string | null {
-  const result = spawnSync('claude', ['--version'], { encoding: 'utf8', timeout: 30_000 });
-  const version = result.status === 0 ? result.stdout.trim() : '';
-  return version || null;
 }
 
 export interface Author {
@@ -146,6 +140,7 @@ export interface RunConfig {
   publicRemote: string | undefined;
   install: InstallPaths;
   aiMaxChars: number;
+  aiMaxCalls: number;
   ai: AiReadOptions;
   operatorNames: string[];
   redact: string[];
@@ -156,13 +151,6 @@ const POLICY_FILES = {
   acceptedFindings: 'public-export-accepted-findings.json',
   approvedBinaries: 'public-export-approved-binaries.txt',
 } as const;
-
-/** Run state, not policy, but kept beside it so the same untracked-only rule covers it. */
-const AI_PASS_CACHE_FILE = 'public-export-ai-pass-cache.txt';
-
-function aiCacheFile(installRoot: string): string {
-  return path.join(policyDir(installRoot), AI_PASS_CACHE_FILE);
-}
 
 export function policyDir(installRoot: string): string {
   return path.join(installRoot, '.nanoclaw');
@@ -204,6 +192,7 @@ function writePrivate(file: string, data: unknown): void {
 export function buildDeps(config: RunConfig): ExportDeps {
   const staging = path.join(config.workDir, 'staging.git');
   const remote = config.publicRemote ?? '';
+  const aiBudget = { cap: config.aiMaxCalls, spent: 0 };
   return {
     publicRemote: config.publicRemote !== undefined,
     redact: config.redact,
@@ -232,27 +221,21 @@ export function buildDeps(config: RunConfig): ExportDeps {
       const publicNames = [...policy.publicNames, ...config.operatorNames];
       const names = knownPrivateNames(config.install, publicNames);
       const scanners = realScanners(config.install);
-      const warn = (message: string) => process.stderr.write(`${message}\n`);
-      const cliVersion = claudeVersion();
-      if (cliVersion === null) warn('claude --version failed; reading every batch without the pass cache');
-      const aiCache =
-        cliVersion === null
-          ? undefined
-          : loadAiPassCache(
-              aiCacheFile(config.install.installRoot),
-              aiReadContext(names, config.ai, publicNames, cliVersion),
-              warn,
-            );
       try {
-        return await gateCommits(shas, (sha) => loadStagingCommit(staging, sha), {
-          scanTree: scanners.scanTree,
-          scanMessage: scanners.scanMessage,
-          aiRead: realAiRead(names, config.ai, publicNames),
-          aiMaxChars: config.aiMaxChars,
-          approvedBinaries: policy.approvedBinaries,
-          acceptedFindings: policy.acceptedFindings,
-          aiCache,
-        });
+        return await gateCommits(
+          shas,
+          (sha) => loadStagingCommit(staging, sha),
+          {
+            scanTree: scanners.scanTree,
+            scanMessage: scanners.scanMessage,
+            aiRead: realAiRead(names, config.ai, publicNames),
+            aiMaxChars: config.aiMaxChars,
+            approvedBinaries: policy.approvedBinaries,
+            acceptedFindings: policy.acceptedFindings,
+            aiBudget,
+          },
+          (sha) => stagingCommitDiff(staging, sha),
+        );
       } finally {
         scanners.dispose();
       }
@@ -264,13 +247,6 @@ export function buildDeps(config: RunConfig): ExportDeps {
     },
     push: (sha) => {
       git(staging, ['push', '-q', remote, `${sha}:refs/heads/main`]);
-    },
-    clearAiCache: () => {
-      try {
-        fs.rmSync(aiCacheFile(config.install.installRoot), { force: true });
-      } catch (error) {
-        process.stderr.write(`AI pass cache not cleared after publishing: ${error}\n`);
-      }
     },
   };
 }
@@ -291,6 +267,7 @@ async function main(): Promise<number> {
       allowlistPath: path.join(installRoot, '.public-boundary-allowlist.json'),
     },
     aiMaxChars: Number(process.env.PUBLIC_EXPORT_AI_MAX_CHARS ?? DEFAULT_AI_MAX_CHARS),
+    aiMaxCalls: Number(process.env.PUBLIC_EXPORT_AI_MAX_CALLS ?? DEFAULT_AI_MAX_CALLS),
     ai: {
       model: process.env.PUBLIC_EXPORT_AI_MODEL || DEFAULT_AI_MODEL,
       timeoutMs: Number(process.env.PUBLIC_EXPORT_AI_TIMEOUT_MS ?? DEFAULT_AI_TIMEOUT_MS),
@@ -302,6 +279,9 @@ async function main(): Promise<number> {
   try {
     if (!Number.isInteger(config.ai.timeoutMs) || config.ai.timeoutMs <= 0) {
       throw new Error('PUBLIC_EXPORT_AI_TIMEOUT_MS must be a positive integer');
+    }
+    if (!Number.isInteger(config.aiMaxCalls) || config.aiMaxCalls <= 0) {
+      throw new Error('PUBLIC_EXPORT_AI_MAX_CALLS must be a positive integer');
     }
     const author = parseAuthor(process.env.PUBLIC_EXPORT_AUTHOR);
     config.operatorNames = authorPublicNames(author);

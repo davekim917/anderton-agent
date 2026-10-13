@@ -11,6 +11,7 @@
 
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { log } from '../../log.js';
 import type { PendingApproval, Session } from '../../types.js';
@@ -32,9 +33,16 @@ import {
 // Approvers are often in a meeting when the card lands.
 const BASH_GATE_TIMEOUT_MS = 60 * 60 * 1000;
 const GATE_CARD_TITLE_MAX_CHARS = 140;
-// Head+tail preview: a long command's final arguments are often the most
-// consequential part.
-const GATE_COMMAND_PREVIEW_MAX_CHARS = 1400;
+// The card body (summary, command preview, footer) is budgeted in UTF-16 units so
+// that both the posted card and its approve/reject edit (title, body and resolution
+// line as one message) fit the platform's text limit; past it the footer, the
+// command's tail or the resolution line would be dropped silently. The limits are
+// the adapters' configured maxTextLength (Slack 2800, Discord 1900), copied because
+// adapters are skill-installed and may be absent; 1900 also covers any other platform.
+const SLACK_MESSAGE_MAX_UNITS = 2800;
+const OTHER_MESSAGE_MAX_UNITS = 1900;
+const RESOLUTION_LINE_RESERVE_UNITS = 160;
+const GATE_COMMAND_PREVIEW_MIN_UNITS = 600;
 
 const pendingTimeouts = new Map<string, NodeJS.Timeout>();
 
@@ -93,29 +101,51 @@ interface GateCategory {
   kindNoun: string;
 }
 
-function commandPreview(command: string): string {
-  const codePoints = Array.from(command);
-  if (codePoints.length <= GATE_COMMAND_PREVIEW_MAX_CHARS) return command;
-
-  const marker = '\n…[middle omitted; full command retained in the approval record]…\n';
-  const markerLength = Array.from(marker).length;
-  const headLength = Math.floor((GATE_COMMAND_PREVIEW_MAX_CHARS - markerLength) / 2);
-  const tailLength = GATE_COMMAND_PREVIEW_MAX_CHARS - markerLength - headLength;
-  return codePoints.slice(0, headLength).join('') + marker + codePoints.slice(-tailLength).join('');
+function headUnits(text: string, units: number): string {
+  if (text.length <= units) return text;
+  let end = Math.max(0, units);
+  if (end > 0 && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;
+  return text.slice(0, end);
 }
 
-function buildCardBody(category: GateCategory, summary: string, command: string): string {
-  const parts: string[] = [summary];
+function tailUnits(text: string, units: number): string {
+  if (text.length <= units) return text;
+  let start = text.length - Math.max(0, units);
+  if (start < text.length && /[\uDC00-\uDFFF]/.test(text[start])) start++;
+  return text.slice(start);
+}
+
+// Head+tail preview: a long command's final arguments are often the most
+// consequential part.
+function commandPreview(command: string, units: number): string {
+  if (command.length <= units) return command;
+  const marker = '\n…[middle omitted; full command retained in the approval record]…\n';
+  const headLength = Math.floor((units - marker.length) / 2);
+  return headUnits(command, headLength) + marker + tailUnits(command, units - marker.length - headLength);
+}
+
+function cardBodyBudget(platformId: string | undefined, title: string): number {
+  const limit = platformId?.startsWith('slack:') ? SLACK_MESSAGE_MAX_UNITS : OTHER_MESSAGE_MAX_UNITS;
+  // The edit is `title\n\nbody\n\nresolution`; Discord's post wraps the title as `**title**\n\n`, which is shorter.
+  return limit - title.length - '\n\n\n\n'.length - RESOLUTION_LINE_RESERVE_UNITS;
+}
+
+function buildCardBody(category: GateCategory, summary: string, command: string, budget: number): string {
+  const timeoutMinutes = BASH_GATE_TIMEOUT_MS / 60_000;
+  const footer = `_Reject, or no answer within ${timeoutMinutes} min, cancels the ${category.kindNoun.toLowerCase()}._`;
+  const separator = '\n\n';
+  const fence = (body: string) => '```\n' + body + '\n```';
+  const fixed = footer.length + separator.length + (command ? fence('').length + separator.length : 0);
+  const summaryUnits = budget - fixed - Math.min(GATE_COMMAND_PREVIEW_MIN_UNITS, command.length);
+  const shownSummary = summary.length <= summaryUnits ? summary : headUnits(summary, summaryUnits - 1) + '…';
+  const parts: string[] = [shownSummary];
   if (command) {
     // The full command is persisted in the approval payload; the card preview
     // keeps head and tail so the approver never infers omitted final arguments.
-    parts.push('```\n' + commandPreview(command) + '\n```');
+    parts.push(fence(commandPreview(command, budget - fixed - shownSummary.length)));
   }
-  const timeoutMinutes = BASH_GATE_TIMEOUT_MS / 60_000;
-  parts.push(
-    `_Approve runs this ${category.kindNoun.toLowerCase()}. Reject cancels it. Times out in ${timeoutMinutes} min._`,
-  );
-  return parts.join('\n\n');
+  parts.push(footer);
+  return parts.join(separator);
 }
 
 function buildCardTitle(category: GateCategory, label: string): string {
@@ -185,14 +215,18 @@ function createGateHandler(category: GateCategory) {
       sessionId: session.id,
     };
 
+    const title = buildCardTitle(category, label);
+    const platformId = session.messaging_group_id
+      ? (await getMessagingGroup(session.messaging_group_id))?.platform_id
+      : undefined;
     const approvalDelivered = await requestApproval({
       session,
       agentName: session.agent_group_id,
       action: category.approvalAction,
       requestId,
       payload: payload as unknown as Record<string, unknown>,
-      title: buildCardTitle(category, label),
-      question: buildCardBody(category, summary, command),
+      title,
+      question: buildCardBody(category, summary, command, cardBodyBudget(platformId, title)),
       // In-thread: thread access IS the authority for work-level gates
       // (response-handler.ts doesn't check clicker identity). Self-mod and
       // credential approvals stay admin-DM.

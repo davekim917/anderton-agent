@@ -1,5 +1,4 @@
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,20 +9,17 @@ import type { RunReport } from '../check-public-boundary.js';
 import { allowSubprocess } from '../../src/test-hermeticity.js';
 import {
   aiBatches,
-  aiReadContext,
   aiSystemPrompt,
   fenceUntrusted,
   gateCommits,
   knownPrivateNames,
   loadAcceptedFindings,
-  loadAiPassCache,
   loadApprovedBinaries,
   loadPublicNames,
   judgeCommit,
   loadStagingCommit,
   realAiRead,
   realScanners,
-  type AiPassCache,
   type AiResult,
   type CommitUnderReview,
   type GateDeps,
@@ -73,6 +69,7 @@ function deps(overrides: Partial<GateDeps> = {}): GateDeps {
     aiMaxChars: 10_000,
     approvedBinaries: new Set<string>(),
     acceptedFindings: [],
+    aiBudget: { cap: 1_000, spent: 0 },
     ...overrides,
   };
 }
@@ -234,6 +231,7 @@ describe('gateCommits', () => {
         return { ...load(sha), treeDir: sha === 'b' ? 'held' : 'clean' };
       },
       deps({ scanTree }),
+      () => commit,
     );
     expect(outcome.lastPassing).toBe('a');
     expect(outcome.held?.sha).toBe('b');
@@ -241,8 +239,63 @@ describe('gateCommits', () => {
   });
 
   it('reports no passing commit when the first one holds', async () => {
-    const outcome = await gateCommits(['a'], load, deps({ scanMessage: () => scannerHit }));
+    const outcome = await gateCommits(['a'], load, deps({ scanMessage: () => scannerHit }), () => commit);
     expect(outcome).toMatchObject({ lastPassing: null, held: { sha: 'a' } });
+  });
+
+  describe('with an AI budget', () => {
+    const lines = (n: number) => Array.from({ length: n }, (_, i) => `src/big.ts:${i + 1}: export const v${i} = ${i};`);
+    const loadSized = (sha: string) => ({ ...commit, sha, addedLines: lines(30), dispose: vi.fn() });
+    const limit = 400;
+    const perCommit = aiBatches({ ...commit, addedLines: lines(30) }, limit)!.length;
+
+    it('holds every commit with no AI call when the batches they could send exceed the cap', async () => {
+      const aiRead = vi.fn(async () => aiOk('pass'));
+      const aiBudget = { cap: 2 * perCommit - 1, spent: 0 };
+      const outcome = await gateCommits(
+        ['a', 'b'],
+        loadSized,
+        deps({ aiRead, aiMaxChars: limit, aiBudget }),
+        loadSized,
+      );
+      expect(aiRead).not.toHaveBeenCalled();
+      expect(outcome).toEqual({
+        lastPassing: null,
+        held: {
+          sha: 'a',
+          reasons: [
+            {
+              source: 'gate',
+              where: 'run',
+              category: `AI budget exceeded: ${2 * perCommit} batches > cap ${2 * perCommit - 1}`,
+            },
+          ],
+          aiFindings: [],
+        },
+      });
+    });
+
+    it('reads every batch when they fit the cap exactly, and records what it spent', async () => {
+      const aiRead = vi.fn(async () => aiOk('pass'));
+      const aiBudget = { cap: 2 * perCommit, spent: 0 };
+      const outcome = await gateCommits(
+        ['a', 'b'],
+        loadSized,
+        deps({ aiRead, aiMaxChars: limit, aiBudget }),
+        loadSized,
+      );
+      expect(outcome).toEqual({ lastPassing: 'b' });
+      expect(aiRead).toHaveBeenCalledTimes(2 * perCommit);
+      expect(aiBudget.spent).toBe(2 * perCommit);
+    });
+
+    it('counts what an earlier gate call in the run already spent', async () => {
+      const aiRead = vi.fn(async () => aiOk('pass'));
+      const aiBudget = { cap: 2 * perCommit, spent: perCommit + 1 };
+      const outcome = await gateCommits(['a'], loadSized, deps({ aiRead, aiMaxChars: limit, aiBudget }), loadSized);
+      expect(aiRead).not.toHaveBeenCalled();
+      expect(outcome.held?.reasons[0].category).toMatch(/^AI budget exceeded/);
+    });
   });
 
   it('disposes each checkout even when judging throws', async () => {
@@ -256,6 +309,7 @@ describe('gateCommits', () => {
             throw new Error('scan failed');
           },
         }),
+        () => commit,
       ),
     ).rejects.toThrow('scan failed');
     expect(dispose).toHaveBeenCalledOnce();
@@ -526,6 +580,7 @@ describe('accepted findings drop only an exact, located match', () => {
       ['c1', 'c2'],
       (sha) => ({ ...at(tree), sha, dispose() {} }),
       deps({ acceptedFindings: accepted, aiRead: async () => aiOk('hold', [finding]) }),
+      () => at(tree),
     );
     expect(outcome).toEqual({
       lastPassing: 'c2',
@@ -644,205 +699,6 @@ describe('public names', () => {
     const privateList = prompt.indexOf('zzclientcorp');
     expect(allowed).toBeGreaterThan(-1);
     expect(prompt.slice(privateList).includes('opidentity')).toBe(false);
-  });
-});
-
-function memoryCache(context = 'ctx'): AiPassCache & { keys: Set<string> } {
-  const keys = new Set<string>();
-  return { context, keys, has: (key) => keys.has(key), add: (added) => added.forEach((key) => keys.add(key)) };
-}
-
-describe('the AI pass cache rereads only batches whose exact input changed', () => {
-  const files = Array.from({ length: 300 }, (_, f) => [`src/f${f}.ts:1: export const f${f} = ${f};`]);
-  const tree: CommitUnderReview = { ...commit, addedLines: files.flat() };
-  const limit = 2_000;
-  const reader = () => {
-    const payloads: string[] = [];
-    return { payloads, aiRead: vi.fn(async (payload: string) => (payloads.push(payload), aiOk('pass'))) };
-  };
-  const linesOf = (payload: string) => payload.split('\n').filter((l) => l.startsWith('src/'));
-  const editFile = (index: number) => ({
-    ...tree,
-    addedLines: tree.addedLines.map((l) => (l.startsWith(`src/f${index}.ts:1:`) ? `${l} // edited` : l)),
-  });
-
-  it('makes no AI call when the same commit is judged again under the same context', async () => {
-    const cache = memoryCache();
-    await judgeCommit(tree, deps({ aiCache: cache, aiMaxChars: limit }));
-    const second = reader();
-    const verdict = await judgeCommit(tree, deps({ aiCache: cache, aiMaxChars: limit, aiRead: second.aiRead }));
-    const total = aiBatches(tree, limit)!.length;
-    expect(second.aiRead).not.toHaveBeenCalled();
-    expect(verdict).toEqual({ verdict: 'pass', aiCache: { hits: total, misses: 0 } });
-  });
-
-  const dropFile = (index: number) => ({
-    ...tree,
-    addedLines: tree.addedLines.filter((l) => !l.startsWith(`src/f${index}.ts:`)),
-  });
-
-  it.each<[string, (index: number) => CommitUnderReview]>([
-    ['an edited line', editFile],
-    ['a dropped file', dropFile],
-  ])(
-    'rereads at most the changed batch and the next for %s when no batch reaches the size limit',
-    async (_label, change) => {
-      const total = aiBatches(tree, limit)!.length;
-      expect(total).toBeGreaterThan(5);
-      for (const index of [0, 137, 299]) {
-        const cache = memoryCache();
-        await judgeCommit(tree, deps({ aiCache: cache, aiMaxChars: limit }));
-        const second = reader();
-        await judgeCommit(change(index), deps({ aiCache: cache, aiMaxChars: limit, aiRead: second.aiRead }));
-        expect(second.aiRead.mock.calls.length).toBeGreaterThan(0);
-        expect(second.aiRead.mock.calls.length).toBeLessThanOrEqual(2);
-      }
-    },
-  );
-
-  it('rereads an edited file together with the unchanged files it was batched with', async () => {
-    const cache = memoryCache();
-    const first = reader();
-    await judgeCommit(tree, deps({ aiCache: cache, aiMaxChars: limit, aiRead: first.aiRead }));
-    const original = first.payloads.find((p) => p.includes('src/f137.ts:1:'))!;
-    const neighbours = linesOf(original).filter((l) => !l.startsWith('src/f137.ts:'));
-    expect(neighbours.length).toBeGreaterThan(0);
-    const second = reader();
-    await judgeCommit(editFile(137), deps({ aiCache: cache, aiMaxChars: limit, aiRead: second.aiRead }));
-    const reread = second.payloads.find((p) => p.includes('src/f137.ts:1:'))!;
-    expect(linesOf(reread)).toEqual(expect.arrayContaining(neighbours));
-  });
-
-  it.each<[string, Partial<CommitUnderReview>, string]>([
-    ['the commit message', { message: 'feat: other' }, 'ctx'],
-    ['the read context', {}, 'other-ctx'],
-  ])('rereads everything when %s changes', async (_label, change, context) => {
-    const cache = memoryCache();
-    await judgeCommit(tree, deps({ aiCache: cache, aiMaxChars: limit }));
-    const moved = memoryCache(context);
-    for (const key of cache.keys) moved.keys.add(key);
-    const second = reader();
-    await judgeCommit({ ...tree, ...change }, deps({ aiCache: moved, aiMaxChars: limit, aiRead: second.aiRead }));
-    expect(second.payloads.flatMap(linesOf)).toEqual(tree.addedLines);
-  });
-
-  it.each<[string, AiResult]>([
-    ['an AI hold', aiOk('hold', [{ file: 'src/f0.ts', line: 1, text: 'f0', why: 'name' }])],
-    ['a hold with no findings', aiOk('hold')],
-    ['a pass that still lists a finding', aiOk('pass', [{ file: 'src/f0.ts', line: 1, text: 'f0', why: 'name' }])],
-    ['a failed call that printed a pass', { ...aiOk('pass'), exitCode: 1 }],
-    ['a timeout that printed a pass', { ...aiOk('pass'), exitCode: null, timedOut: true }],
-    ['unparseable output', { exitCode: 0, timedOut: false, stdout: 'not json' }],
-  ])('caches nothing from %s, so the next run reads it again', async (_label, result) => {
-    const cache = memoryCache();
-    await judgeCommit(commit, deps({ aiCache: cache, aiRead: async () => result }));
-    expect(cache.keys.size).toBe(0);
-    const second = reader();
-    await judgeCommit(commit, deps({ aiCache: cache, aiRead: second.aiRead }));
-    expect(second.aiRead).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not cache a pass that needed an accepted finding', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'public-export-cache-'));
-    try {
-      fs.mkdirSync(path.join(dir, 'src'));
-      fs.writeFileSync(path.join(dir, 'src', 'widget.ts'), 'export const widget = 1;\n');
-      const cache = memoryCache();
-      const finding = { file: 'src/widget.ts', line: 1, text: 'widget', why: 'looks private' };
-      const verdict = await judgeCommit(
-        { ...commit, treeDir: dir },
-        deps({
-          aiCache: cache,
-          aiRead: async () => aiOk('hold', [finding]),
-          acceptedFindings: [{ path: 'src/widget.ts', line: 'export const widget = 1;', reason: 'confirmed generic' }],
-        }),
-      );
-      expect(verdict.verdict).toBe('pass');
-      expect(cache.keys.size).toBe(0);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('keeps the batches that passed in a run that held, and rereads only the one that held', async () => {
-    const cache = memoryCache();
-    let call = 0;
-    const verdict = await judgeCommit(
-      tree,
-      deps({ aiCache: cache, aiMaxChars: limit, aiRead: async () => (++call === 2 ? aiOk('hold') : aiOk('pass')) }),
-    );
-    expect(verdict.verdict).toBe('hold');
-    const second = reader();
-    await judgeCommit(tree, deps({ aiCache: cache, aiMaxChars: limit, aiRead: second.aiRead }));
-    expect(second.aiRead).toHaveBeenCalledTimes(1);
-    expect(second.payloads[0]).toBe(aiBatches(tree, limit)![1]);
-  });
-});
-
-describe('aiReadContext', () => {
-  const options = { model: 'm1', timeoutMs: 1 };
-  const base = () => aiReadContext(['zz-private'], options, ['PublicCo'], 'cli 1.0');
-  it.each<[string, () => string]>([
-    ['the private names', () => aiReadContext(['zz-other'], options, ['PublicCo'], 'cli 1.0')],
-    ['the public names', () => aiReadContext(['zz-private'], options, ['OtherCo'], 'cli 1.0')],
-    ['the model', () => aiReadContext(['zz-private'], { ...options, model: 'm2' }, ['PublicCo'], 'cli 1.0')],
-    ['the claude CLI build', () => aiReadContext(['zz-private'], options, ['PublicCo'], 'cli 1.1')],
-  ])('changes with %s', (_label, changed) => {
-    expect(changed()).not.toBe(base());
-  });
-
-  it('does not change with the per-call nonce or the timeout, so a retry can hit', () => {
-    expect(aiReadContext(['zz-private'], { ...options, timeoutMs: 99 }, ['PublicCo'], 'cli 1.0')).toBe(base());
-  });
-
-  it('is bound to the gate source, so a change to the prompt, flags or reply parsing reads everything again', () => {
-    const source = fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname), 'gate.ts'));
-    expect(base()).toContain(createHash('sha256').update(source).digest('hex'));
-  });
-
-  it('carries the full system prompt the model is given', () => {
-    expect(base()).toContain(JSON.stringify(aiSystemPrompt(['zz-private'], 'NONCE', ['PublicCo'])).slice(1, -1));
-  });
-});
-
-describe('loadAiPassCache', () => {
-  let dir: string;
-  beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'public-export-cache-'));
-  });
-  afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  const key = 'a'.repeat(64);
-
-  it('starts empty and silent when there is no file', () => {
-    const warn = vi.fn();
-    expect(loadAiPassCache(path.join(dir, 'cache.txt'), 'ctx', warn).has(key)).toBe(false);
-    expect(warn).not.toHaveBeenCalled();
-  });
-
-  it('saves what it adds, private to the operator, for the next run', () => {
-    const file = path.join(dir, 'cache.txt');
-    loadAiPassCache(file, 'ctx', vi.fn()).add([key]);
-    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
-    expect(loadAiPassCache(file, 'ctx', vi.fn()).has(key)).toBe(true);
-  });
-
-  it('treats a malformed file as empty, so everything is read again', () => {
-    const file = path.join(dir, 'cache.txt');
-    fs.writeFileSync(file, `${key}\nnot-a-key\n`);
-    const warn = vi.fn();
-    expect(loadAiPassCache(file, 'ctx', warn).has(key)).toBe(false);
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/malformed/));
-  });
-
-  it('reports a failed save and carries on', () => {
-    const blocker = path.join(dir, 'not-a-dir');
-    fs.writeFileSync(blocker, '');
-    const warn = vi.fn();
-    const cache = loadAiPassCache(path.join(blocker, 'cache.txt'), 'ctx', warn);
-    expect(() => cache.add([key])).not.toThrow();
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/not saved/));
   });
 });
 

@@ -4271,12 +4271,20 @@ export async function buildMounts(
         }
       }
 
-      // Mount RW: snow CLI writes to ~/.snowflake/logs/.
-      mounts.push({ hostPath: dest, containerPath: '/home/node/.snowflake', readonly: false });
-
+      // The directory is RW because snow writes its logs and version cache there; the connection
+      // config and keys are nested RO so an agent cannot repoint a connection the destructive guard trusts.
       // Also at the host absolute path: some snowflake libs retry reads at the originally resolved path.
-      if (snowflakeDir !== '/home/node/.snowflake') {
-        mounts.push({ hostPath: dest, containerPath: snowflakeDir, readonly: false });
+      // The staging copy also sits under the session dir, which is mounted RW at /workspace, so it is
+      // protected there too.
+      const readOnly = ['connections.toml', 'config.toml', 'keys'].filter((name) =>
+        fs.existsSync(path.join(dest, name)),
+      );
+      const bases = new Set(['/home/node/.snowflake', snowflakeDir]);
+      for (const base of bases) mounts.push({ hostPath: dest, containerPath: base, readonly: false });
+      for (const base of [...bases, path.join('/workspace', path.relative(sessDir, dest))]) {
+        for (const name of readOnly) {
+          mounts.push({ hostPath: path.join(dest, name), containerPath: path.join(base, name), readonly: true });
+        }
       }
     }
   }

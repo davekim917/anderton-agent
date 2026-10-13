@@ -13,7 +13,6 @@ interface World {
   gated: string[][];
   status: StatusFields | null;
   accepted?: AcceptedDetail[];
-  events: string[];
 }
 
 function harness(
@@ -24,7 +23,6 @@ function harness(
     gate?: (shas: string[]) => GateOutcome;
     writeStatus?: ExportDeps['writeStatus'];
     clearStatus?: ExportDeps['clearStatus'];
-    pushFails?: boolean;
   },
 ): ExportDeps {
   return {
@@ -63,19 +61,14 @@ function harness(
     },
     remoteHead: () => world.remote,
     push: (sha) => {
-      if (opts.pushFails) throw new Error('push rejected');
       world.pushes.push(sha);
-      world.events.push(`push ${sha}`);
       world.remote = sha;
-    },
-    clearAiCache: () => {
-      world.events.push('clear ai cache');
     },
   };
 }
 
 function world(overrides: Partial<World> = {}): World {
-  return { staging: [], remote: null, pushes: [], workflows: [], gated: [], status: null, events: [], ...overrides };
+  return { staging: [], remote: null, pushes: [], workflows: [], gated: [], status: null, ...overrides };
 }
 
 const adds =
@@ -259,46 +252,5 @@ describe('runExport reports accepted findings as a count only', () => {
     expect(code).toBe(0);
     expect(w.status).toMatchObject({ status: 'ok', acceptedFindings: 2 });
     expect(w.accepted?.map((entry) => entry.sha)).toEqual(['s2', 'sq']);
-  });
-});
-
-describe('runExport reports the AI pass cache as counts', () => {
-  it('sums the per-commit attempt and its squash retry into the status', async () => {
-    const w = world({ staging: ['s1'], remote: 's1' });
-    await runExport(
-      harness(w, {
-        publicRemote: true,
-        copybara: (cw, workflow) => (workflow === 'export' ? adds('s2')(cw) : adds('sq')(cw)),
-        gate: (shas) => ({ ...holdOn('s2')(shas), aiCache: { hits: 3, misses: 1 } }),
-      }),
-    );
-    expect(w.status).toMatchObject({ aiCache: { hits: 6, misses: 2 } });
-  });
-});
-
-describe('runExport clears the AI pass cache only after it publishes', () => {
-  it('clears it once the push has landed', async () => {
-    const w = world({ staging: ['s1'], remote: 's1' });
-    await runExport(harness(w, { publicRemote: true, copybara: adds('s2') }));
-    expect(w.events).toEqual(['push s2', 'clear ai cache']);
-  });
-
-  it.each<[string, Partial<World>, Parameters<typeof harness>[1]]>([
-    ['a dry run', {}, { publicRemote: false, copybara: adds('s1') }],
-    [
-      'a run with nothing new',
-      { staging: ['s1'], remote: 's1' },
-      { publicRemote: true, copybara: () => NO_CHANGES_EXIT },
-    ],
-    ['a run whose only commit held', {}, { publicRemote: true, copybara: adds('s1'), gate: holdOn('s1') }],
-    [
-      'a push that failed',
-      { staging: ['s1'], remote: 's1' },
-      { publicRemote: true, copybara: adds('s2'), pushFails: true },
-    ],
-  ])('keeps it after %s, so a retry still skips what passed', async (_label, start, opts) => {
-    const w = world(start);
-    await runExport(harness(w, opts));
-    expect(w.events).not.toContain('clear ai cache');
   });
 });

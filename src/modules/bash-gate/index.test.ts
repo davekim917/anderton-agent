@@ -12,6 +12,8 @@ import type Database from 'better-sqlite3';
 import { openInboundDb as openInboundDbAt } from '../../modules/mailbox/openers.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { getDeliveryAction } from '../../delivery.js';
+import { editApprovalCardResolution } from '../approvals/primitive.js';
+import { getPendingApprovalByRequestId } from '../../db/sessions.js';
 import './index.js';
 
 // `session-manager`'s ids-addressed inbound opener went away with the mailbox
@@ -93,7 +95,7 @@ async function seedSession(): Promise<void> {
   initSessionFolder('ag-1', 'sess-1');
 }
 
-async function runDestructiveGate(label: string, requestId: string, command?: string): Promise<void> {
+async function runDestructiveGate(label: string, requestId: string, command?: string, summary?: string): Promise<void> {
   const handler = getDeliveryAction('request_destructive_gate');
   const session = await getSession('sess-1');
   expect(handler).toBeDefined();
@@ -104,7 +106,7 @@ async function runDestructiveGate(label: string, requestId: string, command?: st
     {
       requestId,
       label,
-      summary: 'The agent wants to run a destructive command.',
+      summary: summary ?? 'The agent wants to run a destructive command.',
       command:
         command ??
         'CREATE OR REPLACE PROCEDURE HOOLI_PLATFORM.MASTER._LONG_TEST_SP() RETURNS STRING LANGUAGE SQL AS $$ SELECT 1; $$',
@@ -164,7 +166,7 @@ describe('bash destructive gate delivery', () => {
 
   it('retains the full command for audit while showing both ends of a long command on the card', async () => {
     mocks.deliver.mockResolvedValue('slack-msg-command');
-    const command = `terraform apply -var='opening=${'a'.repeat(1800)}' -auto-approve --target=module.production`;
+    const command = `terraform apply -var='opening=${'a'.repeat(4000)}' -auto-approve --target=module.production`;
 
     await runDestructiveGate('Terraform apply', 'gate-long-command', command);
 
@@ -177,6 +179,95 @@ describe('bash destructive gate delivery', () => {
       .prepare('SELECT payload FROM pending_approvals WHERE request_id = ?')
       .get('gate-long-command') as { payload: string } | undefined;
     expect(JSON.parse(pending!.payload).command).toBe(command);
+  });
+
+  it("keeps the card body inside Slack's 3000-unit section limit, footer and command tail included", async () => {
+    mocks.deliver.mockResolvedValue('slack-msg-budget');
+    const summary = `Rebuild 🧪 model\n\n> ${'🚨'.repeat(600)}`;
+    const command = `psql -c "select '${'🔥'.repeat(900)}'" --set ON_ERROR_STOP=1 --dbname production`;
+
+    await runDestructiveGate('Emoji-heavy gate', 'gate-budget', command, summary);
+
+    const { question } = JSON.parse(mocks.deliver.mock.calls[0][4] as string) as { question: string };
+    expect(question.length).toBeLessThanOrEqual(3000);
+    expect(question).toContain('--dbname production');
+    expect(question).toMatch(/cancels the destructive command\._$/);
+    expect(hasLoneSurrogate(question)).toBe(false);
+  });
+
+  it("fits a Discord card, title included, in the Discord adapter's 1900-unit message", async () => {
+    getRawDb()
+      .prepare("UPDATE messaging_groups SET channel_type = 'discord', platform_id = 'discord:G1:C1' WHERE id = 'mg-1'")
+      .run();
+    mocks.deliver.mockResolvedValue('discord-msg-budget');
+    const command = `psql -c "delete from t where id in (${'1,'.repeat(1050)}1)" --dbname production`;
+
+    await runDestructiveGate('Delete rows', 'gate-discord-budget', command);
+
+    const { title, question } = JSON.parse(mocks.deliver.mock.calls[0][4] as string) as {
+      title: string;
+      question: string;
+    };
+    expect(`**${title}**\n\n${question}`.length).toBeLessThanOrEqual(1900);
+    expect(question).toContain('--dbname production');
+    expect(question).toMatch(/cancels the destructive command\._$/);
+  });
+
+  it('keeps the command tail and the resolution line when the card is edited after a decision', async () => {
+    const command = `terraform apply -var='opening=${'a'.repeat(4000)}' -auto-approve --target=module.production`;
+    for (const [platform, limit] of [
+      ['slack:C123', 2800],
+      ['discord:G1:C1', 1900],
+    ] as const) {
+      getRawDb().prepare('UPDATE messaging_groups SET platform_id = ? WHERE id = ?').run(platform, 'mg-1');
+      mocks.deliver.mockReset();
+      mocks.deliver.mockResolvedValue(`msg-${platform}`);
+      const requestId = `gate-edit-${platform}`;
+
+      await runDestructiveGate('Terraform apply', requestId, command);
+      const pending = await getPendingApprovalByRequestId(requestId);
+      await editApprovalCardResolution(pending!, 'approve', '');
+
+      const edit = JSON.parse(mocks.deliver.mock.calls.at(-1)![4] as string) as { operation: string; text: string };
+      expect(edit.operation).toBe('edit');
+      expect(edit.text.length).toBeLessThanOrEqual(limit);
+      expect(edit.text).toContain('--target=module.production');
+      expect(edit.text).toMatch(/cancels the destructive command\._\n\n\S/);
+    }
+  });
+
+  it('does not split an emoji where the command tail is cut', async () => {
+    mocks.deliver.mockResolvedValue('slack-msg-tail');
+    const command = `echo ${'🔥'.repeat(1500)} --tail-marker`;
+
+    for (const summary of ['s', 'ss']) {
+      mocks.deliver.mockClear();
+      await runDestructiveGate('Emoji tail', `gate-tail-${summary}`, command, summary);
+      const { question } = JSON.parse(mocks.deliver.mock.calls[0][4] as string) as { question: string };
+      expect(question).toContain('--tail-marker');
+      expect(hasLoneSurrogate(question)).toBe(false);
+    }
+  });
+
+  it('gives a long summary the room a short command leaves', async () => {
+    mocks.deliver.mockResolvedValue('slack-msg-short');
+
+    await runDestructiveGate('Short command', 'gate-short', 'rm -rf /tmp/x', 'y'.repeat(2400));
+
+    const { question } = JSON.parse(mocks.deliver.mock.calls[0][4] as string) as { question: string };
+    expect(question).toContain('y'.repeat(2400));
+  });
+
+  it('cuts an oversized summary before the command preview', async () => {
+    mocks.deliver.mockResolvedValue('slack-msg-summary');
+    const command = `terraform destroy ${'-target=module.x '.repeat(40)}-target=module.production`;
+
+    await runDestructiveGate('Long summary', 'gate-summary', command, 'x'.repeat(5000));
+
+    const { question } = JSON.parse(mocks.deliver.mock.calls[0][4] as string) as { question: string };
+    expect(question.length).toBeLessThanOrEqual(3000);
+    expect(question).toContain('-target=module.production');
+    expect(question).toMatch(/cancels the destructive command\._$/);
   });
 
   it('fails the gate ack immediately when approval-card delivery throws', async () => {

@@ -1,9 +1,8 @@
 import { execFile, execFileSync, spawnSync } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import {
   loadInstallIdentifiers,
@@ -21,6 +20,8 @@ export interface InstallPaths {
   identifiersPath: string;
   allowlistPath: string;
 }
+
+export type CommitDiff = Pick<CommitUnderReview, 'message' | 'addedLines'>;
 
 export interface CommitUnderReview {
   sha: string;
@@ -58,33 +59,15 @@ export interface AcceptedDetail {
   finding: AiFinding;
 }
 
-export interface AiCacheCounts {
-  hits: number;
-  misses: number;
-}
-
-/**
- * `accepted` is set only when an accepted entry dropped at least one AI finding; `aiCache` only when a cache was
- * given and the AI read ran.
- */
+/** `accepted` is set only when an accepted entry dropped at least one AI finding. */
 export type CommitVerdict =
-  | { verdict: 'pass'; accepted?: AiFinding[]; aiCache?: AiCacheCounts }
-  | {
-      verdict: 'hold';
-      reasons: HoldReason[];
-      aiFindings: AiFinding[];
-      accepted?: AiFinding[];
-      aiCache?: AiCacheCounts;
-    };
+  | { verdict: 'pass'; accepted?: AiFinding[] }
+  | { verdict: 'hold'; reasons: HoldReason[]; aiFindings: AiFinding[]; accepted?: AiFinding[] };
 
-/**
- * Keys of batches the AI read passed with no finding. `context` must cover everything the model sees besides the
- * batch payload (see `aiReadContext`).
- */
-export interface AiPassCache {
-  context: string;
-  has(key: string): boolean;
-  add(keys: string[]): void;
+/** AI reads one run may make; shared by every gate call in the run, so a squash retry draws on the same cap. */
+interface AiBudget {
+  readonly cap: number;
+  spent: number;
 }
 
 export interface AiResult {
@@ -100,7 +83,7 @@ export interface GateDeps {
   aiMaxChars: number;
   approvedBinaries: ReadonlySet<string>;
   acceptedFindings: readonly AcceptedFinding[];
-  aiCache?: AiPassCache;
+  aiBudget: AiBudget;
 }
 
 function scannerReasons(report: RunReport, surface: 'tree' | 'message'): HoldReason[] {
@@ -176,65 +159,23 @@ function isAcceptedFinding(finding: unknown, treeDir: string, accepted: readonly
   return actual !== null && candidates.some((entry) => entry.line === actual);
 }
 
-const ADDED_LINE_FILE = /^(.+?):\d+: /;
-
-/** The path entries as one unit, then each file's run of added lines: the pieces a batch boundary may fall between. */
-function aiUnits(commit: CommitUnderReview): string[][] {
-  const units: string[][] = [];
-  let file: string | null = null;
-  for (const line of commit.addedLines) {
-    const lineFile = line.startsWith('PATH ') ? 'PATH' : (ADDED_LINE_FILE.exec(line)?.[1] ?? line);
-    if (lineFile !== file) units.push([]);
-    file = lineFile;
-    units[units.length - 1].push(line);
-  }
-  return units;
-}
-
-const BATCH_MIN_FILL = 0.7;
-const BATCH_BOUNDARY_ONE_IN = 4;
-
-function endsBatch(unit: string[]): boolean {
-  return createHash('sha256').update(JSON.stringify(unit)).digest().readUInt32BE(0) % BATCH_BOUNDARY_ONE_IN === 0;
-}
-
-/**
- * Null when the limit is unusable or one added line cannot fit in a call beside the message header.
- *
- * A batch ends only at the end of a unit whose own hash says so, once the batch is at least 70% full, or where the
- * limit forces it. An edit usually moves only its own batch's boundaries, so the pass cache can still answer the
- * rest of the tree. No bound is guaranteed: where forced cuts run ahead of the next hash-selected unit, a change can
- * shift several later batches (docs/public-export.md has the measured spread).
- */
-export function aiBatches(commit: CommitUnderReview, maxChars: number): string[] | null {
+/** Null when the limit is unusable or one added line cannot fit in a call beside the message header. */
+export function aiBatches(commit: CommitDiff, maxChars: number): string[] | null {
   if (!Number.isInteger(maxChars) || maxChars <= 0) return null;
   const header = `COMMIT MESSAGE:\n${commit.message}\nADDED LINES:\n`;
-  const minFill = header.length + Math.floor((maxChars - header.length) * BATCH_MIN_FILL);
   const batches: string[] = [];
   let current = header;
-  for (const unit of aiUnits(commit)) {
-    for (const line of unit) {
-      const entry = `${line}\n`;
-      if (header.length + entry.length > maxChars) return null;
-      if (current.length + entry.length > maxChars) {
-        batches.push(current);
-        current = header;
-      }
-      current += entry;
-    }
-    if (current.length >= minFill && endsBatch(unit)) {
+  for (const line of commit.addedLines) {
+    const entry = `${line}\n`;
+    if (header.length + entry.length > maxChars) return null;
+    if (current.length + entry.length > maxChars) {
       batches.push(current);
       current = header;
     }
+    current += entry;
   }
-  if (current !== header || batches.length === 0) batches.push(current);
+  batches.push(current);
   return batches;
-}
-
-function aiBatchKey(context: string, payload: string): string {
-  return createHash('sha256')
-    .update(JSON.stringify([context, payload]))
-    .digest('hex');
 }
 
 export async function judgeCommit(commit: CommitUnderReview, deps: GateDeps): Promise<CommitVerdict> {
@@ -247,23 +188,15 @@ export async function judgeCommit(commit: CommitUnderReview, deps: GateDeps): Pr
   ];
   const aiFindings: AiFinding[] = [];
   const accepted: AiFinding[] = [];
-  const cache = deps.aiCache;
-  const counts: AiCacheCounts = { hits: 0, misses: 0 };
   const batches = reasons.length > 0 ? [] : aiBatches(commit, deps.aiMaxChars);
   if (batches === null) {
     reasons.push({ source: 'ai', where: 'diff', category: `line-too-large>${deps.aiMaxChars}` });
   } else {
     for (const [index, payload] of batches.entries()) {
-      const key = cache ? aiBatchKey(cache.context, payload) : '';
-      if (cache?.has(key)) {
-        counts.hits++;
-        continue;
-      }
-      counts.misses++;
       const where = batches.length === 1 ? 'ai read' : `ai read batch ${index + 1}/${batches.length}`;
+      deps.aiBudget.spent++;
       const result = await deps.aiRead(payload);
       const parsed = result.timedOut || result.exitCode !== 0 ? null : parseAiVerdict(result.stdout);
-      if (cache && parsed?.verdict === 'pass' && parsed.findings.length === 0) cache.add([key]);
       if (result.timedOut) reasons.push({ source: 'ai', where, category: 'timeout' });
       else if (result.exitCode !== 0) reasons.push({ source: 'ai', where, category: `exit:${result.exitCode}` });
       else if (!parsed) reasons.push({ source: 'ai', where, category: 'unparseable' });
@@ -279,10 +212,7 @@ export async function judgeCommit(commit: CommitUnderReview, deps: GateDeps): Pr
       }
     }
   }
-  const counted = {
-    ...(accepted.length > 0 ? { accepted } : {}),
-    ...(cache && batches !== null && batches.length > 0 ? { aiCache: counts } : {}),
-  };
+  const counted = accepted.length > 0 ? { accepted } : {};
   return reasons.length === 0 ? { verdict: 'pass', ...counted } : { verdict: 'hold', reasons, aiFindings, ...counted };
 }
 
@@ -292,29 +222,37 @@ export interface GateOutcome {
   held?: { sha: string; reasons: HoldReason[]; aiFindings: AiFinding[] };
   /** Set only when accepted entries dropped AI findings in the judged commits. */
   accepted?: AcceptedDetail[];
-  aiCache?: AiCacheCounts;
 }
 
-export function addCounts(a: AiCacheCounts | undefined, b: AiCacheCounts): AiCacheCounts {
-  return { hits: (a?.hits ?? 0) + b.hits, misses: (a?.misses ?? 0) + b.misses };
-}
-
-/** Commits oldest first; judging stops at the first hold, since a later commit carries the held one's tree. */
+/**
+ * Commits oldest first; judging stops at the first hold, since a later commit carries the held one's tree. Every
+ * batch the commits could send is counted before any is read, and a total over the run's budget holds the first
+ * commit with no AI call at all. A commit the scanner holds still counts, so a budget hold can hide a scanner hold.
+ */
 export async function gateCommits(
   shas: string[],
   load: (sha: string) => CommitUnderReview & { dispose(): void },
   deps: GateDeps,
+  diff: (sha: string) => CommitDiff,
 ): Promise<GateOutcome> {
+  const budget = deps.aiBudget;
+  let planned = budget.spent;
+  for (const sha of shas) planned += aiBatches(diff(sha), deps.aiMaxChars)?.length ?? 0;
+  if (shas.length > 0 && planned > budget.cap) {
+    const category = `AI budget exceeded: ${planned} batches > cap ${budget.cap}`;
+    return {
+      lastPassing: null,
+      held: { sha: shas[0], reasons: [{ source: 'gate', where: 'run', category }], aiFindings: [] },
+    };
+  }
   let lastPassing: string | null = null;
   const accepted: AcceptedDetail[] = [];
-  let aiCache: AiCacheCounts | undefined;
-  const counted = () => ({ ...(accepted.length > 0 ? { accepted } : {}), ...(aiCache ? { aiCache } : {}) });
+  const counted = () => (accepted.length > 0 ? { accepted } : {});
   for (const sha of shas) {
     const commit = load(sha);
     try {
       const verdict = await judgeCommit(commit, deps);
       for (const finding of verdict.accepted ?? []) accepted.push({ sha, finding });
-      if (verdict.aiCache) aiCache = addCounts(aiCache, verdict.aiCache);
       if (verdict.verdict === 'hold') {
         return { lastPassing, held: { sha, reasons: verdict.reasons, aiFindings: verdict.aiFindings }, ...counted() };
       }
@@ -385,11 +323,6 @@ export interface AiReadOptions {
   timeoutMs: number;
 }
 
-/** The judging code itself: a change to the prompt, schema, flags or reply parsing reads every batch again. */
-const GATE_SOURCE_SHA = createHash('sha256')
-  .update(fs.readFileSync(fileURLToPath(import.meta.url)))
-  .digest('hex');
-
 function aiReadArgs(
   knownPrivateNames: string[],
   options: AiReadOptions,
@@ -423,19 +356,6 @@ function aiReadArgs(
  * CLAUDE.md, and auto-memory is off by env (no settings key does it; `--bare` would, but it refuses OAuth login).
  */
 const AI_READ_ENV = { CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' };
-
-/**
- * Everything besides the batch payload that decides a read and that this code controls: the CLI build, this file,
- * and the exact invocation. The CLI still adds its own context (date, environment, account email), which is left out.
- */
-export function aiReadContext(
-  knownPrivateNames: string[],
-  options: AiReadOptions,
-  publicNames: string[],
-  cliVersion: string,
-): string {
-  return JSON.stringify([cliVersion, GATE_SOURCE_SHA, aiReadArgs(knownPrivateNames, options, publicNames, 'NONCE')]);
-}
 
 export function realAiRead(
   knownPrivateNames: string[],
@@ -579,50 +499,11 @@ export function loadApprovedBinaries(file: string): Set<string> {
   );
 }
 
-const CACHE_KEY = /^[0-9a-f]{64}$/;
-
-/**
- * A missing or malformed file is an empty cache: the run rereads everything and never passes on a guess. A failed
- * write is reported and the run goes on; the gate's verdict never depends on it.
- */
-export function loadAiPassCache(file: string, context: string, warn: (message: string) => void): AiPassCache {
-  const keys = new Set<string>();
-  let text = '';
-  try {
-    text = fs.readFileSync(file, 'utf8');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
-      warn(`AI pass cache unreadable, reading everything: ${error}`);
-  }
-  const rows = text.split('\n').filter(Boolean);
-  if (rows.every((row) => CACHE_KEY.test(row))) for (const row of rows) keys.add(row);
-  else warn('AI pass cache malformed, reading everything');
-  return {
-    context,
-    has: (key) => keys.has(key),
-    add(added) {
-      const fresh = added.filter((key) => !keys.has(key));
-      if (fresh.length === 0) return;
-      for (const key of fresh) keys.add(key);
-      try {
-        fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-        const temp = `${file}.${process.pid}.tmp`;
-        fs.writeFileSync(temp, [...keys].join('\n') + '\n', { mode: 0o600 });
-        fs.renameSync(temp, file);
-      } catch (error) {
-        warn(`AI pass cache not saved: ${error}`);
-      }
-    },
-  };
-}
-
 function git(gitDir: string, args: string[]): string {
   return execFileSync('git', ['--git-dir', gitDir, ...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
 }
 
-export function loadStagingCommit(stagingGitDir: string, sha: string): CommitUnderReview & { dispose(): void } {
-  const treeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'public-export-tree-'));
-  git(stagingGitDir, ['worktree', 'add', '--detach', '--force', treeDir, sha]);
+export function stagingCommitDiff(stagingGitDir: string, sha: string): Omit<CommitUnderReview, 'treeDir'> {
   const message = git(stagingGitDir, ['log', '-1', '--format=%B', sha]);
 
   const entries: string[] = [];
@@ -693,12 +574,15 @@ export function loadStagingCommit(stagingGitDir: string, sha: string): CommitUnd
     }
   }
 
+  return { sha, message, addedLines: entries, binaries };
+}
+
+export function loadStagingCommit(stagingGitDir: string, sha: string): CommitUnderReview & { dispose(): void } {
+  const treeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'public-export-tree-'));
+  git(stagingGitDir, ['worktree', 'add', '--detach', '--force', treeDir, sha]);
   return {
-    sha,
-    message,
+    ...stagingCommitDiff(stagingGitDir, sha),
     treeDir,
-    addedLines: entries,
-    binaries,
     dispose() {
       git(stagingGitDir, ['worktree', 'remove', '--force', treeDir]);
     },

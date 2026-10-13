@@ -1,11 +1,4 @@
-import {
-  addCounts,
-  type AcceptedDetail,
-  type AiCacheCounts,
-  type AiFinding,
-  type GateOutcome,
-  type HoldReason,
-} from './gate.js';
+import type { AcceptedDetail, AiFinding, GateOutcome, HoldReason } from './gate.js';
 
 export const NO_CHANGES_EXIT = 4;
 
@@ -19,8 +12,6 @@ export interface Status {
   held?: { sha: string; reasons: HoldReason[] };
   /** How many AI findings accepted entries dropped; counts only. */
   acceptedFindings?: number;
-  /** Batches the AI pass cache answered (hits) and the AI read (misses); counts only. */
-  aiCache?: AiCacheCounts;
   error?: string;
 }
 
@@ -43,8 +34,6 @@ export interface ExportDeps {
   gate(shas: string[]): Promise<GateOutcome>;
   remoteHead(): string | null;
   push(sha: string): void;
-  /** Forget every cached AI pass, so nothing judged before a publish is skipped after it. */
-  clearAiCache(): void;
 }
 
 function trustedGatedHead(deps: Pick<ExportDeps, 'publicRemote' | 'remoteHead'>): string | null {
@@ -70,7 +59,6 @@ interface Exported {
   passing: string | null;
   held?: GateOutcome['held'];
   accepted?: AcceptedDetail[];
-  aiCache?: AiCacheCounts;
 }
 
 async function exportAndGate(deps: ExportDeps, base: string | null, workflow: Workflow): Promise<Exported> {
@@ -81,7 +69,7 @@ async function exportAndGate(deps: ExportDeps, base: string | null, workflow: Wo
   const outcome = await deps.gate(head ? deps.newCommits(base, head) : []);
   const passing = outcome.lastPassing ?? base;
   if (outcome.held) deps.resetStaging(passing);
-  return { passing, held: outcome.held, accepted: outcome.accepted, aiCache: outcome.aiCache };
+  return { passing, held: outcome.held, accepted: outcome.accepted };
 }
 
 export async function runExport(deps: ExportDeps): Promise<number> {
@@ -91,12 +79,10 @@ export async function runExport(deps: ExportDeps): Promise<number> {
     let workflow: Workflow = trusted === null ? 'export_squash' : 'export';
     let result = await exportAndGate(deps, trusted, workflow);
     const accepted = [...(result.accepted ?? [])];
-    let aiCache = result.aiCache;
     if (result.held && workflow === 'export') {
       workflow = 'export_squash';
       result = await exportAndGate(deps, result.passing, workflow);
       accepted.push(...(result.accepted ?? []));
-      if (result.aiCache) aiCache = addCounts(aiCache, result.aiCache);
     }
     if (accepted.length > 0) deps.writeAcceptedDetail(accepted);
     if (result.held) deps.writeHeldDetail({ sha: result.held.sha, aiFindings: result.held.aiFindings });
@@ -107,7 +93,6 @@ export async function runExport(deps: ExportDeps): Promise<number> {
       if (result.passing && result.passing !== trusted) {
         deps.push(result.passing);
         published = result.passing;
-        deps.clearAiCache();
       }
     }
     deps.writeStatus({
@@ -117,7 +102,6 @@ export async function runExport(deps: ExportDeps): Promise<number> {
       lastPassing: result.passing,
       held: result.held ? { sha: result.held.sha, reasons: result.held.reasons } : undefined,
       ...(accepted.length > 0 ? { acceptedFindings: accepted.length } : {}),
-      ...(aiCache ? { aiCache } : {}),
     });
     return result.held ? 2 : 0;
   } catch (error) {

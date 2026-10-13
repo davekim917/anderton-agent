@@ -1823,6 +1823,19 @@ describe('buildMounts agent surfaces', async () => {
     ]);
     const snowflake = at('/home/node/.snowflake');
     expect(fs.readFileSync(path.join(snowflake, 'connections.toml'), 'utf8')).toBe('');
+    // The connection config and keys are read-only inside the writable directory snow logs to.
+    const workspaceCopy = mounts.find((m) => m.containerPath === '/workspace')!.hostPath;
+    expect(snowflake.startsWith(workspaceCopy + path.sep)).toBe(true);
+    const workspaceAlias = path.join('/workspace', path.relative(workspaceCopy, snowflake));
+    for (const base of ['/home/node/.snowflake', path.join(home, '.snowflake'), workspaceAlias]) {
+      if (base !== workspaceAlias) expect(mounts.find((m) => m.containerPath === base)?.readonly).toBe(false);
+      for (const name of ['connections.toml', 'keys']) {
+        expect(mounts.find((m) => m.containerPath === path.join(base, name))).toMatchObject({
+          hostPath: path.join(snowflake, name),
+          readonly: true,
+        });
+      }
+    }
     // A scoped list emptied by ownership references no key, so it must copy none rather than all.
     expect(fs.readdirSync(path.join(snowflake, 'keys'), { recursive: true })).toEqual([]);
 
