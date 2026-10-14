@@ -2,6 +2,9 @@
   "generatedAt": "2026-09-12T04:21:40.000Z",
   "files": {
     "container/agent-runner/src/admission-gate.ts": 100,
+    "container/agent-runner/src/codex-hooks/cli.ts": "untested",
+    "container/agent-runner/src/codex-hooks/hook-failure.ts": 100,
+    "container/agent-runner/src/codex-hooks/runner.ts": 90.07,
     "container/agent-runner/src/db/container-state.ts": 100,
     "container/agent-runner/src/db/delivery-acks.ts": 66.67,
     "container/agent-runner/src/db/index.ts": "n/a",
