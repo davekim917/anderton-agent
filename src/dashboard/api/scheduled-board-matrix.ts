@@ -53,8 +53,14 @@ const STATE_CELL: Record<Verb, (ctx: VerbCtx) => VerbVerdict> = {
         return BUSY;
       case 'strand':
         return STALE;
-      default:
+      case 'healthy':
+      case 'late':
+      case 'stalled':
+      case 'paused':
+      case 'unknown':
         return ALLOW;
+      default:
+        return NA;
     }
   },
 
@@ -66,8 +72,13 @@ const STATE_CELL: Record<Verb, (ctx: VerbCtx) => VerbVerdict> = {
         return BUSY;
       case 'strand':
         return STALE;
-      default:
+      case 'healthy':
+      case 'late':
+      case 'stalled':
+      case 'unknown':
         return ALLOW;
+      default:
+        return NA;
     }
   },
 

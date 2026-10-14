@@ -174,6 +174,18 @@ describe('edit / pause / resume per state', () => {
     expect(verbVerdict('pause', ctx({ state: 'processing', claimed: true })).status).toBe(409);
   });
 
+  it('pause allowed in healthy/late/stalled/unknown', () => {
+    for (const state of ['healthy', 'late', 'stalled', 'unknown'] as HealthState[]) {
+      expect(verbVerdict('pause', ctx({ state })).allowed).toBe(true);
+    }
+  });
+
+  it('edit and pause deny a state outside the matrix', () => {
+    const state = 'quarantined' as HealthState;
+    expect(verbVerdict('edit', ctx({ state }))).toEqual({ allowed: false, reason: 'not_applicable' });
+    expect(verbVerdict('pause', ctx({ state }))).toEqual({ allowed: false, reason: 'not_applicable' });
+  });
+
   it('resume: only available when paused', () => {
     expect(availableVerbs(ctx({ state: 'paused' }))).toContain('resume');
     for (const state of ['healthy', 'late', 'stalled', 'processing', 'unknown', 'strand'] as HealthState[]) {
