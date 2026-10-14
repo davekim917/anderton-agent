@@ -910,7 +910,7 @@
 "src/concurrency.test.ts":{"diff":56,"mode":"100644","sha256":null,"deleted":true},
 "src/concurrency.ts":{"diff":35,"mode":"100644","sha256":null,"deleted":true},
 "src/config-webhook-port.test.ts":{"diff":175,"mode":"100644","sha256":null,"deleted":true},
-"src/config.ts":{"diff":153,"mode":"100644","sha256":"07f4943581578adf1035cf343d76942eab2adf2f36a47b88607c68f51c978d6a"},
+"src/config.ts":{"diff":158,"mode":"100644","sha256":"1987b34b0ba83011a7c802787a7a9ea2c294e68956699f495c0b34f5ae7a2b9e"},
 "src/container-config-model-defaults.test.ts":{"diff":162,"mode":"100644","sha256":null,"deleted":true},
 "src/container-config.test.ts":{"diff":1073,"mode":"100644","sha256":"9af5e427b185f89f4e0e42cb51733510d1ce9a4655c27f8f847b910d5afe5ad0"},
 "src/container-config.ts":{"diff":999,"mode":"100644","sha256":"8a39dd1e9a90643ae94dccb8edf70576f7d6dba6fd6996faa9831f388584c790"},
