@@ -6,8 +6,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$SCRIPT_DIR/smoke-develop-gate.sh"
-REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
-LEGACY_GATE_BASE=672f03a309a4f11f1ad194900d83a710c55765d6
 STATE_DIR="$(mktemp -d)"
 TEST_SHARED_ROOT="$(mktemp -d)"
 STUB_BIN="$(mktemp -d)"
@@ -21,7 +19,8 @@ cat > "$STUB_BIN/mountpoint" <<'STUB'
 STUB
 chmod +x "$STUB_BIN/mountpoint"
 LEGACY_GATE="$STUB_BIN/legacy-smoke-pr-gate.sh"
-git -C "$REPO_ROOT" show "$LEGACY_GATE_BASE:container/skills/smoke-test/scripts/smoke-pr-gate.sh" >"$LEGACY_GATE"
+# The gate as it shipped before task bindings, for claims a running older gate still writes.
+cp "$SCRIPT_DIR/testdata/legacy-smoke-pr-gate.sh" "$LEGACY_GATE"
 chmod +x "$LEGACY_GATE"
 export PATH="$STUB_BIN:$PATH"
 unset SMOKE_GATE_REPO SMOKE_GATE_BACKEND_SERVICE SMOKE_GATE_FRONTEND_SERVICE SMOKE_GATE_DEV_URL 2>/dev/null || true

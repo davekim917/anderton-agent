@@ -9,8 +9,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/smoke-case.sh"
 GATE="$SCRIPT_DIR/smoke-pr-gate.sh"
-REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
-LEGACY_GATE_BASE=672f03a309a4f11f1ad194900d83a710c55765d6
 
 STUB_BIN="$(mktemp -d)"
 TEST_SHARED_ROOT="$(mktemp -d)"
@@ -290,7 +288,14 @@ cat > "$STUB_BIN/mountpoint" <<'STUB'
 STUB
 chmod +x "$STUB_BIN/mountpoint"
 LEGACY_GATE="$STUB_BIN/legacy-smoke-pr-gate.sh"
-git -C "$REPO_ROOT" show "$LEGACY_GATE_BASE:container/skills/smoke-test/scripts/smoke-pr-gate.sh" >"$LEGACY_GATE"
+# The gate as it shipped before task bindings, for claims a running older gate still writes.
+cp "$SCRIPT_DIR/testdata/legacy-smoke-pr-gate.sh" "$LEGACY_GATE"
+# History's comments in the fixture named client incidents; it is published, so it stays code only.
+assert_legacy_fixture_code_only() {
+  [ "$(grep -c '^[[:space:]]*#' "$1")" -eq 3 ] || {
+    echo "$1 carries comment lines beyond its 3-line header" >&2; exit 1; }
+}
+assert_legacy_fixture_code_only "$SCRIPT_DIR/testdata/legacy-smoke-pr-gate.sh"
 chmod +x "$LEGACY_GATE"
 REAL_JQ="$(command -v jq)"
 export REAL_JQ

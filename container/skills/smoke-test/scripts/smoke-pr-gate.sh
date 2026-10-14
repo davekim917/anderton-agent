@@ -162,7 +162,7 @@ FREEZE_MARKER_FRONTEND="${FRONTEND_PREFIX}.render-freeze"
 # the frontend actually calls. Same knob name pattern as
 # SMOKE_BUILD_ID_BUNDLE_PATTERN so both move together if the shape of Vite's
 # hashed output ever changes; default already includes `-` (base64url content
-# hashes legitimately contain it, e.g. `index-Cg8w-v89.js` — the real #1533
+# hashes legitimately contain it, e.g. `index-Ab1c-d23.js` — shaped like a real
 # bundle name) rather than deferring that gap the way #1366 did.
 BUNDLE_PATTERN="${SMOKE_GATE_BUNDLE_PATTERN:-assets/index-[A-Za-z0-9_-]+\.js}"
 num_env IDENTITY_TIMEOUT SMOKE_GATE_IDENTITY_TIMEOUT 10
@@ -235,7 +235,7 @@ verdict_digest() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
 # The per-PR flock serializes gate PROCESSES; it cannot serialize CONTAINERS,
 # because two coordinators in two containers holding the same run id take that
 # lock at different moments and both proceed. That is what happened on the
-# pr1105 and pr1066 campaigns: two coordinators ran the same campaign
+# Two campaigns: two coordinators ran the same campaign
 # concurrently and overwrote each other's markers. The shared workgroup FS is
 # the only durable medium both can see, so the lease is a file with an expiry.
 num_env LEASE_TTL_SECONDS SMOKE_GATE_LEASE_TTL_SECONDS 900
@@ -1312,7 +1312,7 @@ task_lease_remove_fenced() {  # <runId>
 
 # --- Challenger disposition ------------------------------------------------
 # A campaign is not finishable until the challenger files a disposition, and
-# twice (pr1195, pr1228) one never was: challenger/disposition.md was never
+# twice one never was: challenger/disposition.md was never
 # written and the coordinator waited forever with nothing anywhere saying so.
 # `claim` now stamps a deadline and `challenger-timeout` converts an expired
 # one into a BLOCKED verdict — never into permission to synthesize.
@@ -1540,7 +1540,7 @@ emit_poll_lease_failure() { # <detail-json>
 # started a SECOND coordinator on the same PR and the same frozen SHA with
 # nothing telling the first — it discovered the displacement hours later, when
 # its own `progress` finally returned ok:false. Run
-# …-20260822T023125Z was displaced 4h00m03s after its claim: three seconds past
+# …-20260101T000000Z was displaced 4h00m03s after its claim: three seconds past
 # the 4h ceiling, having stamped progress four minutes earlier. It had already
 # been through this once in the same run, and a third run hit it two days
 # later. Overrun is now a reason to REFUSE a claim (see `claim`'s --takeover),
@@ -2435,8 +2435,8 @@ evaluate_pr() {
   # exactly the two marker files (see FREEZE_MARKER_BACKEND/FRONTEND above), so
   # for a freeze PR those two booleans are ALWAYS false, no matter what the
   # frozen TARGET commit (ci_sha, the marker's parent) actually contains.
-  # Confirmed live 2026-08-24 (challenger MG-1, PR #1188): the target carried
-  # migration 222_undo_edit_prior_actor and `check 1188` reported
+  # Confirmed live: the target carried
+  # a migration and `check <pr>` reported
   # migrationsTouched:false anyway.
   #
   # That fix recomputed them off `compare/$BRANCH...target` — which is empty
@@ -2703,11 +2703,11 @@ evaluate_pr() {
     # merge commit that lands ON develop keeps its runs under
     # head_branch=release/<...>, so `gh run list --branch develop` returned
     # zero rows for a fully green SHA and the gate could never settle
-    # (pr1330, 2026-08-30 — the coordinator's manual SHA-bound substitution,
+    # (the coordinator's manual SHA-bound substitution,
     # independently re-proved by the challenger, is exactly this query).
     # Same listing API family as `gh run list`, so the scoped-container-token
     # property that motivated the original `gh run list` choice carries over
-    # — and it was executed in-container under that token during pr1330.
+    # — and it was executed in-container under that token during one campaign.
     if runs_json="$(timeout 10 gh api "repos/$REPO/actions/runs?head_sha=$ci_sha&per_page=100" \
          --jq '[.workflow_runs[] | {headSha: .head_sha, status, conclusion, workflowName: .name}]' 2>/dev/null)" &&
        jq -e 'type == "array"' <<<"$runs_json" >/dev/null 2>&1; then
@@ -2832,8 +2832,8 @@ evaluate_pr() {
   # migrations still refuses (unchanged). A FREEZE does not: its target is
   # already on the tracked branch, so "the range carries a migration" (or "the
   # range is unknown") describes campaign scope, not whether this preview is
-  # safe to test. The failure that introduced the freeze refusal (migration
-  # 222 stopping a backend booting, 2026-08-24) is still caught, by the facts
+  # safe to test. The failure that introduced the freeze refusal (a migration
+  # that stopped a backend booting) is still caught, by the facts
   # that actually observe it: a backend that did not boot is never
   # backendReady/healthzReady. Target identity, CI, deploy identity, frontend
   # readiness and healthz all still gate a freeze below and via fetch_ok.
@@ -2899,7 +2899,7 @@ evaluate_pr() {
       # or "no sizing rules" when the install never supplied a rules file.
       campaignSize: $campaignSize, sizeReason: $sizeReason,
       # migrationFiles names the pending migrations directly — the whole point
-      # of this field is that an agent never has to re-derive what MG-1 took a
+      # of this field is that an agent never has to re-derive what one campaign took a
       # coordinator+challenger 30 minutes to find by hand. migrationsDeterminable
       # is false exactly when migrationsTouched is a fail-closed ASSUMPTION
       # (an unreadable diff) rather than a confirmed read — never report "no
@@ -3330,7 +3330,7 @@ if [ "$COMMAND" = "claim" ]; then
   # artifact, marker and posted message on the old identity while `finish` and
   # `challenger-timeout` — both of which guard on `.activeRunId` — will only
   # answer to the new one, so the campaign has no terminal path at all. That is
-  # exactly how pr1432 looped ~4h under ids nothing it had published named
+  # exactly how one campaign looped ~4h under ids nothing it had published named
   # (2026-09-02). Refuse:
   # reclaim under the published id, or say --takeover and mean it. Note this
   # can only bite once the incumbent is no longer live — a live run is already
@@ -3415,7 +3415,7 @@ if [ "$COMMAND" = "claim" ]; then
   # A reclaim that CONTINUES the same campaign (same SHA, no disposition yet)
   # keeps its original deadline. Stamping a fresh one on every recovery
   # reclaim reset the clock hourly and made `challenger-timeout` unreachable
-  # — pr1432 looped ~4h "stuck waiting on challenger" (2026-09-02).
+  # — one campaign looped ~4h "stuck waiting on challenger".
   CLAIM_RESUMED="$(jq -r --arg sha "$SHA" --arg run "$RUN_ID" \
     'if (.activeSha == $sha and .challengerDisposition == null and .activeRunId == $run)
      then "true" else "false" end' <<<"$STATE")"
@@ -4366,9 +4366,9 @@ if [ "$COMMAND" = "finish" ]; then
   # detect_freeze derives the develop TARGET by walking the supplied SHA's
   # first parent, so passing the target itself walks one commit too far and
   # the hold/publish/ledger artifacts all name a build the campaign never
-  # examined. Live: PR #1211's finish was called with df74301b (the target)
-  # instead of 6259d76b (the marker it claimed and tested); the promotion
-  # hold went out naming 9cf1ec10, PR #1199's commit. It exited ok:true.
+  # examined. Live: a PR's finish was called with the target commit
+  # instead of the marker it claimed and tested; the promotion
+  # hold went out naming another PR's commit. It exited ok:true.
   #
   # There is no legitimate case for a difference. The PR gate settles on
   # strict head/deploy equality (no deploy-lag SHA pair like the develop
@@ -4869,8 +4869,8 @@ if [ "$COMMAND" = "finish" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# challenger-timeout: end a campaign the challenger abandoned. Runs pr1195 and
-# pr1228 stalled indefinitely because challenger/disposition.md was never
+# challenger-timeout: end a campaign the challenger abandoned. Two runs
+# stalled indefinitely because challenger/disposition.md was never
 # written and nothing had a deadline. The ONLY outcome this verb can produce is
 # BLOCKED, and it produces it through the ordinary `finish` — a timeout that
 # unblocks a coordinator toward GO is worse than the stall it ends.
@@ -5450,7 +5450,7 @@ if [ -s "$ALARM_CANDIDATES" ]; then
       # migrationFiles/migrationsDeterminable ride along on every alarm
       # subtype (empty array for warmup/facts) rather than branching the jq
       # object on $W_SUB — harmless on the two subtypes that don't use it, and
-      # this is the wake message MG-1 needed: naming the pending migrations
+      # this is the wake message one campaign needed: naming the pending migrations
       # here is what makes the alarm itself the instant answer.
       jq -cn --argjson pr "$W_PR" --arg sha "$W_SHA" --arg trigger "$TRIGGER" \
         --argjson files "$(jq -c '.migrationFiles // []' <<<"$WINNER")" \
@@ -5585,7 +5585,7 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
   # id on reclaim published a second identity for one campaign while every
   # artifact, marker and message still named the first — and `finish` and
   # `challenger-timeout` both guard on `.activeRunId`, so the campaign was left
-  # with no terminal path under the id it had already announced. pr1432 burned
+  # with no terminal path under the id it had already announced. One campaign burned
   # ~4h that way: one campaign, three run ids, no terminal path (2026-09-02). A reclaim on the same
   # frozen SHA with no disposition yet is a CONTINUATION, so it resumes the id
   # (same predicate `claim` refuses id drift on, and the same one the deadline

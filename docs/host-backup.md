@@ -120,12 +120,12 @@ aws sts assume-role --role-arn <break-glass role ARN> --role-session-name restor
 # One file or subtree, as of the latest manifest (or --as-of <ISO time>):
 AWS_PROFILE=<profile> node_modules/.bin/tsx scripts/host-backup.ts restore \
   --config /etc/nanoclaw-backup/config.json \
-  --prefix /home/ubuntu/nanoclaw-v2/data/v2.db --dest /tmp/restore
+  --prefix <install dir>/data/v2.db --dest /tmp/restore
 ```
 
 `--dest` must not exist yet. Restore creates it mode 0700, so no other user can plant a link
 inside while the restore runs. Paths keep their absolute layout under it, so the example
-writes `/tmp/restore/home/ubuntu/nanoclaw-v2/data/v2.db`. Restore picks the newest run
+writes `/tmp/restore<install dir>/data/v2.db`. Restore picks the newest run
 manifest written at or before `--as-of` and prints any failures that night's run recorded. For each file it takes the newest version no later than that manifest,
 checks it against the manifest's sha256, and falls back to an older retained version with the
 right hash. Files come first and symlinks last, so nothing is ever written through a restored
@@ -158,8 +158,8 @@ about 9 minutes to install packages and build the agent image, 29 to restore, 7 
 file against the manifest, and 35 to copy the tree into place. The restored host started, passed
 its OneCLI preflight, and failed only to reach Slack and Discord. Steps the sources do not carry:
 
-- Create `ubuntu` as uid and gid 1001 before restoring. Ownership is restored by number, and a
-  stock image makes `ubuntu` 1000.
+- Create the install's user with the same uid and gid it had on the old host before restoring.
+  Ownership is restored by number, and a stock image's default user may hold a different one.
 - Restore the OneCLI host directory, key file included, before the OneCLI container first
   starts (see below). Starting it without the key generates a new one, and every stored secret
   becomes unreadable.
@@ -174,7 +174,7 @@ its OneCLI preflight, and failed only to reach Slack and Discord. Steps the sour
 The vault is encrypted secrets in the OneCLI Postgres database plus the key that decrypts them.
 Without `SECRET_ENCRYPTION_KEY` in its environment, the OneCLI image generates that key into
 `/app/data/secret-encryption-key`, so it lives in whichever host directory backs `/app/data`. A
-dump without that key is useless. This install gates both behind
+dump without that key is useless. The backup gates both behind
 `/etc/nanoclaw-backup/onecli.enabled`: a `pg_dumpall` of the Postgres container
 (`onecli-postgres.sql`), and the OneCLI host directory minus the live Postgres data directory,
 which the dump replaces. The operator enables it with `sudo touch /etc/nanoclaw-backup/onecli.enabled`.

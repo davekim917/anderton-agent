@@ -150,7 +150,7 @@ When this rule, or any merge-check rule, changes on main, re-extract the gate
 before the next merge. A PR merged through a skill copy extracted before the
 change landed, but merged after it, is audited under the rule its merge
 commit carries — each merge is audited with its own commit's copy of the
-skill (`.github/scripts/gate-audit.sh:175-180`) — and can be flagged
+skill (the CI job's `gate-audit.sh`) — and can be flagged
 `gate-bypass`. No go-live cutoff is needed.
 
 A class on a second aggregate line must name a structural fix on its newest
@@ -250,8 +250,8 @@ is the primitive, not the next call site: the loop refuses site patches until
 it lands. A finding class is the invariant a finding cites plus the seam its
 flagged sites share, so one missing guard reported at four call sites is one
 class with four rounds, not four files with one round each — the shape a
-file-level detector cannot see, and the shape that ran PR #291 to fourteen
-rounds. `pr-review-loop`'s gate (`codex-review.sh gate`, run by
+file-level detector cannot see, and the shape that has run a single PR to
+fourteen rounds. `pr-review-loop`'s gate (`codex-review.sh gate`, run by
 `codex-review.sh push`) makes this deterministic: three rounds on one class, or
 on one seam with severity not falling, exits non-zero naming the class, the
 sites and the candidate primitive, and lifts only on a commit that touches that
@@ -277,9 +277,9 @@ whoever writes the fix — a review loop, an auto-fix pass, a worker:
   (a new helper layer, flag, wrapper, config), a new dependency, or edits
   outside the diff's existing footprint, it leaves the batch: post the
   finding with the fix you would make and let a human route it onto this PR
-  or its own. Measured on this fleet (2026-08-31, last 20 merged PRs): 94%
-  of later-round findings landed on code fix commits had touched — the
-  fixes, not the original diffs, were generating the rounds.
+  or its own. Measured over 20 consecutive merged PRs: 94% of later-round
+  findings landed on code fix commits had touched — the fixes, not the
+  original diffs, were generating the rounds.
 - **Simplification over machinery.** Prefer the fix that subtracts: tighten
   an existing guard, hoist the check to the seam every caller shares, delete
   the path the finding lives on. If no simplifying fix exists, that is a

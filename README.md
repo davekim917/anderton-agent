@@ -10,7 +10,7 @@ Early. Anderton Agent is built and used daily by one operator, on one Linux host
 
 - It is built on [NanoClaw](https://github.com/nanocoai/nanoclaw) and still uses NanoClaw's internal names: the `ncl` CLI, `nanoclaw.sh`, the `nanoclaw-v2-<slug>` service and the `nanoclaw-agent-v2-<slug>` container image.
 - It runs on Linux. The setup scripts also carry NanoClaw's macOS path, which is not exercised here.
-- Slack and Discord ship in this tree. Other channels install from NanoClaw's own `channels` branch and have not been tested against this code.
+- Slack and Discord ship in this tree. Other channels install from NanoClaw's own `channels` branch and have not been tested against this code. To fetch that branch, setup adds a git remote named `upstream` pointing at NanoClaw's repository.
 - Expect breaking changes. [CHANGELOG.md](CHANGELOG.md) records the ones that need an action from you.
 
 ## What it adds to NanoClaw
@@ -47,7 +47,7 @@ bash nanoclaw.sh
 
 ## Contributing
 
-Issues and pull requests are welcome here. Development happens in a private repository, and this one is exported from it, so an accepted pull request is merged there and comes back here in the next export. `CONTRIBUTING.md` is still NanoClaw's and describes contributing to NanoClaw itself.
+Issues and pull requests are welcome here. Development happens in a private repository, and this one is exported from it, so an accepted pull request is merged there and comes back here in the next export. [CONTRIBUTING.md](CONTRIBUTING.md) has the details.
 
 ## Credits
 

@@ -412,7 +412,9 @@ describe('judgeCommit keeps AI-supplied text out of the hold reasons', () => {
 
 describe('loadApprovedBinaries', () => {
   it('approves nothing when the list is missing', () => {
-    expect(loadApprovedBinaries(path.join(os.tmpdir(), 'public-export-no-such-list'))).toEqual(new Set());
+    expect(
+      loadApprovedBinaries(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'public-export-missing-')), 'no-such-list')),
+    ).toEqual(new Set());
   });
 
   it('takes only full blob ids from the first column', () => {

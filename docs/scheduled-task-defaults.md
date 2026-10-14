@@ -21,17 +21,11 @@ One deliberate difference from chat: a **pure** task wake that OPENS a query doe
 
 The sticky suppression is deliberately provider-neutral: `getStickyModel` is not Claude-specific, so an unpinned Codex or OpenCode task inherited an interactive `-m` exactly the same way and now does not. **Inventory every group, not just your Claude ones.**
 
-A task's own pin still wins over everything, unchanged — which is what makes the practical impact small for most installs (see the measured state below).
+A task's own pin still wins over everything, unchanged — which is what makes the practical impact small for most installs.
 
-### Measured state on this install, 2026-09-08
+### Checking your own install
 
-Verified by reading `container.json` for every group and cross-referencing live series (not inferred):
-
-- 15 non-Claude groups exist (8 Codex, 7 OpenCode).
-- Exactly **one** of them has a live recurring series.
-- That series is **pinned** to `gpt-6-astra`/`high`, and a pin wins under the new code exactly as it did under the old.
-
-**So zero non-Claude series change behaviour here today.** That is a fact about the current fleet, not a property of the change. Re-check it if you add an unpinned Codex or OpenCode scheduled task — such a task _would_ be affected, and nothing warns you.
+Read `container.json` for every non-Claude group and cross-reference its live recurring series. Only an **unpinned** Codex or OpenCode series changes behaviour; a series pinned to a model and effort keeps them, exactly as before. Whatever you find is a fact about your current fleet, not a property of the change: re-check it when you add an unpinned Codex or OpenCode scheduled task, since such a task _would_ be affected and nothing warns you.
 
 This doc is the migration path for that change, written to be handed to a coding agent verbatim: detect → why → fix → verify → rollback.
 

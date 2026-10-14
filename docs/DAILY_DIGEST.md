@@ -45,7 +45,7 @@ GitHub App sentinel—the same chain used for its container.
 ```json
 "dailySummary": {
   "messagingGroupId": "mg-1700000000000-example11",
-  "githubIssuesRepo": "davekim917/nanoclaw"
+  "githubIssuesRepo": "example-owner/example-repo"
 }
 ```
 

@@ -71,6 +71,8 @@ PROGRESS_LOG="$LOGS_DIR/setup.log"
 # so `setup_launched` covers dropoff before bootstrap even starts.
 # shellcheck source=setup/lib/diagnostics.sh
 source "$PROJECT_ROOT/setup/lib/diagnostics.sh"
+# shellcheck source=setup/lib/clone-url.sh
+source "$PROJECT_ROOT/setup/lib/clone-url.sh"
 ph_event setup_launched \
   platform="$(uname -s | tr 'A-Z' 'a-z')" \
   is_wsl="$([ -f /proc/version ] && grep -qi 'microsoft\|wsl' /proc/version 2>/dev/null && echo true || echo false)"
@@ -278,7 +280,13 @@ if [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" -eq 0 ]; then
       printf '  %s\n' "$(dim '3. Enable passwordless sudo:    echo "nanoclaw ALL=(ALL) NOPASSWD:ALL" | tee /etc/sudoers.d/nanoclaw')"
       printf '  %s\n' "$(dim '4. Log out:                     exit')"
       printf '  %s\n' "$(dim '5. Log back in as the new user: ssh nanoclaw@your-server')"
-      printf '  %s\n' "$(dim '6. Clone the repo:              git clone https://github.com/nanocoai/nanoclaw.git && cd nanoclaw')"
+      CLONE_URL="$(clone_url_of "$PROJECT_ROOT")"
+      CLONE_DIR="$(basename "$PROJECT_ROOT")"
+      if [ -n "$CLONE_URL" ]; then
+        printf '  %s\n' "$(dim "6. Clone the repo:              git clone -- $(printf '%q' "$CLONE_URL") $(printf '%q' "$CLONE_DIR") && cd -- $(printf '%q' "$CLONE_DIR")")"
+      else
+        printf '  %s\n' "$(dim "6. Copy this checkout:          $(printf '%q' "$PROJECT_ROOT") into the new user's home, then cd into it")"
+      fi
       printf '  %s\n\n' "$(dim '7. Re-run setup:               bash nanoclaw.sh')"
       exit 1
       ;;

@@ -305,6 +305,6 @@ node_modules/.bin/tsx scripts/check-public-boundary.ts -- --root "$W" --index
 ```
 
 with root = the worktree, so its own index is scanned (the identifier registry falls back to the main
-checkout through git commondir). `--root /home/ubuntu/nanoclaw-v2` from a worktree scans the live index and
+checkout through git commondir). `--root <live checkout>` from a worktree scans the live index and
 proves nothing. A report saying `structural patterns only — no identifier registry found` means blind —
 hold the push.

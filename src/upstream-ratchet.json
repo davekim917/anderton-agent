@@ -566,7 +566,7 @@
 "launchd/com.nanoclaw.plist":{"diff":0,"mode":"100644","sha256":"e4774e918620ffcb887994db8db3c2761999c6a5d2cb2116bebb8a9a752c8b68"},
 "migrate-v2-reset.sh":{"diff":0,"mode":"100644","sha256":"1fb069bc90b08f2be7dc5af1190a8736f3a30b6855c017f81e838dc18f01892a"},
 "migrate-v2.sh":{"diff":93,"mode":"100644","sha256":"b7f76e28d4976ea5a82b184ad364bbf2de64af13c51d98021ebacf5a48ec8faf"},
-"nanoclaw.sh":{"diff":53,"mode":"100755","sha256":"6c1bd054c3e835db9aa671df227ba5c1317ae08c85ef457e93ea6944576e5f70"},
+"nanoclaw.sh":{"diff":63,"mode":"100755","sha256":"074ae2b7b37845ba4047a38043d3d6dbe9a34d0ec14aa46f710df3bf532b1d33"},
 "package.json":{"diff":90,"mode":"100644","sha256":"93695b643322e8a4443127866651265481a2b2475a1fbe969ada7aaa7af258a2"},
 "pnpm-lock.yaml":{"diff":2587,"mode":"100644","sha256":"603c43fe9a0357e26874fe7bcc306022d90f26d1b5bc8fb4e9222ff4c47d0b38"},
 "pnpm-workspace.yaml":{"diff":18,"mode":"100644","sha256":"e5fd678ad7cf284ac1d83e2eb4b291ac813b6b4804dd074e649a89b5a4eee6c8"},

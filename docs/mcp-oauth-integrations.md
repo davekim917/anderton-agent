@@ -233,7 +233,7 @@ it, drop its secret from the old group's workgroup `onecli_secrets` and its `con
 `onecliSecrets`, wherever it is declared, then log in under the new group — the same order
 `startLogin`'s own refusal prints.
 Do **not** reach for `--delete-secret` here: a `--secret` may name a secret that predates the
-integration and that other groups are granted (`Littlebird` on this install is exactly that), and
+integration and that other groups are granted, and
 deleting it to move one integration takes it away from all of them.
 
 ## Removing one

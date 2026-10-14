@@ -254,7 +254,7 @@ This is every **unresolved** thread, not just the newest review. Threads you rep
 
 ## Step 2 — Triage every item before touching code
 
-Read `docs/review-notes.md` and every `docs/review-notes/<PR>.md` fragment before writing or reviewing code (in a container: `/workspace/project/docs/review-notes.md` and `/workspace/project/docs/review-notes/`). A finding in a class already there is a repeat, and its line names the check that should have caught it.
+Read `docs/review-notes.md` and every `docs/review-notes/<PR>.md` fragment before writing or reviewing code (in a container: `/workspace/project/docs/review-notes.md` and `/workspace/project/docs/review-notes/`). A finding in a class already there is a repeat, and its line names the check that should have caught it. A repository that keeps no review-notes registry skips this read.
 
 ### First, check the premise — every round, before the verdicts
 
