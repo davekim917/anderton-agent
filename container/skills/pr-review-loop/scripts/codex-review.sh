@@ -63,7 +63,9 @@
 #       (admin_readiness); only `admin=ready` licenses `gh pr merge --admin`. A legacy
 #       head still gets 24 first when a check GitHub marks required for the PR is red on it
 #       (`required_red`) or the newest independent-review-receipt:v1 for it is not
-#       CLEAR (`independent_receipt_not_clear`) — legacy_precheck — or on `comment_rule`
+#       CLEAR (`independent_receipt_not_clear`) — legacy_precheck — or on `comment_rule`,
+#       and also while any review thread is unresolved or Codex's 👀 shows a review
+#       still running on the PR
 #   27  merge: merge-check allowed the head, but `gh pr merge` did not merge it
 #   28  audit: merge-check would have refused this PR at its merge, or it merged by a
 #       method the gate does not authorize (rebase or manual) — a gate bypass
@@ -230,7 +232,7 @@ comments_page() {
     query($owner:String!,$name:String!,$pr:Int!,$after:String){
       repository(owner:$owner,name:$name){ pullRequest(number:$pr){
         headRefOid comments(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
-          author{login} createdAt lastEditedAt body
+          author{login} createdAt lastEditedAt body reactions(content:EYES,first:100){ totalCount nodes{ createdAt user{login} } }
         } }
       } }
     }' \
@@ -297,6 +299,23 @@ unresolved_thread_count() {
   printf '%s\n' "$pages" | jq -s --arg asOf "$GATE_AS_OF" '
     [ .[] | .data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)
       | select($asOf == "" or ((.comments.nodes[0].createdAt // "") | . == "" or . < $asOf)) ] | length'
+}
+
+# Codex's 👀 on the PR, or on an `@codex review` request comment, while a review is running; it is removed when the
+# review posts. Prints when the newest one was added, `unknown` when a request's 👀 do not fit on one page, or nothing
+# when there is none.
+codex_review_in_flight() {
+  local reaction_pages comment_pages
+  reaction_pages=$(paginate_connection reactions reactions_page) || return 1
+  comment_pages=$(paginate_connection comments comments_page) || return 1
+  printf '%s\n%s\n' "$reaction_pages" "$comment_pages" | jq -rs '
+    def codex: (.user.login // "") | ascii_downcase | startswith("chatgpt-codex-connector");
+    [ .[] | .data.repository.pullRequest ] as $prs
+    | [ $prs[].comments.nodes[]? | select((.body // "") | test("(^|\\s)@codex\\s+review"; "i")) ] as $requests
+    | if any($requests[]; (.reactions.totalCount // 0) > (.reactions.nodes | length)) then "unknown"
+      else [ ($prs[].reactions.nodes[]? | select(.content == "EYES" and codex)),
+             ($requests[].reactions.nodes[]? | select(codex)) | .createdAt ] | max // empty
+      end'
 }
 
 status_observation() {
@@ -1458,10 +1477,10 @@ receipt_comments_page() {
 # `changes` receipt posted the same second the PR merged pass as if it never
 # happened.
 receipt_outcome() {
-  local pages
+  local pages with_at="${2:-}"
   pages=$(paginate_connection comments receipt_comments_page) || return 1
   pages=$(author_standing "$pages") || return 1
-  printf '%s\n' "$pages" | jq_here -rs --arg re "$RECEIPT_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" --arg head "$1" --arg asof "$GATE_AS_OF" '
+  printf '%s\n' "$pages" | jq_here -rs --arg re "$RECEIPT_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" --arg head "$1" --arg asof "$GATE_AS_OF" --arg withAt "$with_at" '
     include "receipt-order";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.standing == "yes")
@@ -1489,7 +1508,7 @@ receipt_outcome() {
           elif $unread != null then
             "unknown\t\($unread.author.login // "someone") posted a comment at \($unread.createdAt), the second the PR merged, so it may have come after the merge"
           elif $latest == null then empty
-          else "\($latest.outcome)\t\($latest.reviewer)" end
+          else "\($latest.outcome)\t\($latest.reviewer)" + (if $withAt == "" then "" else "\t\($latest.at)" end) end
         end'
 }
 
@@ -2208,6 +2227,30 @@ merge_check_main() {
       exit 24
     fi
     legacy_precheck
+    # Step 6 still decides a legacy merge, but never past an open thread or a review still running on the PR.
+    local legacy_open legacy_eyes
+    legacy_open=$(unresolved_thread_count) || exit 1
+    if [ "$legacy_open" -gt 0 ]; then
+      echo "merge=refused head=$SCOPE_HEAD mode=legacy: $legacy_open review thread(s) are unresolved; answer and resolve each before merging" >&2
+      exit 24
+    fi
+    legacy_eyes=$(codex_review_in_flight) || exit 1
+    # A 👀 left behind by a stalled or failed review would hold forever; an approving substitute receipt from a
+    # frontier reviewer for exactly this head is the fallback that review was waiting on, so it stands in. A 👀 added
+    # in or after the receipt's second is a review the receipt never saw.
+    if [ -n "$legacy_eyes" ]; then
+      local legacy_receipt receipt_word receipt_who receipt_at
+      legacy_receipt=$(receipt_outcome "$SCOPE_HEAD" with-time) || exit 1
+      IFS=$'\t' read -r receipt_word receipt_who receipt_at <<<"$legacy_receipt"
+      if [ "$receipt_word" = approve ] && reviewer_model_allowed "$receipt_who" \
+        && [ "$legacy_eyes" != unknown ] && [[ "$legacy_eyes" < "$receipt_at" ]]; then
+        legacy_eyes=
+      fi
+    fi
+    if [ -n "$legacy_eyes" ]; then
+      echo "merge=refused head=$SCOPE_HEAD mode=legacy: a Codex review is still running on this PR (👀); wait for it (codex-review.sh wait) before merging" >&2
+      exit 24
+    fi
     final_gates
     if [ -n "$LEGACY_CI_HOST" ]; then
       local admin
