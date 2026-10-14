@@ -485,7 +485,7 @@
 "container/agent-runner/src/providers/cwd-shim.ts":{"diff":3,"mode":"100644","sha256":"11b5fe6219dee913ab7538cdeb3078bb4047f2464aea7a7600d48aad113959da"},
 "container/agent-runner/src/providers/factory.test.ts":{"diff":231,"mode":"100644","sha256":"7db6305adf2e14daee71bb0e29b6c884dc8fdd60446dbabb1fb7139f734f3dda"},
 "container/agent-runner/src/providers/factory.ts":{"diff":45,"mode":"100644","sha256":"39d2c109e192220718d5744259fdba026d001b24584229c75dc8e5421aaea116"},
-"container/agent-runner/src/providers/index.ts":{"diff":2,"mode":"100644","sha256":"e48bf1b194e655ad56d318fc9ba6f5bc7c82b226e37274472e7da810479cdda1"},
+"container/agent-runner/src/providers/index.ts":{"diff":3,"mode":"100644","sha256":"030527f5a08a58c51b712a7a4c3215879729354bce7f2a05d72d157cf860fdce"},
 "container/agent-runner/src/providers/legacy-payload-compat.test.ts":{"diff":73,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/providers/mock.conformance.test.ts":{"diff":9,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/providers/mock.ts":{"diff":43,"mode":"100644","sha256":"52f491f6b1cd5f33aefe943000c2ddb5d55f7c90abf84178d7f835c3c36164cf"},

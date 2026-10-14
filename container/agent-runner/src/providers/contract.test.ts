@@ -6,7 +6,6 @@ import path from 'path';
 import { discoverPortableSkills, type AgentRuntime } from '../plugin-skill-discovery.js';
 import { declaredContractNames, providerContract } from './contract.js';
 import './index.js';
-import './mock.js';
 import { listProviderNames } from './provider-registry.js';
 
 describe('provider contracts', () => {
