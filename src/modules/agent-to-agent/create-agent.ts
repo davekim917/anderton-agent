@@ -23,6 +23,15 @@ import { requestApproval, type ApprovalHandler } from '../approvals/index.js';
 import { createDestination, getDestinationByName, normalizeName } from './db/agent-destinations.js';
 import { writeDestinations } from './write-destinations.js';
 
+/** The runner's test-only providers; the container's MCP check is no trust boundary, so request and apply refuse them too. */
+export const TEST_ONLY_AGENT_PROVIDERS: ReadonlySet<string> = new Set(['mock']);
+
+function refuseTestOnlyProvider(provider: string | undefined): string | null {
+  return provider !== undefined && TEST_ONLY_AGENT_PROVIDERS.has(provider)
+    ? `create_agent failed: provider '${provider}' is test-only and cannot back a new agent.`
+    : null;
+}
+
 export interface CreateAgentFollowUpContext {
   session: Session;
   group: AgentGroup;
@@ -114,6 +123,11 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
     await notifyAgent(session, 'create_agent failed: provider_config must be a plain object.');
     return;
   }
+  const testOnlyRefusal = refuseTestOnlyProvider(provider);
+  if (testOnlyRefusal) {
+    await notifyAgent(session, testOnlyRefusal);
+    return;
+  }
   if (typeof name !== 'string' || name.trim() === '') {
     await notifyAgent(session, 'create_agent failed: name must be a non-empty string.');
     return;
@@ -157,6 +171,12 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
   const instructions = (payload.instructions as string | null) ?? null;
   const provider = (payload.provider as string | null) ?? undefined;
   const providerConfig = (payload.providerConfig as Record<string, unknown> | null) ?? undefined;
+
+  const testOnlyRefusal = refuseTestOnlyProvider(provider);
+  if (testOnlyRefusal) {
+    await notifyAgent(session, testOnlyRefusal);
+    return;
+  }
 
   const sourceGroup = await getAgentGroup(session.agent_group_id);
   if (!sourceGroup) {

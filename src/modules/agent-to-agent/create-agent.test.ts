@@ -92,7 +92,12 @@ vi.mock('../approvals/index.js', async (importOriginal) => ({
 import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { STANDING_INSTRUCTIONS_FILE } from '../../group-persona.js';
-import { applyCreateAgent, handleCreateAgent, registerCreateAgentFollowUp } from './create-agent.js';
+import {
+  applyCreateAgent,
+  handleCreateAgent,
+  registerCreateAgentFollowUp,
+  TEST_ONLY_AGENT_PROVIDERS,
+} from './create-agent.js';
 import type { PendingApproval, Session } from '../../types.js';
 
 /**
@@ -105,33 +110,37 @@ async function runCreateAgent(content: Record<string, unknown>, session: Session
   await handleCreateAgent(content, session);
   if (capturedApprovalRequests.length > 0) {
     const req = capturedApprovalRequests[0];
-    await applyCreateAgent({
-      session: req.session as Session,
-      payload: req.payload,
-      approval: {
-        approval_id: 'test-approval',
-        session_id: (req.session as Session).id,
-        request_id: 'test-request',
-        action: 'create_agent',
-        payload: JSON.stringify(req.payload),
-        created_at: now(),
-        agent_group_id: (req.session as Session).agent_group_id,
-        channel_type: null,
-        platform_id: null,
-        instance: null,
-        thread_id: null,
-        platform_message_id: null,
-        expires_at: null,
-        status: 'pending',
-        title: 'Create agent',
-        question: 'Create this agent?',
-        options_json: '[]',
-        approver_user_id: 'test-admin',
-      } satisfies PendingApproval,
-      userId: 'test-admin',
-      notify: async () => {},
-    });
+    await applySavedApproval(req.payload, req.session as Session);
   }
+}
+
+async function applySavedApproval(payload: Record<string, unknown>, session: Session): Promise<void> {
+  await applyCreateAgent({
+    session: session,
+    payload: payload,
+    approval: {
+      approval_id: 'test-approval',
+      session_id: session.id,
+      request_id: 'test-request',
+      action: 'create_agent',
+      payload: JSON.stringify(payload),
+      created_at: now(),
+      agent_group_id: session.agent_group_id,
+      channel_type: null,
+      platform_id: null,
+      instance: null,
+      thread_id: null,
+      platform_message_id: null,
+      expires_at: null,
+      status: 'pending',
+      title: 'Create agent',
+      question: 'Create this agent?',
+      options_json: '[]',
+      approver_user_id: 'test-admin',
+    } satisfies PendingApproval,
+    userId: 'test-admin',
+    notify: async () => {},
+  });
 }
 
 function now(): string {
@@ -511,6 +520,57 @@ describe('envelope guard — non-string provider', () => {
 
     expect(await getAgentGroupByFolder('x')).toBeUndefined();
     expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'x'))).toBe(false);
+  });
+});
+
+describe('test-only provider', () => {
+  it('refuses provider=mock at request time, before any approval card goes out', async () => {
+    const { writeSessionMessage } = await import('../../session-manager.js');
+    const session = makeSession();
+
+    await runCreateAgent({ requestId: 'r-mock', name: 'X', provider: 'mock' }, session);
+
+    expect(capturedApprovalRequests).toHaveLength(0);
+    const calls = (writeSessionMessage as ReturnType<typeof vi.fn>).mock.calls;
+    const notifyCall = calls.find((c) => (JSON.parse(c[2].content as string).text as string).includes('test-only'));
+    expect(notifyCall).toBeDefined();
+    expect(await getAgentGroupByFolder('x')).toBeUndefined();
+  });
+
+  it('refuses provider=mock when a saved approval replays straight into apply', async () => {
+    const { writeSessionMessage } = await import('../../session-manager.js');
+    const session = makeSession();
+
+    await applySavedApproval(
+      { name: 'X', instructions: null, provider: 'mock', providerConfig: null, requestId: 'r-saved' },
+      session,
+    );
+
+    const calls = (writeSessionMessage as ReturnType<typeof vi.fn>).mock.calls;
+    const notifyCall = calls.find((c) => (JSON.parse(c[2].content as string).text as string).includes('test-only'));
+    expect(notifyCall).toBeDefined();
+    expect(await getAgentGroupByFolder('x')).toBeUndefined();
+    expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'x'))).toBe(false);
+  });
+
+  it('matches every provider the runner registers as test-only', () => {
+    const providersDir = path.join(process.cwd(), 'container', 'agent-runner', 'src', 'providers');
+    const registered = new Set<string>();
+    let parsedRegistrations = 0;
+    let testOnlyFlags = 0;
+    for (const file of fs.readdirSync(providersDir)) {
+      if (!file.endsWith('.ts') || file.endsWith('.test.ts') || file === 'provider-registry.ts') continue;
+      const source = fs.readFileSync(path.join(providersDir, file), 'utf8');
+      testOnlyFlags += source.match(/testOnly:\s*true/g)?.length ?? 0;
+      for (const m of source.matchAll(/registerProvider\(\s*'([^']+)'[^;]*\{\s*testOnly:\s*true\s*\}/g)) {
+        registered.add(m[1]!);
+        parsedRegistrations += 1;
+      }
+    }
+    expect(registered.size).toBeGreaterThan(0);
+    // A registration shape the pattern misses would drop out of both lists and pass silently.
+    expect(parsedRegistrations).toBe(testOnlyFlags);
+    expect([...TEST_ONLY_AGENT_PROVIDERS].sort()).toEqual([...registered].sort());
   });
 });
 

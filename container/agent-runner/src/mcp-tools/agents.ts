@@ -14,7 +14,11 @@
 import { writeMessageOut } from '../db/messages-out.js';
 // Side-effect import: otherwise this MCP subprocess has an empty provider registry.
 import '../providers/index.js';
-import { listProviderNames, validateProviderConfig } from '../providers/provider-registry.js';
+import {
+  listProviderNames,
+  listSelectableProviderNames,
+  validateProviderConfig,
+} from '../providers/provider-registry.js';
 import { registerTools } from './server.js';
 import { err, generateId, log, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
@@ -64,10 +68,12 @@ export const createAgent: McpToolDefinition = {
     const providerConfig = args.provider_config as Record<string, unknown> | undefined;
 
     if (provider !== undefined) {
-      const registered = listProviderNames();
-      if (!registered.includes(provider)) {
+      const selectable = listSelectableProviderNames();
+      if (!selectable.includes(provider)) {
         return err(
-          `Provider '${provider}' is not registered. Registered: [${registered.join(', ')}]. Run /add-${provider} on the host first.`,
+          listProviderNames().includes(provider)
+            ? `Provider '${provider}' is test-only and cannot back a new agent. Registered: [${selectable.join(', ')}].`
+            : `Provider '${provider}' is not registered. Registered: [${selectable.join(', ')}]. Run /add-${provider} on the host first.`,
         );
       }
     }

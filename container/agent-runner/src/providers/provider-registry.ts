@@ -12,13 +12,15 @@ import type { AgentProvider, ProviderOptions } from './types.js';
 export type ProviderFactory = (options: ProviderOptions) => AgentProvider;
 
 const registry = new Map<string, ProviderFactory>();
+const testOnlyProviders = new Set<string>();
 const schemaRegistry = new Map<string, z.ZodType>();
 
-export function registerProvider(name: string, factory: ProviderFactory): void {
+export function registerProvider(name: string, factory: ProviderFactory, options: { testOnly?: boolean } = {}): void {
   if (registry.has(name)) {
     throw new Error(`Provider already registered: ${name}`);
   }
   registry.set(name, factory);
+  if (options.testOnly) testOnlyProviders.add(name);
 }
 
 export function getProviderFactory(name: string): ProviderFactory {
@@ -32,6 +34,10 @@ export function getProviderFactory(name: string): ProviderFactory {
 
 export function listProviderNames(): string[] {
   return [...registry.keys()];
+}
+
+export function listSelectableProviderNames(): string[] {
+  return listProviderNames().filter((name) => !testOnlyProviders.has(name));
 }
 
 export function registerProviderConfigSchema(name: string, schema: z.ZodType): void {

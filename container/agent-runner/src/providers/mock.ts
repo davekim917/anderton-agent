@@ -82,4 +82,4 @@ export class MockProvider implements AgentProvider {
   }
 }
 
-registerProvider('mock', (opts) => new MockProvider(opts));
+registerProvider('mock', (opts) => new MockProvider(opts), { testOnly: true });

@@ -5,16 +5,38 @@ import { z } from 'zod';
 // to get a fresh registry. Instead, we test using the exported functions directly
 // and rely on unique provider names per test to avoid cross-test collisions.
 import {
+  registerProvider,
   registerProviderConfigSchema,
   getProviderConfigSchema,
+  getProviderFactory,
+  listProviderNames,
+  listSelectableProviderNames,
   validateProviderConfig,
 } from './provider-registry.js';
+import type { AgentProvider } from './types.js';
 
 // Use unique names per test to avoid collisions since the registry is module-global.
 let counter = 0;
 function uniqueName(): string {
   return `test-provider-${counter++}`;
 }
+
+describe('registerProvider testOnly', () => {
+  it('a test-only provider still resolves by name but is not selectable', () => {
+    const name = uniqueName();
+    const factory = () => ({}) as AgentProvider;
+    registerProvider(name, factory, { testOnly: true });
+    expect(getProviderFactory(name)).toBe(factory);
+    expect(listProviderNames()).toContain(name);
+    expect(listSelectableProviderNames()).not.toContain(name);
+  });
+
+  it('a provider registered without the flag is selectable', () => {
+    const name = uniqueName();
+    registerProvider(name, () => ({}) as AgentProvider);
+    expect(listSelectableProviderNames()).toContain(name);
+  });
+});
 
 describe('registerProviderConfigSchema', () => {
   it('test_registerProviderConfigSchema_duplicate_throws: throws on duplicate registration', () => {

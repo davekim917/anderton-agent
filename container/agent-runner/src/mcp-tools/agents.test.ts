@@ -78,6 +78,19 @@ describe('create_agent handler', () => {
     expect(systemActions()).toHaveLength(0);
   });
 
+  it('refuses the test-only mock provider and never offers it', async () => {
+    const refused = await createAgent.handler({ name: 'X', provider: 'mock' });
+    expect(refused.isError).toBe(true);
+    const refusal = refused.content[0].text as string;
+    expect(refusal).toContain('test-only');
+    expect(refusal.slice(refusal.indexOf('Registered:'))).not.toContain('mock');
+
+    const unknown = await createAgent.handler({ name: 'X', provider: 'nonexistent' });
+    expect(unknown.content[0].text as string).not.toContain('mock');
+
+    expect(systemActions()).toHaveLength(0);
+  });
+
   it('test_create_agent_unknown_key_rejected: unknown key in provider_config returns error; no system action written', async () => {
     const result = await createAgent.handler({
       name: 'X',
