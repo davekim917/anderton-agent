@@ -3479,6 +3479,36 @@ describe('codex-review risk-scoped review requests', () => {
   });
 
   it.each([
+    ['a Codex thread', thread(false)],
+    ['a thread from another reviewer', { ...thread(false), comments: { nodes: [{ author: { login: 'some-reviewer' } }] } }],
+  ])('refuses an approving substitute receipt while %s is unresolved', (_case, open) => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      comments: [marker(HEAD, 1), receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z')],
+      threads: [thread(true), open],
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain(`merge=refused head=${HEAD}`);
+    expect(result.stderr).toContain('1 review thread(s) are unresolved');
+  });
+
+  it('allows an approving substitute receipt when every thread is resolved', () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      comments: [marker(HEAD, 1), receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z')],
+      threads: [thread(true)],
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('the latest substitute receipt for this head approves');
+  });
+
+  it.each([
     ['approves an older head', [receiptComment(OLD_HEAD, 'approve', '2026-09-05T00:20:00Z')], 'receipt: none'],
     // Listed newest first, so only a sort by posting order — not list order — finds the later `changes`.
     [
@@ -5595,6 +5625,34 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     const result = runHelper(root, ['audit']);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('verdict=review: an approving substitute receipt before the merge');
+  });
+
+  it('does not count a thread opened after the merge against a receipt merge', () => {
+    const root = tempRoot();
+    const late = thread(false);
+    (late.comments as { nodes: Page[] }).nodes[0].createdAt = '2099-01-01T00:00:00Z';
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', '100')],
+      threads: [thread(true), late],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('an approving substitute receipt before the merge');
+  });
+
+  it('flags a receipt merge that left a review thread unresolved', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', '100')],
+      threads: [thread(true), thread(false)],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain('with 1 review thread(s) unresolved');
   });
 
   // #689 P3-4: a receipt posted in the merge's own second may have landed

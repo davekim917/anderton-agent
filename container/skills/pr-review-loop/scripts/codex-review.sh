@@ -206,7 +206,7 @@ review_threads_page() {
     query($owner:String!,$name:String!,$pr:Int!,$after:String){
       repository(owner:$owner,name:$name){ pullRequest(number:$pr){
         headRefOid reviewThreads(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
-          isResolved comments(first:1){ nodes{ author{login} pullRequestReview{id} } }
+          isResolved comments(first:1){ nodes{ author{login} createdAt pullRequestReview{id} } }
         } }
       } }
     }' \
@@ -287,6 +287,18 @@ paginate_connection() {
 # Unresolved Codex threads intentionally have no date filter: an older thread
 # remains open work until it is replied to and resolved. Under `audit`, review
 # and reaction evidence newer than GATE_AS_OF (the merge) does not count either.
+# Unresolved review threads on the PR, from any round or author. A substitute
+# receipt approves the code, not the conversation, so its merge and its audit
+# both need this to be 0, as the clean-Codex path does. With GATE_AS_OF set
+# (audit), a thread opened at or after the merge could not have blocked it.
+unresolved_thread_count() {
+  local pages
+  pages=$(paginate_connection reviewThreads review_threads_page) || return 1
+  printf '%s\n' "$pages" | jq -s --arg asOf "$GATE_AS_OF" '
+    [ .[] | .data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)
+      | select($asOf == "" or ((.comments.nodes[0].createdAt // "") | . == "" or . < $asOf)) ] | length'
+}
+
 status_observation() {
   local sha="$1" since="$2" thread_pages review_pages comment_pages reaction_pages
   local observed_heads head_count head_changed head_oid open_count review_matches review_count last_review_at last_valid_review_at last_valid_verdict_at quota_matches quota_count last_usage_limit_at reaction_matches reaction_count last_thumbs_up_at rounds codex
@@ -2330,6 +2342,12 @@ merge_check_main() {
       echo "merge=refused head=$SCOPE_HEAD verdict=$SCOPE_VERDICT: the approving substitute receipt names a disallowed reviewer — $(reviewer_model_refusal "$receipt_reviewer"). Post a new receipt (codex-review.sh receipt ...) from a frontier model" >&2
       exit 24
     fi
+    local receipt_unresolved
+    receipt_unresolved=$(unresolved_thread_count) || exit 1
+    if [ "$receipt_unresolved" -gt 0 ]; then
+      echo "merge=refused head=$SCOPE_HEAD verdict=$SCOPE_VERDICT: the substitute receipt approves, but $receipt_unresolved review thread(s) are unresolved; answer and resolve each before merging" >&2
+      exit 24
+    fi
     final_gates
     echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=$ci_word base=$SCOPE_BASE: the latest substitute receipt for this head approves ($receipt_reviewer)"
     exit 0
@@ -3308,6 +3326,11 @@ $assessment
     fi
     if [ "$receipt" = approve ]; then
       if reviewer_model_allowed "$receipt_reviewer"; then
+        audit_unresolved=$(unresolved_thread_count) || { echo "audit=error $where: could not read review threads" >&2; exit 1; }
+        if [ "$audit_unresolved" -gt 0 ]; then
+          echo "audit=violation $where: it merged on an approving substitute receipt with $audit_unresolved review thread(s) unresolved"
+          exit 28
+        fi
         echo "audit=pass $where: an approving substitute receipt before the merge ($receipt_reviewer)"
         exit 0
       fi
