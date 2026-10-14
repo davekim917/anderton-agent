@@ -30,6 +30,19 @@ export interface CodexHookInput {
   [key: string]: unknown;
 }
 
+const ARGV_SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'fish']);
+
+/**
+ * The command line an argv runs. `[shell, -lc, script]` is how a harness wraps a command line, so it is the script;
+ * any other argv is shell-quoted, since a bare join loses its word boundaries.
+ */
+function argvCommandLine(argv: unknown[]): string {
+  const words = argv.map(String);
+  const shell = (words[0] ?? '').split('/').pop() ?? '';
+  if (words.length === 3 && ARGV_SHELLS.has(shell) && /^-[A-Za-z]*c[A-Za-z]*$/.test(words[1])) return words[2];
+  return words.map((w) => (/^[\w@%+=:,./-]+$/.test(w) ? w : `'${w.replace(/'/g, `'\\''`)}'`)).join(' ');
+}
+
 export function normalizeCodexHookInput(input: CodexHookInput): CodexHookInput {
   if (!input || typeof input !== 'object') return input;
   const out: CodexHookInput = { ...input };
@@ -40,10 +53,10 @@ export function normalizeCodexHookInput(input: CodexHookInput): CodexHookInput {
 
   if (out.tool_input && typeof out.tool_input === 'object') {
     const ti = { ...out.tool_input } as Record<string, unknown>;
-    if (Array.isArray(ti.command)) ti.command = (ti.command as unknown[]).join(' ');
+    if (Array.isArray(ti.command)) ti.command = argvCommandLine(ti.command);
     if (!ti.command) {
       if (typeof ti.cmd === 'string') ti.command = ti.cmd;
-      else if (Array.isArray(ti.cmd)) ti.command = (ti.cmd as unknown[]).join(' ');
+      else if (Array.isArray(ti.cmd)) ti.command = argvCommandLine(ti.cmd);
     }
     out.tool_input = ti;
   }

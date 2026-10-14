@@ -18,6 +18,22 @@ describe('normalizeCodexHookInput', () => {
     expect((out.tool_input as { command: string }).command).toBe('ls -la');
   });
 
+  it.each([
+    [['bash', '-lc', 'git status'], 'git status'],
+    [['/bin/zsh', '-c', 'rm -rf build'], 'rm -rf build'],
+    [['echo', 'a; rm -rf ~'], "echo 'a; rm -rf ~'"],
+    [['bash', '-c', 'echo hi', 'extra'], "bash -c 'echo hi' extra"],
+    [['printf', "it's"], "printf 'it'\\''s'"],
+  ])('reads argv %j as the command line %s', (argv, expected) => {
+    const out = normalizeCodexHookInput({ tool_name: 'shell', tool_input: { command: argv } });
+    expect((out.tool_input as { command: string }).command).toBe(expected);
+  });
+
+  it('reads an array cmd the same way', () => {
+    const out = normalizeCodexHookInput({ tool_name: 'exec_command', tool_input: { cmd: ['bash', '-lc', 'ls -la'] } });
+    expect((out.tool_input as { command: string }).command).toBe('ls -la');
+  });
+
   it('falls back to cmd when command absent', () => {
     const out = normalizeCodexHookInput({ tool_name: 'exec_command', tool_input: { cmd: 'pwd' } });
     expect((out.tool_input as { command: string }).command).toBe('pwd');
