@@ -26,7 +26,7 @@ From a container session: read `features/` and the evidence a host run left, or 
 
 - **Binding:** `github.com/davekim917/nanoclaw`. `launch` and `doctor` compare it with this checkout's `origin` (credentials stripped) and stop on a mismatch. The helper builds whatever revision you name from that repository's object store, in a new detached worktree. Its own checkout can be any worktree of the repo, but never use the checkout to build or boot.
 - **Placement:** this skill is committed to the repo because its owner opted in. The repository is the owner's own, so a `verify-*` directory here is not a change to someone else's repo. Its evidence still stays private.
-- **Proven against:** a03448ea0 (origin/main, 2026-10-14), with this helper's first version. The run's evidence is in the private directory below. That revision predates `NANOCLAW_ONECLI_APPROVALS`, so the current helper refuses it: only revisions that carry both shared-service switches can be booted.
+- **Proven against:** 3a2cd6899 (origin/main, 2026-10-14): boot, CLI chat, restart and adoption all passed, guard ok, every cleanup step ok. The run's evidence is in the private directory below. Only revisions that carry both shared-service switches (`NANOCLAW_ONECLI_APPROVALS`, `NANOCLAW_STORAGE_MANAGER_ENABLED`) can be booted.
 - **Private directory:** `~/.agents/skills/verify-nanoclaw/`, outside every checkout. It holds `evidence/` (one directory per run) and the run lock `.inuse`. Scratch state (worktree, HOME, TMPDIR) goes under `~/scratch/verify-nanoclaw/<run id>/`, and cleanup deletes it.
 - **Live instance:** found from the systemd unit's `WorkingDirectory` (`VERIFY_LIVE_UNIT`, default `nanoclaw-v2`). Its slug is `sha1(path)[:8]`. The helper refuses to build or boot at that path or with that slug.
 
@@ -49,7 +49,7 @@ From a container session: read `features/` and the evidence a host run left, or 
 9. Runs the pre-boot doctor.
 10. Starts `node dist/index.js` under `env -i` with the scratch `HOME`/`TMPDIR`, `setsid`, ionice and nice.
 
-Ready means `ncl groups list` answers over the worktree's socket, which happens only after every boot gate. A plain socket bind is not ready. `host.log` should show `Reconciled sessions at startup adopted=0 stopped=0`, `OneCLI preflight ok`, `Webhook server started port=3999`, and `cli` as the only adapter.
+Ready means `ncl groups list` answers over the worktree's socket, which happens only after every boot gate. A plain socket bind is not ready. `host.log` should show `Reconciled sessions at startup adopted=0 stopped=0`, `OneCLI preflight ok`, `Webhook server started port=3999`, `OneCLI approval handler disabled by NANOCLAW_ONECLI_APPROVALS=0`, and `cli` as the only adapter.
 
 Teardown is `cleanup`.
 
@@ -119,12 +119,12 @@ Each step runs whatever an earlier one did. `cleanup` exits non-zero if guard fa
 `guard "$RUN"` exits 3 if any of these happened:
 - the verify host's logs name a container that does not carry this run's label
 - the verify host stopped anything at boot
-- a live-labelled container got `stop`/`kill` during the run and the live host's own log (from the recorded offset) has no stop record for it: a `Killing container` or `Container stopped by host` line naming it
+- a live-labelled container got `stop`/`kill` during the run and the live host's own log (from the recorded offset) has no stop record for it: a `Killing container` or `Container stopped by host` line naming it, or, when the live host restarted mid-run, its boot-time `Stopped an unadoptable container at startup` or `Stopped orphaned containers and proved install quiescence` line naming it (counted separately). A failed-stop line, or the legacy `Stopped orphaned containers` line, which lists names whether or not their stop succeeded, is not a stop record
 - a shared unlabelled container (the live install's `ONECLI_GATEWAY_CONTAINER`, default `onecli`, and `onecli-postgres`) got `stop`/`kill` during the run, whatever stopped it
 - the events recorder logged anything but events, or is not running and cleanup did not stop it: past that point the run is unaudited
 - an image tag other than this run's got `untag`/`delete`, or an image tag present at launch is gone (untag and delete events can name an image by ID alone, so the inventory is the check that cannot miss one)
 
-A `Container exited` line does not count as a stop record, because the live host logs it whoever stopped the container. The live fleet's own idle reaps are counted, not flagged. A live deploy or storage pass that removes a tag during the run does trip guard; check the live log, then rerun. `tests/guard.test.ts` pins each of these cases. If guard fails during a run, run `cleanup` immediately and report.
+A `Container exited` line does not count as a stop record, because the live host logs it whoever stopped the container. The live fleet's own idle reaps are counted, not flagged. A live deploy moving a tag emits only a `tag` event, which guard ignores. A live storage pass that removes a tag does trip guard; check the live log, then rerun. `tests/guard.test.ts` pins each of these cases. If guard fails during a run, run `cleanup` immediately and report.
 
 ## Helpers
 

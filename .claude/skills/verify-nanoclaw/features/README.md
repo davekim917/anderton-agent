@@ -16,6 +16,6 @@ The maintained source for verifying what a NanoClaw user sees. Read this before 
 
 ## Features
 
-- [CLI chat](./cli-chat.md): a message sent on the CLI channel reaches the agent's container and its reply comes back. Proven 2026-10-14 on a03448ea0 with the helper's first version; not yet re-run with this helper.
-- [Restart and adoption](./restart-adoption.md): a host restart leaves the agent's container running, re-adopts it, and it keeps answering. Proven 2026-10-14 on a03448ea0 with the helper's first version; not yet re-run with this helper.
+- [CLI chat](./cli-chat.md): a message sent on the CLI channel reaches the agent's container and its reply comes back. Proven 2026-10-14 on 3a2cd6899.
+- [Restart and adoption](./restart-adoption.md): a host restart leaves the agent's container running, re-adopts it, and it keeps answering. Proven 2026-10-14 on 3a2cd6899.
 - [ncl admin](./ncl-admin.md): operator commands over the host socket. Not yet proven beyond `groups list` and `groups restart`.

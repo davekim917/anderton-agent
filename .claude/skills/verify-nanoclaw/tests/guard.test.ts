@@ -70,7 +70,7 @@ describe('verify-nanoclaw guard', () => {
     fs.appendFileSync(liveLog, 'INFO Killing container sessionId=s1 reason=idle containerName="nanoclaw-v2-live-1"\n');
     const r = guard();
     expect(r.status).toBe(0);
-    expect(r.out).toContain('own stop record: 1; unattributed: 0');
+    expect(r.out).toContain('own stop record: 1; with its boot-time stop record (a live restart): 0; unattributed: 0');
   });
 
   it('fails a live stop whose name appears only in an exit line', () => {
@@ -154,6 +154,40 @@ describe('verify-nanoclaw guard', () => {
     const r = guard();
     expect(r.status).toBe(3);
     expect(r.out).toContain('no image inventory was recorded');
+  });
+
+  it('attributes a live restart stopping an unadoptable container to the live host', () => {
+    events(`stop nanoclaw-v2-live-1 install=${LIVE}`);
+    fs.appendFileSync(
+      liveLog,
+      'INFO Stopped an unadoptable container at startup containerName="nanoclaw-v2-live-1" why="over budget"\n',
+    );
+    const r = guard();
+    expect(r.status).toBe(0);
+    expect(r.out).toContain('with its boot-time stop record (a live restart): 1; unattributed: 0');
+  });
+
+  it('does not attribute a live stop to a failed-stop line', () => {
+    events(`stop nanoclaw-v2-live-1 install=${LIVE}`);
+    fs.appendFileSync(
+      liveLog,
+      'WARN Failed to stop an unadoptable container at startup containerName="nanoclaw-v2-live-1"\n',
+    );
+    const r = guard();
+    expect(r.status).toBe(3);
+    expect(r.out).toContain('UNATTRIBUTED: live container nanoclaw-v2-live-1');
+  });
+
+  it('attributes only the strict orphan cleanup record, not the legacy one that lists failed stops', () => {
+    events(`stop nanoclaw-v2-live-1 install=${LIVE}`);
+    fs.appendFileSync(liveLog, 'INFO Stopped orphaned containers count=1 names=["nanoclaw-v2-live-1"]\n');
+    expect(guard().status).toBe(3);
+
+    fs.appendFileSync(
+      liveLog,
+      'INFO Stopped orphaned containers and proved install quiescence count=1 names=["nanoclaw-v2-live-1"]\n',
+    );
+    expect(guard().status).toBe(0);
   });
 
   it('fails when the verify host stopped a container at boot', () => {

@@ -303,7 +303,7 @@ cmd_restart() {
 }
 
 cmd_guard() { # exit 3 when this run touched a container that is not its own, or shared infrastructure stopped
-  local run="$1" own own_image live_log live_slug name type action install shared shared_list now_tags bad=0 by_live=0 unattributed=0 other=0
+  local run="$1" own own_image live_log live_slug name type action install shared shared_list now_tags bad=0 by_live=0 by_live_boot=0 unattributed=0 other=0
   own="$(st "$run" SLUG)"; live_slug="$(st "$run" LIVE_SLUG)"
   shared_list="$(stq "$run" SHARED_CONTAINERS)"; shared_list="${shared_list:-onecli onecli-postgres}"
   live_log="$run/.guard-live-window.log"
@@ -325,6 +325,8 @@ cmd_guard() { # exit 3 when this run touched a container that is not its own, or
       # A later "Container exited" line names a container whoever stopped it; only the host's stop records count.
       if awk -v n="$name" 'index($0, n) && (index($0, "Killing container") || index($0, "Container stopped by host")) { f = 1 } END { exit !f }' "$live_log"; then
         by_live=$((by_live + 1))
+      elif awk -v n="$name" 'index($0, n) && (index($0, "Stopped an unadoptable container at startup") || index($0, "Stopped orphaned containers and proved install quiescence")) { f = 1 } END { exit !f }' "$live_log"; then
+        by_live_boot=$((by_live_boot + 1))
       else
         echo "guard: UNATTRIBUTED: live container $name got $action and the live host log has no stop record for it"; unattributed=$((unattributed + 1)); bad=1
       fi
@@ -356,7 +358,7 @@ cmd_guard() { # exit 3 when this run touched a container that is not its own, or
   if grep -qE 'Stopped an unadoptable|duplicate container|Stopped orphaned containers' "$run"/host*.log 2>/dev/null; then
     echo "guard: VIOLATION: the verify host stopped a container at boot"; bad=1
   fi
-  echo "guard: live stop/kill events with the live host's own stop record: $by_live; unattributed: $unattributed; other installs or unlabelled: $other"
+  echo "guard: live stop/kill events with the live host's own stop record: $by_live; with its boot-time stop record (a live restart): $by_live_boot; unattributed: $unattributed; other installs or unlabelled: $other"
   [ "$bad" = 0 ] || exit 3
   echo "guard: ok"
 }
