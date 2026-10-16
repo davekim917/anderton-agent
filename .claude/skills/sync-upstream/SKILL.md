@@ -96,8 +96,8 @@ Before pushing, from `$W`:
 
 ```bash
 node_modules/.bin/tsc --noEmit -p tsconfig.json
-flock <scratchpad>/vitest.lock ionice -c3 nice -n 10 node_modules/.bin/eslint src/ scripts/ setup/
-flock <scratchpad>/vitest.lock ionice -c3 nice -n 10 node_modules/.bin/vitest run <targeted files> --maxWorkers=2
+scripts/test-safe.sh lint
+scripts/test-safe.sh <targeted files>
 node_modules/.bin/tsx scripts/upstream-ratchet-report.ts --root "$W" --write [--accept <path>]   # when an upstream-owned file changed
 (cd container/agent-runner && bun install --frozen-lockfile && bun run typecheck && bun run test)   # when container/agent-runner/ changed
 (cd $R && pnpm run check:public-boundary -- --root "$W" --index)   # from the live checkout so pnpm resolves; scans $W's index
