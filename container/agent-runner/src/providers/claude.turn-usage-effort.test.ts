@@ -16,11 +16,14 @@ import os from 'os';
 import path from 'path';
 
 const sdkMessages: unknown[] = [];
+/** Runs when the provider starts the SDK query: the moment the real CLI subprocess spawns. */
+let onSdkQueryStart: (() => void) | null = null;
 
 mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   // Async iterable PLUS the live-control surface applySettings drives
   // (setModel / applyFlagSettings), so an in-flight `-m` can be exercised.
   query: () => {
+    onSdkQueryStart?.();
     const it = (async function* () {
       for (const m of sdkMessages) yield m;
     })();
@@ -76,7 +79,9 @@ afterEach(() => {
  * Run one turn and persist its usage the way poll-loop.ts does — one
  * recordTurnUsage per model entry, all sharing the turn's meta.
  */
-async function runTurnAndRecord(input: { model?: string; effort?: string } = {}): Promise<void> {
+async function runTurnAndRecord(
+  input: { model?: string; effort?: string; continuation?: string } = {},
+): Promise<void> {
   // Faithful to production: index.ts constructs the provider with
   // `env: { ...process.env }`, which is how the host-injected alias env
   // (ANTHROPIC_DEFAULT_*_MODEL) reaches the resolution used for attribution.
@@ -161,6 +166,87 @@ describe('claude turn effort -> turn_usage row', () => {
       [100, 0.5],
       [100, 0.5],
     ]);
+  });
+
+  it('books only this turn when a resumed query()`s first result carries the totals its transcript saved', async () => {
+    const sessionId = '0b9e3c1a-5d2f-4e8b-9a71-c4f2d6e8a013';
+    const projectDir = path.join(tmp, '.claude', 'projects', '-workspace-agent');
+    fs.mkdirSync(projectDir, { recursive: true });
+    const costState = (cost: number, cacheRead: number, forSession = sessionId) =>
+      JSON.stringify({
+        type: 'cost-state',
+        sessionId: forSession,
+        totalCostUSD: cost,
+        totalAPIDuration: 1,
+        totalAPIDurationWithoutRetries: 1,
+        totalToolDuration: 1,
+        totalLinesAdded: 0,
+        totalLinesRemoved: 0,
+        totalDuration: 1,
+        startTime: 1,
+        modelUsage: {
+          'claude-opus-5': {
+            inputTokens: 900,
+            outputTokens: 300_000,
+            cacheReadInputTokens: cacheRead,
+            cacheCreationInputTokens: 8_000_000,
+            webSearchRequests: 0,
+            costUSD: cost,
+          },
+        },
+      });
+    fs.writeFileSync(
+      path.join(projectDir, `${sessionId}.jsonl`),
+      [
+        JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, timestamp: new Date().toISOString() }),
+        costState(40, 70_000_000),
+        // Last valid entry for this session wins; another session's entry is not this counter's start.
+        costState(60, 100_000_000),
+        costState(999, 900_000_000, 'another-session'),
+        '',
+      ].join('\n'),
+    );
+    sdkMessages.length = 0;
+    const result = (cacheRead: number, cost: number) => ({
+      type: 'result',
+      subtype: 'success',
+      result: '',
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 900,
+          outputTokens: 300_000,
+          cacheReadInputTokens: cacheRead,
+          cacheCreationInputTokens: 8_000_000,
+          costUSD: cost,
+        },
+      },
+    });
+    sdkMessages.push(result(100_400_000, 62.5), result(100_900_000, 64));
+    // The CLI appends this query's own cost-state to the transcript once it runs; the starting point predates it.
+    onSdkQueryStart = () =>
+      fs.appendFileSync(path.join(projectDir, `${sessionId}.jsonl`), costState(62.5, 100_400_000) + '\n');
+    try {
+      await runTurnAndRecord({ continuation: sessionId });
+    } finally {
+      onSdkQueryStart = null;
+    }
+    const rows = getTurnUsageRows();
+    expect(rows.map((r) => r.cache_read_tokens)).toEqual([400_000, 500_000]);
+    expect(rows.map((r) => r.cost_usd)).toEqual([2.5, 1.5]);
+  });
+
+  it('books a resumed query()`s first result raw when the transcript saved no totals (the CLI starts at zero)', async () => {
+    const sessionId = '7c1d2e3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f';
+    const projectDir = path.join(tmp, '.claude', 'projects', '-workspace-agent');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectDir, `${sessionId}.jsonl`),
+      JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, timestamp: new Date().toISOString() }) + '\n',
+    );
+    sdkMessages.length = 0;
+    sdkMessages.push(resultWithModels(['claude-opus-5']));
+    await runTurnAndRecord({ continuation: sessionId });
+    expect(getTurnUsageRows().map((r) => [r.input_tokens, r.cost_usd])).toEqual([[100, 0.5]]);
   });
 
   it('records fallback main-loop usage per turn and leaves cumulative cost unknown', async () => {

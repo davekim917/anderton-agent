@@ -302,16 +302,29 @@ export interface AgentQuery {
   readonly resolvedEffort: string | null;
 }
 
+/** A running total's value for one model at the moment its counter opened. */
+export interface CumulativeBaseline {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUsd: number;
+}
+
 /**
  * Per-turn token/cost usage from the provider's own result payload. Omit a field the provider doesn't expose
  * rather than guessing.
  *
  * Report the WHOLE turn, never one model request: sum per-request figures. Reporting a running total (turn-usage.ts
- * CUMULATIVE_PROVIDERS) is safe only when it resets with the process, because the delta baseline is not persisted.
+ * CUMULATIVE_PROVIDERS) is safe only when the provider says where the counter started: zero for a fresh one, or
+ * `resumedFrom` when it continues a total saved before this process, because the delta baseline is not persisted.
  */
 export interface TurnUsageInfo {
-  /** Counter lifetime supplied by the provider; a resumed session can open a new query counter. */
-  accounting?: { kind: 'cumulative'; scope: string } | { kind: 'per-turn' };
+  /**
+   * Counter lifetime supplied by the provider. `resumedFrom` is this model's total when the counter opened, for a
+   * counter that does not start at zero; absent means it started at zero.
+   */
+  accounting?: { kind: 'cumulative'; scope: string; resumedFrom?: CumulativeBaseline } | { kind: 'per-turn' };
   model?: string | null;
   inputTokens?: number | null;
   outputTokens?: number | null;

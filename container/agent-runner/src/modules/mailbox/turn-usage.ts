@@ -59,10 +59,11 @@ const NO_TURN_META: TurnMeta = {
  * Claude's SDK `modelUsage` is a RUNNING TOTAL for the whole SDK stream, and one stream serves many turns, so it
  * is converted to a per-turn delta here. turn_usage rows before 2026-08-24 are inflated by it.
  *
- * The memo is process-local and unpersisted: only a provider whose counter resets with the process may use it.
- * Codex's thread `total` survives a respawn (resumed thread) and would book the whole prior history as one
- * turn, so codex.ts sums per-request `last` instead. OpenCode is per-message and summed at the provider.
- * Entries carry the counter's scope; a scope change forces a raw row.
+ * The memo is process-local and unpersisted. A counter that continues a total saved before this process must carry
+ * that total as `accounting.resumedFrom`, which seeds the memo for the counter's first row; otherwise the first row
+ * books the whole prior history as one turn. Claude reads it from the resumed transcript. Codex's thread `total`
+ * survives a respawn too, so codex.ts sums per-request `last` instead. OpenCode is per-message and summed at the
+ * provider. Entries carry the counter's scope; a scope change without `resumedFrom` forces a raw row.
  */
 type CumulativeMemo = { scope: string; usage: TurnUsageInfo };
 /** One entry per live counter — keyed by model, see CUMULATIVE_PROVIDERS. */
@@ -81,9 +82,10 @@ type Num = number | null | undefined;
  */
 function toTurnDelta(usage: TurnUsageInfo, scope: string, key: string): TurnUsageInfo {
   const memo = lastCumulativeByCounter.get(key);
-  if (!memo || memo.scope !== scope) return usage;
+  const resumedFrom = usage.accounting?.kind === 'cumulative' ? usage.accounting.resumedFrom : undefined;
+  const last = memo && memo.scope === scope ? memo.usage : resumedFrom;
+  if (!last) return usage;
 
-  const last = memo.usage;
   const fields: [Num, Num][] = [
     [usage.inputTokens, last.inputTokens],
     [usage.outputTokens, last.outputTokens],

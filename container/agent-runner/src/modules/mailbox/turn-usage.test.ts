@@ -326,6 +326,60 @@ describe('turn_usage — cumulative-usage delta fix (Claude)', () => {
     expect(rows.map((r) => r.input_tokens)).toEqual([1_000_000, 1_100_000, 50_000]);
   });
 
+  it('books only this turn on a resumed session`s first result, subtracting the totals its transcript saved', () => {
+    // A resumed query() starts its running total from the transcript's saved totals, so its FIRST result already
+    // carries every earlier turn. Taken raw, a 3-step wake turn re-booked the whole session.
+    const model = 'claude-opus-5';
+    const saved = {
+      inputTokens: 1_200,
+      outputTokens: 400_000,
+      cacheReadTokens: 200_000_000,
+      cacheWriteTokens: 12_000_000,
+      costUsd: 110,
+    };
+    const accounting = { kind: 'cumulative' as const, scope: 'query-after-resume', resumedFrom: saved };
+    recordTurnUsage('claude', {
+      accounting,
+      model,
+      inputTokens: 1_210,
+      outputTokens: 400_600,
+      cacheReadTokens: 200_500_000,
+      cacheWriteTokens: 12_450_000,
+      costUsd: 113.9,
+    });
+    recordTurnUsage('claude', {
+      accounting,
+      model,
+      inputTokens: 1_215,
+      outputTokens: 400_700,
+      cacheReadTokens: 200_600_000,
+      cacheWriteTokens: 12_460_000,
+      costUsd: 114.4,
+    });
+    const rows = getTurnUsageRows();
+    expect(rows.map((r) => [r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_write_tokens])).toEqual([
+      [10, 600, 500_000, 450_000],
+      [5, 100, 100_000, 10_000],
+    ]);
+    expect(rows[0].cost_usd).toBeCloseTo(3.9, 9);
+    expect(rows[1].cost_usd).toBeCloseTo(0.5, 9);
+  });
+
+  it('books a resumed first result raw when it is below the saved totals (a reset, e.g. /clear, since the save)', () => {
+    const model = 'claude-opus-5';
+    const saved = { inputTokens: 5_000, outputTokens: 9_000, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 3 };
+    recordTurnUsage('claude', {
+      accounting: { kind: 'cumulative', scope: 'q-reset', resumedFrom: saved },
+      model,
+      inputTokens: 40,
+      outputTokens: 70,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costUsd: 0.02,
+    });
+    expect(getTurnUsageRows().map((r) => [r.input_tokens, r.output_tokens, r.cost_usd])).toEqual([[40, 70, 0.02]]);
+  });
+
   it('records a 0 delta (not the raw total) when a running total is unchanged', () => {
     const model = 'claude-opus-5';
     recordTurnUsage('claude', { model, inputTokens: 900, cacheWriteTokens: 4000 }, undefined, 'sess-a');

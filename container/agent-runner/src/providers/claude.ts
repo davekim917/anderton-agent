@@ -75,6 +75,7 @@ import type {
 } from './types.js';
 import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
 import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
+import { readResumedModelUsage } from './claude-cost-state.js';
 import { transcriptContainsUserText } from './claude-transcript-prompt.js';
 
 export const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const satisfies readonly EffortLevel[];
@@ -2040,6 +2041,12 @@ export class ClaudeProvider implements AgentProvider {
     // Outer bound on the `toolsInFlight` leak: a fresh query has no tool running.
     resetToolInFlightTracking();
 
+    // A resumed query()'s modelUsage continues from the totals the transcript saved, so its first result already
+    // carries the earlier turns. Read before the CLI starts: it appends this query's own cost-state to the same file.
+    const resumedModelUsage = input.continuation
+      ? readResumedModelUsage(findTranscriptPath(input.continuation), input.continuation)
+      : null;
+
     const sdkResult = (sdkQueryOverride ?? sdkQuery)({
       prompt: stream,
       options: {
@@ -2109,8 +2116,7 @@ export class ClaudeProvider implements AgentProvider {
 
     let aborted = false;
     const backgroundScheduled = new Set<string>();
-    // SDKResultMessage.modelUsage resets for each query(), even when resuming
-    // the same session (SDK sdk.d.ts, SDKResultSuccess.modelUsage contract).
+    // Each query() opens a new modelUsage counter.
     const usageCounterScope = randomUUID();
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
@@ -2136,7 +2142,11 @@ export class ClaudeProvider implements AgentProvider {
         // loop, so model count must never switch the accounting source.
         if (modelEntries.length > 0) {
           return modelEntries.map(([model, u]) => ({
-            accounting: { kind: 'cumulative' as const, scope: usageCounterScope },
+            accounting: {
+              kind: 'cumulative' as const,
+              scope: usageCounterScope,
+              ...(resumedModelUsage?.has(model) ? { resumedFrom: resumedModelUsage.get(model) } : {}),
+            },
             model,
             inputTokens: u.inputTokens ?? null,
             outputTokens: u.outputTokens ?? null,
