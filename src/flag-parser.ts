@@ -51,6 +51,9 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
   sonnet55: 'claude-sonnet-5-5',
   'sonnet5-5': 'claude-sonnet-5-5',
   'sonnet-5-5': 'claude-sonnet-5-5',
+  haiku55: 'claude-haiku-5-5',
+  'haiku5-5': 'claude-haiku-5-5',
+  'haiku-5-5': 'claude-haiku-5-5',
   haiku45: 'claude-haiku-4-5',
   'haiku4-5': 'claude-haiku-4-5',
 };
@@ -59,14 +62,14 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
 // chat ack both read these. Per-channel, per-group and per-session layers override on top.
 export const DEFAULT_OPUS_MODEL = 'claude-opus-5-5[1m]';
 export const DEFAULT_SONNET_MODEL = 'claude-sonnet-5-5';
-export const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
+export const DEFAULT_HAIKU_MODEL = 'claude-haiku-5-5';
 export const DEFAULT_FABLE_MODEL = 'claude-fable-5-1[1m]';
 
 /**
  * Deliberately NOT in MODEL_ALIAS_MAP: a stored `opus` tracks the family default across bumps, `opus5` freezes.
  * Resolved at USE (spawn env, chat ack), never at storage.
  */
-const FAMILY_DEFAULTS: Record<string, string> = {
+export const FAMILY_DEFAULTS: Record<string, string> = {
   opus: DEFAULT_OPUS_MODEL,
   sonnet: DEFAULT_SONNET_MODEL,
   haiku: DEFAULT_HAIKU_MODEL,
@@ -99,7 +102,7 @@ export function resolveEffectiveModel(raw: string): string {
 }
 
 const VALID_MODEL_RE =
-  // Haiku ids carry an optional date segment: DEFAULT_HAIKU_MODEL is dated, and rejecting it silently ran Opus.
+  // Haiku ids carry an optional date segment: a dated id such as `claude-haiku-4-5-20251001` was rejected, which silently ran Opus.
   /^(?:opus|sonnet|haiku|fable|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:-\d+)?(?:\[\dm\])?|claude-sonnet-\d+(?:-\d+)?(?:\[\dm\])?|claude-fable-\d+(?:-\d+)?(?:\[\dm\])?)$/;
 
 /**
@@ -117,10 +120,11 @@ export function resolveModelAlias(raw: string): string {
 
 /**
  * Per-model effort support (Anthropic effort docs plus SDK ModelInfo.supportedEffortLevels); update when a model
- * ships. Keyed on both family alias and concrete id so `-m haiku` and `-m claude-haiku-4-5` validate alike.
+ * ships. Keyed on both family alias and concrete id, each validated against its own set: `haiku` follows the family default.
  */
 const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
-  haiku: new Set(),
+  haiku: new Set(['low', 'medium', 'high', 'xhigh', 'max']),
+  'claude-haiku-5-5': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
   'claude-haiku-4-5': new Set(),
   // Keyed explicitly: a lookup miss means "do not clamp", the opposite of Haiku's empty set.
   'claude-haiku-4-5-20251001': new Set(),

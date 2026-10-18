@@ -10,7 +10,9 @@ import {
   renderLogrotateConfig,
   renderNohupWrapper,
   renderSystemdUnit,
+  launchdPid,
   runtimePath,
+  startNohupWrapper,
   type FlockCommandOverrides,
 } from './service.js';
 
@@ -251,5 +253,43 @@ describe('Graphify sidecar decommission', () => {
   it('never installs, enables, or restarts a graphify unit during service setup', () => {
     const source = fs.readFileSync(fileURLToPath(new URL('./service.ts', import.meta.url)), 'utf8');
     expect(source).not.toMatch(/graphify/i);
+  });
+});
+
+describe('startNohupWrapper', () => {
+  function wrapper(body: string): { wrapperPath: string; pidFile: string } {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-nohup-test-'));
+    const pidFile = path.join(dir, 'nanoclaw.pid');
+    const wrapperPath = path.join(dir, 'start-nanoclaw.sh');
+    fs.writeFileSync(wrapperPath, `#!/bin/bash\n${body.replaceAll('PIDFILE', JSON.stringify(pidFile))}\n`);
+    return { wrapperPath, pidFile };
+  }
+
+  it('reports a host that is still running after the wrapper returns', () => {
+    const { wrapperPath, pidFile } = wrapper('nohup sleep 30 >/dev/null 2>&1 &\necho $! > PIDFILE');
+    expect(startNohupWrapper(wrapperPath, pidFile, 200)).toBe(true);
+    process.kill(Number(fs.readFileSync(pidFile, 'utf8')));
+  });
+
+  it('reports a host that exited right after starting', () => {
+    const { wrapperPath, pidFile } = wrapper('true &\necho $! > PIDFILE');
+    expect(startNohupWrapper(wrapperPath, pidFile, 200)).toBe(false);
+  });
+
+  it('reports a wrapper that failed', () => {
+    const { wrapperPath, pidFile } = wrapper('exit 1');
+    expect(startNohupWrapper(wrapperPath, pidFile, 200)).toBe(false);
+  });
+});
+
+describe('launchdPid', () => {
+  const list = ['PID\tStatus\tLabel', '412\t0\tcom.example.running', '-\t78\tcom.example.crashing', ''].join('\n');
+
+  it.each([
+    { label: 'com.example.running', pid: 412 },
+    { label: 'com.example.crashing', pid: null },
+    { label: 'com.example.absent', pid: null },
+  ])('$label → $pid', ({ label, pid }) => {
+    expect(launchdPid(list, label)).toBe(pid);
   });
 });

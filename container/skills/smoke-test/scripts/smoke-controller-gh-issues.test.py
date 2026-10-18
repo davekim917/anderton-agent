@@ -312,6 +312,326 @@ class FindingIssue(unittest.TestCase):
         self.assertEqual(issue["labels"], ["smoke-finding", "severity:p3"])
         self.assertIn("dropped: `nope`", issue["body"])
 
+    # -- a finding that already names its tracker ------------------------------
+
+    def synth(self, *findings):
+        (Path(self.c.args.run_root) / RUN / "synthesis.json").write_text(json.dumps({"findings": list(findings)}))
+
+    def tracker(self, number, state="open"):
+        return {"number": number, "title": "Tracked defect {}".format(number), "body": "the tracker", "state": state,
+                "labels": ["bug"], "html_url": "https://github.test/issues/{}".format(number)}
+
+    def comments(self, number):
+        return json.loads((self.state / "gh.json").read_text())["comments"].get(str(number), [])
+
+    def test_a_named_tracker_gets_one_comment_read_back_by_marker_and_no_new_issue(self):
+        self.gh(labels=["smoke-finding", "severity:p3"],
+                issues=[self.tracker(3191), self.tracker(3192), self.tracker(3193), self.tracker(3194)])
+        self.synth({"id": "CF-1", "severity": "P3", "blocking": False, "confirmed": True, "existingIssue": 3191},
+                   {"id": "CF-2", "confirmed": True, "existingIssue": "#3192"},
+                   {"id": "CF-3", "confirmed": True, "issue": "https://github.com/acme/widget/issues/3193"})
+        self.spec("CF-4", "Fourth finding")
+        doc = json.loads((Path(self.c.args.run_root) / RUN / "controller" / "issues" / "CF-4.json").read_text())
+        (Path(self.c.args.run_root) / RUN / "controller" / "issues" / "CF-4.json").write_text(
+            json.dumps(dict(doc, issue="#3194")))
+        for fid, number in (("CF-1", 3191), ("CF-2", 3192), ("CF-3", 3193), ("CF-4", 3194)):
+            self.assertEqual(self.c.github(RUN, "synthesis", "issue:" + fid), "done")
+            [comment] = self.comments(number)
+            marker = "<!-- smoke-ctl:{} -->".format(ctl.obligation_key(RUN, "gh", "issue:" + fid))
+            self.assertIn(marker, comment["body"])
+            ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:" + fid)]
+            self.assertEqual((ob["detail"]["via"], ob["detail"]["duplicateOf"], ob["detail"]["url"]),
+                             ("tracker-comment", number, comment["html_url"]))
+            self.assertEqual(self.c.decisions[-1]["duplicateOf"], number)
+        [first] = self.comments(3191)
+        line = first["body"].splitlines()[1]
+        for part in (RUN, "a" * 40, "`CF-1`", "severity `P3`", "blocking `false`", "PR #7"):
+            self.assertIn(part, line)
+        self.assertEqual(self.calls(["issue", "create"]), [])
+        self.assertEqual(len(self.filed()), 4)
+
+    def test_a_replay_finds_its_marker_and_posts_no_second_comment(self):
+        # The comment lands but its read-back fails: unknown, and the next
+        # attempt finds the marker instead of commenting again.
+        self.gh(labels=["smoke-finding"], issues=[self.tracker(3191)])
+        self.synth({"id": "CF-1", "confirmed": True, "existingIssue": 3191})
+        # Calls: issue marker scan, tracker GET, comment scan, (comment), read-back.
+        (self.state / "faults.json").write_text(json.dumps({"gh:api": ["pass", "pass", "pass", "fail-before"]}))
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "intent")
+        self.assertEqual(len(self.comments(3191)), 1)
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(len(self.comments(3191)), 1)
+        self.assertEqual(len(self.calls(["issue", "comment"])), 1)
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+        self.assertEqual((ob["detail"]["via"], ob["detail"]["duplicateOf"]), ("tracker-comment", 3191))
+
+    def test_a_closed_tracker_gets_the_comment_and_is_never_reopened_or_edited(self):
+        self.gh(labels=["smoke-finding"], issues=[self.tracker(3191, state="closed")])
+        self.synth({"id": "CF-1", "confirmed": True, "existingIssue": 3191})
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(len(self.comments(3191)), 1)
+        [issue] = self.filed()
+        self.assertEqual((issue["state"], issue["labels"], issue["body"], issue["title"]),
+                         ("closed", ["bug"], "the tracker", "Tracked defect 3191"))
+        with open(os.environ["FAKE_LOG"]) as fh:
+            ops = [json.loads(line)["argv"][:2] for line in fh]
+        self.assertEqual([x for x in ops if x[0] != "api"], [["issue", "comment"]])
+
+    def test_a_malformed_or_foreign_reference_takes_the_create_path(self):
+        refs = [("existingIssue", "WIDGET#3191"), ("existingIssue", "3191"), ("existingIssue", 0),
+                ("existingIssue", True), ("existingIssue", "https://github.com/acme/widget/issues/3191"),
+                ("issue", "https://github.com/other/repo/issues/3191"), ("issue", 3191),
+                ("issue", "https://github.com/acme/widget/pull/3191"), ("issue", "#3191 ")]
+        self.gh(labels=["smoke-finding"], issues=[self.tracker(3191)])
+        self.synth(*[{"id": "R-{}".format(k), "confirmed": True, field: value} for k, (field, value) in enumerate(refs)])
+        for k in range(len(refs)):
+            self.spec("R-{}".format(k), "Finding number {}".format(k))
+            self.assertEqual(self.c.github(RUN, "synthesis", "issue:R-{}".format(k)), "done", refs[k])
+            ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:R-{}".format(k))]
+            self.assertEqual(ob["detail"]["via"], "write", refs[k])
+        self.assertEqual(self.comments(3191), [])
+        self.assertEqual(len(self.calls(["issue", "create"])), len(refs))
+
+    def test_no_reference_files_as_before_and_reads_no_tracker(self):
+        self.gh(labels=["smoke-finding"], issues=[self.tracker(3191)])
+        self.synth({"id": "CF-1", "confirmed": True, "severity": "P3"})
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(len(self.calls(["issue", "create"])), 1)
+        self.assertEqual(self.calls(["issue", "comment"]), [])
+        self.assertEqual([c for c in self.calls(["api"]) if "/comments" in c["argv"][1]], [])
+
+    def test_a_tracker_comment_is_named_in_the_pr_run_record(self):
+        self.gh(labels=["smoke-finding"], issues=[self.tracker(3191)])
+        self.synth({"id": "CF-1", "confirmed": True, "existingIssue": 3191})
+        self.c.github(RUN, "synthesis", "issue:CF-1")
+        self.assertEqual(self.c.github(RUN, "synthesis", "pr-comment", hint={"verdict": "GO"}), "done")
+        [comment] = self.comments(7)
+        self.assertIn("Finding CF-1: already tracked as #3191; re-observation commented there, not filed again",
+                      comment["body"])
+
+    def test_a_pull_request_number_is_never_a_tracker_and_files_as_before(self):
+        pr = dict(self.tracker(3191), pull_request={"url": "https://api.github.test/repos/acme/widget/pulls/3191"})
+        self.gh(labels=["smoke-finding"], issues=[pr])
+        self.synth({"id": "CF-1", "confirmed": True, "existingIssue": 3191})
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(self.comments(3191), [])
+        self.assertEqual(self.calls(["issue", "comment"]), [])
+        self.assertEqual(len(self.calls(["issue", "create"])), 1)
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+        self.assertEqual(ob["detail"]["via"], "write")
+        self.assertIn("pull request", ob["detail"]["trackerRejected"])
+        self.assertIn("pull request", self.c.decisions[-1]["trackerRejected"])
+
+    def test_a_tracker_that_resolves_to_another_repo_is_rejected(self):
+        foreign = dict(self.tracker(3191), repository_url="https://api.github.com/repos/other/repo")
+        self.gh(labels=["smoke-finding"], issues=[foreign])
+        self.synth({"id": "CF-1", "confirmed": True, "existingIssue": 3191})
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+        self.assertEqual(ob["detail"]["via"], "write")
+        self.assertIn("other/repo", ob["detail"]["trackerRejected"])
+        self.assertEqual(self.comments(3191), [])
+
+    def test_a_tracker_that_does_not_exist_is_rejected_but_a_failed_read_is_retried(self):
+        self.gh(labels=["smoke-finding"], issues=[])
+        self.synth({"id": "CF-1", "confirmed": True, "existingIssue": 3191})
+        (self.state / "faults.json").write_text(json.dumps({"gh:api": ["pass", "fail-before"]}))
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "intent")
+        self.assertEqual(self.calls(["issue", "create"]), [])
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+        self.assertEqual(ob["detail"]["via"], "write")
+        self.assertIn("not found", ob["detail"]["trackerRejected"])
+        self.assertEqual(len(self.calls(["issue", "create"])), 1)
+        self.assertEqual(self.comments(3191), [])
+
+    def test_a_chosen_tracker_deleted_before_its_comment_lands_fails_to_terminal_not_forever(self):
+        self.gh(labels=["smoke-finding"], issues=[self.tracker(3191)])
+        self.synth({"id": "CF-1", "confirmed": True, "existingIssue": 3191})
+        (self.state / "faults.json").write_text(json.dumps({"gh:issue-comment": ["fail-before"]}))
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "intent")
+        db = json.loads((self.state / "gh.json").read_text())
+        db["issues"], db["deleted"] = [], [3191]
+        (self.state / "gh.json").write_text(json.dumps(db))
+        states = [self.c.github(RUN, "synthesis", "issue:CF-1") for _ in range(ctl.MAX_EFFECT_FAILURES)]
+        self.assertEqual(states[-1], "failed_terminal", states)
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+        self.assertIn("not found or deleted", ob["detail"]["error"])
+        self.assertEqual(self.calls(["issue", "create"]), [])
+
+    def test_the_destination_is_journaled_before_the_write_and_replays_unchanged(self):
+        # The comment lands, its read-back fails; the owner then re-points the
+        # finding, or drops the reference. The replay still reconciles only
+        # the tracker chosen before the write: no second post, no new issue.
+        for change in ({"existingIssue": 3192}, {}):
+            with self.subTest(change=change):
+                self.tearDown()
+                self.setUp()
+                self.gh(labels=["smoke-finding"], issues=[self.tracker(3191), self.tracker(3192)])
+                self.synth({"id": "CF-1", "confirmed": True, "existingIssue": 3191})
+                (self.state / "faults.json").write_text(json.dumps({"gh:api": ["pass", "pass", "pass", "fail-before"]}))
+                self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "intent")
+                ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+                dest = [h["detail"]["destination"] for h in ob["history"] if "destination" in (h.get("detail") or {})]
+                self.assertEqual(dest, [{"action": "tracker-comment", "repo": "acme/widget", "number": 3191}])
+                self.assertLess(next(i for i, h in enumerate(ob["history"]) if "destination" in (h.get("detail") or {})),
+                                next(i for i, h in enumerate(ob["history"]) if (h.get("detail") or {}).get("outcome")))
+                self.synth(dict({"id": "CF-1", "confirmed": True}, **change))
+                self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+                self.assertEqual((len(self.comments(3191)), len(self.comments(3192))), (1, 0))
+                self.assertEqual(self.calls(["issue", "create"]), [])
+                ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+                self.assertEqual((ob["detail"]["via"], ob["detail"]["duplicateOf"]), ("tracker-comment", 3191))
+
+    def test_only_spawns_non_start_signal_defers_a_read(self):
+        # A read that RAN and failed with the very words spawn() uses for a
+        # refused start is unknown; only a call spawn() never started defers.
+        self.gh(labels=["smoke-finding"])
+        (self.state / "faults.json").write_text(json.dumps({"gh:api": ["fail-sentinel"]}))
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "intent")
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+        self.assertEqual(ob["detail"]["outcome"], "unknown")
+        self.assertEqual(self.calls(["api"])[0]["result"], 1)
+        self.fx.cfg["deadline"] = 1
+        self.assertEqual(self.c.github(RUN, "synthesis", "pr-comment", hint={"verdict": "GO"}), "intent")
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "pr-comment")]
+        self.assertEqual(ob["detail"]["outcome"], "deferred")
+        self.assertEqual(len(self.calls(["api"])), 1, "the deferred read never ran")
+
+    def test_the_publication_hint_follows_the_verdict_even_when_the_failed_set_does_not_change(self):
+        c = self.c
+        c.ensure_alarm = lambda *a, **kw: True
+        c.record(RUN, "verdict", "validated", "done", 1, {"verdict": "GO", "failedChecks": []})
+        unpublished = [{"obligation": "send:verdict", "state": "failed_terminal", "reason": "3 failures"}]
+        c._record_unpublished(RUN, "verdict", "GO", [], unpublished)
+        c._record_unpublished(RUN, "verdict", "BLOCKED", ["head moved"], unpublished)
+        vob = c.obligations()[ctl.obligation_key(RUN, "verdict", "validated")]
+        self.assertEqual(vob["detail"]["publicationHint"], {"verdict": "BLOCKED", "failedChecks": ["head moved"]})
+
+    # -- every PR comment carries the verdict the run finishes with ------------
+
+    def finish_blocked(self):
+        """pre_finish with a BLOCKED verdict (the frozen GO fell), its real
+        GitHub path against the fake and every other effect stubbed."""
+        c = self.c
+        c.driven, finished = set(), []
+        c._settle_alarm_sends = lambda run: None
+        c._run_dir_expected = lambda run: False
+        c._publish_verb = lambda run, view, verb: verb
+        c._terminal_call = lambda run, phase, verb, sha, verdict: finished.append(verdict) or "done"
+        c.post_finish = lambda run, pr, verdict, external: verdict
+        c.send = lambda *a, **kw: "delivered"
+        c.ensure_alarm = lambda run_id, trigger, fp, detail, **kw: c.alarms.append((trigger, detail)) or True
+        c.pre_finish(RUN, 7, "BLOCKED", ["head moved"], {})
+        return finished
+
+    def pre_install_pr_comment(self):
+        """What a controller from before this install leaves: a pr-comment
+        intent with no journaled verdict, and its write-once GO payload."""
+        key = ctl.obligation_key(RUN, "gh", "pr-comment")
+        self.c.record(RUN, "gh", "pr-comment", "intent", 1)
+        payload = Path(self.c.journal.dir) / "payloads" / RUN / (key[:16] + "-pr-comment.md")
+        payload.parent.mkdir(parents=True, exist_ok=True)
+        payload.write_text("<!-- smoke-ctl:{} -->\n# Smoke run record\n\nRun on build: **Safe to ship**.\n".format(key))
+        return key
+
+    def test_a_pre_install_pr_comment_that_never_landed_is_rendered_afresh_from_the_finished_verdict(self):
+        self.gh(labels=["smoke-finding"])
+        self.pre_install_pr_comment()
+        self.assertEqual(self.finish_blocked(), ["BLOCKED"])
+        [comment] = self.comments(7)
+        self.assertIn("Smoke verdict: Could not test honestly", comment["body"])
+        self.assertNotIn("Safe to ship", comment["body"])
+
+    def test_a_pre_install_pr_comment_that_may_have_landed_is_superseded_not_reposted(self):
+        self.gh(labels=["smoke-finding"])
+        key = self.pre_install_pr_comment()
+        db = json.loads((self.state / "gh.json").read_text())
+        db["comments"]["7"] = [{"id": 1, "body": "<!-- smoke-ctl:{} -->\nSafe to ship".format(key),
+                                "html_url": "https://github.test/pr/7#c1"}]
+        (self.state / "gh.json").write_text(json.dumps(db))
+        self.assertEqual(self.finish_blocked(), ["BLOCKED"])
+        self.assertEqual(len(self.comments(7)), 1, "the landed comment is never posted again")
+        self.assertIn("controller_publication_superseded", [t for t, _ in self.c.alarms])
+        vob = self.c.obligations()[ctl.obligation_key(RUN, "verdict", "validated")]
+        self.assertIn("gh:pr-comment", [x["obligation"] for x in vob["detail"]["publicationFailed"]])
+
+    def test_the_finished_verdict_heads_the_pr_comment_whatever_the_owner_prose_says(self):
+        self.gh(labels=["smoke-finding"])
+        (Path(self.c.args.run_root) / RUN / "run-record.md").write_text("# Smoke verdict\nSafe to ship\n")
+        self.assertEqual(self.finish_blocked(), ["BLOCKED"])
+        [comment] = self.comments(7)
+        body = comment["body"]
+        self.assertIn("## Smoke verdict: Could not test honestly", body)
+        self.assertIn("Not cleared: head moved", body)
+        self.assertLess(body.index("Could not test honestly"), body.index("Safe to ship"))
+        self.assertLess(body.index("### Owner's run record"), body.index("Safe to ship"))
+
+    def test_the_chat_verdict_never_carries_owner_bullets_for_another_verdict(self):
+        # Guard (holds before this change too): the chat post's heading is the
+        # hint's verdict, and owner bullets go out only under their own verdict.
+        run = Path(self.c.args.run_root) / RUN
+        (run / "synthesis.json").write_text(json.dumps({"verdict": "GO", "findings": []}))
+        (run / "controller" / "verdict-bullets.md").write_text("- Safe to ship, all lanes passed\n")
+        self.fx.cfg["repo"] = "acme/widget"
+        text, _ = self.fx._render({"runId": RUN, "slot": "verdict",
+                                   "hint": {"verdict": "BLOCKED", "failedChecks": ["head moved"]}})
+        self.assertIn("Could not test honestly", text.splitlines()[0])
+        self.assertNotIn("Safe to ship", text)
+
+    def test_the_gh_allowlist_admits_the_comment_calls_and_nothing_broader(self):
+        allowed = ctl.EffectLayer._gh_call_allowed
+        self.assertTrue(allowed(["issue", "comment", "3191", "-R", "acme/widget", "--body-file", "x"]))
+        self.assertTrue(allowed(["api", "repos/acme/widget/issues/3191/comments?per_page=100", "--paginate", "--jq",
+                                 ".[]"]))
+        self.assertTrue(allowed(["api", "repos/acme/widget/issues/3191"]))
+        for rest in (["issue", "reopen", "3191"], ["issue", "edit", "3191", "--add-label", "x"],
+                     ["issue", "close", "3191"], ["api", "-X", "PATCH", "repos/acme/widget/issues/3191"],
+                     ["api", "repos/acme/widget/issues/3191", "-f", "state=open"],
+                     ["api", "repos/acme/widget/issues/3191", "--method", "PATCH"], ["repo", "delete"]):
+            self.assertFalse(allowed(rest), rest)
+            with self.assertRaises(ctl.ControllerError):
+                self.fx._run(self.fx.gh + rest, 5)
+        self.assertFalse(os.path.exists(os.environ["FAKE_LOG"]), "a refused gh call never runs")
+
+    def test_a_write_github_refused_fails_to_terminal_not_unknown_forever(self):
+        for slot, op, text in (
+                ("pr-comment", "gh:pr-comment", "GraphQL: Resource not accessible by integration (addComment)"),
+                ("issue:CF-1", "gh:issue-create",
+                 "HTTP 403: Resource not accessible by integration (https://api.github.com/graphql)")):
+            with self.subTest(slot=slot):
+                self.tearDown()
+                self.setUp()
+                self.gh(labels=["smoke-finding", "severity:p3"])
+                (self.state / "faults.json").write_text(json.dumps({op: ["refuse:" + text] * ctl.MAX_EFFECT_FAILURES}))
+                states = [self.c.github(RUN, "synthesis", slot, hint={"verdict": "GO"})
+                          for _ in range(ctl.MAX_EFFECT_FAILURES)]
+                self.assertEqual(states, ["intent"] * (ctl.MAX_EFFECT_FAILURES - 1) + ["failed_terminal"])
+                ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", slot)]
+                self.assertEqual(ob["detail"]["effectFailures"], ctl.MAX_EFFECT_FAILURES)
+                self.assertIn(text, ob["detail"]["error"])
+                self.assertEqual([t for t, _ in self.c.alarms], ["controller_gh_failed"])
+                db = json.loads((self.state / "gh.json").read_text())
+                self.assertEqual((db["issues"], db["comments"]), ([], {}))
+
+    def test_only_a_refusal_github_answered_counts_as_a_failed_write(self):
+        for rc, err, refused in (
+                (1, "GraphQL: Resource not accessible by integration (addComment)", True),
+                (1, "HTTP 403: Resource not accessible by integration (https://api.github.com/graphql)", True),
+                (1, "HTTP 422: Validation Failed (https://api.github.com/repos/acme/widget/issues)", False),
+                (1, "HTTP 403: You have exceeded a secondary rate limit (https://api.github.com/graphql)", False),
+                (1, "HTTP 429: Too Many Requests (https://api.github.com/graphql)", False),
+                (1, "HTTP 408 (https://api.github.com/graphql)", False),
+                (1, "HTTP 502: Bad Gateway (https://api.github.com/graphql)", False),
+                (1, "GraphQL: Something went wrong while executing your query. This may be the result of a timeout",
+                 False),
+                (1, "could not add label: 'P3' not found", False),
+                (None, "timed out after 30s", False),
+                (None, ctl.NotStarted("no time left in this fire"), False),
+                (0, "", False)):
+            with self.subTest(err=err):
+                self.assertIs(ctl.gh_refused((rc, "", err)), refused)
+
     def test_a_write_that_exits_zero_but_is_not_found_keeps_the_read_back_error(self):
         self.assertIsNone(ctl.gh_write_error((0, "", "noise"), "issue create"))
         self.assertEqual(ctl.gh_write_error((None, "", "timed out after 30s"), "pr comment"),

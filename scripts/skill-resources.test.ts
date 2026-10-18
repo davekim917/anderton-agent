@@ -66,6 +66,7 @@ const NOT_INSTALLED: ReadonlyArray<{ prefix: string; reason: string }> = [
     reason: 'a symlink to container/skills/pr-review-loop, a container skill whose scripts run in place',
   },
   { prefix: '.claude/skills/slack-a2a-rooms/tests/', reason: 'runs in place under vitest.skills.config.ts' },
+  { prefix: '.claude/skills/verify-nanoclaw/tests/', reason: 'runs in place under vitest.skills.config.ts' },
   {
     prefix: '.claude/skills/use-native-credential-proxy/env.ts',
     reason: 'in-place typecheck shim; the installed file imports src/env.ts directly',

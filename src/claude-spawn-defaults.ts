@@ -128,6 +128,9 @@ export function claudeSpawnEnv(
     `CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=${CLAUDE_SUBAGENT_PROMPT_CACHE_TTL}`,
     '-e',
     'CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1',
+    // Claude Code enables fork subagents in SDK sessions by default, and a fork inherits the parent's whole context.
+    '-e',
+    'CLAUDE_CODE_FORK_SUBAGENT=0',
   );
   return env;
 }

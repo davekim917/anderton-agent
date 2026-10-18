@@ -1159,7 +1159,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // authorized. The adapter already acks the platform event. `action` comes from the render read above, not a
         // second read the winning click could race.
         if (render?.action !== undefined) {
-          setupConfig.onAction(questionId, selectedOption, userId, messageId);
+          const thread = event.thread;
+          const replyToClicker =
+            thread && event.user
+              ? async (text: string): Promise<void> => {
+                  await thread.postEphemeral(event.user, text, { fallbackToDM: false });
+                }
+              : undefined;
+          setupConfig.onAction(questionId, selectedOption, userId, messageId, replyToClicker);
           return;
         }
         const title = render?.title ?? '❓ Question';
@@ -1316,7 +1323,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const limit = config.maxTextLength
           ? Math.max(1, config.maxTextLength - (editSubtext ? editSubtext.length + SUBTEXT_BUDGET_OVERHEAD : 0))
           : undefined;
-        const fitted = limit && editText.length > limit ? splitForLimit(editText, limit)[0].trimEnd() + '…' : editText;
+        const fitted =
+          limit && editText.length > limit
+            ? content.clearActions === true
+              ? fitKeepingLastParagraph(editText, limit)
+              : splitForLimit(editText, limit)[0].trimEnd() + '…'
+            : editText;
         const editBody = editSubtext ? config.renderSubtext!(wrapBody(fitted), editSubtext) : wrapBody(fitted);
         // Edits get 429 handling too: a dropped task-list edit leaves stale progress. A task-list edit never waits
         // here (it would hold the session's queue); the host cools the row down instead (task-list-host.ts).
@@ -2216,7 +2228,19 @@ export async function handleForwardedEvent(
           } catch (err) {
             log.error('Failed to acknowledge Discord answer-card action', { err });
           }
-          setupConfig.onAction(questionId, selectedOption, user?.id || '', messageId);
+          const applicationId = interaction.application_id;
+          const replyToClicker =
+            typeof applicationId === 'string' && applicationId
+              ? async (text: string): Promise<void> => {
+                  const res = await fetch(`https://discord.com/api/v10/webhooks/${applicationId}/${interactionToken}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: text, flags: 64, allowed_mentions: { parse: [] } }),
+                  });
+                  if (!res.ok) throw new Error(`Discord follow-up returned ${res.status}`);
+                }
+              : undefined;
+          setupConfig.onAction(questionId, selectedOption, user?.id || '', messageId, replyToClicker);
           return;
         }
         const cardTitle = render?.title ?? ((originalEmbeds[0]?.title as string) || '❓ Question');
@@ -2277,4 +2301,12 @@ export async function handleForwardedEvent(
       throw err;
     }
   }
+}
+
+/** A resolved card's last paragraph says who answered and what; an over-long edit trims the body above it. */
+function fitKeepingLastParagraph(text: string, limit: number): string {
+  const cut = text.lastIndexOf('\n\n');
+  const tail = cut > 0 ? text.slice(cut) : '';
+  if (!tail || tail.length + 2 > limit) return splitForLimit(text, limit)[0].trimEnd() + '…';
+  return splitForLimit(text.slice(0, cut), limit - tail.length - 1)[0].trimEnd() + '…' + tail;
 }

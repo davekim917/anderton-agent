@@ -32,8 +32,9 @@ esac
 
 # DRIVE_REPO exists so the publisher can be exercised end to end against a
 # throwaway repo and a throwaway Drive root. Production never sets it.
-REPO="${DRIVE_REPO:-/home/ubuntu/nanoclaw-v2/data/workgroups}"
-STATE="${DRIVE_STATE_FILE:-/home/ubuntu/nanoclaw-v2/data/workgroups-drive-state.tsv}"
+INSTALL_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+REPO="${DRIVE_REPO:-$INSTALL_ROOT/data/workgroups}"
+STATE="${DRIVE_STATE_FILE:-$INSTALL_ROOT/data/workgroups-drive-state.tsv}"
 
 # Logs go to STDERR, never stdout. Helpers below return ids through stdout via
 # command substitution; a log line on stdout would be captured as the id. The
@@ -106,7 +107,7 @@ if [[ $DRY_RUN -eq 0 ]]; then
   ROOT_NAME="${DRIVE_ROOT_NAME:?DRIVE_ROOT_NAME must be set (the Drive root folder name)}"
   # Explicit named account on every call. The bare default credential slot
   # (~/.config/gws/credentials.enc) is deliberately NOT used.
-  export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="${GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE:-/home/ubuntu/.config/gws/accounts/primary.json}"
+  export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="${GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE:-$HOME/.config/gws/accounts/primary.json}"
 
   # --- run lock -------------------------------------------------------------
   # A cold run over a large allowlist can take hours; a second run must never

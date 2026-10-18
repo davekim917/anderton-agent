@@ -26,12 +26,15 @@ import type { ResponsePayload } from '../../response-registry.js';
 import { log } from '../../log.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
-import { choiceClickAllowed, getChoiceHandler, resolveChoice } from './choices.js';
+import { getUser } from '../permissions/db/users.js';
+import { choiceApprovers, choiceClickAllowed, getChoiceHandler, resolveChoice } from './choices.js';
 import { finalizeReject, writeApprovalNote } from './finalize.js';
 import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
 import {
+  APPROVAL_RESOLUTION_MAX_UNITS,
   editApprovalCardResolution,
   getApprovalHandler,
+  headUnits,
   notifyApprovalResolved,
   REJECT_WITH_REASON_VALUE,
 } from './primitive.js';
@@ -76,17 +79,28 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
 
   // Ahead of isAuthorizedApprovalClick: the OneCLI resolver enforces its own
   // approver-set auth and claims every onecli_credential row.
-  if (await resolveOneCLIApproval(payload.questionId, payload.value, namespacedUserId(payload) ?? '')) {
+  const refusedCredential = async (approvers: readonly string[]): Promise<void> =>
+    tellClicker(
+      payload,
+      approvers.length === 0
+        ? 'No one can approve this credential request any more, so it will expire. Your click did not count.'
+        : await onlyNamed(approvers),
+    );
+  if (
+    await resolveOneCLIApproval(payload.questionId, payload.value, namespacedUserId(payload) ?? '', refusedCredential)
+  ) {
     return true;
   }
 
-  if (!(await isAuthorizedApprovalClick(approval, payload))) {
+  const refusal = await clickRefusal(approval, payload);
+  if (refusal) {
     log.warn('Ignoring unauthorized approval response', {
       approvalId: approval.approval_id,
       action: approval.action,
       userId: payload.userId,
       channelType: payload.channelType,
     });
+    await tellClicker(payload, refusal);
     return true;
   }
 
@@ -100,7 +114,7 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
   }
 
   if (getChoiceHandler(approval.action)) {
-    await resolveChoice(approval, payload.value, namespacedUserId(payload) ?? '');
+    await resolveChoice(approval, payload.value, namespacedUserId(payload) ?? '', (text) => tellClicker(payload, text));
     return true;
   }
 
@@ -212,30 +226,62 @@ function namespacedUserId(payload: ResponsePayload): string | null {
   return payload.userId.includes(':') ? payload.userId : `${payload.channelType}:${payload.userId}`;
 }
 
-async function isAuthorizedApprovalClick(approval: PendingApproval, payload: ResponsePayload): Promise<boolean> {
+async function clickRefusal(approval: PendingApproval, payload: ResponsePayload): Promise<string | null> {
   const userId = namespacedUserId(payload);
-  if (!userId) return false;
+  if (!userId) return 'Your click could not be matched to a user, so it did not count.';
 
   // An approval may name a specific approver; only that exact user may resolve it.
   if (approval.approver_user_id) {
-    return userId === approval.approver_user_id;
+    return userId === approval.approver_user_id ? null : await onlyNamed([approval.approver_user_id]);
   }
 
   // Any thread member may resolve a thread-delivered card. Choice cards never
   // take this shortcut: an answer is a decision the agent acts on.
   if (approval.session_id && !getChoiceHandler(approval.action)) {
     const session = await getSession(approval.session_id);
-    if (session && (await isThreadDelivery(approval, session))) return true;
+    if (session && (await isThreadDelivery(approval, session))) return null;
   }
 
-  if (getChoiceHandler(approval.action) && !choiceClickAllowed(approval, userId)) return false;
+  if (getChoiceHandler(approval.action) && !choiceClickAllowed(approval, userId)) {
+    return await onlyNamed(choiceApprovers(approval) ?? []);
+  }
 
   const agentGroupId =
     approval.agent_group_id ?? (approval.session_id ? (await getSession(approval.session_id))?.agent_group_id : null);
 
   if (!agentGroupId) {
-    return withCentralSync(() => isOwner(userId) || isGlobalAdmin(userId), 'approval click authority');
+    const allowed = await withCentralSync(() => isOwner(userId) || isGlobalAdmin(userId), 'approval click authority');
+    return allowed ? null : 'Only the owner or a global admin can answer this card. Your click did not count.';
   }
 
-  return withCentralSync(() => hasAdminPrivilege(userId, agentGroupId), 'approval click authority');
+  const allowed = await withCentralSync(() => hasAdminPrivilege(userId, agentGroupId), 'approval click authority');
+  return allowed ? null : 'Only an admin of this agent can answer this card. Your click did not count.';
+}
+
+async function onlyNamed(approvers: readonly string[]): Promise<string> {
+  const names: string[] = [];
+  for (const id of approvers) {
+    const name = (await getUser(id))?.display_name;
+    if (!name) return 'Only the people this card names can answer it. Your click did not count.';
+    if (!names.includes(name)) names.push(name);
+  }
+  if (names.length === 0) {
+    return 'Only the people this card names can answer it. Your click did not count.';
+  }
+  const all = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}`;
+  const who =
+    all.length <= APPROVAL_RESOLUTION_MAX_UNITS
+      ? all
+      : headUnits(all, APPROVAL_RESOLUTION_MAX_UNITS - 1).trimEnd() + '…';
+  return `Only ${who} can answer this card. Your click did not count.`;
+}
+
+async function tellClicker(payload: ResponsePayload, text: string): Promise<void> {
+  if (!payload.replyToClicker) return;
+  try {
+    await payload.replyToClicker(text);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- the refusal stands whether or not its explanation reached the clicker
+  } catch (err) {
+    log.warn('Could not tell a clicker why the click did not count', { questionId: payload.questionId, err });
+  }
 }

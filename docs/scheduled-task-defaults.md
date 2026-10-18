@@ -10,7 +10,7 @@ One deliberate difference from chat: a **pure** task wake that OPENS a query doe
 
 > **How narrow this is:** scheduled tasks do not arrive in conversations. Every series runs in its own session (`resolveTaskSession` keys it by series id), so this is reachable only inside a task's own thread — someone replies there, that opens an interactive turn, and the next fire of that same series joins it.
 >
-> This is deliberate rather than overlooked. Deciding correctly requires knowing whether the turn being joined is idle or is a human's in-flight answer, and the admitted batch is a fragment of that turn: it can say "this is a task wake" but not "nobody is waiting on this". An earlier attempt to suppress there retargeted a running turn off its own model mid-answer — the inverse of the problem this release fixes. Tracked in [#585](https://github.com/davekim917/nanoclaw/issues/585).
+> This is deliberate rather than overlooked. Deciding correctly requires knowing whether the turn being joined is idle or is a human's in-flight answer, and the admitted batch is a fragment of that turn: it can say "this is a task wake" but not "nobody is waiting on this". An earlier attempt to suppress there retargeted a running turn off its own model mid-answer — the inverse of the problem this release fixes.
 
 **Two changes with two different scopes — this matters for what you need to inventory:**
 

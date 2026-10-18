@@ -133,3 +133,47 @@ describe('channel auth detection', () => {
   });
 });
 
+
+describe('findStalePingAgentFolders', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-ping-test-'));
+    fs.mkdirSync(path.join(tempDir, 'data'), { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('returns setup ping agents wired to nothing but the local CLI chat', async () => {
+    const { findStalePingAgentFolders } = await import('./environment.js');
+    const db = new Database(path.join(tempDir, 'data', 'v2.db'));
+    db.exec(`
+      CREATE TABLE agent_groups (id TEXT PRIMARY KEY, folder TEXT);
+      CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, channel_type TEXT, platform_id TEXT);
+      CREATE TABLE messaging_group_agents (id TEXT PRIMARY KEY, messaging_group_id TEXT, agent_group_id TEXT);
+      INSERT INTO messaging_groups VALUES ('mg-cli', 'cli', 'local'), ('mg-chat', 'slack', 'slack:D0FAKE01');
+      INSERT INTO agent_groups VALUES
+        ('ag-1', 'ping-test-0a1b2c3d'),
+        ('ag-2', 'ping-test-11223344'),
+        ('ag-3', 'ping-test-deadbeef'),
+        ('ag-4', 'cli-with-tester'),
+        ('ag-5', 'ping-test-notahex');
+      INSERT INTO messaging_group_agents VALUES
+        ('w-1', 'mg-cli', 'ag-1'),
+        ('w-3a', 'mg-cli', 'ag-3'),
+        ('w-3b', 'mg-chat', 'ag-3'),
+        ('w-4', 'mg-cli', 'ag-4'),
+        ('w-5', 'mg-cli', 'ag-5');
+    `);
+    db.close();
+
+    expect(findStalePingAgentFolders(tempDir).sort()).toEqual(['ping-test-0a1b2c3d', 'ping-test-11223344']);
+  });
+
+  it('returns nothing when there is no central DB', async () => {
+    const { findStalePingAgentFolders } = await import('./environment.js');
+    expect(findStalePingAgentFolders(tempDir)).toEqual([]);
+  });
+});

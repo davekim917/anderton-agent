@@ -242,9 +242,41 @@ describe('routing check — scope', () => {
 });
 
 describe('routing check — check points a and c (continue_thread adoption)', () => {
-  it('an adopted thread scoring below the threshold is not adopted: the key opens a new thread, stored and noticed', async () => {
+  it('a low score is advisory: the adopted thread is still adopted, and the score is stored without a notice', async () => {
     archiveThread('thr-roster', 3);
     scores(0.11);
+    const session = await fireSession();
+    insertPost(
+      session.id,
+      'out-1',
+      handoff('Vintage view of the same conversion rate', 'lb-dm-1', { continueThread: 'thr-roster' }),
+    );
+    const calls = recordingAdapter();
+
+    await deliverUntilSettled(session);
+
+    expect(calls).toEqual([{ threadId: `${PID}:thr-roster` }]);
+    expect(await keyRows()).toEqual([{ thread_key: 'lb-dm-1', thread_platform_id: 'thr-roster' }]);
+    expect(await checkRows()).toEqual([
+      {
+        message_out_id: 'out-1',
+        thread_key: 'lb-dm-1',
+        check_point: 'a',
+        candidate_thread_id: 'thr-roster',
+        score: 0.11,
+        threshold: 0,
+        decision: 'keep',
+        model: JEV_MODEL,
+        error: null,
+        split_thread_key: null,
+      },
+    ]);
+    expect(noticeOf(session.id, 'out-1')).toBeNull();
+  });
+
+  it('a failed check on an adoption is a veto: the key opens a new thread, stored and noticed', async () => {
+    archiveThread('thr-roster', 3);
+    jev.mockRejectedValue(new Error('TypeSafe HTTP 503'));
     const session = await fireSession();
     insertPost(session.id, 'out-1', handoff('Oven repair ask', 'lb-dm-1', { continueThread: 'thr-roster' }));
     const calls = recordingAdapter();
@@ -253,30 +285,19 @@ describe('routing check — check points a and c (continue_thread adoption)', ()
 
     expect(calls).toEqual([{ threadId: null }]);
     expect(await keyRows()).toEqual([{ thread_key: 'lb-dm-1', thread_platform_id: '123456789000000001' }]);
-    expect(await checkRows()).toEqual([
-      {
-        message_out_id: 'out-1',
-        thread_key: 'lb-dm-1',
-        check_point: 'a',
-        candidate_thread_id: 'thr-roster',
-        score: 0.11,
-        threshold: 0.25,
-        decision: 'veto',
-        model: JEV_MODEL,
-        error: null,
-        split_thread_key: null,
-      },
+    expect(await checkRows()).toMatchObject([
+      { check_point: 'a', candidate_thread_id: 'thr-roster', decision: 'veto', split_thread_key: null },
     ]);
     expect(noticeOf(session.id, 'out-1')).toBe(
-      'ROUTING CHECK VETO: continue_thread thr-roster is not working on this request (routing check score 0.11 ' +
-        'is below 0.25). This post opened a NEW thread: https://discord.com/channels/111/123456789000000001. Keep ' +
-        'using thread_key "lb-dm-1" for this request; it now points at the new thread.',
+      'ROUTING CHECK VETO: continue_thread thr-roster is not working on this request (the routing check failed ' +
+        '(TypeSafe HTTP 503)). This post opened a NEW thread: https://discord.com/channels/111/123456789000000001. ' +
+        'Keep using thread_key "lb-dm-1" for this request; it now points at the new thread.',
     );
   });
 
-  it('an adopted thread scoring exactly the threshold is adopted as before', async () => {
+  it('the lowest possible score is still adopted', async () => {
     archiveThread('thr-live', 3);
-    scores(0.25);
+    scores(0);
     const session = await fireSession();
     insertPost(session.id, 'out-1', handoff('Same trial, names attached', 'lb-dm-2', { continueThread: 'thr-live' }));
     const calls = recordingAdapter();
@@ -285,7 +306,7 @@ describe('routing check — check points a and c (continue_thread adoption)', ()
 
     expect(calls).toEqual([{ threadId: `${PID}:thr-live` }]);
     expect(await keyRows()).toEqual([{ thread_key: 'lb-dm-2', thread_platform_id: 'thr-live' }]);
-    expect(await checkRows()).toMatchObject([{ check_point: 'a', decision: 'keep', score: 0.25 }]);
+    expect(await checkRows()).toMatchObject([{ check_point: 'a', decision: 'keep', score: 0 }]);
     expect(noticeOf(session.id, 'out-1')).toBeNull();
   });
 
@@ -298,16 +319,16 @@ describe('routing check — check points a and c (continue_thread adoption)', ()
 
     await deliverUntilSettled(session);
 
-    expect(calls).toEqual([{ threadId: null }]);
-    expect(await checkRows()).toMatchObject([{ check_point: 'c', decision: 'veto', score: 0.2 }]);
+    expect(calls).toEqual([{ threadId: `${PID}:thr-old` }]);
+    expect(await checkRows()).toMatchObject([{ check_point: 'c', decision: 'keep', score: 0.2 }]);
   });
 });
 
 describe("routing check — check point b (a post into the key's own earlier thread)", () => {
-  it('a handoff scoring below the threshold moves to a split key; the earlier key keeps its thread; later posts follow their keys', async () => {
+  it('a handoff whose check fails moves to a split key; the earlier key keeps its thread; later posts follow their keys', async () => {
     archiveThread('thr-earlier', 4);
     await seedAnchor('lb-dm-b', 'thr-earlier');
-    scores(0.03);
+    jev.mockRejectedValue(new Error('TypeSafe HTTP 503'));
     const session = await fireSession();
     insertPost(session.id, 'out-1', handoff('Applicant screening script ask', 'lb-dm-b'));
     const calls = recordingAdapter();
@@ -324,7 +345,8 @@ describe("routing check — check point b (a post into the key's own earlier thr
       { check_point: 'b', candidate_thread_id: 'thr-earlier', decision: 'veto', split_thread_key: split },
     ]);
     expect(noticeOf(session.id, 'out-1')).toBe(
-      'ROUTING CHECK VETO: thread thr-earlier is not working on this request (routing check score 0.03 is below 0.25). ' +
+      'ROUTING CHECK VETO: thread thr-earlier is not working on this request (the routing check failed (TypeSafe ' +
+        'HTTP 503)). ' +
         'This post opened a NEW thread: https://discord.com/channels/111/123456789000000001. Its thread_key is ' +
         `"${split}". Use thread_key "${split}" for this request's topic file, its dispatch and every later post about ` +
         'it. Thread_key "lb-dm-b" stays with the earlier request.',
@@ -347,10 +369,10 @@ describe("routing check — check point b (a post into the key's own earlier thr
     expect(jev).toHaveBeenCalledTimes(1);
   });
 
-  it('a handoff scoring above the threshold threads under the key as before', async () => {
+  it('a scored handoff threads under the key however low it scores', async () => {
     archiveThread('thr-keys', 2);
     await seedAnchor('lb-dm-keys', 'thr-keys');
-    scores(0.8);
+    scores(0.03);
     const session = await fireSession();
     insertPost(session.id, 'out-1', handoff('New keys for the same integration', 'lb-dm-keys'));
     const calls = recordingAdapter();
@@ -360,7 +382,7 @@ describe("routing check — check point b (a post into the key's own earlier thr
     expect(calls).toEqual([{ threadId: `${PID}:thr-keys` }]);
     expect(await keyRows()).toEqual([{ thread_key: 'lb-dm-keys', thread_platform_id: 'thr-keys' }]);
     expect(await checkRows()).toMatchObject([
-      { check_point: 'b', decision: 'keep', score: 0.8, split_thread_key: null },
+      { check_point: 'b', decision: 'keep', score: 0.03, split_thread_key: null },
     ]);
     expect(noticeOf(session.id, 'out-1')).toBeNull();
   });
@@ -497,7 +519,7 @@ describe('routing check — any failure opens a new thread', () => {
   });
 
   it('a row retried after a failed post reuses its verdict and asks Jev once', async () => {
-    scores(0.05);
+    jev.mockRejectedValue(new Error('TypeSafe HTTP 503'));
     archiveThread('thr-prior', 2);
     await seedAnchor('lb-dm-x', 'thr-prior');
     const session = await fireSession();
@@ -573,7 +595,7 @@ describe('routing check — what Jev is asked', () => {
     expect(threadView('t1', messages.slice(0, 1))).not.toHaveProperty('latest_messages');
   });
 
-  it('replays a misroute: a new request posted into a thread about another request from the same person is vetoed', async () => {
+  it('replays a misroute: asks Jev exactly as the backtest did and stores its low score, which no longer vetoes', async () => {
     const req: RouteCheckRequest = {
       via: 'adopt',
       threadKey: 'lb-slack-dm-replay',
@@ -599,11 +621,11 @@ describe('routing check — what Jev is asked', () => {
     });
 
     expect(ask).toHaveBeenCalledTimes(1);
-    expect(verdict).toEqual({ keep: false, checkPoint: 'a', score: 0.03, error: null });
+    expect(verdict).toEqual({ keep: true, checkPoint: 'a', score: 0.03, error: null });
   });
 
   it.each<[string, Record<string, JevAnswer>, string | null]>([
-    ['just below the threshold', { same_request: { type: 'noul', noul: 0.2499 } }, null],
+    ['below zero', { same_request: { type: 'noul', noul: -0.01 } }, 'malformed Jev answer'],
     ['out of range', { same_request: { type: 'noul', noul: 1.2 } }, 'malformed Jev answer'],
     ['missing', {}, 'malformed Jev answer'],
   ])('a score %s is a veto', async (_label, answers, error) => {

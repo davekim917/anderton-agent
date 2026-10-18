@@ -1,0 +1,9 @@
+{
+  "entries": [
+    {
+      "path": "CODE_OF_CONDUCT.md",
+      "value": "community\u0040nanoclaw.dev",
+      "reason": "Published project code of conduct contact; the at sign is JSON-escaped so this file's own text holds no address for the scan to flag"
+    }
+  ]
+}

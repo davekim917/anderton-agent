@@ -15,4 +15,4 @@ ingress fence, read at the poll loop's provider-idle boundary. `poll-loop.ts`
 asks `evaluateAdmission()` and knows nothing about fences.
 
 Nothing outside this directory (and upstream's `../../mailbox/sqlite/`) may
-open a session DB. See `docs/specs/upstream-mailbox-seam/plan.md` §4.1/§4.3.
+open a session DB.

@@ -392,12 +392,24 @@ export async function getMessagingGroupAgents(messagingGroupId: string): Promise
          COALESCE(priority, 0) AS priority,
          default_model, default_effort, default_tone,
          threads,
+         engage_senders,
          created_at
        FROM messaging_group_agents
        WHERE messaging_group_id = ?
        ORDER BY priority DESC`,
     messagingGroupId,
   );
+}
+
+/** Decodes `engage_senders`. Anything but a JSON array of strings reads as empty, so a bad value never widens engagement. */
+export function parseEngageSenders(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.every((v) => typeof v === 'string') ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 export async function getMessagingGroupAgentByPair(

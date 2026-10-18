@@ -61,6 +61,7 @@ const CONTAINER_CODEX_CONFIG_BASE = [
   'approvals_reviewer = "auto_review"',
   'model_context_window = 400000',
   'model_auto_compact_token_limit = 360000',
+  'model_reasoning_effort = "high"',
   '',
   '[features]',
   'context_management = true',

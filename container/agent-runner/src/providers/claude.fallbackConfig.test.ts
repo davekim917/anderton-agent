@@ -111,11 +111,12 @@ describe('a claude provider fallback reaches the provider without a container-si
     expect(fallbackSpawn({ model: 'fable' }).effort).toBe('medium');
     expect(fallbackSpawn({ model: 'sonnet5' }).effort).toBe('high');
     expect(fallbackSpawn({ model: 'claude-opus-5[1m]' }).effort).toBe('high');
+    expect(fallbackSpawn({ model: 'haiku' }).effort).toBe('medium');
   });
 
-  it('test_fallback_haiku_declaration_gets_no_effort_at_all', () => {
-    const r = fallbackSpawn({ model: 'haiku' });
-    expect(r.model).toBe('claude-haiku-4-5-20251001');
+  it('test_fallback_haiku45_declaration_gets_no_effort_at_all', () => {
+    const r = fallbackSpawn({ model: 'haiku45' });
+    expect(r.model).toBe('claude-haiku-4-5');
     expect(r.effort).toBeUndefined();
   });
 

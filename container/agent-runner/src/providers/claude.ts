@@ -213,6 +213,15 @@ export function laneForSlot(declaration: string | undefined, slotName: string | 
 
 let sdkQueryOverride: typeof sdkQuery | null = null;
 
+/** The image's pinned Claude Code; `undefined` lets the SDK run the CLI build it bundles. */
+export const IMAGE_CLAUDE_CODE_EXECUTABLE = '/pnpm/claude';
+let claudeCodeExecutable: string | undefined = IMAGE_CLAUDE_CODE_EXECUTABLE;
+
+/** Test-only: a test outside the image has no `/pnpm/claude`. */
+export function _setClaudeCodeExecutableForTesting(executable: string | undefined): void {
+  claudeCodeExecutable = executable;
+}
+
 /** Test-only. A seam rather than `mock.module`, which Bun cannot undo across files. */
 export function _setSdkQueryForTesting(impl?: typeof sdkQuery): void {
   sdkQueryOverride = impl ?? null;
@@ -1649,7 +1658,7 @@ function canonicalUsageModel(model: string | undefined, env: Record<string, stri
 
 /**
  * Per-family default effort, applied only when nothing upstream (-e, group config, NANOCLAW_EFFORT_OVERRIDE) chose
- * one. The values are operator policy; haiku gets none because it has no effort control at the API.
+ * one. The values are operator policy; Haiku 4.5 gets none because it has no effort control at the API.
  */
 function defaultEffortForModel(model: string | undefined): string | undefined {
   if (!model) return 'high';
@@ -1657,7 +1666,8 @@ function defaultEffortForModel(model: string | undefined): string | undefined {
   if (m === 'opus' || m.startsWith('claude-opus-')) return 'high';
   if (m === 'sonnet' || m.startsWith('claude-sonnet-')) return 'high';
   if (m === 'fable' || m.startsWith('claude-fable-')) return 'medium';
-  if (m === 'haiku' || m.startsWith('claude-haiku-')) return undefined;
+  if (m.startsWith('claude-haiku-4-')) return undefined;
+  if (m === 'haiku' || m.startsWith('claude-haiku-')) return 'medium';
   return 'high';
 }
 
@@ -1669,8 +1679,8 @@ function defaultEffortForModel(model: string | undefined): string | undefined {
 function clampEffortForModel(model: string | undefined, effort: string | undefined): string | undefined {
   if (!effort) return effort;
   const m = (model ?? '').toLowerCase();
-  if (m === 'haiku' || m.startsWith('claude-haiku-')) return defaultEffortForModel(model);
-  // Every non-haiku model this install runs supports the full effort surface.
+  if (m.startsWith('claude-haiku-4-')) return undefined;
+  // Every other model this install runs supports the full effort surface.
   return effort;
 }
 
@@ -2059,7 +2069,7 @@ export class ClaudeProvider implements AgentProvider {
         ...(this.fastMode ? { settings: { fastMode: true } } : {}),
         // `display: 'summarized'` makes thinking text visible; the default is empty text plus signature.
         thinking: { type: 'adaptive', display: 'summarized' },
-        pathToClaudeCodeExecutable: '/pnpm/claude',
+        pathToClaudeCodeExecutable: claudeCodeExecutable,
         systemPrompt: instructions
           ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions }
           : undefined,
@@ -2460,7 +2470,7 @@ export class ClaudeProvider implements AgentProvider {
     // Updated by applySettings so an effort-only change clamps against the model actually in effect.
     let activeModel = model;
     // Same for effort, which `result` stamps onto usage. `activeRequestedEffort` is the PRE-clamp value, which tells a
-    // Haiku turn ("high configured, none sent") apart from one never configured.
+    // Haiku 4.5 turn ("high configured, none sent") apart from one never configured.
     let activeEffort = effort;
     let activeRequestedEffort = requestedEffort;
     // How many times the effort MOVED during the current turn; any movement makes that turn's usage unattributable

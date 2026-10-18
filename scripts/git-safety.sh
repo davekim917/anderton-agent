@@ -62,8 +62,8 @@
 # Silent on success (a pending deletion still gets its own DM even on an
 # otherwise clean run — see below). On FAILURE it exits 1 and does NOT DM
 # the owner itself: the installed unit's OnFailure=nanoclaw-unit-alert@%n
-# (groups/_ops/systemd/nanoclaw-git-safety.service — tracked in the SEPARATE
-# davekim917/nanoclaw-groups repo, not this one's data/systemd/) already
+# (groups/_ops/systemd/nanoclaw-git-safety.service — tracked in the install's
+# SEPARATE groups repo, not this one's data/systemd/) already
 # fires on any non-zero exit and DMs ONE journal line — the unit's last
 # error-like line, else its plain last line, cut to 300 characters — plus
 # a `journalctl` pointer, at most once per 30 minutes per unit

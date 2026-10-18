@@ -15,7 +15,8 @@
  * So the wire lives in exactly one place (init-first-agent) and is never
  * duplicated across channel skills.
  */
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 import * as p from '@clack/prompts';
 
@@ -101,6 +102,13 @@ export interface ChannelSkillOverrides extends Partial<RunSkillOptions> {
   fail?: (stepName: string, msg: string, hint?: string, rawLogPath?: string) => Promise<never>;
 }
 
+/** A build that exited clean yet left no compiled adapter: the host would start without the channel. */
+function adapterMissingAfterBuild(projectRoot: string, channel: string, applied: string[]): boolean {
+  if (!applied.some((step) => step.startsWith('run: build:'))) return false;
+  if (!existsSync(join(projectRoot, 'src', 'channels', `${channel}.ts`))) return false;
+  return !existsSync(join(projectRoot, 'dist', 'channels', `${channel}.js`));
+}
+
 export async function runChannelSkill(
   channel: string,
   displayName: string,
@@ -182,6 +190,14 @@ export async function runChannelSkill(
         rawLog,
       );
     }
+  }
+
+  if (adapterMissingAfterBuild(projectRoot, channel, res.applied)) {
+    await failWith(
+      `${channel}-build`,
+      `${channel} was installed, but its adapter wasn't built.`,
+      `The build finished without producing dist/channels/${channel}.js. Run \`pnpm run build\`, fix what it reports, then retry setup.`,
+    );
   }
 
   // Identity confirmation captured by the skill (e.g. add-slack's auth.test).

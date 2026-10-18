@@ -196,7 +196,9 @@ world() { # tick
       mkdir -p "$R/controller/issues"
       jq -cn '{title:"Checkout button misaligned at 390px",body:"Seen on B1.",labels:["ui"]}' \
         >"$R/controller/issues/$FINDING.json"
-      synthesis "$VERDICT" ".findings=[{id:\"$FINDING\",confirmed:true,blocking:false,disposition:\"not-blocking:cosmetic\"}]"
+      # TRACKER=<n>: the owner names the finding's existing tracker issue.
+      synthesis "$VERDICT" ".findings=[{id:\"$FINDING\",confirmed:true,blocking:false,disposition:\"not-blocking:cosmetic\"}
+        + (if \"${TRACKER:-}\" == \"\" then {} else {existingIssue:(\"${TRACKER:-0}\" | tonumber),severity:\"P3\"} end)]"
     else
       synthesis "$VERDICT"
     fi
@@ -304,6 +306,13 @@ campaign() { # last-tick   (CRASH2: a second kill, armed once CRASH has fired)
     inputs_from_fakes
     local extra=()
     [ "$n" = 0 ] && extra=(--poll-json "$C/wake.json")
+    # NO_TIME_TICKS="6 7": those fires start with their time already spent,
+    # so spawn() starts no effect subprocess in them.
+    case " ${NO_TIME_TICKS:-} " in *" $n "*) extra+=(--deadline-epoch 1) ;; esac
+    # HEAD_MOVES_AT=k: the PR head moves off the frozen sha from tick k on.
+    if [ -n "${HEAD_MOVES_AT:-}" ] && [ "$n" -ge "$HEAD_MOVES_AT" ]; then
+      printf '{"%s":"%s"}\n' "$PR" "$SHA2" >"$C/heads.json"
+    fi
     if [ -n "${CRASH:-}" ] && [ "$crashed" = false ]; then
       SMOKE_CONTROLLER_CRASH_AT="$CRASH" step "$now" "${extra[@]}"
       [ "$STEP_RC" = 0 ] || [ "$STEP_RC" = 137 ] || fail "crash fire $now rc=$STEP_RC $STEP_OUT"
@@ -569,6 +578,36 @@ campaign 10
 [ "$(jq -s '[.[] | select(.tool=="ncl" and .op=="refused")] | length' "$FAKE_LOG")" = 1 ] \
   || fail "a refused dispatch is not retried"
 alarm_raised dispatch-failed alarm:dispatch-failed:
+
+fi
+if smoke_case 5a-dispatch-no-fire-time; then
+# --- 5a. a critic create spawn() never started is created later, not held ------
+# Two fires whose time is spent when the critic is due: no create runs, so the
+# next fire creates it once -- never a dispatch-ambiguous hold that blocks GO.
+new_case dispatch-no-fire-time
+NO_TIME_TICKS="1 2" campaign 12
+assert_once dispatch-no-fire-time
+jr '[.[] | select(.kind=="dispatch" and .slot=="critic" and .detail.outcome=="deferred")] | length >= 2' | grep -qx true \
+  || fail "dispatch-no-fire-time: each spent fire records the create as deferred: $(jr '[.[] | select(.kind=="dispatch")]')"
+[ "$(jq -s '[.[] | select(.tool=="ncl" and (.argv[:2] == ["tasks","create"]))] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "dispatch-no-fire-time: the critic is created exactly once"
+jr '[.[] | select(.kind=="dispatch" and .slot=="critic") | .state] | index("enqueued") != null and last == "done"' \
+  | grep -qx true \
+  || fail "dispatch-no-fire-time: the critic is created once the fire has time, and answers: $(jr '[.[] | select(.kind=="dispatch")]')"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:dispatch-ambiguous")))] | length == 0' | grep -qx true \
+  || fail "dispatch-no-fire-time: a create that never started is not ambiguous"
+[ "$(finish_verdict)" = '"GO"' ] || fail "dispatch-no-fire-time: still GO: $(finish_verdict)"
+unset NO_TIME_TICKS
+# A kill right after the deferred create returns leaves it deferred, never a
+# bare intent the next fire reads as ambiguous.
+new_case dispatch-no-fire-time-killed
+CRASH=after-effect:dispatch:critic NO_TIME_TICKS="1 2" campaign 12
+[ "$(jq -s '[.[] | select(.tool=="ncl" and (.argv[:2] == ["tasks","create"]))] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "dispatch-no-fire-time-killed: the critic is created exactly once"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:dispatch-ambiguous")))] | length == 0' | grep -qx true \
+  || fail "dispatch-no-fire-time-killed: not ambiguous: $(jr '[.[] | select(.kind=="dispatch")]')"
+[ "$(finish_verdict)" = '"GO"' ] || fail "dispatch-no-fire-time-killed: still GO: $(finish_verdict)"
+unset NO_TIME_TICKS
 
 fi
 if smoke_case 5b-owner-overdue; then
@@ -1334,8 +1373,8 @@ cite() { # <file> <line> <literal substring the cited line must contain>
     || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
 }
 ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
-for c in 'smoke-pr-gate.sh:5608' 'smoke-campaign-controller.py:1535-1537' \
-         'smoke-run-scaffold.sh:270-272' 'smoke-campaign-controller.py:1524-1534'; do
+for c in 'smoke-pr-gate.sh:5608' 'smoke-campaign-controller.py:1730-1732' \
+         'smoke-run-scaffold.sh:270-272' 'smoke-campaign-controller.py:1719-1729'; do
   grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
 done
 cite smoke-pr-gate.sh 5608 'OWNER_TOKEN="$(new_owner_token'
@@ -1344,9 +1383,9 @@ cite smoke-pr-gate.sh 5642 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
 cite smoke-pr-gate.sh 5689 '.activeLeaseOwner=$owner'
 cite smoke-run-scaffold.sh 271 '[ "$owner" = "$DEFAULT_OWNER" ]'
 cite smoke-run-scaffold.sh 710 'adds NO new authority check of its own'
-cite smoke-campaign-controller.py 1480 'def _owner_wake'
-cite smoke-campaign-controller.py 1530 'os.unlink("brief-{}.ack"'
-cite smoke-campaign-controller.py 1535 'if c.get("wake"):'
+cite smoke-campaign-controller.py 1675 'def _owner_wake'
+cite smoke-campaign-controller.py 1725 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1730 'if c.get("wake"):'
 
 
 fi
@@ -2172,6 +2211,177 @@ RECEIPT_TIMES=1 ticks 0 11
 jq -e '.challengerProvisionalDeadline != null' "$C/state/pr-$PR-state.json" >/dev/null \
   || fail "c6: the armed start stands"
 certified_go c6
+fi
+# --- 27. a verdict post that fails to publish is not a QA verdict --------------
+# The chat verdict, the PR run-record comment and the alarms about them are
+# publication: failing to publish one never turns a validated GO into BLOCKED.
+# Every other failed_terminal still does (4-*, 5-dispatch-refused, the
+# ambiguous crash case above).
+verdict_key() { key "$RUN" send verdict; }
+verdict_sends() { jq -s --arg k "$(verdict_key)" '[.[] | select(.tool=="enqueue") | .argv as $a
+  | ($a | index("--id")) as $i | select($a[$i + 1] | startswith($k))] | length' "$FAKE_LOG"; }
+if smoke_case 27-no-fire-time; then
+# Three fires whose time is already spent when the verdict is due (the shape
+# of a fire that slow GitHub calls ate): the post is never handed to the
+# helper, so nothing counts as a failure, and it goes out once time returns.
+new_case no-fire-time
+NO_TIME_TICKS="6 7 8" campaign 12
+assert_once no-fire-time
+jr '[.[] | select(.kind=="send" and .slot=="verdict" and .detail.outcome=="deferred")] | length >= 3' | grep -qx true \
+  || fail "no-fire-time: each spent fire records the post as deferred: $(jr '[.[] | select(.kind=="send" and .slot=="verdict")]')"
+jr '[.[] | select(.kind=="send" and .slot=="verdict") | .detail.effectFailures // 0] | max == 0' | grep -qx true \
+  || fail "no-fire-time: a post never started is never an effect failure: $(jr '[.[] | select(.kind=="send" and .slot=="verdict")]')"
+dq '[.[] | select(.reason=="send deferred: no time left in this fire" and .slot=="verdict")] | length >= 3' | grep -qx true \
+  || fail "no-fire-time: the deferral is a decision on record"
+jr '[.[] | select(.kind=="send" and .slot=="verdict")] | last | .state == "delivered"' | grep -qx true \
+  || fail "no-fire-time: the verdict post is delivered once the fire has time"
+[ "$(jq -c --arg k "$(verdict_key)" '[.messages | keys[] | select(startswith($k))]' "$C/fake/enqueue.json")" = "[\"$(verdict_key)#1\"]" ] \
+  || fail "no-fire-time: one attempt, sent once"
+[ "$(finish_verdict)" = '"GO"' ] || fail "no-fire-time: the validated GO finishes GO: $(finish_verdict) $(dq '[.[]|select(.type=="finish")]')"
+unset NO_TIME_TICKS
+
+fi
+if smoke_case 27-post-after-settle; then
+# No verdict post is prepared until every check that can still change the
+# verdict has settled, so a fire never posts one verdict and finishes another.
+new_case post-after-settle
+FINDING=F1 campaign 9
+assert_once post-after-settle
+jr 'map("\(.kind):\(.slot)") as $s | ($s | index("gh:issue:F1")) < ($s | index("send:verdict"))
+    and ($s | index("send:verdict")) < ($s | index("gh:pr-comment"))' | grep -qx true \
+  || fail "post-after-settle: the issues settle before the chat post, the PR comment after it: $(jr '[.[] | "\(.kind):\(.slot)"] | unique')"
+[ "$(finish_verdict)" = '"GO"' ] || fail "post-after-settle: still GO"
+
+fi
+if smoke_case 27-blocked-before-post; then
+# An issue obligation already failed_terminal: the verdict is BLOCKED, and the
+# only verdict ever posted says so -- never the validated GO first.
+new_case blocked-before-post
+jq -cn --arg run "$RUN" --arg k "$(key "$RUN" gh issue:F1)" \
+  '{v:1,at:"2026-09-18T09:59:00Z",fire:"seed",runId:$run,kind:"gh",slot:"issue:F1",key:$k,state:"failed_terminal",
+    attempt:1,mode:"live",detail:{reason:"3 failures",effectFailures:3}}' >>"$C/out/journal.ndjson"
+FINDING=F1 campaign 9
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "blocked-before-post: a failed_terminal issue still forces BLOCKED: $(finish_verdict)"
+texts="$(jq -c --arg k "$(verdict_key)" '[.messages | to_entries[] | select(.key | startswith($k)) | .value.text]' "$C/fake/enqueue.json")"
+jq -e 'length == 1 and (.[0] | contains("Could not test honestly")) and (map(contains("Safe to ship")) | any | not)' \
+  <<<"$texts" >/dev/null || fail "blocked-before-post: one verdict post, BLOCKED, never GO: $texts"
+
+fi
+if smoke_case 27-repoint-unsent; then
+# The chat post fails three times while the PR comment is still held; then the
+# PR head moves and the frozen GO falls to BLOCKED. The post never went out, so
+# it is re-pointed: the only verdict ever posted is the BLOCKED one, rendered
+# afresh, and the PR comment written after the change says BLOCKED too.
+new_case repoint-unsent
+jq -cn --arg k "enqueue:$(verdict_key | cut -c1-12)" \
+  '{($k):["fail-before","fail-before","fail-before"], "gh:pr-comment":["fail-before","fail-before","fail-before","fail-before"]}' \
+  >"$C/fake/faults.json"
+HEAD_MOVES_AT=8 campaign 11
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "repoint-unsent: the moved head finishes BLOCKED: $(finish_verdict)"
+texts="$(jq -c --arg k "$(verdict_key)" '[.messages | to_entries[] | select(.key | startswith($k)) | .value.text]' "$C/fake/enqueue.json")"
+jq -e 'length == 1 and (.[0] | contains("Could not test honestly")) and (map(contains("Safe to ship")) | any | not)' \
+  <<<"$texts" >/dev/null || fail "repoint-unsent: only the finished verdict is ever posted: $texts"
+jr '[.[] | select(.kind=="send" and .slot=="verdict") | .detail.retarget // empty] == [1]' | grep -qx true \
+  || fail "repoint-unsent: re-pointed once: $(jr '[.[] | select(.kind=="send" and .slot=="verdict")]')"
+jq -e '.comments["7"] | length == 1 and (.[0].body | contains("Verdict at finish: Could not test honestly"))' \
+  "$C/fake/gh.json" >/dev/null || fail "repoint-unsent: the PR record names the finished verdict: $(jq -c '.comments' "$C/fake/gh.json")"
+jr '[.[] | select(.kind=="verdict" and .slot=="validated") | .detail.publicationHint // empty] | last | .verdict == "BLOCKED"' \
+  | grep -qx true || fail "repoint-unsent: the recorded hint is the finished verdict"
+unset HEAD_MOVES_AT
+
+fi
+if smoke_case 27-superseded-landed; then
+# The GO post is delivered while the PR comment is still held; then the head
+# moves and the run finishes BLOCKED. The delivered post is never re-sent; an
+# alarm says which verdict the run finishes with, and it is on record.
+new_case superseded-landed
+jq -cn '{"gh:pr-comment":["fail-before","fail-before","fail-before","fail-before"]}' >"$C/fake/faults.json"
+HEAD_MOVES_AT=8 campaign 11
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "superseded-landed: BLOCKED: $(finish_verdict)"
+[ "$(verdict_sends)" = 1 ] || fail "superseded-landed: the delivered GO post is never re-sent: $(verdict_sends)"
+alarm_raised superseded-landed alarm:publication-superseded:
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:publication-superseded:"))) | .detail.hint.detail]
+    | first | .posted == "GO" and .verdict == "BLOCKED"' | grep -qx true \
+  || fail "superseded-landed: the alarm names the posted and the finished verdict"
+jr '[.[] | select(.kind=="verdict" and .slot=="validated") | .detail.publicationFailed // empty] | last
+    | map(.obligation) | index("send:verdict") != null' | grep -qx true \
+  || fail "superseded-landed: the superseded post is on the verdict record: $(jr '[.[] | select(.kind=="verdict")]')"
+unset HEAD_MOVES_AT
+
+fi
+if smoke_case 27-publication-failed; then
+# The verdict post genuinely fails three times (the helper errors, no write):
+# failed_terminal and alarmed as before, but the GO stands, the failure is
+# recorded on the verdict record, and the post is re-offered after finish.
+new_case publication-failed
+jq -cn --arg k "enqueue:$(verdict_key | cut -c1-12)" '{($k):["fail-before","fail-before","fail-before"]}' \
+  >"$C/fake/faults.json"
+campaign 10
+assert_once publication-failed
+jr '[.[] | select(.kind=="send" and .slot=="verdict" and .state=="failed_terminal") | .detail.reason] == ["3 failures"]' \
+  | grep -qx true || fail "publication-failed: three failures make the post failed_terminal once"
+[ "$(finish_verdict)" = '"GO"' ] || fail "publication-failed: GO, not BLOCKED: $(finish_verdict) $(dq '[.[]|select(.type=="finish")]')"
+dq '[.[] | select(.type=="finish")] | last | .failedChecks == []' | grep -qx true \
+  || fail "publication-failed: the finish names no failed check"
+jr '[.[] | select(.kind=="verdict" and .slot=="validated") | .detail.publicationFailed // empty] | last
+    | map(.obligation) == ["send:verdict"]' | grep -qx true \
+  || fail "publication-failed: recorded on the verdict record: $(jr '[.[] | select(.kind=="verdict")]')"
+dq '[.[] | select(.type=="publication_failed" and .verdict=="GO")] | length >= 1' | grep -qx true \
+  || fail "publication-failed: a decision says the post failed and the verdict stands"
+alarm_raised publication-failed alarm:publication-failed:
+alarm_raised publication-failed alarm:controller_send_failed:
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:publication-failed:"))) | .detail.publicationOf] | first == "send:verdict"' \
+  | grep -qx true || fail "publication-failed: the alarm names the post it is about"
+jr '[.[] | select(.kind=="send" and .slot=="verdict")] | last | .state == "delivered"' | grep -qx true \
+  || fail "publication-failed: the post re-offered after finish lands: $(jr '[.[] | select(.kind=="send" and .slot=="verdict")]')"
+jr '[.[] | select(.kind=="send" and .slot=="verdict") | .detail.publicationReoffers // empty] == [1]' | grep -qx true \
+  || fail "publication-failed: one re-offer"
+[ "$(jq -c --arg k "$(verdict_key)" '[.messages | keys[] | select(startswith($k))]' "$C/fake/enqueue.json")" = "[\"$(verdict_key)#1\"]" ] \
+  || fail "publication-failed: the re-offer replays the same attempt, never a second post"
+dq '[.[] | select(.reason=="verdict post published after finish")] | length == 1' | grep -qx true \
+  || fail "publication-failed: the late publication is a decision on record"
+
+fi
+if smoke_case 27-publication-bounded; then
+# A helper that never recovers: the re-offers are bounded, and the run then
+# takes the done fast path instead of retrying forever.
+new_case publication-bounded
+jq -cn --arg k "enqueue:$(verdict_key | cut -c1-12)" '{($k):[range(30) | "fail-before"]}' >"$C/fake/faults.json"
+campaign 16
+[ "$(finish_verdict)" = '"GO"' ] || fail "publication-bounded: GO: $(finish_verdict)"
+[ "$(verdict_sends)" = 9 ] || fail "publication-bounded: 3 tries, then 3 per re-offer, then none: $(verdict_sends)"
+jr '[.[] | select(.kind=="send" and .slot=="verdict")] | last | .state == "failed_terminal"' | grep -qx true \
+  || fail "publication-bounded: ends failed_terminal"
+jr '[.[] | select(.kind=="send" and .slot=="verdict") | .detail.publicationReoffers // empty] == [1, 2]' | grep -qx true \
+  || fail "publication-bounded: exactly two re-offers"
+n0="$(verdict_sends)"
+step_ok "$(tick_time 17)"
+[ "$(verdict_sends)" = "$n0" ] || fail "publication-bounded: nothing after the last re-offer"
+jq -e '.runs | map(.runId) | index("'"$RUN"'") == null' <<<"$STEP_OUT" >/dev/null \
+  || fail "publication-bounded: the run is back on the done fast path: $STEP_OUT"
+
+fi
+if smoke_case 28-tracker-comment; then
+# The owner names the finding's existing tracker: the campaign comments there
+# once, files no wrapper issue, lists it in the PR's run record, and finishes.
+new_case tracker-comment
+jq -cn '{comments:{}, prs:{}, issues:[{number:3191,title:"Checkout drift",body:"tracker",state:"open",labels:[],
+  html_url:"https://github.test/issues/3191"}]}' >"$C/fake/gh.json"
+TRACKER=3191 FINDING=F1 campaign 9
+# Exactly once, apart from the seeded tracker: the one body no run wrote.
+r="$(effects_once)"
+jq -e '.errors == ["GitHub write without a marker"] and .terminal == 1' <<<"$r" >/dev/null \
+  || fail "tracker-comment: effects not exactly once: $r"
+[ "$(jq '.issues | length' "$C/fake/gh.json")" = 1 ] || fail "tracker-comment: no wrapper issue: $(jq -c .issues "$C/fake/gh.json")"
+jq -e --arg m "<!-- smoke-ctl:$(key "$RUN" gh issue:F1) -->" '.comments["3191"] | length == 1 and (.[0].body | contains($m))' \
+  "$C/fake/gh.json" >/dev/null || fail "tracker-comment: one marked comment on #3191"
+jq -e '.comments["7"][0].body | contains("Finding F1: already tracked as #3191")' "$C/fake/gh.json" >/dev/null \
+  || fail "tracker-comment: the PR run record names the tracker"
+jr '[.[] | select(.kind=="gh" and .slot=="issue:F1" and .state=="done") | .detail | [.via, .duplicateOf]] == [["tracker-comment", 3191]]' \
+  | grep -qx true || fail "tracker-comment: done via tracker-comment"
+[ "$(finish_verdict)" = '"GO"' ] || fail "tracker-comment: GO"
+unset TRACKER
+
 fi
 smoke_cases_done
 echo "smoke campaign controller live tests passed"

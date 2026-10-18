@@ -18,14 +18,21 @@ import {
 } from '../../db/messaging-groups.js';
 import { getPendingApprovalByRequestId, getPendingApprovalsByAction } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
-import { readEnvFile } from '../../env.js';
 import { unguarded } from '../../guard/index.js';
+import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { resolveSession, sessionMessageExists } from '../../session-manager.js';
 import { isChannelVariant, type MessagingGroup, type PendingApproval, type Session } from '../../types.js';
 import { registerChoiceHandler, retireChoice, type ChoiceHandlerContext } from '../approvals/choices.js';
 import { notifyAgent, requestApprovalOutcome, type RequestApprovalOptions } from '../approvals/primitive.js';
-import { parseReleaseShipScope, releaseShipScopeJson, type ReleaseShipScope } from '../approvals/release-ship-scope.js';
+import {
+  cardReleaseScopeJson,
+  parseReleaseShipScope,
+  RELEASE_OPTIONS,
+  warningOptions,
+  type ReleaseShipScope,
+  unscopedReleaseCard,
+} from '../approvals/release-ship-scope.js';
 import { hasAdminPrivilege } from '../permissions/db/user-roles.js';
 import { getUser } from '../permissions/db/users.js';
 
@@ -33,17 +40,13 @@ export const REQUEST_CHOICE_ACTION = 'request_choice';
 const MAX_CHOICE_OPTIONS = 10;
 const MAX_CHOICE_APPROVERS = 20;
 export const SUPERSEDED_LINE = '↩️ Superseded by a newer ask';
+const OUT_OF_DATE_LINE =
+  '⚠️ Closed: this release card is out of date and cannot approve anything. Ask for a fresh card.';
 /** The host-only event tag on a relayed answer (notifyAgent); the agent acts on nothing else. */
 const CHOICE_RESPONSE_EVENT = 'choice_response';
 const ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const USER_ID_RE = /^[^:\s]+:\S+$/;
 const OPTION_STYLES = new Set<unknown>(['primary', 'danger', 'default']);
-const DECISION_REQUIRED_KEY = 'NANOCLAW_RELEASE_CARD_DECISION_REQUIRED';
-const DECISION_KEYS = ['question', 'ifItShips', 'evidence'];
-const MAX_DECISION_QUESTION = 300;
-const MAX_DECISION_IF_IT_SHIPS = 1200;
-const MAX_DECISION_LINES = 10;
-const MAX_DECISION_EVIDENCE = 500;
 const MAX_RELEASE_CARD_TEXT = 1800;
 const HEX_RUN_RE = /[0-9a-f]{40}/i;
 const DISPLAY_SAFE_RE =
@@ -51,11 +54,70 @@ const DISPLAY_SAFE_RE =
 const VISIBLE_RE = /[A-Za-z0-9\u00C0-\u00FF]/;
 const EVIDENCE_RE = /^https:\/\/[^\s<>|]+$/;
 
-interface ReleaseDecision {
-  question: string;
-  ifItShips: string[];
+/**
+ * What the approver reads. A `warning` card exists only because agents recommend
+ * not shipping; its Ship button names the risk the clicker accepts. A `release`
+ * card is a scheduled production release and lists its warnings, or says it has none.
+ */
+type ReleaseDecision = WarningDecision | ScheduledReleaseDecision;
+
+interface WarningDecision {
+  kind: 'warning';
+  headline: string;
+  asked: string;
+  does: string[];
+  diverges?: string;
+  risk: string;
+  undo: string;
+  holdingCosts: string;
+  recommend: string;
+  reviewers?: string;
+  evidence: string;
+  accept: string;
+}
+
+interface ScheduledReleaseDecision {
+  kind: 'release';
+  headline: string;
+  warnings: string[];
+  does: string[];
+  undo: string;
+  reviewers?: string;
   evidence: string;
 }
+
+interface FieldRule {
+  max: number;
+  /** Lines rendered as bullets; absent means one line. */
+  maxLines?: number;
+  optional?: boolean;
+}
+
+const DECISION_FIELDS: Record<ReleaseDecision['kind'], Record<string, FieldRule>> = {
+  warning: {
+    headline: { max: 200 },
+    asked: { max: 300 },
+    does: { max: 700, maxLines: 6 },
+    diverges: { max: 300, optional: true },
+    risk: { max: 300 },
+    undo: { max: 300 },
+    holdingCosts: { max: 300 },
+    recommend: { max: 300 },
+    reviewers: { max: 300, optional: true },
+    evidence: { max: 500 },
+    accept: { max: 50 },
+  },
+  release: {
+    headline: { max: 200 },
+    warnings: { max: 700, maxLines: 6 },
+    does: { max: 700, maxLines: 6 },
+    undo: { max: 300 },
+    reviewers: { max: 300, optional: true },
+    evidence: { max: 500 },
+  },
+};
+const SILENCE_LINE = 'Silence = nothing ships: it stays held until someone clicks.';
+const AGENT_WORDS_LINE = 'Everything above is the requesting agent’s words, not checked by the host.';
 
 interface ChoiceRequest {
   choiceId: string;
@@ -82,17 +144,11 @@ function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | {
   if (decision !== undefined && !scope) return { error: 'decision belongs only on an approvalScope release card' };
   const brief = decision === undefined ? undefined : parseReleaseDecision(decision);
   if (typeof brief === 'string') return { error: brief };
-  if (scope && !brief) {
-    if (decisionRequired()) {
-      return { error: 'a release card needs decision {question, ifItShips, evidence}' };
-    }
-    log.warn('request_choice: release card posted without a decision', {
-      choiceId,
-      repository: scope.repository,
-      pullRequest: scope.pullRequest,
-    });
+  if (scope && !brief) return { error: 'a release card needs its decision: an approver must see what ships' };
+  if (brief?.kind === 'warning' && !scope?.holds?.length) {
+    return { error: 'a warning card needs approvalScope.holds: the exact hold codes its Go accepts' };
   }
-  const canonical = scope ? canonicalReleaseChoice(scope, brief) : undefined;
+  const canonical = scope && brief ? canonicalReleaseChoice(scope, brief) : undefined;
   const cardText = canonical ? `**${canonical.title}**\n\n${canonical.question}`.length : 0;
   if (cardText > MAX_RELEASE_CARD_TEXT) {
     return { error: `decision is too long for one card: shorten it by ${cardText - MAX_RELEASE_CARD_TEXT} characters` };
@@ -150,41 +206,54 @@ function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | {
   };
 }
 
-function decisionRequired(): boolean {
-  return readEnvFile([DECISION_REQUIRED_KEY])[DECISION_REQUIRED_KEY] === '1';
+function parseReleaseDecision(value: unknown): ReleaseDecision | string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return 'decision must be an object with kind "warning" or "release"';
+  }
+  const record = value as Record<string, unknown>;
+  const kind = record.kind;
+  if (kind !== 'warning' && kind !== 'release') return 'decision.kind must be "warning" or "release"';
+  const rules = DECISION_FIELDS[kind];
+  const extra = Object.keys(record).find((k) => k !== 'kind' && !(k in rules));
+  if (extra !== undefined) return `a ${kind} decision takes only kind, ${Object.keys(rules).join(', ')} (not ${extra})`;
+  const out: Record<string, unknown> = { kind };
+  for (const [name, rule] of Object.entries(rules)) {
+    const parsed = parseDecisionField(name, record[name], rule);
+    if (typeof parsed === 'string') return parsed;
+    if (parsed !== undefined) out[name] = parsed.value;
+  }
+  const evidence = out.evidence as string;
+  if (!EVIDENCE_RE.test(evidence) || !URL.canParse(evidence)) return 'decision.evidence must be one https link';
+  return out as unknown as ReleaseDecision;
 }
 
-function parseReleaseDecision(value: unknown): ReleaseDecision | string {
-  if (!value || typeof value !== 'object' || Array.isArray(value))
-    return 'decision must be {question, ifItShips, evidence}';
-  const record = value as Record<string, unknown>;
-  if (Object.keys(record).some((k) => !DECISION_KEYS.includes(k)))
-    return 'decision takes only question, ifItShips, evidence';
-  const [question, ifItShips, evidence] = DECISION_KEYS.map((k) =>
-    typeof record[k] === 'string' ? record[k].normalize('NFKC') : undefined,
-  );
-  if (question === undefined || !VISIBLE_RE.test(question)) return 'decision.question is required';
-  if (ifItShips === undefined || !VISIBLE_RE.test(ifItShips)) return 'decision.ifItShips is required';
-  if (evidence === undefined || !evidence) return 'decision.evidence is required';
-  if (question.length > MAX_DECISION_QUESTION) return `decision.question is over ${MAX_DECISION_QUESTION} characters`;
-  if (ifItShips.length > MAX_DECISION_IF_IT_SHIPS) {
-    return `decision.ifItShips is over ${MAX_DECISION_IF_IT_SHIPS} characters`;
+function parseDecisionField(
+  name: string,
+  raw: unknown,
+  rule: FieldRule,
+): { value: string | string[] } | string | undefined {
+  const text = typeof raw === 'string' ? raw.normalize('NFKC') : undefined;
+  if (text === undefined || !VISIBLE_RE.test(text)) {
+    if (rule.optional && (raw === undefined || (typeof raw === 'string' && !raw.trim()))) return undefined;
+    return `decision.${name} is required`;
   }
-  if (evidence.length > MAX_DECISION_EVIDENCE) return `decision.evidence is over ${MAX_DECISION_EVIDENCE} characters`;
-  const lines = ifItShips
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (lines.length > MAX_DECISION_LINES) return `decision.ifItShips has over ${MAX_DECISION_LINES} lines`;
-  const text = [question, ...lines, evidence];
-  if (!text.every(isDisplaySafe)) {
+  if (text.length > rule.max) return `decision.${name} is over ${rule.max} characters`;
+  const lines = rule.maxLines
+    ? text
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+    : [text.trim()];
+  if (rule.maxLines && lines.length > rule.maxLines) return `decision.${name} has over ${rule.maxLines} lines`;
+  if (!lines.every(isDisplaySafe)) {
     return 'decision text must be plain text: ASCII, accented Latin letters, and ‘ ’ “ ” – — • … → £ € °';
   }
-  if (text.some((t) => HEX_RUN_RE.test(t))) return 'decision text must not hold a commit SHA: the host pins the head';
-  if (text.some((t) => t.includes(']('))) return 'decision text must not hold markdown links: put the link in evidence';
-  if (text.some((t) => t.includes('||'))) return 'decision text must not hold || (Discord hides text between bars)';
-  if (!EVIDENCE_RE.test(evidence) || !URL.canParse(evidence)) return 'decision.evidence must be one https link';
-  return { question: neutralize(question.trim()), ifItShips: lines.map(neutralize), evidence };
+  if (lines.some((t) => HEX_RUN_RE.test(t))) return 'decision text must not hold a commit SHA: the host pins the head';
+  if (lines.some((t) => t.includes('](')))
+    return 'decision text must not hold markdown links: put the link in evidence';
+  if (lines.some((t) => t.includes('||'))) return 'decision text must not hold || (Discord hides text between bars)';
+  if (name === 'evidence') return { value: lines[0] };
+  return { value: rule.maxLines ? lines.map(neutralize) : neutralize(lines[0]) };
 }
 
 function isDisplaySafe(normalized: string): boolean {
@@ -197,26 +266,58 @@ function neutralize(text: string): string {
 
 function canonicalReleaseChoice(
   scope: ReleaseShipScope,
-  brief?: ReleaseDecision,
+  brief: ReleaseDecision,
 ): Pick<ChoiceRequest, 'title' | 'question' | 'options'> {
-  const pin = `Ship ${scope.repository}#${scope.pullRequest} from ${scope.base} at ${scope.headSha}?`;
+  const pin = `Pinned to ${scope.repository}#${scope.pullRequest} from ${scope.base} at ${scope.headSha}.`;
+  const accepts = scope.holds?.length
+    ? ['Ship accepts only these holds, at this head:', ...scope.holds.map((code) => `• \`${code}\``)]
+    : ['Ship accepts no holds: any hold keeps it held.'];
+  const bullets = (lines: string[]) => lines.map((line) => `• ${line}`);
+  const optional = (label: string, text: string | undefined) => (text ? [`${label}: ${text}`] : []);
+  if (brief.kind === 'release') {
+    return {
+      title: `Release: ${scope.repository}#${scope.pullRequest}`,
+      question: [
+        brief.headline,
+        SILENCE_LINE,
+        '',
+        'Warnings:',
+        ...bullets(brief.warnings),
+        'What goes to production:',
+        ...bullets(brief.does),
+        `Undo: ${brief.undo}`,
+        ...optional('Reviewers', brief.reviewers),
+        `Evidence: ${brief.evidence}`,
+        '',
+        AGENT_WORDS_LINE,
+        ...accepts,
+        pin,
+      ].join('\n'),
+      options: RELEASE_OPTIONS,
+    };
+  }
   return {
-    title: `Release approval: ${scope.repository}#${scope.pullRequest}`,
-    question: brief
-      ? [
-          'The requesting agent’s brief (its words, not checked by the host):',
-          `The question: ${brief.question}`,
-          'If it ships:',
-          ...brief.ifItShips.map((line) => `• ${line}`),
-          `Evidence: ${brief.evidence}`,
-          '',
-          pin,
-        ].join('\n')
-      : pin,
-    options: [
-      { label: 'Ship', value: 'ship', style: 'primary' },
-      { label: 'Hold', value: 'hold', style: 'danger' },
-    ],
+    title: `Held for your call: ${scope.repository}#${scope.pullRequest}`,
+    question: [
+      brief.headline,
+      SILENCE_LINE,
+      '',
+      `You asked: ${brief.asked}`,
+      'This does:',
+      ...bullets(brief.does),
+      ...optional('Diverges', brief.diverges),
+      `Risk you’d accept: ${brief.risk}`,
+      `Undo: ${brief.undo}`,
+      `Holding costs: ${brief.holdingCosts}`,
+      `Agents recommend: ${brief.recommend}`,
+      ...optional('Reviewers', brief.reviewers),
+      `Evidence: ${brief.evidence}`,
+      '',
+      AGENT_WORDS_LINE,
+      ...accepts,
+      pin,
+    ].join('\n'),
+    options: warningOptions(brief.accept),
   };
 }
 
@@ -455,18 +556,6 @@ export function formatChoiceResponse(fields: {
   return ['choice_response', ...pairs.map(([k, v]) => `${k}=${encode(v)}`)].join(' ');
 }
 
-/** A corrupt pending payload can never add scope to a host-origin response. */
-function responseReleaseScope(approval: PendingApproval): string | undefined {
-  try {
-    const payload = JSON.parse(approval.payload) as { approvalScope?: unknown };
-    const scope = parseReleaseShipScope(payload.approvalScope);
-    return scope ? releaseShipScopeJson(scope) : undefined;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- malformed stored payload must remain unscoped
-  } catch {
-    return undefined;
-  }
-}
-
 async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
   const target = (await cardConversationSession(ctx.approval, ctx.requester)) ?? ctx.requester;
   if (!target) return null;
@@ -483,7 +572,7 @@ async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
         label: ctx.label,
         userId: ctx.userId,
         userName: user?.display_name ?? null,
-        releaseScope: responseReleaseScope(ctx.approval),
+        releaseScope: cardReleaseScopeJson(ctx.approval),
       }),
       { id, event: CHOICE_RESPONSE_EVENT },
     );
@@ -511,3 +600,18 @@ registerDeliveryAction(
   ),
 );
 registerChoiceHandler(REQUEST_CHOICE_ACTION, relayChoice);
+
+export async function retireUnscopedReleaseCards(): Promise<void> {
+  for (const row of await getPendingApprovalsByAction(REQUEST_CHOICE_ACTION)) {
+    if (row.status !== 'pending' || !unscopedReleaseCard(row)) continue;
+    if (await retireChoice(row, OUT_OF_DATE_LINE)) {
+      log.info('Out-of-date release card closed', { approvalId: row.approval_id, agentGroupId: row.agent_group_id });
+    }
+  }
+}
+
+onHostStart(function outOfDateReleaseCardsHostStart() {
+  void retireUnscopedReleaseCards().catch((err: unknown) => {
+    log.error('Closing out-of-date release cards failed', { err });
+  });
+});

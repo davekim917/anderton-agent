@@ -489,7 +489,7 @@ export function runtimeReach(
 const names = (spec: string, packages: string[]): boolean =>
   packages.some((pkg) => spec === pkg || spec.startsWith(`${pkg}/`));
 
-const MOCKS = /^(?:vi|jest)\.(?:mock|doMock|unstable_mockModule)$/;
+const MOCKS = /^(?:(?:vi|jest)\.(?:mock|doMock|unstable_mockModule)|mock\.module)$/;
 const STUBS = /^(?:vi|jest)\.stubGlobal$/;
 const SPIES = /^(?:vi|jest)\.spyOn$/;
 /** Globals a live-path test's transport runs on; stubbing one fakes the wire as surely as mocking a module. */
@@ -562,7 +562,20 @@ function moduleUse(
 }
 
 /** The setup files vitest loads before every test file, which can mock a module for all of them. */
-function vitestSetupFiles(read: (file: string) => string | null): string[] {
+const AGENT_RUNNER = 'container/agent-runner';
+
+/** The files every test of `test`'s runner loads first: vitest's setup files, or the agent-runner's Bun preloads. */
+function setupFiles(test: string, read: (file: string) => string | null): string[] {
+  if (test.startsWith(`${AGENT_RUNNER}/`)) {
+    const manifest = read(`${AGENT_RUNNER}/package.json`);
+    const scripts = manifest
+      ? Object.values((JSON.parse(manifest) as { scripts?: Record<string, string> }).scripts ?? {})
+      : [];
+    const fromScripts = scripts.flatMap((script) => [...script.matchAll(/--preload[=\s]+(\S+)/g)].map((m) => m[1]!));
+    const bunfig = /^\s*preload\s*=\s*\[([^\]]*)\]/m.exec(read(`${AGENT_RUNNER}/bunfig.toml`) ?? '')?.[1] ?? '';
+    const fromBunfig = [...bunfig.matchAll(/['"]([^'"]+)['"]/g)].map((m) => m[1]!);
+    return [...new Set([...fromScripts, ...fromBunfig])].map((file) => path.posix.join(AGENT_RUNNER, file));
+  }
   const config = read('vitest.config.ts');
   const list = config ? /setupFiles:\s*\[([^\]]*)\]/.exec(config)?.[1] : undefined;
   return list ? [...list.matchAll(/['"]([^'"]+)['"]/g)].map((m) => m[1]!) : [];
@@ -570,7 +583,7 @@ function vitestSetupFiles(read: (file: string) => string | null): string[] {
 
 /**
  * Whether a test loads one of `packages` without faking them. A mock in any repo module the test reaches through
- * relative imports, or in vitest's setup files, applies to the test, so every one is read; a module mocked anywhere
+ * relative imports, or in the setup files of the test's runner, applies to the test, so every one is read; a module mocked anywhere
  * does not count as loading what it imports. The test and its modules may mock no package or network builtin, since
  * the library beneath a live package is its wire, nor stub, spy on or reassign a transport global; the setup files, shared by every test, may not
  * mock the path's own packages. A name-only check would accept a placeholder test; this cheap floor refuses one that
@@ -598,7 +611,7 @@ function testLoads(test: string, packages: string[], read: (file: string) => str
       for (const spec of use.imports) if (spec.startsWith('.')) queue.push(local(file, spec));
     }
   };
-  const setup = vitestSetupFiles(read);
+  const setup = setupFiles(test, read);
   const mocked = new Set<string>();
   let fake = false;
   const collect =

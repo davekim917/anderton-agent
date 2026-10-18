@@ -15,13 +15,15 @@ const REPOSITORY_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9][A-Za-z0-9_.
 const BASE_RE = /^[^\s\x00-\x1F\x7F]{1,255}$/;
 const HEAD_RE = /^[a-f0-9]{40}$/;
 const RELEASE_SCOPE_KEYS = ['purpose', 'repository', 'pullRequest', 'base', 'headSha'] as const;
-const DECISION_KEYS = ['question', 'ifItShips', 'evidence'];
-
-interface ReleaseDecision {
-  question: string;
-  ifItShips: string;
-  evidence: string;
-}
+const HOLD_RE = /^hold:[A-Za-z0-9_.:/@+-]{1,160}$/;
+const MAX_SCOPE_HOLDS = 12;
+const DECISION_FIELDS: Record<'warning' | 'release', { required: string[]; optional: string[] }> = {
+  warning: {
+    required: ['headline', 'asked', 'does', 'risk', 'undo', 'holdingCosts', 'recommend', 'evidence', 'accept'],
+    optional: ['diverges', 'reviewers'],
+  },
+  release: { required: ['headline', 'warnings', 'does', 'undo', 'evidence'], optional: ['reviewers'] },
+};
 
 interface ReleaseShipScope {
   purpose: 'release_ship';
@@ -29,15 +31,22 @@ interface ReleaseShipScope {
   pullRequest: number;
   base: string;
   headSha: string;
+  holds?: string[];
 }
 
 function parseReleaseShipScope(value: unknown): ReleaseShipScope | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record);
+  const holds = record.holds;
   if (
-    keys.length !== RELEASE_SCOPE_KEYS.length ||
-    keys.some((key) => !RELEASE_SCOPE_KEYS.includes(key as (typeof RELEASE_SCOPE_KEYS)[number])) ||
+    keys.some((key) => key !== 'holds' && !RELEASE_SCOPE_KEYS.includes(key as (typeof RELEASE_SCOPE_KEYS)[number])) ||
+    RELEASE_SCOPE_KEYS.some((key) => !keys.includes(key)) ||
+    (holds !== undefined &&
+      (!Array.isArray(holds) ||
+        holds.length > MAX_SCOPE_HOLDS ||
+        new Set(holds).size !== holds.length ||
+        !holds.every((code) => typeof code === 'string' && HOLD_RE.test(code)))) ||
     record.purpose !== 'release_ship' ||
     typeof record.repository !== 'string' ||
     !REPOSITORY_RE.test(record.repository) ||
@@ -57,17 +66,29 @@ function parseReleaseShipScope(value: unknown): ReleaseShipScope | undefined {
     pullRequest: record.pullRequest,
     base: record.base,
     headSha: record.headSha,
+    ...(Array.isArray(holds) ? { holds: [...(holds as string[])].sort() } : {}),
   };
 }
 
-function isReleaseDecision(value: unknown): value is ReleaseDecision {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+const DOES_FIELD = { type: 'string', description: 'What changes for clients, one fact per line (up to 6 lines, 700)' };
+const UNDO_FIELD = { type: 'string', description: 'How to revert, and what cannot be undone (up to 300)' };
+const REVIEWERS_FIELD = {
+  type: 'string',
+  description: 'Optional: who reviewed it, with any dissent named (up to 300)',
+};
+const EVIDENCE_FIELD = { type: 'string', description: 'One https link to the evidence (up to 500 characters)' };
+
+/** The transport check; the host re-validates every field and renders the card. */
+function decisionError(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return 'decision must be an object';
   const record = value as Record<string, unknown>;
-  const keys = Object.keys(record);
-  return (
-    keys.length === DECISION_KEYS.length &&
-    DECISION_KEYS.every((k) => typeof record[k] === 'string' && (record[k] as string).trim() !== '')
-  );
+  if (record.kind !== 'warning' && record.kind !== 'release') return 'decision.kind must be "warning" or "release"';
+  const { required, optional } = DECISION_FIELDS[record.kind];
+  const extra = Object.keys(record).find((k) => k !== 'kind' && !required.includes(k) && !optional.includes(k));
+  if (extra !== undefined) return `a ${record.kind} decision does not take ${extra}`;
+  const missing = required.find((k) => typeof record[k] !== 'string' || !(record[k] as string).trim());
+  if (missing !== undefined) return `a ${record.kind} decision needs ${missing} as non-empty text`;
+  return undefined;
 }
 
 function channelDestinationNames(): string {
@@ -122,37 +143,78 @@ export const requestChoice: McpToolDefinition = {
         approvalScope: {
           type: 'object',
           description:
-            'Optional host-canonical release approval scope. When supplied, omit title/question/options: the host renders exact Ship and Hold buttons and the repo/PR/base/head line from this scope. `decision` is required with it.',
+            'Optional host-canonical release approval scope. When supplied, omit title/question/options: the host renders the buttons and the repo/PR/base/head line from this scope. `decision` is required with it.',
           properties: {
             purpose: { type: 'string', enum: ['release_ship'] },
             repository: { type: 'string', description: 'Exact owner/repository' },
             pullRequest: { type: 'integer', minimum: 1 },
             base: { type: 'string' },
             headSha: { type: 'string', description: 'Exact lower-case 40-hex commit SHA' },
+            holds: {
+              type: 'array',
+              maxItems: 12,
+              items: { type: 'string' },
+              description:
+                'The exact `hold:` codes the release policy published for this head, unique. Required on a warning card; the card shows them and a Ship click accepts only these, at this head. Absent or empty, a Ship accepts no hold.',
+            },
           },
           required: ['purpose', 'repository', 'pullRequest', 'base', 'headSha'],
           additionalProperties: false,
         },
         decision: {
-          type: 'object',
           description:
-            'Required with approvalScope, refused without it: what the approver is deciding, shown on the card above the host\'s Ship line and labelled as your words. Plain text only (ASCII, accented Latin letters and ‘ ’ “ ” – — • … → £ € °; no emoji). The host refuses a commit SHA, a markdown link or || anywhere in it, or a card over 1800 characters; that refusal arrives later as a "request_choice failed" message.',
-          properties: {
-            question: {
-              type: 'string',
-              description: 'The one question in client terms, one sentence ending in "?" (up to 300 characters)',
+            'Required with approvalScope, refused without it. `kind: "warning"` is a HELD card: post one only when agents recommend NOT shipping; it renders "Silence = nothing ships", every field in order, and the buttons "Ship anyway — I accept <accept>" (value ship) and "Send back" (value send_back). `kind: "release"` is a scheduled production release: its warnings (or "No unresolved warnings"), what goes to production, undo, evidence, and the buttons "Ship release" (ship) and "Hold" (hold). Plain text only (ASCII, accented Latin letters and ‘ ’ “ ” – — • … → £ € °; no emoji). The host refuses a commit SHA, a markdown link or || anywhere in it, a field over its limit, or a card over 1800 characters; that refusal arrives later as a "request_choice failed" message.',
+          oneOf: [
+            {
+              type: 'object',
+              properties: {
+                kind: { type: 'string', enum: ['warning'] },
+                headline: { type: 'string', description: 'The one thing to worry about, in client terms (up to 200)' },
+                asked: {
+                  type: 'string',
+                  description:
+                    'The latest agreed request with its amendments, quoted with who and when, or exactly "No ask on record" (up to 300)',
+                },
+                does: DOES_FIELD,
+                diverges: { type: 'string', description: 'Optional: where it differs from the ask (up to 300)' },
+                risk: {
+                  type: 'string',
+                  description: 'The specific risk the clicker accepts, with clients and numbers (up to 300)',
+                },
+                undo: UNDO_FIELD,
+                holdingCosts: { type: 'string', description: 'What waits, and for whom, if it stays held (up to 300)' },
+                recommend: {
+                  type: 'string',
+                  description: 'The agents’ recommended alternative, never Ship (up to 300)',
+                },
+                reviewers: REVIEWERS_FIELD,
+                evidence: EVIDENCE_FIELD,
+                accept: {
+                  type: 'string',
+                  description: 'The accepted risk in a few words, shown on the Ship anyway button (up to 50)',
+                },
+              },
+              required: DECISION_FIELDS.warning.required.concat('kind'),
+              additionalProperties: false,
             },
-            ifItShips: {
-              type: 'string',
-              description: 'What changes for the client, one fact per line (up to 10 lines, 1200 characters)',
+            {
+              type: 'object',
+              properties: {
+                kind: { type: 'string', enum: ['release'] },
+                headline: { type: 'string', description: 'What this release is (up to 200)' },
+                warnings: {
+                  type: 'string',
+                  description: 'One unresolved warning per line, or exactly "No unresolved warnings" (up to 6 lines)',
+                },
+                does: DOES_FIELD,
+                undo: UNDO_FIELD,
+                reviewers: REVIEWERS_FIELD,
+                evidence: EVIDENCE_FIELD,
+              },
+              required: DECISION_FIELDS.release.required.concat('kind'),
+              additionalProperties: false,
             },
-            evidence: {
-              type: 'string',
-              description: 'One https link to the evidence the approver should open (up to 500 characters)',
-            },
-          },
-          required: ['question', 'ifItShips', 'evidence'],
-          additionalProperties: false,
+          ],
         },
       },
     },
@@ -163,10 +225,12 @@ export const requestChoice: McpToolDefinition = {
     if (approvalScope !== undefined && !releaseScope) return err('approvalScope is malformed');
     if (decision !== undefined && !releaseScope) return err('decision belongs only on an approvalScope release card');
     if (releaseScope && decision === undefined) {
-      return err('a release card needs decision {question, ifItShips, evidence}: an approver must see what ships');
+      return err('a release card needs its decision: an approver must see what ships');
     }
-    if (decision !== undefined && !isReleaseDecision(decision)) {
-      return err('decision needs exactly question, ifItShips and evidence, each non-empty text');
+    const decisionProblem = decision === undefined ? undefined : decisionError(decision);
+    if (decisionProblem !== undefined) return err(decisionProblem);
+    if ((decision as { kind?: unknown } | undefined)?.kind === 'warning' && !releaseScope?.holds?.length) {
+      return err('a warning card needs approvalScope.holds: the exact hold codes its Go accepts');
     }
     if (
       !releaseScope &&

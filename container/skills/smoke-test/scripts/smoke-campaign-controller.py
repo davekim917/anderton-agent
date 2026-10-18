@@ -148,6 +148,15 @@ GATE_REFUSALS = {
     "no-deadline": "permanent",
 }
 POST_FINISH_SLOTS = ("freeze-close",)
+# The posts that PUBLISH the verdict: chat and the PR's run record. Failing to
+# publish is not a QA result, so neither one's failed_terminal, nor its age,
+# ever turns a validated verdict BLOCKED (pre_finish); the failure is recorded
+# on the verdict and alarmed, and the post is re-driven after finish
+# (_republish), with up to PUBLICATION_REOFFERS fresh rounds of effect retries
+# for PUBLICATION_REDRIVE_SECONDS. An open post is still waited on.
+PUBLICATION_SLOTS = (("send", "verdict"), ("gh", "pr-comment"))
+PUBLICATION_REOFFERS = 2
+PUBLICATION_REDRIVE_SECONDS = 86400
 # Journal kinds whose obligations must all be receipted before a GO finish.
 PRE_FINISH_KINDS = ("send", "gh", "dispatch")
 OWNER_STEP_SLA_SECONDS = 3600
@@ -169,6 +178,11 @@ CRITIC_ARTIFACT = "contact-sheet/critic.json"
 # Open issues listed for title dedup; a listing that reaches it is incomplete
 # and files nothing (EffectLayer._gh).
 ISSUE_DEDUP_LIMIT = 5000
+# Every gh call the effect layer makes, by subcommand; spawn() refuses any
+# other. `api` is further held to the two read shapes EffectLayer issues
+# (_gh_call_allowed): a write through `gh api` needs a method or field flag.
+GH_SUBCOMMANDS = (("api",), ("issue", "list"), ("issue", "create"), ("issue", "comment"), ("label", "list"),
+                  ("pr", "view"), ("pr", "comment"), ("pr", "close"))
 POST_FINISH_SLA_SECONDS = 3600
 CLOSED_DISPOSITION = re.compile(r"^(fixed-verified|not-blocking:.+|refuted:.+)$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -182,7 +196,14 @@ PASS_STATUSES = {"pass"}
 # deployment's run prefix), never stepped as a campaign.
 PSEUDO_PREFIX = "ctl."
 # Consecutive helper/GitHub failures of ONE attempt before it goes terminal.
+# An effect spawn() never started for lack of fire time is not one of them.
 MAX_EFFECT_FAILURES = 3
+NO_FIRE_TIME = "no time left in this fire"
+
+
+class NotStarted(str):
+    """spawn()'s stderr when it refused to start the command. The TYPE is the
+    signal: a child that ran and printed the same words is an ordinary str."""
 # Wakes offered for one owner brief before the controller stops re-offering
 # it (the owner acks with controller/brief-<step>.ack as its first act).
 OWNER_WAKE_OFFERS = 3
@@ -704,7 +725,7 @@ def spawn(argv, timeout, allowed, env=None):
     if not any(tuple(argv[:len(p)]) == tuple(p) for p in allowed):
         raise ControllerError("refusing to run non-allowlisted command: {}".format(argv[:2]))
     if timeout < 1:
-        return None, "", "no time left in this fire"
+        return None, "", NotStarted(NO_FIRE_TIME)
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, env=env, start_new_session=True)
@@ -810,6 +831,11 @@ GATE_ALARM_TEXT = {
 }
 ALARM_WORDS = {
     "controller_send_failed": "a chat post could not be delivered after its retries",
+    "controller_publication_failed": ("a verdict post (chat or the PR run record) could not be published; the QA "
+                                      "verdict stands and finishes unchanged, and the post is retried after finish"),
+    "controller_publication_superseded": ("a verdict post went out (or may have) carrying a verdict this run no "
+                                          "longer finishes with; it is not re-sent -- the verdict the run finishes "
+                                          "with is the one named here"),
     "controller_send_budget": "the controller's chat budget for this run is spent",
     "controller_dispatch_ambiguous": "a judgment task may or may not have started; it is held for a human",
     "controller_dispatch_unconfirmed": ("an owner phase dispatch could not be confirmed as admitted; the controller "
@@ -909,14 +935,15 @@ class EffectLayer:
 
     shadow: perform() records the would-be effect and returns shadow_refused;
     nothing runs. live: perform() runs the effect and returns its outcome:
-      send        enqueued | replay | budget | failed | unknown
-      gh          done | failed | unknown
+      send        enqueued | replay | budget | failed | unknown | deferred
+      gh          done | failed | unknown | deferred
       gate        ok | refused | unknown
-      ncl_create  created(taskId) | failed | unknown
+      ncl_create  created(taskId) | failed | unknown | deferred
       owner_wake  brief_written | failed
     `unknown` means the outcome could not be established (timeout, 5xx, a
     crash of the helper): the obligation stays open and the next fire
-    reconciles it -- never a blind retry.
+    reconciles it -- never a blind retry. `deferred` means the write was
+    never started because the fire had no time left: nothing was attempted.
     """
 
     LIVE_REQUIRED = ("repo", "send_to", "gate_cmd", "enqueue_cmd", "gh_cmd", "ncl_cmd")
@@ -938,7 +965,8 @@ class EffectLayer:
             self.gh = shlex.split(self.cfg["gh_cmd"])
             self.ncl = shlex.split(self.cfg["ncl_cmd"])
             self.enqueue = shlex.split(self.cfg["enqueue_cmd"])
-            self.allowed = [tuple(self.gate), tuple(self.gh), tuple(self.ncl), tuple(self.enqueue)]
+            self.allowed = [tuple(self.gate)] + [tuple(self.gh) + sub for sub in GH_SUBCOMMANDS] + \
+                [tuple(self.ncl), tuple(self.enqueue)]
 
     def bind(self, ctl):
         self.ctl = ctl
@@ -1012,7 +1040,28 @@ class EffectLayer:
             # gate refuses progress/finish/challenger-timeout on a run whose
             # recorded claimant differs (smoke-pr-gate.sh claimant_guard).
             env = dict(os.environ, SMOKE_GATE_CLAIMANT="controller")
+        if tuple(argv[:len(self.gh)]) == tuple(self.gh) and not self._gh_call_allowed(argv[len(self.gh):]):
+            raise ControllerError("refusing gh call outside the controller's read/write set: {}".format(
+                argv[len(self.gh):len(self.gh) + 3]))
         return spawn(argv, min(timeout, self._left()), self.allowed, env=env)
+
+    @staticmethod
+    def _not_started(result):
+        """True when spawn() refused to start the call: the fire's time is
+        spent, so it neither ran nor can have landed."""
+        return result[0] is None and isinstance(result[2], NotStarted)
+
+    @staticmethod
+    def _read_failed(err):
+        """A GitHub read (or a write that never started) that settled nothing:
+        deferred only on spawn()'s own non-start signal, else unknown."""
+        return {"outcome": "deferred" if isinstance(err, NotStarted) else "unknown", "error": str(err)}
+
+    @staticmethod
+    def _gh_call_allowed(rest):
+        if rest[:1] == ["api"]:
+            return len(rest) >= 2 and not str(rest[1]).startswith("-") and rest[2:] in ([], ["--paginate", "--jq", ".[]"])
+        return tuple(rest[:2]) in GH_SUBCOMMANDS
 
     def _claim(self, run_id):
         ob = self.ctl.obligations().get(obligation_key(run_id, "run", "claim")) or {}
@@ -1111,7 +1160,9 @@ class EffectLayer:
 
     def _send(self, effect):
         run_id, mid = effect["runId"], effect["messageId"]
-        name = mid.replace("#", "-")
+        # A re-pointed post renders afresh; the helper still refuses the new
+        # bytes under an id it already holds (`mismatch`).
+        name = mid.replace("#", "-") + ("-r{}".format(effect["retarget"]) if effect.get("retarget") else "")
         root = self.ctl.journal.dir
         doc_parts = self._payload_dir(run_id) + [name + ".json"]
         doc_path = os.path.join(root, *doc_parts)
@@ -1133,6 +1184,8 @@ class EffectLayer:
         if self.cfg.get("outbox_root"):
             argv += ["--outbox-root", self.cfg["outbox_root"]]
         rc, out, errtext = self._run(argv, 30)
+        if self._not_started((rc, out, errtext)):
+            return {"outcome": "deferred", "error": str(errtext)}
         doc = last_json_line(out) if rc is not None else None
         if not doc:
             return {"outcome": "unknown", "error": (errtext or "no output")[:300]}
@@ -1150,6 +1203,8 @@ class EffectLayer:
     def _gh_json_lines(self, api_path, timeout=25):
         """(objects, error) from `gh api <path> --paginate --jq '.[]'`."""
         rc, out, err = self._run(self.gh + ["api", api_path, "--paginate", "--jq", ".[]"], timeout)
+        if isinstance(err, NotStarted):
+            return None, err
         if rc != 0:
             return None, (err or "rc={}".format(rc)).strip()[:200]
         objs = []
@@ -1189,32 +1244,68 @@ class EffectLayer:
             state = self._pr_state(pr)
             if state in ("CLOSED", "MERGED"):
                 return {"outcome": "done", "via": "write", "state": state}
-            return {"outcome": "unknown",
+            return {"outcome": "failed" if gh_refused(wrote) else "unknown",
                     "error": gh_write_error(wrote, "pr close") or "pr still {} after close".format(state)}
         if slot == "pr-comment":
             api = "repos/{}/issues/{}/comments?since={}&per_page=100".format(repo, pr, since)
-            found, err = self._find_marker(api, marker)
+            rev = effect.get("retarget")
+            tag = "<!-- smoke-ctl-rev:{} -->".format(rev) if rev else None
+            found, err, obj = self._find_marked(api, marker)
             if err:
-                return {"outcome": "unknown", "error": err}
+                return self._read_failed(err)
             if found:
-                return {"outcome": "done", "via": "search", "url": found}
+                # After a re-point only a body carrying this revision is ours.
+                stale = {"stale": True} if tag and tag not in str(obj.get("body") or "") else {}
+                return dict({"outcome": "done", "via": "search", "url": found}, **stale)
             body = self._run_record(run_id, c, effect.get("hint") or {}) + self._dedup_note(run_id)
-            path, _ = write_contained_once(root, self._payload_dir(run_id) + [key[:16] + "-pr-comment.md"],
-                                           "{}\n{}\n".format(marker, body))
+            if tag:
+                hint = effect.get("hint") or {}
+                body = "{}\n**Verdict at finish: {}** -- this record supersedes one written under an earlier " \
+                       "verdict, or before posts recorded their verdict.\n\n{}".format(
+                           tag, VERDICT_CHAT.get(hint.get("verdict"), hint.get("verdict")), body)
+            path, _ = write_contained_once(root, self._payload_dir(run_id) + [key[:16] + "-pr-comment{}.md".format(
+                "-r{}".format(rev) if rev else "")], "{}\n{}\n".format(marker, body))
             wrote = self._run(self.gh + ["pr", "comment", str(pr), "-R", repo, "--body-file", path], 30)
+            if self._not_started(wrote):
+                return self._read_failed(wrote[2])
             found, err = self._find_marker(api, marker)
             if found:
                 return {"outcome": "done", "via": "write", "url": found}
-            return {"outcome": "unknown",
+            return {"outcome": "failed" if gh_refused(wrote) else "unknown",
                     "error": gh_write_error(wrote, "pr comment") or err or "comment not found on read-back"}
         if slot.startswith("issue:"):
             fid = slot[len("issue:"):]
+            # Where this obligation writes is chosen ONCE and journaled before
+            # its first write; every replay reconciles that destination only,
+            # whatever the finding's reference says by then.
+            dest = ((self.ctl.obligations().get(key) or {}).get("detail") or {}).get("destination")
+            dest = dest if isinstance(dest, dict) and dest.get("action") in ("tracker-comment", "create") else None
+            if dest and dest["action"] == "tracker-comment":
+                return self._tracker_comment(run_id, fid, c, dest["repo"], int(dest["number"]),
+                                             self._tracker_of(run_id, fid)[1], marker, key, since)
+            if dest:
+                repo = dest["repo"]
             api = "repos/{}/issues?state=all&since={}&per_page=100".format(repo, since)
             found, err = self._find_marker(api, marker)
             if err:
-                return {"outcome": "unknown", "error": err}
+                return self._read_failed(err)
             if found:
                 return {"outcome": "done", "via": "search", "url": found}
+            if not dest:
+                tracker, finding = self._tracker_of(run_id, fid)
+                dest = {"action": "create", "repo": repo}
+                if tracker:
+                    ok, why = self._tracker_is_issue(repo, tracker)
+                    if ok is None:
+                        return self._read_failed(why)
+                    if ok:
+                        dest = {"action": "tracker-comment", "repo": repo, "number": tracker}
+                    else:
+                        dest["trackerRejected"] = why
+                self.ctl.record(run_id, "gh", slot, "intent", 1, {"destination": dest})
+                if dest["action"] == "tracker-comment":
+                    return self._tracker_comment(run_id, fid, c, repo, tracker, finding, marker, key, since)
+            rejected = {"trackerRejected": dest["trackerRejected"]} if dest.get("trackerRejected") else {}
             title, body, labels = self._issue_content(run_id, fid, c)
             repo_labels = self._labels_of(repo)
             # SI: dedup against open smoke-finding issues by normalized title,
@@ -1229,7 +1320,7 @@ class EffectLayer:
             # runId), not the next campaign's. Listed once per fire (_open_issues).
             open_issues, err = self._open_issues(repo)
             if err:
-                return {"outcome": "unknown", "error": err}
+                return self._read_failed(err)
             if len(open_issues) >= ISSUE_DEDUP_LIMIT:
                 # A full listing is not proof of absence: unknown, never a
                 # create. The obligation's overdue alarm carries this text.
@@ -1242,8 +1333,8 @@ class EffectLayer:
                     continue
                 names = {str(x.get("name")).lower() for x in issue.get("labels") or [] if isinstance(x, dict)}
                 if not scoped or "smoke-finding" in names:
-                    return {"outcome": "done", "via": "dedup", "url": issue.get("url"),
-                            "duplicateOf": issue.get("number")}
+                    return dict({"outcome": "done", "via": "dedup", "url": issue.get("url"),
+                                 "duplicateOf": issue.get("number")}, **rejected)
             labels, mapped, dropped = resolve_labels(labels, repo_labels)
             name = key[:16] + "-issue.md"
             if dropped:
@@ -1260,6 +1351,9 @@ class EffectLayer:
             for label in labels:
                 argv += ["--label", label]
             wrote = self._run(argv, 30)
+            if self._not_started(wrote):
+                return dict(self._read_failed(wrote[2]), **dict(rejected, **{
+                    k: v for k, v in (("labelsMapped", mapped), ("labelsDropped", dropped)) if v}))
             # Read back the issue the create names: the issues listing can lag
             # a fresh create, and a miss here pops the fire's cached listing.
             # The listing scan stays the fallback -- no URL printed, or the GET
@@ -1268,7 +1362,7 @@ class EffectLayer:
             found, err = self._created_issue(repo, wrote, marker), None
             if not found:
                 found, err = self._find_marker(api, marker)
-            relabel = {k: v for k, v in (("labelsMapped", mapped), ("labelsDropped", dropped)) if v}
+            relabel = dict(rejected, **{k: v for k, v in (("labelsMapped", mapped), ("labelsDropped", dropped)) if v})
             if found:
                 # The fire's cached listing learns what it just filed, as a
                 # fresh listing would, so a same-title finding later in this
@@ -1277,6 +1371,8 @@ class EffectLayer:
                 open_issues.append({"number": int(number.group(1)) if number else None, "title": title,
                                     "url": found, "labels": [{"name": x} for x in labels]})
                 return dict({"outcome": "done", "via": "write", "url": found}, **relabel)
+            if gh_refused(wrote):
+                return dict({"outcome": "failed", "error": gh_write_error(wrote, "issue create")}, **relabel)
             # The create may have landed unseen: the next obligation relists.
             self._open_issue_lists.pop(repo, None)
             return dict({"outcome": "unknown",
@@ -1284,22 +1380,108 @@ class EffectLayer:
                         **relabel)
         return {"outcome": "failed", "error": "no GitHub handler for slot {!r}".format(slot)}
 
-    def _run_record(self, run_id, claim, hint):
-        """The PR's run-record comment body. The owner's prose where it wrote
-        any -- run-record.md, else synthesis.md (27 of the 30 replayed runs
-        wrote it at the run root; the legacy prompt names coordinator/) --
-        otherwise a record rendered from synthesis.json and the verdict, so a
-        finished run always gets its comment."""
+    def _tracker_of(self, run_id, fid):
+        """(issue number, synthesis finding): the existing tracker the owner
+        named for this finding, from the synthesis finding first, then its
+        controller/issues/<fid>.json. Only `existingIssue` (N or "#N") and
+        `issue` (this repo's issue URL or "#N") count; a missing, malformed or
+        foreign reference answers None and the finding is filed as before."""
         run = self._run_dir(run_id)
+        syn, _ = read_json_file(os.path.join(run, "synthesis.json"))
+        findings = syn.get("findings") if isinstance(syn, dict) else None
+        finding = next((f for f in findings or [] if isinstance(f, dict) and f.get("id") == fid), {})
+        spec = {}
+        if safe_component(fid):
+            doc, err = read_json_file(os.path.join(run, "controller", "issues", "{}.json".format(fid)))
+            spec = doc if not err and isinstance(doc, dict) else {}
+        for source in (finding, spec):
+            for field in ("existingIssue", "issue"):
+                number = tracker_number(field, source.get(field), self.cfg["repo"])
+                if number:
+                    return number, finding
+        return None, finding
+
+    def _tracker_is_issue(self, repo, number):
+        """(True, None) when `number` is an ISSUE of `repo`; (False, why) when
+        GitHub says it is a pull request or another repo's or number's; (None,
+        error) when the GET settled nothing (retried, never guessed). `gh
+        issue comment` accepts a PR number too, so the type is read first."""
+        rc, out, err = self._run(self.gh + ["api", "repos/{}/issues/{}".format(repo, number)], 20)
+        if rc != 0:
+            if isinstance(err, NotStarted):
+                return None, err
+            if gh_gone(err):
+                return False, "#{} is not an issue of {} (not found or deleted)".format(number, repo)
+            return None, (err or "tracker read rc={}".format(rc)).strip()[:200]
+        try:
+            doc = json.loads(out)
+        except ValueError:
+            return None, "unparsable tracker read"
+        if not isinstance(doc, dict):
+            return None, "tracker read returned no object"
+        if "pull_request" in doc:
+            return False, "#{} is a pull request, not an issue".format(number)
+        if doc.get("number") != number or not str(doc.get("repository_url") or "").lower().endswith(
+                "/repos/" + repo.lower()):
+            return False, "#{} resolved to {}#{}".format(number, doc.get("repository_url"), doc.get("number"))
+        return True, None
+
+    def _tracker_comment(self, run_id, fid, claim, repo, number, finding, marker, key, since):
+        """A finding already tracked by issue `number`: one re-observation
+        comment there, found again by its marker, instead of a new issue. The
+        tracker itself is never reopened, relabelled or edited."""
+        root = self.ctl.journal.dir
+        api = "repos/{}/issues/{}/comments?since={}&per_page=100".format(repo, number, since)
+        done = {"outcome": "done", "via": "tracker-comment", "duplicateOf": number}
+        gone = {"outcome": "failed", "error": "tracker #{} of {} is not found or deleted".format(number, repo)}
+        found, err = self._find_marker(api, marker)
+        if err:
+            return gone if gh_gone(err) else self._read_failed(err)
+        if found:
+            return dict(done, url=found)
+        sev = finding.get("severity")
+        blocking = finding.get("blocking")
+        line = ("Re-observed by smoke run `{}` on build `{}`: finding `{}`, severity `{}`, blocking `{}` (as the run "
+                "recorded it). Run record: the smoke run-record comment on PR #{} (https://github.com/{}/pull/{}).").format(
+            run_id, claim["sha"] or "unknown", fid, sev if isinstance(sev, str) and sev else "not recorded",
+            json.dumps(blocking) if isinstance(blocking, bool) else "not recorded", claim["pr"], repo, claim["pr"])
+        path, _ = write_contained_once(root, self._payload_dir(run_id) + [key[:16] + "-tracker-comment.md"],
+                                       "{}\n{}\n".format(marker, line))
+        wrote = self._run(self.gh + ["issue", "comment", str(number), "-R", repo, "--body-file", path], 30)
+        if self._not_started(wrote):
+            return self._read_failed(wrote[2])
+        found, err = self._find_marker(api, marker)
+        if found:
+            return dict(done, url=found)
+        if gh_gone(err):
+            return gone
+        return {"outcome": "failed" if gh_refused(wrote) else "unknown",
+                "error": gh_write_error(wrote, "issue comment") or err or "comment not found on read-back"}
+
+    def _run_record(self, run_id, claim, hint):
+        """The PR's run-record comment body. It always OPENS with the verdict
+        the run finishes with (the hint the post was aligned to), rendered
+        here, so no prose below it can contradict the finish unlabelled. Then
+        the owner's prose where it wrote any -- run-record.md, else
+        synthesis.md (27 of the 30 replayed runs wrote it at the run root; the
+        legacy prompt names coordinator/) -- labelled as the owner's record,
+        otherwise a record rendered from synthesis.json, so a finished run
+        always gets its comment."""
+        run = self._run_dir(run_id)
+        verdict = hint.get("verdict")
+        head = ["## Smoke verdict: {}".format(VERDICT_CHAT.get(verdict, verdict or "no verdict")), "",
+                "Run `{}` on build `{}` finishes **{}**.".format(
+                    run_id, (claim["sha"] or "")[:12], VERDICT_CHAT.get(verdict, verdict or "no verdict"))]
+        for f in hint.get("failedChecks") or []:
+            head.append("- Not cleared: {}".format(f))
         for rel in ("run-record.md", "synthesis.md", os.path.join("coordinator", "synthesis.md")):
             text = self._read_text(os.path.join(run, rel))
             if text:
-                return text
-        verdict = hint.get("verdict")
-        lines = ["# Smoke run record", "", "Run `{}` on build `{}`: **{}**.".format(
-            run_id, (claim["sha"] or "")[:12], VERDICT_CHAT.get(verdict, verdict or "no verdict"))]
-        for f in hint.get("failedChecks") or []:
-            lines.append("- Not cleared: {}".format(f))
+                return "\n".join(head + [
+                    "", "The retained owner's run record follows verbatim. Where it disagrees with the verdict "
+                    "above, the verdict above is the one this run finishes with.", "", "---", "",
+                    "### Owner's run record", "", text])
+        lines = head + ["", "### Run record", ""]
         syn, err = read_json_file(os.path.join(run, "synthesis.json"))
         if not err and isinstance(syn, dict):
             for f in syn.get("findings") or []:
@@ -1317,6 +1499,8 @@ class EffectLayer:
         if repo not in self._open_issue_lists:
             rc, out, errtext = self._run(self.gh + ["issue", "list", "-R", repo, "--state", "open", "--limit",
                                                     str(ISSUE_DEDUP_LIMIT), "--json", "number,title,url,labels"], 60)
+            if isinstance(errtext, NotStarted):
+                return None, errtext
             if rc != 0:
                 return None, (errtext or "issue list rc={}".format(rc))[:200]
             try:
@@ -1348,7 +1532,8 @@ class EffectLayer:
 
     def _dedup_note(self, run_id):
         """Findings this run did NOT file because an open issue already had
-        the title (via=dedup). In a repo without `smoke-finding` that match can
+        the title (via=dedup) or the owner named the finding's existing
+        tracker (via=tracker-comment). In a repo without `smoke-finding` that match can
         be a human's issue, so the PR's run record says so rather than the
         journal alone. pre_finish steps every issue obligation before the
         pr-comment in the same fire (:3624-3628); one still unsettled then is not
@@ -1357,9 +1542,12 @@ class EffectLayer:
         for ob in self.ctl.obligations().values():
             d = ob.get("detail") or {}
             if ob["runId"] == run_id and ob["kind"] == "gh" and ob["slot"].startswith("issue:") \
-                    and ob["state"] == "done" and d.get("via") == "dedup":
-                lines.append("- Finding {}: matched open issue #{} by title, not filed again{}".format(
-                    ob["slot"][len("issue:"):], d.get("duplicateOf"), " ({})".format(d["url"]) if d.get("url") else ""))
+                    and ob["state"] == "done" and d.get("via") in ("dedup", "tracker-comment"):
+                how = "matched open issue #{} by title, not filed again" if d["via"] == "dedup" else \
+                    "already tracked as #{}; re-observation commented there, not filed again"
+                lines.append("- Finding {}: {}{}".format(
+                    ob["slot"][len("issue:"):], how.format(d.get("duplicateOf")),
+                    " ({})".format(d["url"]) if d.get("url") else ""))
         return "\n\n" + "\n".join(sorted(lines)) if lines else ""
 
     def _created_issue(self, repo, wrote, marker):
@@ -1383,13 +1571,18 @@ class EffectLayer:
         return doc.get("html_url") or lines[-1]
 
     def _find_marker(self, api, marker):
+        found, err, _ = self._find_marked(api, marker)
+        return found, err
+
+    def _find_marked(self, api, marker):
+        """(url, error, the marked object)."""
         objs, err = self._gh_json_lines(api)
         if err:
-            return None, err
+            return None, err, None
         for o in objs:
             if marker in str(o.get("body") or ""):
-                return o.get("html_url") or o.get("url") or "found", None
-        return None, None
+                return o.get("html_url") or o.get("url") or "found", None, o
+        return None, None, None
 
     def _pr_state(self, pr):
         rc, out, _ = self._run(self.gh + ["pr", "view", str(pr), "-R", self.cfg["repo"], "--json", "state"], 20)
@@ -1463,6 +1656,8 @@ class EffectLayer:
         if self.cfg.get("oneshot_effort"):
             argv += ["--effort", self.cfg["oneshot_effort"]]
         rc, out, err = self._run(argv, 40)
+        if self._not_started((rc, out, err)):
+            return {"outcome": "deferred", "error": str(err)}
         try:
             doc = json.loads(out) if rc is not None and out.strip() else None
         except ValueError:
@@ -1728,6 +1923,25 @@ def safe_component(name):
     return isinstance(name, str) and bool(re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", name))
 
 
+def tracker_number(field, value, repo):
+    """The issue number a finding's `existingIssue` (N or "#N") or `issue`
+    ("#N" or https://github.com/<repo>/issues/N) names, or None."""
+    if field == "existingIssue" and isinstance(value, int) and not isinstance(value, bool):
+        return value if value > 0 else None
+    if not isinstance(value, str):
+        return None
+    m = re.fullmatch(r"#([1-9][0-9]{0,9})", value)
+    if not m and field == "issue":
+        m = re.fullmatch(r"https://github\.com/{}/issues/([1-9][0-9]{{0,9}})".format(re.escape(repo)), value,
+                         re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def publication_label(kind, slot):
+    """`kind:slot` for a verdict post (PUBLICATION_SLOTS), else None."""
+    return "{}:{}".format(kind, slot) if (kind, slot) in PUBLICATION_SLOTS else None
+
+
 def normalize_title(title):
     return " ".join(re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).split())
 
@@ -1743,6 +1957,28 @@ def gh_write_error(result, what):
         return None
     text = " ".join(str(err or "").split())
     return "{} {}: {}".format(what, "timed out" if rc is None else "rc={}".format(rc), text or "no stderr")[:300]
+
+
+def gh_gone(err):
+    """True when a gh call that ran was answered 404/410: the object is not
+    there, so re-reading it can never settle anything."""
+    return not isinstance(err, NotStarted) and bool(re.search(r"HTTP (404|410)\b", str(err or "")))
+
+
+def gh_refused(result):
+    """True when a gh write ran to its exit and GitHub refused it outright: an
+    `HTTP 4xx:` (go-gh HTTPError) or a `GraphQL:` error (GraphQLError), with
+    nothing written behind it. A timeout, a 408/429 or 5xx, a rate limit or a
+    GraphQL timeout may clear on retry, so it stays unknown -- as does a 422,
+    which GitHub also answers for an endpoint it is temporarily throttling as
+    spam."""
+    rc, _, err = result
+    text = str(err or "")
+    if rc in (None, 0) or isinstance(err, NotStarted):
+        return False
+    if re.search(r"rate limit|too quickly|timed? ?out|try again|something went wrong", text, re.I):
+        return False
+    return bool(re.search(r"^HTTP 4(?!08|22|29)\d\d\b|^GraphQL: ", text, re.M))
 
 
 def resolve_labels(wanted, repo_labels):
@@ -2262,7 +2498,8 @@ class Controller:
         append_decision(self.journal.dir, d)
         return d
 
-    def ensure_alarm(self, run_id, trigger, fingerprint, detail, slot=None, hint=None, thread_key=None):
+    def ensure_alarm(self, run_id, trigger, fingerprint, detail, slot=None, hint=None, thread_key=None,
+                     publication=None):
         """The ONLY way an alarm is raised.
 
         1. Its send obligation is JOURNALED first, unconditionally: an intent
@@ -2275,7 +2512,10 @@ class Controller:
            the lane refuses this fire rolls to the next, where open alarms are
            drained before any run is stepped.
         Called on EVERY fire its condition holds, and never gated on a flag:
-        the obligation, not a flag, is what settles it. True when raised now."""
+        the obligation, not a flag, is what settles it. True when raised now.
+        `publication` names the verdict post (PUBLICATION_SLOTS) the alarm is
+        about: such an alarm is publication too, so its own delivery never
+        holds or blocks the verdict either (pre_finish)."""
         slot = slot or "alarm:" + fingerprint
         key = obligation_key(run_id, "send", slot)
         raised = key not in self.obligations()
@@ -2285,6 +2525,8 @@ class Controller:
             rec = {"fingerprint": fingerprint, "hint": hint or {"trigger": trigger, "detail": detail}, "alarm": True}
             if thread_key:
                 rec["threadKey"] = thread_key
+            if publication:
+                rec["publicationOf"] = publication
             crash_point("before-intent", "send", slot)
             self.record(run_id, "send", slot, "intent", None, rec)
             crash_point("after-journal", "send", slot)
@@ -2316,8 +2558,9 @@ class Controller:
         """Over budget: no delivery. A per-fire refusal waits for the next fire
         (an alarm's journaled intent stays open and is drained first). A
         per-run or per-fingerprint one never clears, so the obligation goes
-        failed_terminal -- which permits only finish BLOCKED (spec rev 3) --
-        and, for an ordinary send, its alarm is journaled BEFORE that."""
+        failed_terminal -- which permits only finish BLOCKED (spec rev 3),
+        except for a verdict post (PUBLICATION_SLOTS) -- and, for an ordinary
+        send, its alarm is journaled BEFORE that."""
         self.decide(run_id, phase, "alarm", "mechanical", "controller_send_budget", slot=slot, detail=reason)
         if scope == "fire":
             if not is_alarm_send(run_id, slot):
@@ -2327,7 +2570,7 @@ class Controller:
         key = obligation_key(run_id, "send", slot)
         if not is_alarm_send(run_id, slot):
             self.ensure_alarm(run_id, "controller_send_budget", "send-budget:{}".format(key[:12]),
-                              {"slot": slot, "reason": reason})
+                              {"slot": slot, "reason": reason}, publication=publication_label("send", slot))
         self.record(run_id, "send", slot, "failed_terminal", attempt or None,
                     {"reason": "controller_send_budget: {}".format(reason)})
         return "failed_terminal"
@@ -2345,7 +2588,7 @@ class Controller:
             # never a terminal state with no alarm behind it.
             if not is_alarm_send(run_id, slot):
                 self.ensure_alarm(run_id, trigger, "{}:{}".format(trigger, obligation_key(run_id, kind, slot)[:12]),
-                                  {"slot": slot, "error": result.get("error")})
+                                  {"slot": slot, "error": result.get("error")}, publication=publication_label(kind, slot))
             self.record(run_id, kind, slot, "failed_terminal", attempt, dict(detail, reason="{} failures".format(n)))
             return "failed_terminal"
         self.record(run_id, kind, slot, "intent", attempt, detail)
@@ -2354,7 +2597,7 @@ class Controller:
     def _send_exhausted(self, run_id, slot, key, attempt):
         if not is_alarm_send(run_id, slot):
             self.ensure_alarm(run_id, "controller_send_failed", "send-failed:{}".format(key[:12]),
-                              {"slot": slot, "attempts": attempt})
+                              {"slot": slot, "attempts": attempt}, publication=publication_label("send", slot))
         self.record(run_id, "send", slot, "failed_terminal", attempt, {"reason": "{} attempts failed".format(attempt)})
         return "failed_terminal"
 
@@ -2425,9 +2668,11 @@ class Controller:
             crash_point("after-intent", "send", slot)
         mid = send_id(key, next_attempt)
         self.fire_sends[(run_id, lane)] = self.fire_sends.get((run_id, lane), 0) + 1
+        retarget = (self.obligations().get(key) or {"detail": {}})["detail"].get("retarget")
         result = self.effects.perform({"type": "send", "runId": run_id, "slot": slot, "messageId": mid,
                                        "threadKey": thread_key or run_id, "fingerprint": fingerprint,
-                                       "hint": hint or {}, "budgetRun": (run_id + ".alarms") if lane else run_id})
+                                       "hint": hint or {}, "budgetRun": (run_id + ".alarms") if lane else run_id,
+                                       "retarget": retarget})
         self.decide(run_id, phase, "send", "mechanical", "obligation due", slot=slot, key=key, attempt=next_attempt,
                     messageId=mid, effect=result["outcome"])
         crash_point("after-effect", "send", slot)
@@ -2443,6 +2688,20 @@ class Controller:
                 # receipt may be too -- settle it now rather than a fire later.
                 return self.send(run_id, phase, slot, fingerprint=fingerprint, hint=hint, thread_key=thread_key)
             return "enqueued"
+        if retarget and result["outcome"] == "failed" and str(result.get("error") or "").startswith("mismatch"):
+            # The helper already holds this id with the earlier verdict's text:
+            # that post went out (or will), so it is superseded, not retried.
+            have = next((h["detail"]["hint"] for h in reversed(self.obligations()[key]["history"][:-1])
+                         if isinstance((h.get("detail") or {}).get("hint"), dict)
+                         and h["detail"]["hint"] != hint), {})
+            return self._publication_superseded(run_id, phase, "send", slot, have, hint or {}, next_attempt)
+        if result["outcome"] == "deferred":
+            # Never handed to the helper: not a failure, and not a send this
+            # fire spent. The SAME attempt stays open and is replayed next fire.
+            self.fire_sends[(run_id, lane)] -= 1
+            self.record(run_id, "send", slot, "intent", next_attempt, {"outcome": "deferred", "error": result.get("error")})
+            self.decide(run_id, phase, "wait", "wait", "send deferred: no time left in this fire", slot=slot, messageId=mid)
+            return "intent"
         if result["outcome"] == "budget":
             # The helper's own budget (same limits, same transaction as the
             # insert) refused: its per-fire count clears next fire.
@@ -2470,16 +2729,21 @@ class Controller:
             self.decide(run_id, phase, "gh_reconcile", "mechanical", "prior outcome unknown; search marker before write",
                         slot=slot, marker="<!-- smoke-ctl:{} -->".format(key))
         elif not planned_now:
-            self.record(run_id, "gh", slot, "intent", 1)
+            # A verdict post journals the verdict it carries (_align_publication).
+            self.record(run_id, "gh", slot, "intent", 1,
+                        {"hint": hint} if hint and publication_label("gh", slot) else None)
             crash_point("after-intent", "gh", slot)
         else:
             crash_point("after-intent", "gh", slot)
+        d = (self.obligations().get(key) or {"detail": {}})["detail"]
+        if publication_label("gh", slot) and isinstance(d.get("hint"), dict):
+            hint = d["hint"]
         result = self.effects.perform({"type": "gh", "runId": run_id, "slot": slot, "hint": hint or {},
                                        "marker": "<!-- smoke-ctl:{} -->".format(key),
-                                       "writeOnlyIfMarkerAbsent": reconcile})
+                                       "writeOnlyIfMarkerAbsent": reconcile, "retarget": d.get("retarget")})
         self.decide(run_id, phase, "gh", "mechanical", "obligation due", slot=slot, key=key, effect=result["outcome"],
                     afterReconcile=reconcile, **{k: result[k] for k in ("error", "labelsMapped", "labelsDropped",
-                                                                   "duplicateOf") if result.get(k)})
+                                                                   "duplicateOf", "trackerRejected") if result.get(k)})
         crash_point("after-effect", "gh", slot)
         if result["outcome"] == "shadow_refused":
             self.record(run_id, "gh", slot, "done", 1, {"outcome": result["outcome"], "shadowAssumed": True})
@@ -2487,11 +2751,21 @@ class Controller:
         if result["outcome"] == "done":
             self.record(run_id, "gh", slot, "done", 1, {k: result[k] for k in ("outcome", "via", "url", "state",
                                                                                 "duplicateOf", "labelsMapped",
-                                                                                "labelsDropped") if k in result})
+                                                                                "labelsDropped", "trackerRejected")
+                                                         if k in result})
+            if result.get("stale"):
+                # The marker search found the body written before the post was
+                # re-pointed: that one went out, so it is superseded.
+                have = next((h["detail"]["hint"] for h in self.obligations()[key]["history"]
+                             if isinstance((h.get("detail") or {}).get("hint"), dict)), {})
+                return self._publication_superseded(run_id, phase, "gh", slot, have, hint or {})
             return "done"
-        if result["outcome"] == "unknown":
+        if result["outcome"] in ("unknown", "deferred"):
             # Stays a bare intent: the next fire reconciles by marker search.
-            self.record(run_id, "gh", slot, "intent", 1, {"outcome": "unknown", "error": result.get("error")})
+            # `deferred` started no write this fire (no time left in it).
+            self.record(run_id, "gh", slot, "intent", 1, {"outcome": result["outcome"], "error": result.get("error")})
+            if result["outcome"] == "deferred":
+                self.decide(run_id, phase, "wait", "wait", "GitHub write deferred: no time left in this fire", slot=slot)
             return "intent"
         return self._effect_failed(run_id, "gh", slot, 1, result, "controller_gh_failed")
 
@@ -2598,7 +2872,9 @@ class Controller:
             return "done"
         if ob and ob["state"] in ("done", "enqueued", "failed_terminal", "abandoned"):
             return ob["state"]
-        if ob and ob["state"] == "intent":
+        # A deferred create never started (spawn refused it: no fire time), so
+        # nothing can exist and it is created again, never held ambiguous.
+        if ob and ob["state"] == "intent" and ob["detail"].get("deferred") is not True:
             # A bare intent means the fire died between journaling it and
             # recording the create's outcome (see the enqueued record below).
             live = [t for t in self.tasks if isinstance(t, dict) and (t.get("name") or "").startswith(slug)]
@@ -2628,10 +2904,17 @@ class Controller:
             self.decide(run_id, phase, "escalate", "coordination_model", "controller_dispatch_ambiguous",
                         slot=slot, slug=slug)
             return "ambiguous"
-        self.record(run_id, "dispatch", slot, "intent", 1, {"slug": slug})
+        self.record(run_id, "dispatch", slot, "intent", 1, {"slug": slug, "deferred": None})
         crash_point("after-intent", "dispatch", slot)
         result = self.effects.perform({"type": "ncl_create", "runId": run_id, "slot": slot, "name": slug,
                                        "marker": "smoke-ctl:{}".format(key), "muteChat": True})
+        if result["outcome"] == "deferred":
+            # Journaled before any later step can die: a bare intent would read
+            # as ambiguous. The next create's intent clears the flag.
+            self.record(run_id, "dispatch", slot, "intent", 1, {"outcome": "deferred", "deferred": True})
+            self.decide(run_id, phase, "wait", "wait", "dispatch deferred: no time left in this fire", slot=slot)
+            crash_point("after-effect", "dispatch", slot)
+            return "intent"
         self.decide(run_id, phase, "dispatch", "judgment", "fresh one-shot", slot=slot, slug=slug,
                     effect=result["outcome"])
         crash_point("after-effect", "dispatch", slot)
@@ -3191,7 +3474,8 @@ class Controller:
             detail = {"obligation": label, "state": ob["state"], "since": since}
             if ob["detail"].get("error"):
                 detail["error"] = ob["detail"]["error"]  # why it is stuck, e.g. gh's refusal
-            if self.ensure_alarm(run_id, "controller_obligation_overdue", fp, detail):
+            if self.ensure_alarm(run_id, "controller_obligation_overdue", fp, detail,
+                                 publication=publication_label(ob["kind"], ob["slot"])):
                 self.decide(run_id, phase, "escalate", "coordination_model", "obligation overdue", obligation=label)
 
     # -- one run ------------------------------------------------------------
@@ -3760,22 +4044,29 @@ class Controller:
             for fid in (m["doc"] or {}).get("confirmedFindings") or []:
                 if isinstance(fid, str) and fid not in findings:
                     findings.append(fid)
+        # EVERY check that can still change the verdict is settled before any
+        # verdict post is prepared or sent, so a fire can never post one
+        # verdict and finish another. The issues are driven first; while any
+        # of them (or any other non-publication obligation) is still open the
+        # verdict is not final and nothing is posted this fire. That cannot
+        # starve the post: a fire whose time the issues spent defers it
+        # (deferred, never a failure), and the next fire finds them settled.
         states = []
         for fid in findings:
             states.append(("gh", "issue:{}".format(fid), self.github(run_id, phase, "issue:{}".format(fid))))
-        states.append(("send", "verdict", self.send(run_id, phase, "verdict",
-                                                    hint={"verdict": verdict, "failedChecks": failed[:4]})))
-        states.append(("gh", "pr-comment", self.github(run_id, phase, "pr-comment",
-                                                       hint={"verdict": verdict, "failedChecks": failed[:4]})))
         self._settle_alarm_sends(run_id)
         # failed_terminal and dispatch-ambiguous obligations keep their
-        # escalation evidence and permit ONLY finish BLOCKED (spec rev 3).
+        # escalation evidence and permit ONLY finish BLOCKED (spec rev 3) --
+        # except a verdict post and the alarms about it: a post that cannot be
+        # published says nothing about the build, so the verdict stands and
+        # the failure is recorded beside it (_record_unpublished).
         blocking = []
         for ob in self.obligations().values():
             if ob["runId"] != run_id:
                 continue
             if ob["state"] == "failed_terminal" and ob["kind"] != "gate":
-                blocking.append("obligation {}:{} is failed_terminal".format(ob["kind"], ob["slot"]))
+                if not self._is_publication(ob):
+                    blocking.append("obligation {}:{} is failed_terminal".format(ob["kind"], ob["slot"]))
             elif ob["kind"] == "dispatch" and ob["detail"].get("ambiguous"):
                 # Sticky (spec rev 3): once escalated, a late artifact does not
                 # clear the hold -- a human does, by finishing the run.
@@ -3788,11 +4079,12 @@ class Controller:
             # the ones assembled above: a critic still enqueued, a root post or
             # alarm awaiting its receipt. Young ones are waited on; one older
             # than the owner SLA can no longer be assumed to land, so GO is
-            # refused (BLOCKED, naming it) rather than waited on forever.
+            # refused (BLOCKED, naming it) rather than waited on forever. The
+            # verdict posts and their alarms are judged below, never here.
             for ob in self.obligations().values():
                 if ob["runId"] != run_id or ob["kind"] not in PRE_FINISH_KINDS or ob["slot"] in POST_FINISH_SLOTS:
                     continue
-                if ob["state"] in TERMINAL_OK:
+                if ob["state"] in TERMINAL_OK or self._is_publication(ob):
                     continue
                 if ob["kind"] == "dispatch" and run.has(ONESHOT_ARTIFACTS.get(ob["slot"], CRITIC_ARTIFACT)):
                     continue  # its evidence is in; dispatch() records done on its next pass
@@ -3804,6 +4096,29 @@ class Controller:
                     verdict = "BLOCKED"
                 elif (ob["kind"], ob["slot"]) not in {(k, sl) for k, sl, _ in states}:
                     states.append((ob["kind"], ob["slot"], "enqueued" if ob["state"] == "enqueued" else "intent"))
+        pending = [s for s in states if s[2] in ("intent", "enqueued", "budget")]
+        if pending:
+            self.decide(run_id, phase, "wait", "wait", "pre-finish obligations pending", pending=pending,
+                        postsHeld=True)
+            return "verdict"
+        # The verdict is final for this fire. Each post is first aligned with
+        # it (_align_publication): one that has not gone out is re-pointed at
+        # this verdict, one that went out with another is never re-sent and
+        # is alarmed. The PR comment goes after the chat post: its body lists
+        # the findings matched to existing issues (_dedup_note).
+        hint = {"verdict": verdict, "failedChecks": failed[:4]}
+        for kind, slot in PUBLICATION_SLOTS:
+            if self._align_publication(run_id, phase, kind, slot, hint) == "superseded":
+                continue
+            states.append((kind, slot, self.send(run_id, phase, slot, hint=hint) if kind == "send" else
+                           self.github(run_id, phase, slot, hint=hint)))
+        unpublished = self._unpublished(run_id)
+        vob = self.obligations().get(obligation_key(run_id, "verdict", "validated")) or {"detail": {}}
+        if unpublished or vob["detail"].get("publicationFailed"):
+            # Kept current: a post re-pointed and published since clears it.
+            self._record_unpublished(run_id, phase, verdict, failed, unpublished)
+        # A verdict post still open is waited on as before (a missing receipt
+        # is ambiguous, never resent); only its age no longer refuses GO.
         pending = [s for s in states if s[2] in ("intent", "enqueued", "budget")]
         if pending:
             self.decide(run_id, phase, "wait", "wait", "pre-finish obligations pending", pending=pending)
@@ -3832,6 +4147,142 @@ class Controller:
             # PRP step 7: the freeze-PR close follows finish in the same turn.
             return self.post_finish(run_id, pr, verdict, external=False)
         return "verdict"
+
+    def _is_publication(self, ob):
+        """A verdict post (PUBLICATION_SLOTS), or an alarm raised about one."""
+        if (ob["kind"], ob["slot"]) in PUBLICATION_SLOTS:
+            return True
+        return ob["kind"] == "send" and str(ob["slot"]).startswith("alarm:") and \
+            bool(self._publication_of(ob))
+
+    def _publication_of(self, ob):
+        """The verdict post an alarm is about, or None. New alarms carry it
+        (`publicationOf`); one journaled by a controller that predates the
+        field is read from its fingerprint (`<cause>:<key12>`, every cause that
+        names a post's obligation key) or, failing that, from its hint."""
+        d = ob.get("detail") or {}
+        if d.get("publicationOf"):
+            return d["publicationOf"]
+        fp = str(d.get("fingerprint") or str(ob["slot"])[len("alarm:"):])
+        m = re.fullmatch(r"(?:send-failed|send-budget|controller_send_failed|controller_gh_failed|overdue|"
+                         r"publication-failed|publication-superseded):([0-9a-f]{12})", fp)
+        for kind, slot in PUBLICATION_SLOTS:
+            if m and obligation_key(ob["runId"], kind, slot)[:12] == m.group(1):
+                return "{}:{}".format(kind, slot)
+        hint = d.get("hint") if isinstance(d.get("hint"), dict) else {}
+        detail = hint.get("detail") if isinstance(hint.get("detail"), dict) else {}
+        trigger = hint.get("trigger")
+        if trigger in ("controller_send_failed", "controller_send_budget") and detail.get("slot") == "verdict":
+            return "send:verdict"
+        if trigger == "controller_gh_failed" and detail.get("slot") == "pr-comment":
+            return "gh:pr-comment"
+        if trigger == "controller_obligation_overdue" and detail.get("obligation") in ("send:verdict", "gh:pr-comment"):
+            return detail["obligation"]
+        return None
+
+    def _record_unpublished(self, run_id, phase, verdict, failed, unpublished):
+        """The verdict stands; what could not be published is recorded on the
+        verdict's own journal record (machine-readable, beside the verdict it
+        did not carry), decided, and alarmed once per post. `publicationHint`
+        is what the posts render after finish (_republish)."""
+        for item in unpublished:
+            kind, _, slot = item["obligation"].partition(":")
+            label = publication_label(kind, slot)
+            if label and item["state"] == "failed_terminal":
+                self.ensure_alarm(run_id, "controller_publication_failed",
+                                  "publication-failed:{}".format(obligation_key(run_id, kind, slot)[:12]),
+                                  dict(item, verdict=verdict), publication=label)
+        vob = self.obligations().get(obligation_key(run_id, "verdict", "validated"))
+        hint = {"verdict": verdict, "failedChecks": failed[:4]}
+        if vob and vob["detail"].get("publicationFailed") == unpublished and \
+                vob["detail"].get("publicationHint") == hint:
+            return
+        self.record(run_id, "verdict", "validated", "done", 1, {"publicationFailed": unpublished,
+                                                                "publicationHint": hint})
+        self.decide(run_id, phase, "publication_failed", "mechanical",
+                    "a verdict post could not be published; the validated verdict stands" if unpublished else
+                    "every verdict post now carries the verdict; the earlier publication failure is cleared",
+                    verdict=verdict, unpublished=unpublished)
+
+    def _unpublished(self, run_id):
+        """The run's verdict posts that did not publish the verdict: terminal
+        (the posts, and the alarms about them), or superseded by a later
+        verdict (_align_publication)."""
+        out = []
+        for ob in self.obligations().values():
+            if ob["runId"] != run_id or not self._is_publication(ob):
+                continue
+            last = ob["history"][-1].get("detail") or {}
+            if ob["detail"].get("superseded"):
+                out.append({"obligation": "{}:{}".format(ob["kind"], ob["slot"]), "state": ob["state"],
+                            "reason": ob["detail"].get("supersededReason")})
+            elif ob["state"] == "failed_terminal":
+                out.append({"obligation": "{}:{}".format(ob["kind"], ob["slot"]), "state": ob["state"],
+                            "reason": last.get("reason")})
+        return sorted(out, key=lambda x: x["obligation"])
+
+    def _align_publication(self, run_id, phase, kind, slot, want):
+        """Make a verdict post carry `want` (the verdict and failed checks
+        this run now finishes with) before it is driven. "new"/"ok": nothing
+        to change. "retargeted": the post has not gone out, so it is re-pointed
+        -- its hint replaced and its payload rendered afresh under a new
+        revision; the helper's id check (send) or the marker search (gh) still
+        catches one that did go out (_publication_superseded). "superseded": it
+        went out (or may have) with another verdict, so it is never re-sent,
+        and an alarm states the verdict the run finishes with."""
+        ob = self.obligations().get(obligation_key(run_id, kind, slot))
+        if not ob:
+            return "new"
+        d = ob["detail"]
+        if d.get("superseded"):
+            return "superseded"
+        have = d.get("hint")
+        if have is None and kind == "send":
+            # Every controller has journaled a chat post's hint with its first
+            # intent; one without is a send refused by budget before any
+            # intent, so no payload and no post exist.
+            if ob["state"] not in TERMINAL_OK | {"abandoned"}:
+                self.record(run_id, kind, slot, ob["state"], ob["attempt"] or None, {"hint": want})
+            return "ok"
+        if have is None:
+            # A PR comment journaled before posts recorded their verdict (a
+            # controller from before this install): what it carries, or the
+            # write-once payload it left, is UNKNOWN. One that went out is
+            # superseded; one still open is re-pointed, so its payload is
+            # rendered afresh under a new identity and the marker search
+            # decides whether the old one had already landed (stale ->
+            # superseded).
+            if ob["state"] in TERMINAL_OK:
+                return self._publication_superseded(run_id, phase, kind, slot, {"verdict": "unknown"}, want)
+            have = {}
+        if have == want:
+            return "ok"
+        if ob["state"] in ("enqueued", "delivered", "done"):
+            return self._publication_superseded(run_id, phase, kind, slot, have, want)
+        n = int(d.get("retarget") or 0) + 1
+        self.record(run_id, kind, slot, "failed" if ob["state"] == "failed" else "intent", ob["attempt"] or None,
+                    {"hint": want, "retarget": n, "effectFailures": 0})
+        self.decide(run_id, phase, "republish", "mechanical", "verdict post re-pointed at the verdict the run finishes "
+                    "with", slot=slot, kind=kind, posted=have.get("verdict"), verdict=want.get("verdict"), retarget=n)
+        return "retargeted"
+
+    def _publication_superseded(self, run_id, phase, kind, slot, have, want, attempt=None):
+        """A post that went out (or may have) with a verdict the run no longer
+        finishes with. It is not re-sent and not waited on; the alarm, raised
+        once, says which verdict the run finishes with."""
+        label = "{}:{}".format(kind, slot)
+        key = obligation_key(run_id, kind, slot)
+        why = "carries {} but the run finishes {}".format(have.get("verdict"), want.get("verdict"))
+        self.ensure_alarm(run_id, "controller_publication_superseded", "publication-superseded:{}".format(key[:12]),
+                          {"obligation": label, "posted": have.get("verdict"), "verdict": want.get("verdict"),
+                           "failedChecks": want.get("failedChecks")}, publication=label)
+        ob = self.obligations().get(key) or {"state": "intent", "attempt": 0, "detail": {}}
+        if not ob["detail"].get("superseded"):
+            self.record(run_id, kind, slot, ob["state"] if ob["state"] in TERMINAL_OK else "abandoned",
+                        attempt or ob["attempt"] or None, {"superseded": True, "supersededReason": why})
+            self.decide(run_id, phase, "escalate", "coordination_model", "controller_publication_superseded",
+                        slot=slot, kind=kind, reason_detail=why)
+        return "superseded"
 
     def _terminal_call(self, run_id, phase, verb, claim_sha, verdict):
         args = [run_id] if verb == "challenger-timeout" else [claim_sha, run_id, verdict]
@@ -3900,7 +4351,65 @@ class Controller:
             if ob["runId"] == run_id and ob["slot"] in POST_FINISH_SLOTS and ob["state"] not in (
                     "done", "delivered", "abandoned", "failed_terminal"):
                 return True
-        return False
+        return bool(self._unpublished_after_finish(run_id))
+
+    def _unpublished_after_finish(self, run_id):
+        """The verdict posts still owed once THIS controller has finished the
+        run: open (intent, enqueued, a failed receipt with attempts left), or
+        failed_terminal on effect failures with a re-offer left -- for
+        PUBLICATION_REDRIVE_SECONDS after the finish. A budget refusal or
+        MAX_SEND_ATTEMPTS failed receipts are never re-offered: both are the
+        host's own definitive answer."""
+        run_ob = self.obligations().get(obligation_key(run_id, "run", "claim"))
+        if not run_ob or run_ob["state"] != "done" or run_ob["detail"].get("finishedBy") != "controller":
+            return []
+        done_at = next((parse_iso(h.get("at")) for h in run_ob["history"] if h.get("state") == "done"), None)
+        if not done_at or (self.now - done_at).total_seconds() > PUBLICATION_REDRIVE_SECONDS:
+            return []
+        out = []
+        for kind, slot in PUBLICATION_SLOTS:
+            ob = self.obligations().get(obligation_key(run_id, kind, slot))
+            if not ob:
+                continue
+            last = ob["history"][-1].get("detail") or {}
+            if ob["state"] in ("intent", "enqueued", "failed") or (
+                    ob["state"] == "failed_terminal" and re.fullmatch(r"\d+ failures", str(last.get("reason"))) and
+                    int(ob["detail"].get("publicationReoffers") or 0) < PUBLICATION_REOFFERS):
+                out.append(ob)
+        return out
+
+    def _republish(self, run_id):
+        """Drive the verdict posts the finish went out without, on the fires
+        after it (never the finishing fire, which just drove them). A post
+        that went terminal on effect failures is re-offered: its SAME attempt
+        reopens with a fresh failure count, so the idempotent helper replay or
+        the marker search decides whether it lands -- never a second post."""
+        # Rendered from the verdict the run FINISHED with, never a hint or
+        # payload left from before a later change of verdict.
+        finished = (self.obligations().get(obligation_key(run_id, "run", "claim")) or {"detail": {}})["detail"].get(
+            "verdict")
+        vob = self.obligations().get(obligation_key(run_id, "verdict", "validated")) or {"detail": {}}
+        hint = vob["detail"].get("publicationHint") or {}
+        if hint.get("verdict") != finished:
+            hint = {"verdict": finished, "failedChecks": []}
+        for ob in self._unpublished_after_finish(run_id):
+            if any(h.get("fire") == self.fire for h in ob["history"]):
+                continue
+            kind, slot = ob["kind"], ob["slot"]
+            if self._align_publication(run_id, "finished", kind, slot, hint) == "superseded":
+                continue
+            ob = self.obligations()[ob["key"]]
+            if ob["state"] == "failed_terminal":
+                n = int(ob["detail"].get("publicationReoffers") or 0) + 1
+                self.record(run_id, kind, slot, "intent", ob["attempt"] or 1,
+                            {"effectFailures": 0, "publicationReoffers": n})
+                self.decide(run_id, "finished", "republish", "mechanical", "verdict post re-offered after finish",
+                            slot=slot, kind=kind, reoffer=n)
+            state = self.send(run_id, "finished", slot) if kind == "send" else \
+                self.github(run_id, "finished", slot, hint=hint)
+            if state in TERMINAL_OK:
+                self.decide(run_id, "finished", "log", "mechanical", "verdict post published after finish",
+                            slot=slot, kind=kind)
 
     def post_finish(self, run_id, pr, verdict, external):
         obs = self.obligations()
@@ -3960,6 +4469,7 @@ class Controller:
                     if not ob["detail"].get("overdue"):
                         self.record(run_id, "gh", "freeze-close", "intent", 1, {"overdue": True})
             self.github(run_id, "finished", "freeze-close")
+        self._republish(run_id)
         self.decide(run_id, "finished", "log", "mechanical", "run finished", verdict=verdict,
                     finishedBy="gate" if external else "controller")
         return "finished"

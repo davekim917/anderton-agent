@@ -6233,8 +6233,8 @@ describe('status subtext — round-two regressions', () => {
       recordContextTokens(8_200);
       yield { type: 'result', text: '<message to="here">done</message>' };
     }
-    // Sticky -e xhigh from an earlier turn, then -m haiku. The provider
-    // clamps to the family default, which for haiku is nothing at all.
+    // Sticky -e xhigh from an earlier turn, then -m haiku45. The provider
+    // clamps to the family default, which for Haiku 4.5 is nothing at all.
     const query: AgentQuery = {
       push: () => {},
       end: () => {},

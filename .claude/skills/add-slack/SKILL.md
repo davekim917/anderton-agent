@@ -29,6 +29,7 @@ file is copied in:
 
 ```nc:copy from-branch:channels owned-by-fork
 src/channels/slack.ts
+src/channels/slack-a2a-guard.ts
 src/channels/slack-registration.test.ts
 container/skills/slack-formatting/SKILL.md
 ```

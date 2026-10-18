@@ -56,11 +56,10 @@ import { addMember } from '../src/modules/permissions/db/agent-group-members.js'
 import { getUserRoles, grantRole } from '../src/modules/permissions/db/user-roles.js';
 import { upsertUser } from '../src/modules/permissions/db/users.js';
 import { writeContainerConfigScalars } from '../src/container-config.js';
-import { ensureContainerConfig } from '../src/db/container-configs.js';
 import { namespacedPlatformId } from '../src/platform-id.js';
 import type { AgentGroup, MessagingGroup } from '../src/types.js';
 
-import { findOrCreateAgentGroup, generateId } from './lib/bootstrap-agent-group.js';
+import { findOrCreateAgentGroup, generateId, stampGroupProvider } from './lib/bootstrap-agent-group.js';
 
 type Role = 'owner' | 'admin' | 'member';
 
@@ -226,9 +225,8 @@ async function main(): Promise<void> {
   // 2. Agent group + filesystem.
   const folder = `dm-with-${normalizeName(args.displayName)}`;
   const pickedProvider = process.env.NANOCLAW_PICKED_PROVIDER?.trim().toLowerCase();
-  const ag = await findOrCreateAgentGroup(folder, args.agentName, now);
-  // Stamped with the setup pick, else the instance default; a reused group keeps its provider.
-  await ensureContainerConfig(ag.id, pickedProvider);
+  const { ag, created } = await findOrCreateAgentGroup(folder, args.agentName, now);
+  await stampGroupProvider(ag, created, pickedProvider);
   stageGroupPersona(
     path.resolve(GROUPS_DIR, folder),
     `# ${args.agentName}\n\n` +

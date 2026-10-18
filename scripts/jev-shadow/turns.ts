@@ -17,7 +17,7 @@ import Database from 'better-sqlite3';
 
 import { CLAUDE_USAGE_TRUSTED_FROM, isUntrustedTurnUsage, UNTRUSTED_USAGE_NOTE } from '../../src/db/usage-trust.js';
 
-const ROOT = process.env.NANOCLAW_ROOT ?? '/home/ubuntu/nanoclaw-v2';
+const ROOT = process.env.NANOCLAW_ROOT ?? process.cwd();
 
 /**
  * The workgroups in focus: a scope choice, not a data-sharing restriction. Set per run with

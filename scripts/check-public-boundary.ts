@@ -10,6 +10,15 @@ import { pathToFileURL } from 'node:url';
 
 import Database from 'better-sqlite3';
 
+import {
+  cachedGithubVisibility,
+  defaultVisibilityCachePath,
+  ghVisibilityLookup,
+  type GithubRepository,
+  type PublicRepositoryResolver,
+  repositoryKey,
+} from './lib/github-visibility.js';
+
 export type ScanCategory =
   | 'private-identifier'
   | 'email-address'
@@ -48,6 +57,10 @@ export interface ScanOptions {
   index: boolean;
   portable: boolean;
   allowStructural: boolean;
+  // Gate without an identifier source only where its file does not exist (a clone no install has set up yet).
+  allowAbsentSources?: boolean;
+  // Undefined: ask GitHub, through the install's cache, which store clones are public. False: none are.
+  publicRepositories?: ((installRoot: string) => PublicRepositoryResolver) | false;
   dbPath?: string;
   // Undefined: resolve the local default, then the main checkout's.
   identifiersPath?: string;
@@ -77,6 +90,7 @@ const GENERIC_REPOSITORY_WORDS = new Set([
   'app',
   'apps',
   'backend',
+  'bootstrap',
   'bot',
   'cli',
   'client',
@@ -99,6 +113,7 @@ const GENERIC_REPOSITORY_WORDS = new Set([
   'main',
   'maintenance',
   'mobile',
+  'nanoclaw',
   'ops',
   'pipeline',
   'platform',
@@ -547,8 +562,21 @@ function listSource(dir: string, problems: string[], what: string): string[] {
 }
 
 // An unreadable source is recorded in `problems`, never by name.
-export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, problems: string[]): Set<string> {
+export interface InstallIdentifierOptions {
+  /** Proves store clones public; absent, every network clone contributes its names. */
+  publicRepositories?: PublicRepositoryResolver;
+  /** The other sources' identifiers: a public clone whose owner or name matches one stays private. */
+  otherIdentifiers?: Iterable<string>;
+}
+
+export function loadInstallIdentifiers(
+  dbPath: string,
+  remotes: PublicRemotes,
+  problems: string[],
+  options: InstallIdentifierOptions = {},
+): Set<string> {
   const identifiers = new Set<string>();
+  const clones: { names: string[]; repository: GithubRepository | null }[] = [];
   const installRoot = installRootOf(dbPath);
   if (!installRoot) return identifiers;
   const groupsDir = path.join(installRoot, 'groups');
@@ -596,13 +624,57 @@ export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, p
         if (!isGenericRepositoryName(name)) addIdentifier(identifiers, name);
         continue;
       }
-      if (!remotes.owners.has(parsed.owner.toLowerCase()) && !isGenericRepositoryName(parsed.owner))
-        addIdentifier(identifiers, parsed.owner);
-      if (!remotes.repositories.has(parsed.key) && !isGenericRepositoryName(parsed.repo))
-        addIdentifier(identifiers, parsed.repo);
+      const names = [
+        ...(!remotes.owners.has(parsed.owner.toLowerCase()) && !isGenericRepositoryName(parsed.owner)
+          ? [parsed.owner]
+          : []),
+        ...(!remotes.repositories.has(parsed.key) && !isGenericRepositoryName(parsed.repo) ? [parsed.repo] : []),
+      ];
+      if (names.length > 0) clones.push({ names, repository: parsed.host === 'github.com' ? parsed : null });
     }
   }
+
+  const lookedUp = clones.flatMap((clone) => (clone.repository ? [clone.repository] : []));
+  const proven = lookedUp.length > 0 && options.publicRepositories ? options.publicRepositories(lookedUp) : new Set();
+  const isProven = (clone: (typeof clones)[number]) =>
+    clone.repository !== null && proven.has(repositoryKey(clone.repository));
+  for (const clone of clones) {
+    if (!isProven(clone)) for (const name of clone.names) addIdentifier(identifiers, name);
+  }
+  // A public repository a client owns, or names after one, still identifies the relationship.
+  const known = [...identifiers, ...(options.otherIdentifiers ?? [])];
+  for (const clone of clones) {
+    if (isProven(clone) && clone.names.some((name) => namesKnownIdentifier(name, known)))
+      for (const name of clone.names) addIdentifier(identifiers, name);
+  }
   return identifiers;
+}
+
+function nameWords(value: string): string[] {
+  return value.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+// Either name may be the shortened form of the other: an org slug of a legal name, or a name inside a slug.
+function namesKnownIdentifier(name: string, known: string[]): boolean {
+  const normalized = nameWords(name).join('');
+  const words = new Set(nameWords(name).filter((word) => word.length >= 4 && !GENERIC_REPOSITORY_WORDS.has(word)));
+  return known.some((identifier) => {
+    const other = nameWords(identifier).join('');
+    if (other.length < 4) return other.length > 0 && other === normalized;
+    return (
+      normalized.includes(other) ||
+      (normalized.length >= 4 && other.includes(normalized)) ||
+      nameWords(identifier).some((word) => words.has(word)) ||
+      identifierMatcher(identifier).patterns.some((pattern) => {
+        pattern.lastIndex = 0;
+        return pattern.test(name);
+      })
+    );
+  });
+}
+
+export function githubPublicRepositories(installRoot: string): PublicRepositoryResolver {
+  return cachedGithubVisibility({ cachePath: defaultVisibilityCachePath(installRoot), lookup: ghVisibilityLookup });
 }
 
 export function loadLocalIdentifiers(identifiersPath: string): Set<string> {
@@ -757,6 +829,19 @@ function decodeContent(file: string, content: Buffer): DecodedContent {
   return BINARY_EXTENSIONS.has(extension) ? { kind: 'binary' } : { kind: 'unscannable' };
 }
 
+// A value written as an escape sequence reads as plain text to whoever consumes the file. A decoded
+// newline would shift every later line number, so those escapes stay as written.
+const ESCAPE_SEQUENCE =
+  /\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})|\\x([0-9a-fA-F]{2})|&#[xX]([0-9a-fA-F]{1,6});?|&#([0-9]{1,7});?/g;
+
+function decodeEscapes(text: string): string {
+  return text.replace(ESCAPE_SEQUENCE, (raw: string, ...groups: Array<string | undefined>) => {
+    const hex = groups.slice(0, 5).find((group) => group !== undefined);
+    const code = hex !== undefined ? parseInt(hex, 16) : Number(groups[5]);
+    return !(code <= 0x10ffff) || code === 0x0a || code === 0x0d ? raw : String.fromCodePoint(code);
+  });
+}
+
 interface Match {
   line: number;
   category: ScanCategory;
@@ -858,8 +943,11 @@ export function scanInputs(
       addFinding({ file, line: 1, category: 'unscannable-content' });
       continue;
     }
-    for (const match of findMatches(input.file, decoded.text, forIdentifiers(decoded.text), matchers, allowlist)) {
-      addFinding({ file, line: match.line, category: match.category });
+    const unescaped = decodeEscapes(decoded.text);
+    for (const text of unescaped === decoded.text ? [decoded.text] : [decoded.text, unescaped]) {
+      for (const match of findMatches(input.file, text, forIdentifiers(text), matchers, allowlist)) {
+        addFinding({ file, line: match.line, category: match.category });
+      }
     }
   }
   return [...findings.values()].sort(
@@ -957,6 +1045,7 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
     index: false,
     portable: false,
     allowStructural: false,
+    allowAbsentSources: false,
     messageRaw: false,
     writeBaseline: false,
     acceptGrowth: false,
@@ -966,6 +1055,7 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
     if (arg === '--') continue;
     if (arg === '--portable') options.portable = true;
     else if (arg === '--allow-structural') options.allowStructural = true;
+    else if (arg === '--allow-absent-sources') options.allowAbsentSources = true;
     else if (arg === '--staged' || arg === '--index') options.index = true;
     else if (arg === '--root') options.root = argv[++i] ?? '';
     else if (arg === '--db') options.dbPath = argv[++i];
@@ -1246,23 +1336,6 @@ export function runReport(options: ScanOptions): RunReport {
 
   if (!options.portable) {
     const mainCheckoutRoot = findMainCheckoutRoot(options.root);
-    const registry = resolveIdentifierSet(
-      options.dbPath,
-      options.root,
-      mainCheckoutRoot,
-      DEFAULT_DB_RELATIVE,
-      (dbPath) => {
-        const values = loadRegistryIdentifiers(dbPath);
-        const installRoot = installRootOf(dbPath);
-        const remotes = publicRemotes(installRoot ? [options.root, installRoot] : [options.root]);
-        for (const value of loadInstallIdentifiers(dbPath, remotes, discoveryProblems)) values.add(value);
-        return values;
-      },
-    );
-    registryOrigin = registry.origin;
-    registryPathsTried = registry.attemptedPaths;
-    for (const value of registry.identifiers) privateIdentifiers.add(value);
-
     const identifiers = resolveIdentifierSet(
       options.identifiersPath,
       options.root,
@@ -1272,6 +1345,30 @@ export function runReport(options: ScanOptions): RunReport {
     );
     identifiersOrigin = identifiers.origin;
     identifiersPathsTried = identifiers.attemptedPaths;
+
+    const registry = resolveIdentifierSet(
+      options.dbPath,
+      options.root,
+      mainCheckoutRoot,
+      DEFAULT_DB_RELATIVE,
+      (dbPath) => {
+        const values = loadRegistryIdentifiers(dbPath);
+        const installRoot = installRootOf(dbPath);
+        const remotes = publicRemotes(installRoot ? [options.root, installRoot] : [options.root]);
+        const installValues = loadInstallIdentifiers(dbPath, remotes, discoveryProblems, {
+          publicRepositories:
+            installRoot && options.publicRepositories !== false
+              ? (options.publicRepositories ?? githubPublicRepositories)(installRoot)
+              : undefined,
+          otherIdentifiers: [...values, ...identifiers.identifiers],
+        });
+        for (const value of installValues) values.add(value);
+        return values;
+      },
+    );
+    registryOrigin = registry.origin;
+    registryPathsTried = registry.attemptedPaths;
+    for (const value of registry.identifiers) privateIdentifiers.add(value);
     for (const value of identifiers.identifiers) privateIdentifiers.add(value);
   }
 
@@ -1358,6 +1455,22 @@ function describeMode(report: RunReport): string {
   return usedFallback ? 'identifiers from main checkout' : 'identifiers from local install';
 }
 
+function missingSourcesAreAbsent(report: RunReport): boolean {
+  const missing = (file: string) => {
+    try {
+      fs.lstatSync(file);
+      return false;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'ENOENT';
+    }
+  };
+  const absent = (origin: RunReport['registryOrigin'], tried: string[]) => origin !== 'none' || tried.every(missing);
+  return (
+    absent(report.registryOrigin, report.registryPathsTried) &&
+    absent(report.identifiersOrigin, report.identifiersPathsTried)
+  );
+}
+
 function describeMissingIdentifierSources(report: RunReport): string {
   const sources: string[] = [];
   if (report.registryOrigin === 'none') {
@@ -1395,9 +1508,12 @@ export function main(argv = process.argv.slice(2)): number {
           ? `no identifier registry found; ${missing} — running structural-pattern checks only; real names and tenant identifiers will NOT be caught`
           : `install-aware checks are incomplete; ${missing}`;
       process.stderr.write(`WARNING: ${coverage}\n`);
-      if ((options.index || options.messagePath) && !options.allowStructural) {
+      const tolerated = options.allowStructural || (options.allowAbsentSources && missingSourcesAreAbsent(report));
+      if ((options.index || options.messagePath) && !tolerated) {
         process.stderr.write(
-          'public boundary check failed: gating scans require both an install registry and identifier inventory; use --allow-structural only for read-only structural reporting\n',
+          options.allowAbsentSources
+            ? 'public boundary check failed: an identifier source exists but could not be read; fix or remove it\n'
+            : 'public boundary check failed: gating scans require both an install registry and identifier inventory; use --allow-structural only for read-only structural reporting\n',
         );
         return 1;
       }

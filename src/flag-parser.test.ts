@@ -9,6 +9,7 @@ import {
   DEFAULT_OPUS_MODEL,
   DEFAULT_FABLE_MODEL,
   DEFAULT_SONNET_MODEL,
+  DEFAULT_HAIKU_MODEL,
   CODEX_FAMILY_DEFAULTS,
   resolveEffectiveModel,
 } from './flag-parser.js';
@@ -36,7 +37,7 @@ describe('formatFlagConfirmation model rendering', () => {
     const s = parseMessageFlags('-m sonnet hi');
     expect(formatFlagConfirmation(s.intent ?? {}, s.warnings, s.errors)).toContain(DEFAULT_SONNET_MODEL);
     const h = parseMessageFlags('-m haiku hi');
-    expect(formatFlagConfirmation(h.intent ?? {}, h.warnings, h.errors)).toContain('claude-haiku-4-5');
+    expect(formatFlagConfirmation(h.intent ?? {}, h.warnings, h.errors)).toContain(DEFAULT_HAIKU_MODEL);
   });
 
   it('applies the same resolution to a per-turn -m1 flag', () => {
@@ -53,6 +54,9 @@ describe('resolveModelAlias', () => {
     expect(resolveModelAlias('sonnet55')).toBe('claude-sonnet-5-5');
     expect(resolveModelAlias('sonnet5-5')).toBe('claude-sonnet-5-5');
     expect(resolveModelAlias('sonnet-5-5')).toBe('claude-sonnet-5-5');
+    expect(resolveModelAlias('haiku55')).toBe('claude-haiku-5-5');
+    expect(resolveModelAlias('haiku5-5')).toBe('claude-haiku-5-5');
+    expect(resolveModelAlias('haiku-5-5')).toBe('claude-haiku-5-5');
     expect(resolveModelAlias('haiku45')).toBe('claude-haiku-4-5');
   });
 
@@ -298,11 +302,21 @@ describe('parseMessageFlags', () => {
   });
 
   describe('validation', () => {
-    it('warns and drops effort when model is haiku', () => {
-      const r = parseMessageFlags('-m haiku -e low summarize');
-      expect(r.intent).toEqual({ stickyModel: 'haiku' });
+    it('warns and drops effort when model is Haiku 4.5', () => {
+      const r = parseMessageFlags('-m haiku45 -e low summarize');
+      expect(r.intent).toEqual({ stickyModel: 'claude-haiku-4-5' });
       expect(r.warnings).toHaveLength(1);
-      expect(r.warnings[0]).toMatch(/haiku doesn't support effort/);
+      expect(r.warnings[0]).toMatch(/claude-haiku-4-5 doesn't support effort/);
+    });
+
+    it('accepts the full effort ladder on bare haiku (Haiku 5.5)', () => {
+      expect(parseMessageFlags('-m haiku -e low summarize').intent).toEqual({
+        stickyModel: 'haiku',
+        stickyEffort: 'low',
+      });
+      const r = parseMessageFlags('-m haiku -e max summarize');
+      expect(r.intent).toEqual({ stickyModel: 'haiku', stickyEffort: 'max' });
+      expect(r.warnings).toEqual([]);
     });
 
     it('accepts xhigh on bare sonnet (now resolves to Sonnet 5, which has xhigh)', () => {
@@ -383,7 +397,7 @@ describe('formatFlagConfirmation', () => {
   // name the model that will actually run, not the alias the user typed.
   it('formats a plain sticky switch', () => {
     const out = formatFlagConfirmation({ stickyModel: 'haiku' }, [], []);
-    expect(out).toBe('⚙️ model → claude-haiku-4-5-20251001 (via haiku)');
+    expect(out).toBe('⚙️ model → claude-haiku-5-5 (via haiku)');
   });
 
   it('combines model + effort on one line', () => {
@@ -393,7 +407,7 @@ describe('formatFlagConfirmation', () => {
 
   it('appends warnings on their own line', () => {
     const out = formatFlagConfirmation({ stickyModel: 'haiku' }, ["haiku doesn't support effort — skipped effort"], []);
-    expect(out).toContain('⚙️ model → claude-haiku-4-5-20251001');
+    expect(out).toContain('⚙️ model → claude-haiku-5-5');
     expect(out).toContain('⚠️');
   });
 

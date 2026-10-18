@@ -162,6 +162,8 @@ export interface ComposeGroupClaudeMdOptions {
   workgroupReadAccessInstructions?: string | null;
   /** Host-generated from the same wiki mount as this spawn (src/workgroup-wiki.ts). */
   workgroupWikiInstructions?: string | null;
+  /** Host-generated from the same shared-tree mount as this spawn (src/workgroup-verify-skills.ts). */
+  workgroupVerifySkillsInstructions?: string | null;
   /** The spawn's workgroup MCP servers; a group's own entry of the same name wins, as at spawn. */
   workgroupMcpServers?: Record<string, McpServerConfig>;
   /** The spawn's workgroup plugin opt-outs, unioned with the group's own as at the mount. */
@@ -223,6 +225,11 @@ export async function composeGroupClaudeMd(
   if (options.workgroupWikiInstructions) {
     if (!options.workgroupId) throw new Error('workgroup wiki instructions require a spawn-resolved workgroup ID');
     desired.set('host-workgroup-wiki.md', options.workgroupWikiInstructions);
+  }
+  if (options.workgroupVerifySkillsInstructions) {
+    if (!options.workgroupId)
+      throw new Error('workgroup verify-skill instructions require a spawn-resolved workgroup ID');
+    desired.set('host-workgroup-verify-skills.md', options.workgroupVerifySkillsInstructions);
   }
 
   // Built-in module fragments (`<name>.instructions.md`). Scheduling guidance lives only in the cli fragment,

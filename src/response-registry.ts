@@ -24,6 +24,8 @@ export interface ResponsePayload {
    * click to its own card with this. Absent or null when the adapter gave none.
    */
   messageId?: string | null;
+  /** Answers the clicker alone; absent where the platform cannot. */
+  replyToClicker?: (text: string) => Promise<void>;
 }
 
 export type ResponseHandler = (payload: ResponsePayload) => Promise<boolean>;

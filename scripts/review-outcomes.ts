@@ -16,6 +16,7 @@ import nodePath from 'node:path';
 
 import { parse } from 'yaml';
 import { walkArgs } from './lib/cli-args.js';
+import { originRepo } from './lib/origin-repo.js';
 
 export interface PullRequestData {
   number: number;
@@ -1593,7 +1594,7 @@ export function fetchShadowReviewedPRs(repo: string): number[] {
 
 function parseArgs(argv: readonly string[]): Options {
   const options: Options = {
-    repo: 'davekim917/nanoclaw',
+    repo: '',
     // The gate's actual go-live instant: a rounded midnight would misclassify PRs merged before it.
     switchIso: GATE_GO_LIVE_ISO,
     days: 30,
@@ -1618,6 +1619,7 @@ function parseArgs(argv: readonly string[]): Options {
     fail(`--switch is not a valid ISO date: ${options.switchIso}`);
   if (options.weeklyDays !== undefined && (!Number.isFinite(options.weeklyDays) || options.weeklyDays <= 0))
     fail('--weekly-days must be a positive number');
+  if (!options.repo) options.repo = originRepo();
   return options;
 }
 

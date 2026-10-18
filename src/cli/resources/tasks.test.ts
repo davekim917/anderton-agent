@@ -3361,12 +3361,14 @@ describe('ncl tasks repin', () => {
   });
 
   it('rejects a pin whose axis the parser DROPS rather than errors on', async () => {
-    // `-m1 haiku -e1 xhigh` is a WARNING in chat, not an error: the parser
+    // `-m1 haiku45 -e1 xhigh` is a WARNING in chat, not an error: the parser
     // applies the model, skips the effort, and the human reads "skipped
     // effort" on screen. A pin has no such reader — it fires unattended for
     // weeks — so "accepted, minus a piece you asked for" is indistinguishable
     // from "accepted" at every later read.
-    expect(validateTaskPin({ model: 'haiku', effort: 'xhigh' }, 'claude').error).toContain('dropped by validation');
+    expect(validateTaskPin({ model: 'claude-haiku-4-5', effort: 'xhigh' }, 'claude').error).toContain(
+      'dropped by validation',
+    );
     expect(validateTaskPin({ model: 'sonnet', effort: 'xhigh' }, 'claude').error).toBeUndefined();
 
     // And repin must not store the raw request when validation returned
@@ -3375,7 +3377,7 @@ describe('ncl tasks repin', () => {
     const r = await repin({
       group: 'ag-1',
       from_model: 'claude-sonnet-5',
-      to_model: 'haiku',
+      to_model: 'claude-haiku-4-5',
       from_effort: 'xhigh',
       to_effort: 'xhigh',
     });

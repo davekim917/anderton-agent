@@ -24,6 +24,7 @@
  * confirmed with the user, and free-text replies fall through to a
  * headless `claude -p` call for IANA-zone resolution.
  */
+import { randomBytes } from 'crypto';
 import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import * as os from 'os';
@@ -53,7 +54,7 @@ import { runAdvancedScreen } from './lib/setup-config-screen.js';
 import { runWindowedStep } from './lib/windowed-runner.js';
 import { runUninstallFlow } from './uninstall/flow.js';
 import { detectExistingInstall } from './uninstall/scan.js';
-import { detectRegisteredGroups, detectExistingDisplayName } from './environment.js';
+import { detectRegisteredGroups, detectExistingDisplayName, findStalePingAgentFolders } from './environment.js';
 import { pollHealth } from './onecli.js';
 import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
 import { claudeCliAvailable, resolveTimezoneViaClaude } from './lib/tz-from-claude.js';
@@ -65,6 +66,16 @@ import { isValidTimezone } from '../src/timezone.js';
 import { DEFAULT_AGENT_PROVIDER } from '../src/config.js';
 
 const CLI_AGENT_NAME = 'Terminal Agent';
+// Per run, so the ping cleanup cannot delete an agent the operator already has.
+const PING_TEST_FOLDER = `ping-test-${randomBytes(4).toString('hex')}`;
+
+async function deletePingAgent(folder: string): Promise<{ ok: boolean; rawLog: string }> {
+  const rawLog = setupLog.stepRawLog('cleanup-cli-agent');
+  const start = Date.now();
+  const res = await spawnQuiet('pnpm', ['exec', 'tsx', 'scripts/delete-cli-agent.ts', '--folder', folder], rawLog);
+  setupLog.step('cleanup-cli-agent', res.ok ? 'success' : 'failed', Date.now() - start, { exit_code: res.exitCode }, rawLog);
+  return { ok: res.ok, rawLog };
+}
 const RUN_START = Date.now();
 
 type ChannelChoice = 'telegram' | 'discord' | 'whatsapp' | 'signal' | 'teams' | 'slack' | 'imessage' | 'other' | 'skip';
@@ -214,6 +225,9 @@ async function main(): Promise<void> {
           'Log out and back in (or run `newgrp docker` in a new shell), then retry.',
         );
       }
+      if (err === 'docker_plugin_missing') {
+        await failDockerPlugin('container', res.terminal?.fields.MISSING);
+      }
       await fail(
         'container',
         "Couldn't build the sandbox.",
@@ -309,6 +323,9 @@ async function main(): Promise<void> {
       );
       if (!res.ok) {
         const err = res.terminal?.fields.ERROR;
+        if (err === 'docker_plugin_missing') {
+          await failDockerPlugin('onecli', res.terminal?.fields.MISSING);
+        }
         if (err === 'onecli_not_on_path_after_install') {
           await fail(
             'onecli',
@@ -412,6 +429,31 @@ async function main(): Promise<void> {
       done: 'NanoClaw is running.',
     });
     if (!res.ok) {
+      const fields = res.terminal?.fields;
+      if (fields?.ERROR === 'build_failed') {
+        await fail(
+          'service',
+          "Couldn't build NanoClaw.",
+          `The build output is above and in ${res.rawLog}.`,
+          res.rawLog,
+        );
+      }
+      if (fields?.ERROR === 'service_not_running') {
+        const start =
+          fields.SERVICE_TYPE === 'nohup'
+            ? `bash ${fields.WRAPPER_PATH ?? 'start-nanoclaw.sh'}`
+            : fields.SERVICE_TYPE === 'systemd-user'
+              ? `systemctl --user start ${fields.SERVICE_UNIT ?? getSystemdUnit()}`
+              : fields.SERVICE_TYPE === 'systemd-system'
+                ? `sudo systemctl start ${fields.SERVICE_UNIT ?? getSystemdUnit()}`
+                : `launchctl kickstart gui/$(id -u)/${fields.SERVICE_LABEL ?? getLaunchdLabel()}`;
+        await fail(
+          'service',
+          'NanoClaw is installed but not running.',
+          `Check logs/nanoclaw.error.log, then start it with \`${start}\` and retry.`,
+          res.rawLog,
+        );
+      }
       await fail('service', "Couldn't start NanoClaw.", 'See logs/nanoclaw.error.log for details.');
     }
     if (res.terminal?.fields.DOCKER_GROUP_STALE === 'true') {
@@ -434,6 +476,11 @@ async function main(): Promise<void> {
     return displayName;
   }
 
+  for (const folder of findStalePingAgentFolders(process.cwd())) {
+    const { ok, rawLog } = await deletePingAgent(folder);
+    if (!ok) p.log.warn(brandBody(`Couldn't remove a test agent left by an earlier setup run. See ${rawLog} for details.`));
+  }
+
   if (!skip.has('cli-agent') && detectRegisteredGroups(process.cwd())) {
     skip.add('cli-agent');
     skip.add('first-chat');
@@ -447,7 +494,7 @@ async function main(): Promise<void> {
         running: 'Bringing your assistant online…',
         done: 'Assistant wired up.',
       },
-      ['--display-name', displayName!, '--agent-name', CLI_AGENT_NAME, '--folder', '_ping-test'],
+      ['--display-name', displayName!, '--agent-name', CLI_AGENT_NAME, '--folder', PING_TEST_FOLDER],
     );
     if (!res.ok) {
       await fail(
@@ -468,21 +515,8 @@ async function main(): Promise<void> {
       const ping = await confirmAssistantResponds();
       if (ping === 'ok') {
         phEmit('first_chat_ready');
-        const cleanupRawLog = setupLog.stepRawLog('cleanup-cli-agent');
-        const cleanupStart = Date.now();
-        const cleanup = await spawnQuiet(
-          'pnpm',
-          ['exec', 'tsx', 'scripts/delete-cli-agent.ts', '--folder', '_ping-test'],
-          cleanupRawLog,
-        );
-        setupLog.step(
-          'cleanup-cli-agent',
-          cleanup.ok ? 'success' : 'failed',
-          Date.now() - cleanupStart,
-          { exit_code: cleanup.exitCode },
-          cleanupRawLog,
-        );
-        if (!cleanup.ok) {
+        const { ok: cleanedUp, rawLog: cleanupRawLog } = await deletePingAgent(PING_TEST_FOLDER);
+        if (!cleanedUp) {
           p.log.warn(
             brandBody(
               `Couldn't clean up the test agent — it may still appear in your agent list. See ${cleanupRawLog} for details.`,
@@ -1488,3 +1522,11 @@ main().catch((err) => {
   p.cancel('Setup aborted.');
   process.exit(1);
 });
+
+async function failDockerPlugin(stepName: string, plugin: string | undefined): Promise<never> {
+  return fail(
+    stepName,
+    `Docker has no ${plugin ?? 'buildx/compose'} plugin.`,
+    "Your distro's Docker package leaves it out. Install `docker-buildx` and `docker-compose-v2` (Debian/Ubuntu), or reinstall Docker from https://get.docker.com, then retry.",
+  );
+}

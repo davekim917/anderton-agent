@@ -14,6 +14,7 @@ import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { getDeliveryAction } from '../../delivery.js';
 import { editApprovalCardResolution } from '../approvals/primitive.js';
 import { getPendingApprovalByRequestId } from '../../db/sessions.js';
+import { upsertUser } from '../permissions/db/users.js';
 import './index.js';
 
 // `session-manager`'s ids-addressed inbound opener went away with the mailbox
@@ -233,6 +234,31 @@ describe('bash destructive gate delivery', () => {
       expect(edit.text.length).toBeLessThanOrEqual(limit);
       expect(edit.text).toContain('--target=module.production');
       expect(edit.text).toMatch(/cancels the destructive command\._\n\n\S/);
+    }
+  });
+
+  it('keeps the approver line, clipped, when a long display name approves a full-budget card', async () => {
+    const command = `terraform apply -var='opening=${'a'.repeat(4000)}' -auto-approve --target=module.production`;
+    const longName = '𝐀𝐥𝐞𝐱𝐚𝐧𝐝𝐫𝐚 '.repeat(30);
+    await upsertUser({ id: 'slack:U-LONG', kind: 'slack', display_name: longName, created_at: now() });
+    for (const [platform, limit] of [
+      ['slack:C123', 2800],
+      ['discord:G1:C1', 1900],
+    ] as const) {
+      getRawDb().prepare('UPDATE messaging_groups SET platform_id = ? WHERE id = ?').run(platform, 'mg-1');
+      mocks.deliver.mockReset();
+      mocks.deliver.mockResolvedValue(`msg-long-${platform}`);
+      const requestId = `gate-long-name-${platform}`;
+
+      await runDestructiveGate('Terraform apply', requestId, command);
+      const pending = await getPendingApprovalByRequestId(requestId);
+      await editApprovalCardResolution(pending!, 'approve', 'slack:U-LONG');
+
+      const edit = JSON.parse(mocks.deliver.mock.calls.at(-1)![4] as string) as { text: string };
+      expect(edit.text.length).toBeLessThanOrEqual(limit);
+      expect(edit.text).toContain('--target=module.production');
+      expect(edit.text).toMatch(/cancels the destructive command\._\n\n.+ — 𝐀𝐥𝐞𝐱𝐚𝐧𝐝𝐫𝐚 .*…$/u);
+      expect(hasLoneSurrogate(edit.text)).toBe(false);
     }
   });
 

@@ -83,6 +83,9 @@ PRODUCT_FILES = glob(
         "scripts/workflow-label-descriptions.test.ts",
         "src/memory-migration-contract.test.ts",
         "src/upstream-ratchet.test.ts",
+        # This host's own systemd units; setup/service.ts writes an install's units.
+        "scripts/nanoclaw-v2.service",
+        "scripts/nanoclaw-codex-sync.service",
         "container/skills/smoke-test/scripts/testdata/controller-replay-corpus.ndjson",
         "container/skills/smoke-test/scripts/smoke-controller-shadow-report.test.sh",
         "data/**",
@@ -113,11 +116,62 @@ def export_workflow(name, mode, transformations):
 # The root README.md and CLAUDE.md describe this private install; the public ones live in public-overlay/.
 PUBLIC_OVERLAY = core.move("public-overlay", "")
 
+# This install's policy that a public clone must not inherit. run.ts passes --ignore-noop, so a replace whose
+# `before` no longer matches would export silently: allowlist.test.ts asserts each one matches its file once.
+#
+# The prebuild gate refuses a dirty tree or a HEAD other than origin/main, which is every public install after
+# a channel skill copies its adapter in. A public build is tsc plus the dashboard bundle.
+PUBLIC_BUILD = core.replace(
+    before = """    "prebuild": "tsx scripts/check-build-clean.ts",
+""",
+    after = "",
+    multiline = True,
+    paths = glob(["package.json"]),
+)
+
+# Setup reports install events to upstream's PostHog project unless opted out; the public product sends none
+# unless the operator opts in.
+PUBLIC_DIAGNOSTICS = [
+    core.replace(
+        before = """[ "$${NANOCLAW_NO_DIAGNOSTICS:-}" = "1" ] && return 0""",
+        after = """[ "$${NANOCLAW_DIAGNOSTICS:-}" = "1" ] || return 0""",
+        paths = glob(["setup/lib/diagnostics.sh"]),
+    ),
+    core.replace(
+        before = "if (process.env.NANOCLAW_NO_DIAGNOSTICS === '1') return;",
+        after = "if (process.env.NANOCLAW_DIAGNOSTICS !== '1') return;",
+        paths = glob(["setup/lib/diagnostics.ts"]),
+    ),
+    core.replace(
+        before = "Honors NANOCLAW_NO_DIAGNOSTICS=1.",
+        after = "Sends nothing unless NANOCLAW_DIAGNOSTICS=1.",
+        paths = glob(["setup/lib/diagnostics.sh", "setup/lib/diagnostics.ts"]),
+    ),
+]
+
+# The git hooks' boundary scan refuses a commit unless the install registry and the ignored identifier inventory
+# both load. A fresh public clone has neither, so its hooks tolerate a source whose file does not exist: structural
+# patterns alone before setup, plus that install's own registry once setup has written one. A source that exists
+# but cannot be read still refuses.
+PUBLIC_BOUNDARY_SCAN = [
+    core.replace(
+        before = "\"check:public-boundary\": \"tsx scripts/check-public-boundary.ts\"",
+        after = "\"check:public-boundary\": \"tsx scripts/check-public-boundary.ts --allow-absent-sources\"",
+        paths = glob(["package.json"]),
+    ),
+    core.replace(
+        before = "scripts/check-public-boundary.ts\" --root",
+        after = "scripts/check-public-boundary.ts\" --allow-absent-sources --root",
+        paths = glob([".husky/pre-push"]),
+    ),
+]
+
+PUBLIC_TRANSFORMS = [PUBLIC_OVERLAY, PUBLIC_BUILD] + PUBLIC_DIAGNOSTICS + PUBLIC_BOUNDARY_SCAN
+
 export_workflow(
     name = "export",
     mode = "ITERATIVE",
-    transformations = [
-        PUBLIC_OVERLAY,
+    transformations = PUBLIC_TRANSFORMS + [
         metadata.replace_message("${COPYBARA_CURRENT_MESSAGE_TITLE}"),
         metadata.scrubber("^Merge (pull request #[0-9]+ from|remote-tracking branch|branch) .*$", replacement = "Merge changes"),
         metadata.scrubber(" *\\(#[0-9]+\\)$"),
@@ -127,8 +181,7 @@ export_workflow(
 export_workflow(
     name = "export_squash",
     mode = "SQUASH",
-    transformations = [
-        PUBLIC_OVERLAY,
+    transformations = PUBLIC_TRANSFORMS + [
         metadata.replace_message("Snapshot of the product tree"),
     ],
 )

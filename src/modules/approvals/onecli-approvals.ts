@@ -94,6 +94,7 @@ export async function resolveOneCLIApproval(
   approvalId: string,
   selectedOption: string,
   userId: string,
+  onRefused?: (approvers: readonly string[]) => Promise<void>,
 ): Promise<boolean> {
   const row = await getPendingApproval(approvalId);
   if (!row || row.action !== ONECLI_ACTION) return false;
@@ -109,6 +110,7 @@ export async function resolveOneCLIApproval(
       agentGroupId: row.agent_group_id,
       userId,
     });
+    await onRefused?.(approvers);
     return true;
   }
   if (userId && !approvers.includes(userId)) {
@@ -117,6 +119,7 @@ export async function resolveOneCLIApproval(
       userId,
       approvers,
     });
+    await onRefused?.(approvers);
     return true;
   }
   if (!userId) {

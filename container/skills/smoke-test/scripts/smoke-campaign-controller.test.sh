@@ -385,11 +385,67 @@ step_ok 2026-09-18T10:50:00Z
 jr "[.[] | select(.key==\"$k\")] | last | .state == \"failed_terminal\"" | grep -qx true || fail "attempt 3 failed -> terminal"
 echo "$STEP_OUT" | jq -e '[.alarms[] | select(.trigger=="controller_send_failed")] | length == 1' >/dev/null \
   || fail "exhausted sends raise controller_send_failed: $STEP_OUT"
-[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "a failed_terminal pre-finish send permits only BLOCKED, got $(finish_verdict)"
-dq '[.[] | select(.type=="finish") | .failedChecks[]] | any(contains("send:verdict is failed_terminal"))' \
-  | grep -qx true || fail "the BLOCKED finish must name the exhausted send"
+# The verdict post is publication, not evidence: its failed_terminal leaves
+# the validated GO standing (a deliberate change from "failed_terminal permits
+# only BLOCKED", which still holds for every other obligation -- below).
+[ "$(finish_verdict)" = '"GO"' ] || fail "an undeliverable verdict post must not change the verdict, got $(finish_verdict)"
+dq '[.[] | select(.type=="finish")] | last | .failedChecks == []' \
+  | grep -qx true || fail "the GO finish carries no failed check for the post: $(dq '[.[] | select(.type=="finish")]')"
+jr '[.[] | select(.kind=="verdict" and .slot=="validated") | .detail.publicationFailed // empty] | last
+    | map(.obligation) == ["send:verdict"]' | grep -qx true \
+  || fail "the publication failure is recorded on the verdict record: $(jr '[.[] | select(.kind=="verdict")]')"
+echo "$STEP_OUT" | jq -e '[.alarms[] | select(.trigger=="controller_publication_failed")] | length == 1' >/dev/null \
+  || fail "the publication failure is alarmed: $STEP_OUT"
+step_ok 2026-09-18T11:00:00Z
 jr '[.[] | select(.kind=="send" and .slot=="verdict" and .state=="intent" and .attempt==4)] | length == 0' \
-  | grep -qx true || fail "no 4th attempt"
+  | grep -qx true || fail "no 4th attempt, after finish either"
+
+# --- any other failed_terminal still permits only BLOCKED --------------------
+
+new_case issue-terminal
+ready_run CLEAR
+synthesis GO
+seed run claim enqueued 1 '{"pr":7}'
+seed gh issue:F1 intent 1
+seed gh issue:F1 failed_terminal 1 '{"reason":"3 failures","effectFailures":3}'
+step_ok 2026-09-18T10:50:00Z
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "a failed_terminal issue obligation permits only BLOCKED, got $(finish_verdict)"
+dq '[.[] | select(.type=="finish") | .failedChecks[]] | any(contains("gh:issue:F1 is failed_terminal"))' \
+  | grep -qx true || fail "the BLOCKED finish must name the failed issue obligation"
+
+# --- alarms journaled before the upgrade keep the publication exemption -------
+# An existing journal's alarms carry no `publicationOf`; the controller reads
+# what they are about from their fingerprint (or hint), so a pre-install
+# alarm about the verdict post can neither block nor hold the validated GO.
+vk12="$(key "$RUN" send verdict | cut -c1-12)"
+new_case upgrade-terminal
+ready_run CLEAR
+synthesis GO
+seed run claim enqueued 1 '{"pr":7}'
+seed send verdict intent 1 '{"hint":{"verdict":"GO","failedChecks":[]}}'
+seed send verdict failed_terminal 1 '{"reason":"3 failures","effectFailures":3}'
+seed send "alarm:controller_send_failed:$vk12" intent null \
+  "{\"fingerprint\":\"controller_send_failed:$vk12\",\"alarm\":true,\"hint\":{\"trigger\":\"controller_send_failed\",\"detail\":{\"slot\":\"verdict\"}}}"
+seed send "alarm:controller_send_failed:$vk12" failed_terminal 1 '{"reason":"3 failures"}'
+seed send alarm:controller_send_failed:old failed_terminal 1 \
+  '{"alarm":true,"hint":{"trigger":"controller_send_failed","detail":{"slot":"verdict"}}}'
+step_ok 2026-09-18T10:50:00Z
+[ "$(finish_verdict)" = '"GO"' ] || fail "upgrade-terminal: a pre-install terminal alarm about the verdict post must not block GO: $(dq '[.[] | select(.type=="finish")]')"
+
+new_case upgrade-pending
+ready_run CLEAR
+synthesis GO
+seed run claim enqueued 1 '{"pr":7}'
+seed send verdict intent 1 '{"hint":{"verdict":"GO","failedChecks":[]}}'
+seed send verdict enqueued 1 "{\"messageId\":\"$(key "$RUN" send verdict)#1\"}"
+seed send verdict delivered 1
+seed send "alarm:overdue:$vk12" intent null \
+  "{\"fingerprint\":\"overdue:$vk12\",\"alarm\":true,\"hint\":{\"trigger\":\"controller_obligation_overdue\",\"detail\":{\"obligation\":\"send:verdict\",\"state\":\"enqueued\"}}}"
+seed send "alarm:overdue:$vk12" intent 1
+seed send "alarm:overdue:$vk12" enqueued 1 "{\"messageId\":\"$(key "$RUN" send "alarm:overdue:$vk12")#1\"}"
+# 11:05 is past the owner SLA for the seeded (09:59) alarm, still unreceipted.
+step_ok 2026-09-18T11:05:00Z
+[ "$(finish_verdict)" = '"GO"' ] || fail "upgrade-pending: a pre-install unreceipted alarm about the verdict post must not refuse GO: $(dq '[.[] | select(.type=="finish")]')"
 
 # --- stale synthesis -> BLOCKED, naming the failed check ------------------------
 

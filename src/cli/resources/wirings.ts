@@ -15,6 +15,7 @@ import {
   getMessagingGroup,
   getMessagingGroupAgentByPair,
   getMessagingGroupByPlatform,
+  parseEngageSenders,
 } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
@@ -47,6 +48,30 @@ function validateInstructionsProfile(v: unknown): void {
       `--instructions-profile must match ${INSTRUCTIONS_PROFILE_RE.source} (lowercase letters, digits, dashes), got "${String(v)}"`,
     );
   }
+}
+
+const ENGAGE_SENDER_RE = /^\S+:\S+$/;
+
+function normalizeEngageSenders(v: unknown): string | null {
+  if (v === null || v === '') return null;
+  const raw = String(v).trim();
+  let ids: string[];
+  if (raw.startsWith('[')) {
+    ids = parseEngageSenders(raw);
+    if (ids.length === 0 && raw !== '[]') throw new Error(`--engage-senders: "${raw}" is not a JSON array of user ids`);
+  } else {
+    ids = raw
+      .split(',')
+      .map((id) => id.trim())
+      .filter(Boolean);
+  }
+  ids = [...new Set(ids)];
+  for (const id of ids) {
+    if (!ENGAGE_SENDER_RE.test(id)) {
+      throw new Error(`--engage-senders takes comma-separated user ids in users.id form (slack:U123), got "${id}"`);
+    }
+  }
+  return ids.length > 0 ? JSON.stringify(ids) : null;
 }
 
 async function requireMessagingGroup(id: unknown): Promise<MessagingGroup> {
@@ -99,6 +124,14 @@ registerResource({
       description:
         'Regex for engage_mode=pattern. Required when mode is pattern. Use "." to match every message (always-on). Ignored for mention modes.',
       updatable: true,
+    },
+    {
+      name: 'engage_senders',
+      type: 'string',
+      description:
+        'Comma-separated user ids (users.id form, e.g. slack:U123) whose messages engage this wiring whatever engage_mode says, root posts and thread replies alike: for alert bots that never @-mention. Engagement only, never admission: the sender still has to pass unknown_sender_policy and sender_scope, so admit it with `ncl members add` unless the channel is public and sender_scope is all. Stored as a JSON array, which is also accepted as input; `--engage-senders ""` clears it.',
+      updatable: true,
+      nullable: true,
     },
     {
       name: 'sender_scope',
@@ -191,6 +224,7 @@ registerResource({
     if (updates.threads !== undefined) updates.threads = normalizeThreads(updates.threads);
     // genericUpdate has already turned `""` into null.
     validateInstructionsProfile(updates.instructions_profile);
+    if (updates.engage_senders !== undefined) updates.engage_senders = normalizeEngageSenders(updates.engage_senders);
 
     const merged: EngageValues = { ...current, ...updates };
     // Legacy rows can be engage_mode='pattern' with a NULL pattern (the
@@ -214,7 +248,7 @@ registerResource({
     create: {
       access: 'approval',
       description:
-        'Wire a messaging group to an agent group. Identify the messaging group by --messaging-group-id OR --channel-type + --platform-id (+ --instance); identify the agent by --agent-group-id OR --agent-group <folder>. Idempotent on (messaging group, agent group). Engagement flags: --engage-mode, --engage-pattern, --session-mode, --sender-scope, --ignored-message-policy, --threads, --priority. Omitted engage flags default from the channel adapter declaration.',
+        'Wire a messaging group to an agent group. Identify the messaging group by --messaging-group-id OR --channel-type + --platform-id (+ --instance); identify the agent by --agent-group-id OR --agent-group <folder>. Idempotent on (messaging group, agent group). Engagement flags: --engage-mode, --engage-pattern, --engage-senders, --session-mode, --sender-scope, --ignored-message-policy, --threads, --priority. Omitted engage flags default from the channel adapter declaration.',
       handler: async (args) => {
         // Resolve the messaging group.
         let mgId = args.messaging_group_id as string | undefined;
@@ -266,6 +300,7 @@ registerResource({
         }
         if (args.engage_pattern !== undefined) values.engage_pattern = args.engage_pattern;
         if (args.threads !== undefined) values.threads = args.threads;
+        if (args.engage_senders !== undefined) values.engage_senders = normalizeEngageSenders(args.engage_senders);
         if (args.priority !== undefined) values.priority = Number(args.priority);
         // Omitted stays NULL and inherits the group default.
         for (const name of ['default_tone', 'default_model', 'default_effort', 'instructions_profile'] as const) {

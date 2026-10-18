@@ -6,16 +6,20 @@
  * review) lands in "not reviewed", so treat "unreviewed but flagged" as a lead to check against
  * the PR's risk labels and receipts, never as a review-scope gap.
  *
- *   pnpm exec tsx scripts/jev-shadow/prs.ts [--since 2026-09-08]
+ *   pnpm exec tsx scripts/jev-shadow/prs.ts [--since 2026-09-08] [--repo owner/name]
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { originRepo } from '../lib/origin-repo.js';
 import { ask, MODEL, pool } from './jev.js';
 
-const REPO = 'davekim917/nanoclaw';
+const repoArg = process.argv.includes('--repo') ? process.argv[process.argv.indexOf('--repo') + 1] : null;
+if (repoArg === undefined) throw new Error('--repo needs a value: owner/name');
+const REPO = repoArg ?? originRepo();
+const [OWNER, NAME] = REPO.split('/');
 const since = process.argv.includes('--since') ? process.argv[process.argv.indexOf('--since') + 1]! : '2026-09-08';
 const OUT = process.env.JEV_SHADOW_OUT ?? path.join(os.homedir(), 'jev-shadow-out');
 const MAX_DIFF_CHARS = 60_000; // ~15k tokens: the state budget is 32k tokens incl. the longest question
@@ -40,7 +44,7 @@ for (let page = 1; ; page += 1) {
 }
 
 function codexFindings(n: number): { reviewed: boolean; p1: number; p2: number } {
-  const q = `query { repository(owner:"davekim917", name:"nanoclaw") { pullRequest(number:${n}) {
+  const q = `query { repository(owner:"${OWNER}", name:"${NAME}") { pullRequest(number:${n}) {
     reviews(first:50) { nodes { author { login } } }
     reviewThreads(first:100) { nodes { comments(first:1) { nodes { author { login } body } } } } } } }`;
   const d = JSON.parse(gh(['api', 'graphql', '-f', `query=${q}`])) as {

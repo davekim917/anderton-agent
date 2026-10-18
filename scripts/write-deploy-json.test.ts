@@ -2,8 +2,8 @@
  * The rollback manifest's encoder.
  *
  * r2 [high]: `scripts/deploy.sh` built this object with a `printf` template, so
- * a unit id carrying a backslash — which systemd's own escaping produces, e.g.
- * `nanoclaw-worker@blue\x2dgreen.service` — emitted `"...blue\x2dgreen..."`,
+ * a unit id carrying a backslash — which systemd's own escaping produces for a
+ * dash in a templated instance name — emitted `"...blue\x2dgreen..."`,
  * which is not valid JSON. The write succeeded, the restart handed off, and on
  * the next boot `readJson` (src/deploy-crash-guard.ts:111-117) caught the parse
  * error and answered null, `evaluateBoot` (:134) read null as `no-op`, and

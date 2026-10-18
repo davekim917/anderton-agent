@@ -33,6 +33,7 @@ import {
   createMessagingGroupAgentInTransaction,
   getMessagingGroupAgents,
   getMessagingGroupWithAgentCount,
+  parseEngageSenders,
   updateMessagingGroup,
 } from './db/messaging-groups.js';
 import { centralTransaction } from './db/central-lease.js';
@@ -793,7 +794,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     );
     const effectiveThreadId = threadsEnabled ? event.threadId : null;
 
-    const engages = await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId, supportsThreads);
+    const engages = await evaluateEngage(agent, messageText, isMention, userId, mg, effectiveThreadId, supportsThreads);
 
     const accessDecision =
       engages && accessGate ? await accessGate(event, userId, mg, agent.agent_group_id, effectiveThreadId) : null;
@@ -901,15 +902,20 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
  *                      session existence IS our subscription state; once
  *                      a thread has engaged us once, follow-ups arrive
  *                      with no mention and should still fire.
+ *
+ * Whatever the mode, a sender listed in `engage_senders` engages, root post or thread reply alike: alert bots
+ * never @-mention. It only decides engagement; the access and sender-scope gates still judge that sender.
  */
 async function evaluateEngage(
   agent: MessagingGroupAgent,
   text: string,
   isMention: boolean,
+  userId: string | null,
   mg: MessagingGroup,
   threadId: string | null,
   adapterSupportsThreads: boolean,
 ): Promise<boolean> {
+  if (userId !== null && parseEngageSenders(agent.engage_senders).includes(userId)) return true;
   switch (agent.engage_mode) {
     case 'pattern': {
       const pat = agent.engage_pattern ?? '.';

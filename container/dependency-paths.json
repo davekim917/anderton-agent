@@ -26,7 +26,7 @@
     },
     "provider-claude": {
       "description": "Agent turns through the Claude Agent SDK and the Claude Code CLI in the container",
-      "tests": []
+      "tests": ["container/agent-runner/src/providers/claude-live-path.test.ts"]
     },
     "provider-codex": {
       "description": "Agent turns through the Codex CLI in the container",

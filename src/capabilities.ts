@@ -684,7 +684,7 @@ export function buildSessionServicesSnapshotFrom(
         : 'Hex declared but the host holds no `hex auth login` credentials — ask the operator',
       activation: credsExist
         ? `\`hex\` CLI ready. Skill at \`/app/skills/hex/SKILL.md\` documents the full command surface. Common verbs: \`hex projects list --json\`, \`hex project get <id> --json\`, \`hex cell list --project-id <id> --json\`, \`hex cell run <cell-id>\`, \`hex project run <id> --watch\`, \`hex suggestion list --json\` (Context Studio), \`hex guide preview\` then \`hex guide publish <preview-id>\`, \`hex project export <id> > project.yaml\`. Always pass \`--json\` when parsing programmatically. If \`hex auth status\` reports not authenticated, the host operator needs to re-run \`hex auth login\` — do NOT attempt OAuth from inside the container.`
-        : `Hex tool declared but \`~/.local/share/hex/\` is empty on the host. Ask the operator to run \`hex auth login\` on the host once. Mount allowlist: \`/home/ubuntu\` is already covered (no /manage-mounts call needed).`,
+        : `Hex tool declared but \`~/.local/share/hex/\` is empty on the host. Ask the operator to run \`hex auth login\` on the host once. If the mount allowlist already covers the host user's home directory, no /manage-mounts call is needed.`,
     });
   }
 

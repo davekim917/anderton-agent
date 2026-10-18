@@ -70,11 +70,11 @@ export const createAgent: McpToolDefinition = {
     if (provider !== undefined) {
       const selectable = listSelectableProviderNames();
       if (!selectable.includes(provider)) {
-        return err(
-          listProviderNames().includes(provider)
-            ? `Provider '${provider}' is test-only and cannot back a new agent. Registered: [${selectable.join(', ')}].`
-            : `Provider '${provider}' is not registered. Registered: [${selectable.join(', ')}]. Run /add-${provider} on the host first.`,
-        );
+        const registered = `Registered: [${selectable.join(', ')}].`;
+        if (listProviderNames().includes(provider)) {
+          return err(`Provider '${provider}' is test-only and cannot back a new agent. ${registered}`);
+        }
+        return err(`Provider '${provider}' is not registered. ${registered} Run /add-${provider} on the host first.`);
       }
     }
 

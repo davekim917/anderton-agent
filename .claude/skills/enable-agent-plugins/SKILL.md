@@ -340,7 +340,7 @@ treats it as a fault will undo the opt-out trying to repair it.
    # whose sub-plugins are named "<repo>/<entry>" with the directory in repoName
    bun -e "import {planCodexPluginRegistration as plan} from './src/codex-companion-setup.ts'; \
      const n='<name>'; \
-     console.log(plan('/home/ubuntu/plugins').filter(x=>x.name===n||x.repoName===n) \
+     console.log(plan(process.env.HOME+'/plugins').filter(x=>x.name===n||x.repoName===n) \
        .map(x=>x.name+' -> '+x.action+(x.reason?' ('+x.reason+')':'')).join('\n'))"
    ```
 

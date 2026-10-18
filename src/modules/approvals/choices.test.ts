@@ -15,6 +15,7 @@ import { createAgentGroup } from '../../db/agent-groups.js';
 import { getChoiceReceipt, getChoiceReceiptsByRequestId } from '../../db/choice-receipts.js';
 import { createPendingApproval, createSession, getPendingApproval } from '../../db/sessions.js';
 import { log } from '../../log.js';
+import { upsertUser } from '../permissions/db/users.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { registerChoiceHandler, resolveChoice, type ChoiceHandlerContext } from './choices.js';
 
@@ -41,8 +42,24 @@ vi.mock('../../db/choice-receipts.js', async (importOriginal) => {
   };
 });
 
+const cardEdits = vi.hoisted(() => [] as string[]);
+vi.mock('./primitive.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./primitive.js')>();
+  return {
+    ...real,
+    editApprovalCard: async (...args: Parameters<typeof real.editApprovalCard>) => {
+      cardEdits.push(args[1]);
+      return real.editApprovalCard(...args);
+    },
+  };
+});
+
 const ACTION = 'test-choice';
 const USER = 'slack-fixture:U-clicker';
+const WARNING_OPTIONS = [
+  { label: 'Ship anyway — I accept a missing menu entry', value: 'ship' },
+  { label: 'Send back', value: 'send_back' },
+];
 const RELEASE_SCOPE = {
   purpose: 'release_ship',
   repository: 'owner/repository',
@@ -97,6 +114,7 @@ let handler: ReturnType<typeof vi.fn<(ctx: ChoiceHandlerContext) => Promise<Sess
 
 beforeEach(async () => {
   probe.pendingRowAtWrite = undefined;
+  cardEdits.length = 0;
   await initMigratedTestDb();
   handler = vi.fn<(ctx: ChoiceHandlerContext) => Promise<Session | null>>();
   registerChoiceHandler(ACTION, (ctx: ChoiceHandlerContext) => handler(ctx));
@@ -150,7 +168,10 @@ describe('choice receipts', () => {
     try {
       const claimedAt = new Date('2026-09-13T10:00:00.000Z');
       vi.setSystemTime(claimedAt);
-      const approval = await seedApproval({ payload: JSON.stringify({ approvalScope: RELEASE_SCOPE }) });
+      const approval = await seedApproval({
+        payload: JSON.stringify({ approvalScope: { ...RELEASE_SCOPE, holds: ['hold:access:a.sql'] } }),
+        options_json: JSON.stringify(WARNING_OPTIONS),
+      });
       handler.mockImplementation(async () => {
         // This is after the CAS. The old writer sampled this later value after
         // delivery, letting transport latency re-date a human decision.
@@ -158,15 +179,144 @@ describe('choice receipts', () => {
         return fakeSession('sess-target');
       });
 
-      await resolveChoice(approval, 'ship-a', USER);
+      await resolveChoice(approval, 'ship', USER);
 
       expect(await getChoiceReceipt(approval.approval_id)).toMatchObject({
-        release_scope_json: JSON.stringify(RELEASE_SCOPE),
+        release_scope_json: JSON.stringify({ ...RELEASE_SCOPE, holds: ['hold:access:a.sql'] }),
         resolved_at: claimedAt.toISOString(),
       });
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it.each([
+    [
+      'a pre-warning bare Ship / Hold card',
+      [
+        { label: 'Ship', value: 'ship' },
+        { label: 'Hold', value: 'hold' },
+      ],
+      null,
+    ],
+    ['a warning card posted before it had to name its holds', WARNING_OPTIONS, null],
+    [
+      'a scheduled release card',
+      [
+        { label: 'Ship release', value: 'ship' },
+        { label: 'Hold', value: 'hold' },
+      ],
+      JSON.stringify(RELEASE_SCOPE),
+    ],
+  ])('a click on %s records the release scope only when the host rendered that card', async (_n, options, want) => {
+    const approval = await seedApproval({
+      payload: JSON.stringify({ approvalScope: RELEASE_SCOPE }),
+      options_json: JSON.stringify(options),
+    });
+    handler.mockResolvedValue(fakeSession('sess-target'));
+    await resolveChoice(approval, 'ship', USER);
+    expect((await getChoiceReceipt(approval.approval_id))?.release_scope_json).toBe(want);
+  });
+
+  it.each([
+    [
+      'a bare Ship / Hold release card',
+      RELEASE_SCOPE,
+      [
+        { label: 'Ship', value: 'ship' },
+        { label: 'Hold', value: 'hold' },
+      ],
+      'ship',
+      true,
+    ],
+    ['a warning card posted before it had to name its holds', RELEASE_SCOPE, WARNING_OPTIONS, 'ship', true],
+    [
+      'a warning card that names its holds',
+      { ...RELEASE_SCOPE, holds: ['hold:access:a.sql'] },
+      WARNING_OPTIONS,
+      'ship',
+      false,
+    ],
+    ['Send back on an out-of-date warning card', RELEASE_SCOPE, WARNING_OPTIONS, 'send_back', false],
+    ['a warning card whose stored payload is corrupt', null, WARNING_OPTIONS, 'ship', true],
+    [
+      'a generic card whose buttons read like a release card',
+      undefined,
+      [
+        { label: 'Ship release', value: 'ship' },
+        { label: 'Hold', value: 'hold' },
+      ],
+      'ship',
+      false,
+    ],
+    [
+      'a non-release choice card',
+      undefined,
+      [
+        { label: 'Ship', value: 'ship' },
+        { label: 'Hold', value: 'hold' },
+      ],
+      'ship',
+      false,
+    ],
+  ])(
+    'a click on %s tells the clicker a Ship did not count only when it approved nothing',
+    async (_n, scope, options, value, uncounted) => {
+      const approval = await seedApproval({
+        payload: scope === null ? '{' : JSON.stringify(scope ? { approvalScope: scope } : {}),
+        options_json: JSON.stringify(options),
+      });
+      handler.mockResolvedValue(fakeSession('sess-target'));
+      const told: string[] = [];
+      await resolveChoice(approval, value, USER, async (text) => void told.push(text));
+      const label = options.find((o) => o.value === value)!.label;
+      expect(told).toEqual(
+        uncounted
+          ? [
+              'This card is out of date: it does not list the risks a Ship accepts, so your click did not count. Ask for a fresh card if one does not appear.',
+            ]
+          : [],
+      );
+      expect(cardEdits.at(-1)).toBe(
+        `Ship it?\n\n${uncounted ? `⚠️ Ship did not count (out-of-date card) — ${USER}` : `✅ ${label} — ${USER}`}`,
+      );
+    },
+  );
+
+  it('keeps the out-of-date line inside what a full release card leaves of a Discord edit, whatever the name', async () => {
+    await upsertUser({ id: USER, kind: 'slack-fixture', display_name: 'N'.repeat(200), created_at: now() });
+    const approval = await seedApproval({
+      payload: JSON.stringify({ approvalScope: RELEASE_SCOPE }),
+      options_json: JSON.stringify(WARNING_OPTIONS),
+    });
+    handler.mockResolvedValue(fakeSession('sess-target'));
+    await resolveChoice(approval, 'ship', USER);
+    // 1900-unit Discord edit, 1800-unit release card body, a blank line between them.
+    expect(cardEdits.at(-1)!.split('\n\n').at(-1)!.length).toBeLessThanOrEqual(98);
+  });
+
+  it('records the holds a warning card showed in its receipt, sorted, beside the pinned head', async () => {
+    const approval = await seedApproval({
+      payload: JSON.stringify({
+        approvalScope: { ...RELEASE_SCOPE, holds: ['hold:irreversible:b:1_rows', 'hold:access:a.sql'] },
+      }),
+      options_json: JSON.stringify(WARNING_OPTIONS),
+    });
+    handler.mockResolvedValue(fakeSession('sess-target'));
+    await resolveChoice(approval, 'ship', USER);
+    expect((await getChoiceReceipt(approval.approval_id))?.release_scope_json).toBe(
+      `{"purpose":"release_ship","repository":"owner/repository","pullRequest":42,"base":"main","headSha":"${'a'.repeat(40)}","holds":["hold:access:a.sql","hold:irreversible:b:1_rows"]}`,
+    );
+  });
+
+  it('records no release scope when a stored warning card holds a malformed holds list', async () => {
+    const approval = await seedApproval({
+      payload: JSON.stringify({ approvalScope: { ...RELEASE_SCOPE, holds: ['wait:effect_check'] } }),
+      options_json: JSON.stringify(WARNING_OPTIONS),
+    });
+    handler.mockResolvedValue(fakeSession('sess-target'));
+    await resolveChoice(approval, 'ship', USER);
+    expect((await getChoiceReceipt(approval.approval_id))?.release_scope_json).toBeNull();
   });
 
   it('a losing second click writes nothing and never reaches delivery', async () => {

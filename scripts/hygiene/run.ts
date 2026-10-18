@@ -5,11 +5,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import ts from 'typescript';
+
 import { vendoredEngineFiles } from '../../src/design-artifact-loop-vendor.js';
+import { CODEX_FAMILY_DEFAULTS, FAMILY_DEFAULTS } from '../../src/flag-parser.js';
 import { scanComments } from './comments.js';
 
 export interface Finding {
-  check: 'knip' | 'jscpd' | 'comments';
+  check: 'knip' | 'jscpd' | 'comments' | 'instructions' | 'test-imports';
   kind: string;
   location: string;
   message: string;
@@ -208,6 +211,177 @@ export function commentFindings(root: string, files: string[]): Finding[] {
   );
 }
 
+/** Trunk files composed into, or loaded as, an agent's instructions; see src/claude-md-compose.ts and container-runner.ts. */
+const INSTRUCTION_FILE =
+  /^container\/(?:CLAUDE\.md|spawn-template\.md|agent-runner\/src\/mcp-tools\/[^/]+\.instructions\.md|skills\/.+\/SKILL\.md)$/;
+
+const EFFORT_LEVEL = 'low|medium|high|xhigh|max|ultra';
+
+const MODEL_OR_EFFORT = new RegExp(
+  [
+    String.raw`\bclaude-(?:${Object.keys(FAMILY_DEFAULTS).join('|')})(?:[\w.\-[\]]*[\w\]])?`,
+    String.raw`\bgpt-?\d(?:[\w.-]*\w)?`,
+    String.raw`\bgpt-[a-z](?:[\w.-]*\w)?`,
+    String.raw`\b(?:${[...Object.keys(FAMILY_DEFAULTS), ...Object.keys(CODEX_FAMILY_DEFAULTS)].join('|')})(?:[\d.-]*\d)?\b`,
+    String.raw`\bo[134]-(?:mini|pro)\b`,
+    String.raw`\b(?:gemini|kimi|qwen|deepseek|glm|llama|mistral|grok)-?[\w.]*\d(?:[\w.-]*\w)?`,
+    String.raw`\b(?:xhigh|ultracode)\b`,
+    String.raw`effort(?:[\s_]level)?[${'`'}'"]?\s*(?:[:=]|to\b|of\b|at\b)?\s*[${'`'}'"]?(?:${EFFORT_LEVEL})\b`,
+    String.raw`\b(?:${EFFORT_LEVEL})[\s${'`'}'"-]{1,3}effort\b`,
+  ].join('|'),
+  'gi',
+);
+
+interface ModelNameExemption {
+  file: string;
+  names: string[];
+  reason: string;
+}
+
+const MODEL_NAME_EXEMPTIONS: ModelNameExemption[] = [
+  {
+    file: 'container/skills/remotion/SKILL.md',
+    names: ['gpt-4o-mini-tts'],
+    reason: 'the OpenAI text-to-speech model the skill calls for narration, not a model an agent runs on',
+  },
+  {
+    file: 'container/skills/pr-review-loop/SKILL.md',
+    names: [
+      'opus',
+      'sonnet',
+      'haiku',
+      'fable',
+      'luna',
+      'terra',
+      'gpt-6-astra',
+      'gemini-3.8-flash',
+      'gemini-3.5-flash-lite',
+      'claude-opus-5',
+      'deepseek-v4.1-flash',
+    ],
+    reason:
+      "the reviewer-tier policy names the tiers codex-review.sh admits and refuses, its receipt examples and precheck-opencode.sh's default",
+  },
+  {
+    file: 'container/skills/pr-review-loop/SKILL.md',
+    names: ['gpt-6.1-sol', 'high` effort', 'effort=high', 'effort_level=high', 'effort high'],
+    reason: 'a reviewer model and effort pinned in prose rather than config; tracked in issue 1580',
+  },
+];
+
+function walkFiles(root: string, dir: string): string[] {
+  if (!fs.existsSync(path.join(root, dir))) return [];
+  return fs.readdirSync(path.join(root, dir), { withFileTypes: true }).flatMap((entry) => {
+    const file = path.posix.join(dir, entry.name);
+    if (entry.isDirectory()) return entry.name === 'node_modules' || entry.name === '.git' ? [] : walkFiles(root, file);
+    return entry.isFile() ? [file] : [];
+  });
+}
+
+export function modelNameFindings(
+  root: string,
+  exempt: Exempt,
+  exemptions: ModelNameExemption[] = MODEL_NAME_EXEMPTIONS,
+): Finding[] {
+  const used = new Set<string>();
+  const findings: Finding[] = [];
+  const files = walkFiles(root, 'container')
+    .filter((file) => INSTRUCTION_FILE.test(file) && !isExempt(exempt, file))
+    .sort();
+  for (const file of files) {
+    const allowed = new Set(
+      exemptions.filter((e) => e.file === file).flatMap((e) => e.names.map((n) => n.toLowerCase())),
+    );
+    fs.readFileSync(path.join(root, file), 'utf8')
+      .split('\n')
+      .forEach((text, index) => {
+        for (const [match] of text.matchAll(MODEL_OR_EFFORT)) {
+          if (allowed.has(match.toLowerCase())) {
+            used.add(`${file}\0${match.toLowerCase()}`);
+            continue;
+          }
+          findings.push({
+            check: 'instructions',
+            kind: 'model-name',
+            location: `${file}:${index + 1}`,
+            message: match,
+          });
+        }
+      });
+  }
+  for (const { file, names } of exemptions) {
+    for (const name of names) {
+      if (used.has(`${file}\0${name.toLowerCase()}`)) continue;
+      findings.push({
+        check: 'instructions',
+        kind: 'stale-exemption',
+        location: file,
+        message: `${name} no longer appears; remove it from the list`,
+      });
+    }
+  }
+  return findings;
+}
+
+const TEST_ROOTS = ['src', 'setup', 'scripts', 'container', 'dashboard', 'tests', '.claude/skills'];
+const TEST_FILE = /\.test\.[cm]?[jt]sx?$/;
+const MODULE_LOADERS = new Set([
+  'require',
+  'require.resolve',
+  'vi.mock',
+  'vi.doMock',
+  'vi.unmock',
+  'vi.doUnmock',
+  'vi.importActual',
+  'vi.importMock',
+  'mock.module',
+]);
+/** A worktree or session-scratch prefix resolves only on the machine, and in the checkout, that wrote the test. */
+const AUTHORING_PATH = /\/home\/|\/tmp\/claude-/;
+
+function moduleSpecifiers(file: string, text: string): ts.Expression[] {
+  const sourceFile = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+  const specifiers: ts.Expression[] = [];
+  const visit = (node: ts.Node): void => {
+    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier) {
+      specifiers.push(node.moduleSpecifier);
+    } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
+      specifiers.push(node.argument.literal);
+    } else if (ts.isCallExpression(node) && node.arguments[0]) {
+      const callee = node.expression;
+      if (callee.kind === ts.SyntaxKind.ImportKeyword || MODULE_LOADERS.has(callee.getText(sourceFile))) {
+        specifiers.push(node.arguments[0]);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return specifiers;
+}
+
+const specifierText = (node: ts.Expression) =>
+  ts.isStringLiteralLike(node) ? node.text : ts.isTemplateExpression(node) ? node.getText().slice(1, -1) : '';
+
+export function testImportFindings(root: string): Finding[] {
+  const files = TEST_ROOTS.flatMap((dir) => walkFiles(root, dir))
+    .filter((file) => TEST_FILE.test(file))
+    .sort();
+  return files.flatMap((file) =>
+    moduleSpecifiers(file, fs.readFileSync(path.join(root, file), 'utf8'))
+      .filter((specifier) => AUTHORING_PATH.test(specifierText(specifier)))
+      .map((specifier) => {
+        const sourceFile = specifier.getSourceFile();
+        const line = sourceFile.getLineAndCharacterOfPosition(specifier.getStart(sourceFile)).line + 1;
+        return {
+          check: 'test-imports' as const,
+          kind: 'absolute-import',
+          location: `${file}:${line}`,
+          message: specifierText(specifier),
+        };
+      }),
+  );
+}
+
 const GROWTH_BASE_REF = 'origin/main';
 
 export interface CommentGrowth {
@@ -280,11 +454,13 @@ export function hygieneFindings(root: string, exempt: Exempt): Finding[] {
       root,
       files.filter((file) => !isExempt(exempt, file)),
     ),
+    ...modelNameFindings(root, exempt),
+    ...testImportFindings(root),
   ];
 }
 
 function print(findings: Finding[]): void {
-  for (const check of ['knip', 'jscpd', 'comments'] as const) {
+  for (const check of ['knip', 'jscpd', 'comments', 'instructions', 'test-imports'] as const) {
     const group = findings.filter((finding) => finding.check === check);
     const kinds = new Map<string, number>();
     for (const finding of group) kinds.set(finding.kind, (kinds.get(finding.kind) ?? 0) + 1);

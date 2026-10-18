@@ -5,7 +5,7 @@
 # Writes JSON status to logs/deploy-status.json so the post-restart
 # process can announce the result.
 
-REPO_ROOT="${NANOCLAW_DEPLOY_ROOT:-/home/ubuntu/nanoclaw-v2}"
+REPO_ROOT="${NANOCLAW_DEPLOY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$REPO_ROOT" || exit 1
 
 STATUS_FILE="logs/deploy-status.json"
@@ -487,13 +487,11 @@ fi
 # resident, BEFORE the handoff below (#822).
 #
 # This has to be here and not after the restart of nanoclaw-v2: that restart
-# kills this script (the host spawns it `detached: true`, which gives it its own
-# process group and session but leaves it in the unit's cgroup —
-# src/channels/discord-slash-commands.ts:110-118 — and neither
-# scripts/nanoclaw-v2.service nor the installed copy sets KillMode, so systemd's
-# default `control-group` SIGTERMs the whole cgroup on stop). Nothing appended
-# after that restart ever executes — which is the same reason the success status
-# is written before it, per the comment below.
+# kills this script. The host spawns it detached, which gives it its own process
+# group and session but leaves it in the unit's cgroup, and stopping the unit
+# ends every process still in that cgroup. Nothing appended after that restart
+# ever executes — which is the same reason the success status is written before
+# it, per the comment below.
 #
 # Failure is terminal, and deliberately so: the rollback trap has not handed off
 # yet, so exiting here restores dist/, node_modules/ and the previous commit

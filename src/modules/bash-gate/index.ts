@@ -23,7 +23,9 @@ import {
 } from '../../db/sessions.js';
 
 import {
+  APPROVAL_RESOLUTION_MAX_UNITS,
   editApprovalCard,
+  headUnits,
   registerApprovalHandler,
   requestApproval,
   notifyAgent,
@@ -41,7 +43,6 @@ const GATE_CARD_TITLE_MAX_CHARS = 140;
 // adapters are skill-installed and may be absent; 1900 also covers any other platform.
 const SLACK_MESSAGE_MAX_UNITS = 2800;
 const OTHER_MESSAGE_MAX_UNITS = 1900;
-const RESOLUTION_LINE_RESERVE_UNITS = 160;
 const GATE_COMMAND_PREVIEW_MIN_UNITS = 600;
 
 const pendingTimeouts = new Map<string, NodeJS.Timeout>();
@@ -101,13 +102,6 @@ interface GateCategory {
   kindNoun: string;
 }
 
-function headUnits(text: string, units: number): string {
-  if (text.length <= units) return text;
-  let end = Math.max(0, units);
-  if (end > 0 && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;
-  return text.slice(0, end);
-}
-
 function tailUnits(text: string, units: number): string {
   if (text.length <= units) return text;
   let start = text.length - Math.max(0, units);
@@ -127,7 +121,7 @@ function commandPreview(command: string, units: number): string {
 function cardBodyBudget(platformId: string | undefined, title: string): number {
   const limit = platformId?.startsWith('slack:') ? SLACK_MESSAGE_MAX_UNITS : OTHER_MESSAGE_MAX_UNITS;
   // The edit is `title\n\nbody\n\nresolution`; Discord's post wraps the title as `**title**\n\n`, which is shorter.
-  return limit - title.length - '\n\n\n\n'.length - RESOLUTION_LINE_RESERVE_UNITS;
+  return limit - title.length - '\n\n\n\n'.length - APPROVAL_RESOLUTION_MAX_UNITS;
 }
 
 function buildCardBody(category: GateCategory, summary: string, command: string, budget: number): string {

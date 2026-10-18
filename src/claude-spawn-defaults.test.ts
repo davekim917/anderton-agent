@@ -178,7 +178,7 @@ describe('claudeSpawnEnv', () => {
       '-e',
       'ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5-5',
       '-e',
-      'ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001',
+      'ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-5-5',
       '-e',
       `ANTHROPIC_DEFAULT_FABLE_MODEL=${DEFAULT_FABLE_MODEL}`,
       '-e',
@@ -193,6 +193,8 @@ describe('claudeSpawnEnv', () => {
       'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h',
       '-e',
       'CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1',
+      '-e',
+      'CLAUDE_CODE_FORK_SUBAGENT=0',
     ]);
   });
 
@@ -207,15 +209,16 @@ describe('claudeSpawnEnv', () => {
       NANOCLAW_CLAUDE_MODEL: DEFAULT_OPUS_MODEL,
       ANTHROPIC_DEFAULT_OPUS_MODEL: DEFAULT_OPUS_MODEL,
       ANTHROPIC_DEFAULT_SONNET_MODEL: DEFAULT_SONNET_MODEL,
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5-20251001',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-5-5',
       ANTHROPIC_DEFAULT_FABLE_MODEL: DEFAULT_FABLE_MODEL,
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: '600000',
       CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '2',
       CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '5',
       CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL: '1h',
       CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1',
+      CLAUDE_CODE_FORK_SUBAGENT: '0',
     });
-    expect(env).toHaveLength(20);
+    expect(env).toHaveLength(22);
   });
 
   it('claude_spawn_env_matches_the_live_fleet_baseline', () => {
@@ -284,7 +287,7 @@ describe('claudeSpawnEnv — the family aliases are install constants, never the
   it('the sonnet, haiku and fable aliases are constants too', () => {
     const env = pairs(claudeSpawnEnv(cfg({ model: 'claude-opus-5[1m]' })));
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(DEFAULT_SONNET_MODEL);
-    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-haiku-4-5-20251001');
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-haiku-5-5');
     expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe(DEFAULT_FABLE_MODEL);
   });
 

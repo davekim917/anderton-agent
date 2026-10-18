@@ -1,7 +1,7 @@
 /**
  * Reasoning-effort attribution for `turn_usage` rows. Effort is a request parameter no provider bills back, so
  * it is stamped here: `effort` is the post-clamp value sent, `effortRequested` the pre-clamp resolution. They
- * diverge where the clamp acts (a Haiku turn sends none), and recording only one would hide that.
+ * diverge where the clamp acts (a Haiku 4.5 turn sends none), and recording only one would hide that.
  *
  * Attach effort only to a usage entry that unambiguously represents the model it was resolved for. On a
  * multi-model Claude turn only the entry whose id equals the query's current model gets it; subagent rows stay

@@ -181,6 +181,7 @@ export interface MessagingGroupAgent {
    * updating.
    */
   threads?: number | null;
+  engage_senders?: string | null;
   created_at: string;
 }
 

@@ -6,7 +6,7 @@
 #   ph_event bootstrap_completed status=success platform=macos
 #
 # All emits are fire-and-forget (background curl, 3s max timeout); they
-# never fail the caller. Honors NANOCLAW_NO_DIAGNOSTICS=1. The distinct_id
+# never fail the caller. Sends nothing unless NANOCLAW_DIAGNOSTICS=1. The distinct_id
 # is persisted at data/install-id so the bash + node halves of setup use
 # the same id and events from one install join into a single funnel.
 
@@ -34,7 +34,7 @@ ph_install_id() {
 # `key=value` pairs merged into properties. Values are JSON-escaped for
 # quotes and backslashes; keep them short and alphanumeric-ish.
 ph_event() {
-  [ "${NANOCLAW_NO_DIAGNOSTICS:-}" = "1" ] && return 0
+  [ "${NANOCLAW_DIAGNOSTICS:-}" = "1" ] || return 0
   local event=$1
   shift
   local id

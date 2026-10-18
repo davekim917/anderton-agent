@@ -139,6 +139,7 @@ describe('central migration registry', () => {
       'task-run-outcome-lanes',
       'thread-route-checks',
       'workgroup-access',
+      'wiring-engage-senders',
     ]);
     const liveSchema = schemaObjects(live);
     // Canary: two empty snapshots compare equal, so assert the query actually

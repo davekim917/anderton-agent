@@ -72,6 +72,8 @@ CREATE TABLE messaging_group_agents (
                          -- 'pattern' | 'mention' | 'mention-sticky'
   engage_pattern         TEXT,   -- regex; required when engage_mode='pattern';
                                  -- '.' means "match every message"
+  engage_senders         TEXT,   -- JSON array of users.id that engage in any
+                                 -- mode (migration 088); NULL = none
   sender_scope           TEXT NOT NULL DEFAULT 'all',    -- 'all' | 'known'
   ignored_message_policy TEXT NOT NULL DEFAULT 'drop',   -- 'drop' | 'accumulate'
   session_mode           TEXT DEFAULT 'shared',
@@ -86,6 +88,7 @@ CREATE TABLE messaging_group_agents (
 
 - `session_mode`: `shared` (one session per channel), `per-thread` (one per thread), `agent-shared` (one per agent group across all channels).
 - `engage_mode` / `engage_pattern` / `sender_scope` / `ignored_message_policy`: four orthogonal axes (migration 010) that replaced v1's opaque `trigger_rules` JSON + `response_scope` enum. `engage_mode='pattern'` requires `engage_pattern` (`'.'` matches every message — the "always respond" flavor); `sender_scope='known'` restricts engagement to group members; `ignored_message_policy='accumulate'` keeps ignored messages as context instead of dropping them.
+- `engage_senders`: senders whose messages engage the wiring whatever `engage_mode` says, root posts and thread replies alike — for alert bots that never @-mention. It decides engagement only: the sender still passes `unknown_sender_policy` and `sender_scope`, so on a gated channel it also needs a membership (`ncl members add`). Set with `ncl wirings update --engage-senders <id,id>`.
 - `default_tone` / `instructions_profile`: the two per-channel always-on layers, and deliberately separate. `default_tone` is **voice only** — one slot, by invariant — resolving to `groups/<folder>/tone-profiles/<name>.md` then the shared `tone-profiles/<name>.md`. `instructions_profile` is the room's **operating rules**, resolving to `groups/<folder>/channel-instructions/<name>.md` only, and injected ahead of the tone block so rules are read before register. Both NULL by default; neither is inherited by auto-wire. Full mechanics in [api-details.md](api-details.md#channel-instructions).
 - `default_model` / `default_effort`: sticky per-channel overrides using the same vocabulary as the `-m` / `-e` chat flags. An in-chat flag persists here, so a one-off experiment becomes the channel default.
 - **Side effect:** creating a wiring must also populate `agent_destinations` — don't mutate one without the other (see §1.10).

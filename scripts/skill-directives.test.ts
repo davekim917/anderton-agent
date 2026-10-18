@@ -58,6 +58,7 @@ describe('skill-directives parser, on the converted add-slack', () => {
     expect(copy.args).toContain('owned-by-fork');
     expect(copy.body).toEqual([
       'src/channels/slack.ts',
+      'src/channels/slack-a2a-guard.ts',
       'src/channels/slack-registration.test.ts',
       'container/skills/slack-formatting/SKILL.md',
     ]);

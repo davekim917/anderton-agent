@@ -15,20 +15,25 @@ Early. Anderton Agent is built and used daily by one operator, on one Linux host
 
 ## What it adds to NanoClaw
 
-| Addition | What it does | Doc |
-|---|---|---|
-| Workgroups | Groups sibling agents around a shared pool: chat archive, durable memory, and inherited secrets, tools and MCP servers. | [docs/workgroups.md](docs/workgroups.md) |
-| Cross-workgroup reads | Grants one workgroup read-only access to another's data, by policy on the host. | [docs/workgroup-read-access.md](docs/workgroup-read-access.md) |
-| Fleet-wide MCP servers | Adds an MCP server to every agent with one command, as data rather than code. | [docs/fleet-mcp-servers.md](docs/fleet-mcp-servers.md) |
-| Remote MCP over OAuth | Connects a remote MCP server through its own OAuth flow, with no developer app and no pasted key, and keeps the token fresh. | [docs/mcp-oauth-integrations.md](docs/mcp-oauth-integrations.md) |
-| Secret intake | An agent asks for an API key, and a person enters it in a Slack or Discord form that writes straight to the vault. The key never passes through chat. | [docs/secret-intake.md](docs/secret-intake.md) |
-| Three providers, with fallback | Claude, Codex and OpenCode providers in the tree. A group can fall back to another provider when its account stops answering. | [docs/provider-fallback.md](docs/provider-fallback.md) |
-| Work that survives restarts | `continue_work` lets an agent promise follow-up that a fresh container must account for after a kill. | [docs/agent-runner-details.md](docs/agent-runner-details.md) |
-| Keyed task dispatch | Admits one-shot tasks under idempotent keys, so a repeated event never runs twice. | [docs/keyed-task-dispatch.md](docs/keyed-task-dispatch.md) |
-| Slack and Discord in the tree | Both adapters ship with the code, including hot-attaching a new Slack bot without a restart. | `src/channels/` |
-| Observatory | A web dashboard over the fleet: decisions, agents, threads and schedules. | [dashboard/PRODUCT.md](dashboard/PRODUCT.md) |
+| Addition                       | What it does                                                                                                                                          | Doc                                                              |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Workgroups                     | Groups sibling agents around a shared pool: chat archive, durable memory, and inherited secrets, tools and MCP servers.                               | [docs/workgroups.md](docs/workgroups.md)                         |
+| Cross-workgroup reads          | Grants one workgroup read-only access to another's data, by policy on the host.                                                                       | [docs/workgroup-read-access.md](docs/workgroup-read-access.md)   |
+| Fleet-wide MCP servers         | Adds an MCP server to every agent with one command, as data rather than code.                                                                         | [docs/fleet-mcp-servers.md](docs/fleet-mcp-servers.md)           |
+| Remote MCP over OAuth          | Connects a remote MCP server through its own OAuth flow, with no developer app and no pasted key, and keeps the token fresh.                          | [docs/mcp-oauth-integrations.md](docs/mcp-oauth-integrations.md) |
+| Secret intake                  | An agent asks for an API key, and a person enters it in a Slack or Discord form that writes straight to the vault. The key never passes through chat. | [docs/secret-intake.md](docs/secret-intake.md)                   |
+| Three providers, with fallback | Claude, Codex and OpenCode providers in the tree. A group can fall back to another provider when its account stops answering.                         | [docs/provider-fallback.md](docs/provider-fallback.md)           |
+| Work that survives restarts    | `continue_work` lets an agent promise follow-up that a fresh container must account for after a kill.                                                 | [docs/agent-runner-details.md](docs/agent-runner-details.md)     |
+| Keyed task dispatch            | Admits one-shot tasks under idempotent keys, so a repeated event never runs twice.                                                                    | [docs/keyed-task-dispatch.md](docs/keyed-task-dispatch.md)       |
+| Slack and Discord in the tree  | Both adapters ship with the code, including hot-attaching a new Slack bot without a restart.                                                          | `src/channels/`                                                  |
+| Observatory                    | A web dashboard over the fleet: decisions, agents, threads and schedules.                                                                             | [dashboard/PRODUCT.md](dashboard/PRODUCT.md)                     |
 
 ## Quick start
+
+Before setup, install two things it does not handle:
+
+- **A C toolchain.** The `better-sqlite3` dependency compiles a native module during install. On Debian or Ubuntu, run `sudo apt-get install -y build-essential`; on macOS, `xcode-select --install`.
+- **Docker with BuildKit and Compose, if Docker is already installed.** Setup installs Docker only when it is missing. Ubuntu's `docker.io` package ships without either plugin, so the agent image build fails (`--mount option requires BuildKit`) and so does OneCLI (`Docker Compose is not available`). Either install Docker from [get.docker.com](https://get.docker.com), or add `sudo apt-get install -y docker-buildx docker-compose-v2` on top of `docker.io`.
 
 Clone this repository, then run setup from its root:
 

@@ -513,6 +513,51 @@ describe('wirings — per-channel instructions profile', () => {
   });
 });
 
+describe('wirings — engage_senders', () => {
+  const stored = async (id: unknown) => (await getMessagingGroupAgent(id as string))!.engage_senders;
+
+  it('omitted stays NULL', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
+    expect(await stored(row.id)).toBeNull();
+  });
+
+  it('create stores a comma-separated list as a deduplicated JSON array', async () => {
+    const row = await create({
+      messaging_group_id: 'mg-group',
+      agent_group_id: 'ag-1',
+      engage_senders: 'slack:alert-bot, slack-ops:other-bot,slack:alert-bot,@alerts:chat.example.org',
+    });
+    expect(JSON.parse((await stored(row.id))!)).toEqual([
+      'slack:alert-bot',
+      'slack-ops:other-bot',
+      '@alerts:chat.example.org',
+    ]);
+  });
+
+  it('update sets it, and "" clears it back to NULL', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
+    await update({ id: row.id, engage_senders: 'slack:alert-bot' });
+    expect(JSON.parse((await stored(row.id))!)).toEqual(['slack:alert-bot']);
+    await update({ id: row.id, engage_senders: '' });
+    expect(await stored(row.id)).toBeNull();
+  });
+
+  it('accepts the stored JSON form back unchanged, so a re-run of preUpdate on a retried update is a no-op', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
+    await update({ id: row.id, engage_senders: '["slack:alert-bot","slack:alert-bot"]' });
+    expect(await stored(row.id)).toBe('["slack:alert-bot"]');
+  });
+
+  it.each([['alert-bot'], ['["slack:alert bot"]'], ['[1]'], ['["slack:alert-bot"'], ['slack:alert bot']])(
+    'rejects %s',
+    async (value) => {
+      const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
+      await expect(update({ id: row.id, engage_senders: value })).rejects.toThrow(/--engage-senders/);
+      expect(await stored(row.id)).toBeNull();
+    },
+  );
+});
+
 describe('wirings-create — transactional rollback', () => {
   // Pins the seam-3 invariant (plan §8.4): the INSERT into
   // messaging_group_agents and the ensureAgentDestinationForWiring call live

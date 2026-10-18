@@ -238,7 +238,7 @@ export const UPDATE_CONTAINER_PROMPT = [
   '- container: `cd container/agent-runner && bun install --frozen-lockfile && bun test`, then from the repo root run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit`.',
   // No models-cache reset: ~/.codex/models_cache.json has no client-version gate and revalidates by ETag.
   '- Codex CLI: put the exact host-parity installation command in the PR checklist. Do not add a models-cache reset.',
-  'Show the final diff before committing. Commit and push only the validated, approved files, open the PR against davekim917/nanoclaw (or davekim917/bootstrap), verify the PR URL is in the intended repository, then stop.',
+  "Show the final diff before committing. Commit and push only the validated, approved files, open each PR against the repository named by that clone's `origin` remote (NanoClaw or bootstrap), verify the PR URL is in that repository, then stop.",
   'Never merge, deploy, restart services, or build Docker from inside the agent container.',
 ].join('\n');
 

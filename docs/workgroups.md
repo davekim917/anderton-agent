@@ -115,6 +115,22 @@ Every sibling can read the whole checkout, `.git/config` included, so keep
 credentials out of it: no token in the remote URL and no `http.extraheader`.
 Authenticate the refresh through the host's git credential helper.
 
+## Workgroup verify skills
+
+The bootstrap `create-verification-skill` skill writes a generated
+`verify-<project>` skill into the workgroup's shared tree, at
+`data/workgroups/<workgroup-id>/.claude/skills/verify-<project>/`
+(`/workspace/workgroup/.claude/skills/` in a container). No provider runtime
+scans that directory for skills, so while the shared tree is mounted, the
+composed `CLAUDE.md` / `AGENTS.md` lists each one by its `SKILL.md` path and
+tells the agent to read and run it before claiming a change to that project
+works. See `src/workgroup-verify-skills.ts`.
+
+Siblings can write that tree, so the list carries only directory names
+matching `^verify-[a-z0-9-]+$` that hold a regular `SKILL.md` (symlinks are
+skipped), never a skill's description or body. It shows at most 20, then a
+"+N more" line. No verify skill, or no shared-tree mount, means no section.
+
 ## Workgroup-scoped plugins
 
 `~/plugins` is fleet-wide: every agent group mounts every plugin unless its
@@ -221,8 +237,6 @@ The structural test at `tests/structural/projection-chokepoint.test.ts` enforces
 The consequence is worth stating outright, because it is coarser than every other row on the Observatory's thread endpoint: **a caller entitled to any ONE agent group in a workgroup sees every attention item that workgroup declares.** An attention item is ownerless by construction — that is what makes it an attention item — so it carries no `agent_group_id` to filter on, and there is nothing finer to gate against without inventing an owner.
 
 The reader that enforces the other half of this boundary is `readReleaseBoardSource` (`src/dashboard/api/board-attention.ts`): the declared `root` is resolved through symlinks and checked to still be inside `groups/<workgroup>/` before anything is read, because that directory is bind-mounted read-write into the workgroup's own containers. Pooling **within** a workgroup is the design; reading **across** two of them is not.
-
-Full rule and rationale: [observatory-console/DESIGN.md §3.6](specs/observatory-console/DESIGN.md).
 
 ---
 
@@ -491,7 +505,4 @@ The migration path is well-understood (table rebuild with a new column for the o
 | Google Drive mirror (host, one-way)  | `scripts/publish-workgroups-drive.sh` — [workgroups-drive-publish.md](workgroups-drive-publish.md) |
 | Structural assertion                 | `tests/structural/projection-chokepoint.test.ts`                                          |
 
-Current memory contract:
-`docs/specs/workgroup-memory-and-session-capabilities/design.md`. The original
-workgroup entity-model history remains under
-`docs/specs/workgroup-scoped-data-layer/`.
+Current memory contract: [memory.md](memory.md).

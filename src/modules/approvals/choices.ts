@@ -28,8 +28,8 @@ import { log } from '../../log.js';
 import { equivalentSlackUserIds } from '../../slack-user-identity.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { getUser } from '../permissions/db/users.js';
-import { editApprovalCard, notifyApprovalResolved } from './primitive.js';
-import { parseReleaseShipScope, releaseShipScopeJson } from './release-ship-scope.js';
+import { editApprovalCard, headUnits, notifyApprovalResolved } from './primitive.js';
+import { cardReleaseScopeJson, unscopedReleaseCard } from './release-ship-scope.js';
 
 export interface ChoiceHandlerContext {
   approval: PendingApproval;
@@ -72,14 +72,19 @@ export function getChoiceHandler(action: string): ChoiceHandler | undefined {
  * ids, the equivalence role checks use (equivalentSlackUserIds).
  */
 export function choiceClickAllowed(approval: PendingApproval, userId: string): boolean {
-  const approvers = payloadApprovers(approval);
+  const approvers = choiceApprovers(approval);
   if (approvers === undefined) return true;
   const clicker = new Set(equivalentSlackUserIds(userId));
   return approvers.some((approver) => clicker.has(approver));
 }
 
 /** First click wins: the pending→approved compare-and-swap lets exactly one racing click through. */
-export async function resolveChoice(approval: PendingApproval, selectedOption: string, userId: string): Promise<void> {
+export async function resolveChoice(
+  approval: PendingApproval,
+  selectedOption: string,
+  userId: string,
+  tellClicker?: (text: string) => Promise<void>,
+): Promise<void> {
   const handler = getChoiceHandler(approval.action);
   if (!handler) return;
 
@@ -144,7 +149,17 @@ export async function resolveChoice(approval: PendingApproval, selectedOption: s
   await writeChoiceReceipt(approval, deliveredTo, option, userId, resolvedAt);
   await deletePendingApproval(approval.approval_id);
   const name = (await getUser(userId))?.display_name || userId;
-  await editApprovalCard(approval, cardText(approval, `✅ ${option.label} — ${name}`));
+  const uncounted = option.value === 'ship' && unscopedReleaseCard(approval);
+  await editApprovalCard(
+    approval,
+    cardText(
+      approval,
+      uncounted
+        ? `⚠️ Ship did not count (out-of-date card) — ${headUnits(name, UNCOUNTED_NAME_UNITS)}`
+        : `✅ ${option.label} — ${name}`,
+    ),
+  );
+  if (uncounted) await tellClicker?.(UNCOUNTED_SHIP);
   // A choice resolves as approval of the chosen option.
   await notifyApprovalResolved({ approval, session: deliveredTo, outcome: 'approve', userId });
 }
@@ -193,7 +208,7 @@ async function writeChoiceReceipt(
       value: option.value,
       label: option.label,
       clickerUserId: userId,
-      releaseScopeJson: receiptReleaseScopeJson(approval),
+      releaseScopeJson: cardReleaseScopeJson(approval) ?? null,
       resolvedAt,
     });
     // eslint-disable-next-line no-catch-all/no-catch-all -- the answer is already delivered; a receipt-write failure must not reopen the card
@@ -206,19 +221,7 @@ async function writeChoiceReceipt(
   }
 }
 
-/** A corrupt pending payload can never manufacture externally trusted scope. */
-function receiptReleaseScopeJson(approval: PendingApproval): string | null {
-  try {
-    const payload = JSON.parse(approval.payload) as { approvalScope?: unknown };
-    const scope = parseReleaseShipScope(payload.approvalScope);
-    return scope ? releaseShipScopeJson(scope) : null;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- corrupt payload is unscoped, never an authority grant
-  } catch {
-    return null;
-  }
-}
-
-function payloadApprovers(approval: PendingApproval): string[] | undefined {
+export function choiceApprovers(approval: PendingApproval): string[] | undefined {
   try {
     const approvers = (JSON.parse(approval.payload) as { approvers?: unknown }).approvers;
     return Array.isArray(approvers) ? approvers.filter((a): a is string => typeof a === 'string') : undefined;
@@ -237,6 +240,11 @@ function storedOptions(approval: PendingApproval): NormalizedOption[] {
     return [];
   }
 }
+
+// A release card's body may use 1800 of Discord's 1900-unit edit, which keeps only the head of an over-long edit.
+const UNCOUNTED_NAME_UNITS = 32;
+const UNCOUNTED_SHIP =
+  'This card is out of date: it does not list the risks a Ship accepts, so your click did not count. Ask for a fresh card if one does not appear.';
 
 function cardText(approval: PendingApproval, line: string): string {
   return [approval.title, approval.question, line].filter(Boolean).join('\n\n');

@@ -33,8 +33,12 @@ export async function run(_args: string[]): Promise<void> {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     log.info('Build succeeded');
-  } catch {
+  } catch (err) {
     log.error('Build failed');
+    // The step's own output is its raw log, and setup prints its tail on failure.
+    const { stdout, stderr } = err as { stdout?: Buffer; stderr?: Buffer };
+    if (stdout) process.stderr.write(stdout);
+    if (stderr) process.stderr.write(stderr);
     emitStatus('SETUP_SERVICE', {
       SERVICE_TYPE: 'unknown',
       NODE_PATH: nodePath,
@@ -279,11 +283,11 @@ function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string, fl
     log.error('launchctl load failed', { err });
   }
 
-  // Verify
+  // A loaded KeepAlive job stays listed while it crash-loops; only a running one has a PID.
+  settle(2000);
   let serviceLoaded = false;
   try {
-    const output = execSync('launchctl list', { encoding: 'utf-8' });
-    serviceLoaded = output.includes(label);
+    serviceLoaded = launchdPid(execSync('launchctl list', { encoding: 'utf-8' }), label) !== null;
   } catch {
     // launchctl list failed
   }
@@ -295,9 +299,10 @@ function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string, fl
     PROJECT_PATH: projectRoot,
     PLIST_PATH: plistPath,
     SERVICE_LOADED: serviceLoaded,
-    STATUS: 'success',
+    ...loadedStatus(serviceLoaded),
     LOG: 'logs/setup.log',
   });
+  if (!serviceLoaded) process.exit(1);
 }
 
 function setupLinux(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): void {
@@ -521,9 +526,10 @@ function setupSystemd(projectRoot: string, nodePath: string, homeDir: string, fl
     ...(logrotatePath ? { LOGROTATE_PATH: logrotatePath } : {}),
     ...(dockerGroupStale ? { DOCKER_GROUP_STALE: true } : {}),
     LINGER_ENABLED: !runningAsRoot,
-    STATUS: 'success',
+    ...loadedStatus(serviceLoaded),
     LOG: 'logs/setup.log',
   });
+  if (!serviceLoaded) process.exit(1);
 }
 
 export function renderNohupWrapper(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): string {
@@ -569,14 +575,58 @@ function setupNohupFallback(projectRoot: string, nodePath: string, homeDir: stri
   fs.writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
   log.info('Wrote nohup wrapper script', { wrapperPath });
 
+  const serviceLoaded = startNohupWrapper(wrapperPath, path.join(projectRoot, 'nanoclaw.pid'));
   emitStatus('SETUP_SERVICE', {
     SERVICE_TYPE: 'nohup',
     NODE_PATH: nodePath,
     PROJECT_PATH: projectRoot,
     WRAPPER_PATH: wrapperPath,
-    SERVICE_LOADED: false,
+    SERVICE_LOADED: serviceLoaded,
     FALLBACK: 'wsl_no_systemd',
-    STATUS: 'success',
+    ...loadedStatus(serviceLoaded),
     LOG: 'logs/setup.log',
   });
+  if (!serviceLoaded) process.exit(1);
+}
+
+function settle(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** The PID column of `launchctl list` for `label`, or null when the job is not listed or not running ("-"). */
+export function launchdPid(listOutput: string, label: string): number | null {
+  for (const line of listOutput.split('\n')) {
+    const [pid, , name] = line.trim().split(/\s+/);
+    if (name !== label) continue;
+    return /^\d+$/.test(pid) ? Number(pid) : null;
+  }
+  return null;
+}
+
+function loadedStatus(serviceLoaded: boolean): { STATUS: string; ERROR?: string } {
+  return serviceLoaded ? { STATUS: 'success' } : { STATUS: 'failed', ERROR: 'service_not_running' };
+}
+
+/** Runs the wrapper, then reports whether the pid it recorded is still alive after `settleMs`. */
+export function startNohupWrapper(wrapperPath: string, pidFile: string, settleMs = 2000): boolean {
+  const res = spawnSync('bash', [wrapperPath], { stdio: 'ignore' });
+  if (res.status !== 0) {
+    log.error('nohup wrapper failed', { status: res.status });
+    return false;
+  }
+  settle(settleMs);
+  let pid: number;
+  try {
+    pid = Number.parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
+  } catch {
+    return false;
+  }
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    log.error('NanoClaw exited right after the nohup wrapper started it', { pid });
+    return false;
+  }
 }

@@ -609,6 +609,37 @@ describe('buildMounts agent surfaces', async () => {
     expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf8')).not.toContain('## Workgroup wiki');
   });
 
+  it('lists workgroup verify skills in the composed doc only when the shared tree they live in is mounted', async () => {
+    const ag = group('ag-verify-skills', 'verify-skills-member');
+    await createAgentGroup(ag);
+    assignWorkgroup(ag, 'verify-wg');
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem(ag, {});
+    const skillDir = path.join(DATA_DIR, 'workgroups', 'verify-wg', '.claude', 'skills', 'verify-example-app');
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: verify-example-app\n---\n');
+    const docs = (): string[] =>
+      ['CLAUDE.md', 'AGENTS.md'].map((name) => fs.readFileSync(path.join(GROUPS_DIR, ag.folder, name), 'utf8'));
+    const skillLine = '`/workspace/workgroup/.claude/skills/verify-example-app/SKILL.md`';
+
+    // The test config pins WORKGROUP_SHARED_FS off, so the tree is unmounted until a migration marker exists.
+    const unmounted = await buildMounts(
+      ag,
+      session('s-verify-off', ag.id),
+      containerConfig(),
+      'claude',
+      {},
+      'verify-wg',
+    );
+    expect(unmounted.some((mount) => mount.containerPath === '/workspace/workgroup')).toBe(false);
+    for (const doc of docs()) expect(doc).not.toContain('## Workgroup verify skills');
+
+    fs.writeFileSync(path.join(DATA_DIR, 'workgroups', 'verify-wg', '.migrated'), '{}\n');
+    const mounted = await buildMounts(ag, session('s-verify-on', ag.id), containerConfig(), 'claude', {}, 'verify-wg');
+    expect(mounted.some((mount) => mount.containerPath === '/workspace/workgroup')).toBe(true);
+    for (const doc of docs()) expect(doc).toContain(skillLine);
+  });
+
   it('mounts the workgroup memory lock after the writable workgroup tree it sits inside', async () => {
     const ag = group('ag-memory-lock-order', 'memory-lock-order');
     await createAgentGroup(ag);

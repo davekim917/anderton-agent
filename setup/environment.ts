@@ -101,6 +101,40 @@ export function detectRegisteredGroups(projectRoot: string): boolean {
   }
 }
 
+const SETUP_PING_FOLDER = /^ping-test-[0-9a-f]{8}$/;
+
+/**
+ * Ping agents an earlier setup run left behind when its ping failed: a
+ * setup-named folder wired to nothing but the local CLI chat. Left in place,
+ * one answers every `pnpm run chat` line and makes setup believe an agent is
+ * already wired.
+ */
+export function findStalePingAgentFolders(projectRoot: string): string[] {
+  const dbPath = path.join(projectRoot, 'data', 'v2.db');
+  if (!fs.existsSync(dbPath)) return [];
+
+  let db: Database.Database | null = null;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const rows = db
+      .prepare(
+        `SELECT ag.folder AS folder FROM agent_groups ag
+         WHERE NOT EXISTS (
+           SELECT 1 FROM messaging_group_agents mga
+           JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+           WHERE mga.agent_group_id = ag.id
+             AND NOT (mg.channel_type = 'cli' AND mg.platform_id = 'local')
+         )`,
+      )
+      .all() as { folder: string }[];
+    return rows.map((r) => r.folder).filter((folder) => SETUP_PING_FOLDER.test(folder));
+  } catch {
+    return [];
+  } finally {
+    db?.close();
+  }
+}
+
 export async function run(_args: string[]): Promise<void> {
   const projectRoot = process.cwd();
 

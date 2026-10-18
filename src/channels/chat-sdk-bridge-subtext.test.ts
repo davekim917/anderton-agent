@@ -172,6 +172,23 @@ describe('chat-sdk bridge status subtext', () => {
     expect(edits[0].markdown).toContain('-# opus-5 · high · 90k context');
   });
 
+  it('fits an over-long resolved card edit by trimming the body, so the answer line survives', async () => {
+    const { bridge, edits } = subtextBridge({ maxTextLength: 100 });
+
+    await bridge.deliver('thread-1', null, {
+      kind: 'chat-sdk',
+      content: {
+        operation: 'edit',
+        messageId: 'm-1',
+        text: `Release\n\n${'y'.repeat(300)}\n\n⚠️ Ship did not count (out-of-date card) — Dana`,
+        clearActions: true,
+      },
+    });
+
+    expect(edits[0].markdown!.length).toBeLessThanOrEqual(100);
+    expect(edits[0].markdown!.endsWith('…\n\n⚠️ Ship did not count (out-of-date card) — Dana')).toBe(true);
+  });
+
   // A send_file caption is stamped by the runner; the footer must land on the
   // message that carries the files, not be dropped by the attachment path.
   it('renders the subtext on a captioned file post, on the message carrying the file', async () => {

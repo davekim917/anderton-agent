@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  githubPublicRepositories,
   loadInstallIdentifiers,
   loadLocalIdentifiers,
   loadRegistryIdentifiers,
@@ -425,10 +426,15 @@ export function realScanners(install: InstallPaths): Pick<GateDeps, 'scanTree' |
 
 export function knownPrivateNames(install: InstallPaths, publicNames: string[] = []): string[] {
   const problems: string[] = [];
+  const registry = loadRegistryIdentifiers(install.dbPath);
+  const local = loadLocalIdentifiers(install.identifiersPath);
   const names = new Set([
-    ...loadRegistryIdentifiers(install.dbPath),
-    ...loadInstallIdentifiers(install.dbPath, publicRemotes([install.installRoot]), problems),
-    ...loadLocalIdentifiers(install.identifiersPath),
+    ...registry,
+    ...loadInstallIdentifiers(install.dbPath, publicRemotes([install.installRoot]), problems, {
+      publicRepositories: githubPublicRepositories(install.installRoot),
+      otherIdentifiers: [...registry, ...local],
+    }),
+    ...local,
   ]);
   if (problems.length > 0) throw new Error(`identifier discovery incomplete: ${problems.join('; ')}`);
   const isPublic = new Set(publicNames.map((identity) => identity.toLowerCase()));

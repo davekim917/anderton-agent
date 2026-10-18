@@ -43,6 +43,10 @@ describe('runChannelSkill adapter (Option A)', () => {
       // string — an exec that discards it now bounces instead of silently
       // writing an empty file (skill-apply.ts's owned-by-fork branch).
       if (c.startsWith('git show')) return '// placeholder branch content\n';
+      if (c === 'pnpm run build') {
+        mkdirSync(join(root, 'dist/channels'), { recursive: true });
+        writeFileSync(join(root, 'dist/channels/slack.js'), '// compiled\n');
+      }
     };
     const wired: WireArgs[] = [];
 
@@ -525,6 +529,45 @@ describe('runChannelSkill adapter (Option A)', () => {
     expect(failCalls[0].msg).toBe('Register the webhook by hand'); // heading → headline
     expect(failCalls[0].hint).toContain('Open the Faily dashboard'); // prose → hint
     expect(failCalls[0].hint).not.toBe('See logs/setup-steps/ for details, then retry setup.'); // not the generic
+  });
+
+  it('fails the install when a clean build leaves no compiled adapter', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'rcs-nobuild-'));
+    writeFileSync(join(root, 'package.json'), '{"name":"scratch"}');
+    writeFileSync(join(root, '.env'), '');
+    mkdirSync(join(root, 'src/channels'), { recursive: true });
+    writeFileSync(join(root, `src/channels/${failChannel}.ts`), '// adapter source\n');
+    mkdirSync(failSkillDir, { recursive: true });
+    writeFileSync(
+      join(failSkillDir, 'SKILL.md'),
+      [`# add ${failChannel}`, '', '## Build', '```nc:run effect:build', 'pnpm run build', '```', ''].join('\n'),
+    );
+
+    const failCalls: string[] = [];
+    const fakeFail = (step: string): Promise<never> => {
+      failCalls.push(step);
+      return Promise.reject(new Error('__failed__'));
+    };
+    const wired: WireArgs[] = [];
+    await expect(
+      runChannelSkill(failChannel, 'Bob', {
+        projectRoot: root,
+        exec: () => {},
+        resolveRemote: () => 'origin',
+        agentName: 'Nano',
+        role: 'owner',
+        reuse: false,
+        inputs: {},
+        fail: fakeFail,
+        wire: (a) => {
+          wired.push(a);
+          return true;
+        },
+      }),
+    ).rejects.toThrow('__failed__');
+
+    expect(failCalls).toEqual([`${failChannel}-build`]);
+    expect(wired).toHaveLength(0);
   });
 });
 

@@ -311,8 +311,6 @@ The pattern, and why each part is load-bearing:
   a delivery error, a concurrent drain) must leave the gate disarmed, so uncertainty costs an extra
   poll rather than a lost message.
 
-See `docs/specs/bounded-periodic-work/plan.md`.
-
 **Agent-runner creates schedules** by emitting a `messages_out` row with `kind: 'system'` and an `action` (`schedule_task`, `cancel_task`, …) — it cannot write host-owned `inbound.db` directly. The host applies the action during delivery (`src/modules/scheduling/actions.ts`), inserting/updating the `kind: 'task'` `messages_in` row with `process_after` and optionally `recurrence`.
 
 ### messages_in content by kind

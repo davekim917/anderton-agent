@@ -406,9 +406,14 @@ describe('per-model-family effort defaults', () => {
     expect(opts?.effort).toBe('xhigh');
   });
 
-  it('test_effort_default_haiku_none: haiku gets no effort option (no API-level effort support)', () => {
+  it('test_effort_default_haiku_none: Haiku 4.5 gets no effort option (no API-level effort support)', () => {
     const opts = run({ model: 'claude-haiku-4-5' });
     expect(opts?.effort).toBeUndefined();
+  });
+
+  it('test_effort_haiku55: Haiku 5.5 defaults to medium and keeps an explicit effort', () => {
+    expect(run({ model: 'claude-haiku-5-5' })?.effort).toBe('medium');
+    expect(run({ model: 'claude-haiku-5-5', effort: 'xhigh' })?.effort).toBe('xhigh');
   });
 
   it('test_effort_default_sonnet_high: Sonnet 5 defaults to high (fleet default)', () => {
@@ -445,12 +450,12 @@ describe('per-model-family effort defaults', () => {
 
   it('test_effort_xhigh_survives_on_all_opus: explicit -e xhigh passes through on any opus model', () => {
     // Pre-5 opus ids (4.6 etc.) are no longer used, but xhigh passes through
-    // regardless — only haiku clamps, every other model gets the full surface.
+    // regardless — only Haiku 4.5 clamps, every other model gets the full surface.
     const explicit = run({ model: 'claude-opus-4-6[1m]', effort: 'xhigh' });
     expect(explicit?.effort).toBe('xhigh');
   });
 
-  it('test_effort_clamp_haiku_drops_any_effort: haiku drops even an explicit effort (no API support)', () => {
+  it('test_effort_clamp_haiku_drops_any_effort: Haiku 4.5 drops even an explicit effort (no API support)', () => {
     const opts = run({ model: 'claude-haiku-4-5', effort: 'high' });
     expect(opts?.effort).toBeUndefined();
   });

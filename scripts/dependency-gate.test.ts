@@ -434,6 +434,50 @@ describe('registry', () => {
     expect(registryProblems(registry, directDependencies(files()), withSetup)).toEqual([]);
   });
 
+  describe('an agent-runner live-path test under Bun', () => {
+    const test = 'container/agent-runner/src/providers/claude-live-path.test.ts';
+    const bunRegistry: Registry = {
+      livePaths: { 'provider-claude': { description: 'x', tests: [test] } },
+      packages: { '@anthropic-ai/claude-agent-sdk': { kind: 'live', paths: ['provider-claude'] } },
+    };
+    const files: Record<string, string> = {
+      'container/agent-runner/package.json': JSON.stringify({
+        scripts: { test: 'bun test --preload ./src/test-hermeticity.ts' },
+      }),
+      'container/agent-runner/src/test-hermeticity.ts':
+        "mock.module('node:child_process', () => guarded);\nglobalThis.fetch = guard(globalThis.fetch);\nexport const allowNetwork = () => {};\n",
+      'container/agent-runner/src/providers/claude.ts':
+        "import { query } from '@anthropic-ai/claude-agent-sdk';\nexport const run = () => query();\n",
+      [test]:
+        "import { allowNetwork } from '../test-hermeticity.js';\nimport { run } from './claude.js';\nit('runs', () => run());\n",
+    };
+    const readBun =
+      (overrides: Record<string, string> = {}) =>
+      (file: string): string | null =>
+        overrides[file] ?? files[file] ?? null;
+
+    it('accepts one that imports the Bun preload, which wraps builtins and fetch for every test', () => {
+      expect(registryProblems(bunRegistry, new Set(), readBun())).toEqual([]);
+    });
+
+    it('refuses one that replaces its package with mock.module', () => {
+      const mocked = readBun({ [test]: `mock.module('@anthropic-ai/claude-agent-sdk', () => ({}));\n${files[test]}` });
+      expect(registryProblems(bunRegistry, new Set(), mocked)).toEqual([
+        expect.stringContaining(`${test}, which loads none of the packages on that path`),
+      ]);
+    });
+
+    it('refuses one whose package the Bun preload mocks', () => {
+      const mocked = readBun({
+        'container/agent-runner/src/test-hermeticity.ts':
+          "mock.module('@anthropic-ai/claude-agent-sdk', () => ({}));\n",
+      });
+      expect(registryProblems(bunRegistry, new Set(), mocked)).toEqual([
+        expect.stringContaining(`${test}, which loads none of the packages on that path`),
+      ]);
+    });
+  });
+
   it('refuses a weaker registry than the base unless a ledger explains it', () => {
     const weaker: Registry = {
       livePaths: { ...registry.livePaths, 'chat-inbound': { description: 'x', tests: [] } },

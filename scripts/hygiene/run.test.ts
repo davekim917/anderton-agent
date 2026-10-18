@@ -16,7 +16,9 @@ import {
   hygieneFindings,
   jscpdFindings,
   knipFindings,
+  modelNameFindings,
   sourceFiles,
+  testImportFindings,
 } from './run.js';
 
 enforceHermeticity();
@@ -280,6 +282,136 @@ describe('exempt files', () => {
     },
     TOOL_TIMEOUT * 2,
   );
+});
+
+describe('model and effort names in agent instructions', () => {
+  const NO_EXEMPT = { upstream: new Set<string>(), vendored: new Set<string>() };
+  const SKILL = 'container/skills/demo/SKILL.md';
+  const scan = (files: Record<string, string>, allowed: { file: string; names: string[]; reason: string }[] = []) =>
+    summary(modelNameFindings(project('model-names', files), NO_EXEMPT, allowed));
+
+  it.each([
+    ['a Claude family word', 'Dispatch the reviewer on Sonnet.', 'Sonnet'],
+    ['a Claude model id', 'Run `claude --model claude-opus-5-5[1m]`.', 'claude-opus-5-5[1m]'],
+    ['a Codex model id', 'Start `codex exec -m gpt-6.1-sol` for review.', 'gpt-6.1-sol'],
+    ['a letter-led Codex model id', 'Run `codex exec -m gpt-oss-120b` locally.', 'gpt-oss-120b'],
+    ['a Codex family word', 'The coordinator runs on Terra.', 'Terra'],
+    ['a pinned Claude alias', 'Switch with `-m opus55` first.', 'opus55'],
+    ['a pinned dashed Claude alias', 'Switch with `-m sonnet5-5` first.', 'sonnet5-5'],
+    ['an OpenCode model slug', 'Use opencode-go/kimi-k2.7-code here.', 'kimi-k2.7-code'],
+    ['an effort level before the word', 'Every reviewer runs at `high` effort.', 'high` effort'],
+    ['an effort level after the word', 'Pass `--effort max` to the CLI.', 'effort max'],
+    ['an effort config key', 'Set `model_reasoning_effort=high`.', 'effort=high'],
+    ['a spaced TOML effort key', 'Set `model_reasoning_effort = "high"`.', 'effort = "high'],
+    ['a JSON effort key', 'Write `{ "effort": "max" }`.', 'effort": "max'],
+    ['an effort set in prose', 'Raise the effort to medium.', 'effort to medium'],
+    ['an effort env var', 'Export `CLAUDE_CODE_EFFORT_LEVEL=medium`.', 'EFFORT_LEVEL=medium'],
+    ['a level only effort names', 'Escalate to xhigh when stuck.', 'xhigh'],
+  ])('reports %s', (_name, line, match) => {
+    expect(scan({ [SKILL]: `# Demo\n\n${line}\n` })).toEqual([`model-name ${SKILL}:3 ${match}`]);
+  });
+
+  it('reports nothing for prose that only resembles a model or effort name', () => {
+    const prose = [
+      'Use a terracotta accent and a high-level summary.',
+      'Cleanup is best-effort. High contrast wins; reading effort matters more.',
+      'The model and effort come from container.json, never from this file.',
+      'Claude and Codex agents both read it.',
+    ].join('\n');
+    expect(scan({ [SKILL]: prose })).toEqual([]);
+  });
+
+  it('scans only the files composed into an agent instructions', () => {
+    const line = 'Run on Opus.\n';
+    expect(
+      scan({
+        'container/CLAUDE.md': line,
+        'container/spawn-template.md': line,
+        'container/agent-runner/src/mcp-tools/cli.instructions.md': line,
+        'container/skills/demo/nested/SKILL.md': line,
+        'container/skills/demo/reference.md': line,
+        'container/agent-runner/src/mcp-tools/cli.md': line,
+        'docs/models.md': line,
+        '.claude/skills/model-bump/SKILL.md': line,
+      }),
+    ).toEqual([
+      'model-name container/CLAUDE.md:1 Opus',
+      'model-name container/agent-runner/src/mcp-tools/cli.instructions.md:1 Opus',
+      'model-name container/skills/demo/nested/SKILL.md:1 Opus',
+      'model-name container/spawn-template.md:1 Opus',
+    ]);
+  });
+
+  it('skips a listed name in its listed file only, and reports a listed name that no longer appears', () => {
+    const allowed = [
+      { file: SKILL, names: ['gpt-4o-mini-tts', 'gone-1'], reason: 'fixture' },
+      { file: 'container/skills/stale/SKILL.md', names: ['opus'], reason: 'fixture' },
+    ];
+    expect(
+      scan(
+        {
+          [SKILL]: 'Call the TTS API with gpt-4o-mini-tts, then review on Opus.\n',
+          'container/skills/other/SKILL.md': 'Call it with gpt-4o-mini-tts.\n',
+        },
+        allowed,
+      ),
+    ).toEqual([
+      `model-name ${SKILL}:1 Opus`,
+      'model-name container/skills/other/SKILL.md:1 gpt-4o-mini-tts',
+      `stale-exemption ${SKILL} gone-1 no longer appears; remove it from the list`,
+      'stale-exemption container/skills/stale/SKILL.md opus no longer appears; remove it from the list',
+    ]);
+  });
+});
+
+describe('absolute paths in test imports', () => {
+  const scan = (files: Record<string, string>) => summary(testImportFindings(project('test-imports', files)));
+  const WT = ['', 'home', 'someone', 'scratch', 'wt-x'].join('/');
+  const SCRATCH = ['', 'tmp', 'claude-1001', 'wt'].join('/');
+
+  it.each([
+    ['a static import', `import { a } from '${WT}/src/a.js';`],
+    ['a side-effect import', `import '${WT}/src/setup.js';`],
+    ['a re-export', `export { a } from '${WT}/src/a.js';`],
+    ['a dynamic import', `const m = await import('${SCRATCH}/src/a.js');`],
+    ['a module mock', `vi.mock('${WT}/src/a.js', () => ({}));`],
+    ['a module unmock', `vi.doUnmock('${WT}/src/a.js');`],
+    ['a Bun module mock', `mock.module('${SCRATCH}/src/a.ts', () => ({}));`],
+    ['a type-position import', `type A = typeof import('${WT}/src/a.js');`],
+    ['an interpolated dynamic import', `const m = await import(\`${WT}/src/\${name}.js\`);`],
+    ['a dynamic import split across lines', `const m = await import(\n  '${SCRATCH}/src/a.js'\n);`],
+    ['a module mock split across lines', `vi.mock(\n  '${WT}/src/a.js',\n  () => ({}),\n);`],
+  ])('reports %s', (_name, source) => {
+    const specifier = source.match(/['`]([^'`]+)['`]/)![1];
+    const line = source.split('\n').findIndex((text) => text.includes(specifier)) + 1;
+    expect(scan({ 'container/agent-runner/src/a.test.ts': `${source}\n` })).toEqual([
+      `absolute-import container/agent-runner/src/a.test.ts:${line} ${specifier}`,
+    ]);
+  });
+
+  it('reports nothing for relative imports, import-like text in strings or comments, or non-test files', () => {
+    expect(
+      scan({
+        'src/a.test.ts': [
+          "import { a } from './a.js';",
+          "import fs from 'node:fs';",
+          "const HOME = '/home/fixture-user';",
+          "expect(resolve('/tmp/claude-1001/x')).toBe('/tmp/claude-1001/x');",
+          `expect(generated).toContain("import '${WT}/src/a.js'");`,
+          `// e.g. import { a } from '${WT}/src/a.js';`,
+        ].join('\n'),
+        'src/a.ts': `export { a } from '${WT}/src/a.js';\n`,
+      }),
+    ).toEqual([]);
+  });
+
+  it('scans test files outside the source roots', () => {
+    const line = `import { a } from '${WT}/a.js';\n`;
+    expect(scan({ 'dashboard/src/view.test.tsx': line, 'container/entry.test.ts': line })).toEqual([
+      `absolute-import container/entry.test.ts:1 ${WT}/a.js`,
+      `absolute-import dashboard/src/view.test.tsx:1 ${WT}/a.js`,
+    ]);
+  });
 });
 
 describe('comment growth', () => {

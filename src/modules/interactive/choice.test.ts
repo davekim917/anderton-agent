@@ -37,7 +37,7 @@ import { registerApprovalHandler, requestApproval } from '../approvals/primitive
 import { handleApprovalsResponse, resolveApprovalFromHost } from '../approvals/response-handler.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { grantRole } from '../permissions/db/user-roles.js';
-import { formatChoiceResponse, REQUEST_CHOICE_ACTION, SUPERSEDED_LINE } from './choice.js';
+import { formatChoiceResponse, REQUEST_CHOICE_ACTION, retireUnscopedReleaseCards, SUPERSEDED_LINE } from './choice.js';
 
 vi.mock('../../container-runner.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../container-runner.js')>()),
@@ -55,13 +55,6 @@ vi.mock('../../session-manager.js', async () => {
 });
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-request-choice') }));
-const envFile = vi.hoisted(() => ({ values: {} as Record<string, string> }));
-
-vi.mock('../../env.js', async () => ({
-  ...(await vi.importActual<typeof import('../../env.js')>('../../env.js')),
-  readEnvFile: (keys: string[]) =>
-    Object.fromEntries(keys.filter((k) => k in envFile.values).map((k) => [k, envFile.values[k]])),
-}));
 
 // A Slack variant (isChannelVariant, types.ts:194-196), so the Slack
 // thread-id composition applies, under its own registry key.
@@ -88,12 +81,42 @@ const RELEASE_SCOPE = {
   base: 'main',
   headSha: 'a'.repeat(40),
 };
-const DECISION = {
-  question: 'Retire the legacy export button?',
-  ifItShips: 'The export menu loses one entry.\n\nSaved exports keep working.',
-  evidence: 'https://github.com/owner/repository/pull/42#issuecomment-1',
+const WARNING_SCOPE = {
+  ...RELEASE_SCOPE,
+  holds: ['hold:access:sql/grants.sql', 'hold:irreversible:analytics.orders:10_rows'],
 };
-const PIN = `Ship owner/repository#42 from main at ${'a'.repeat(40)}?`;
+const ACCEPTS = [
+  'Ship accepts only these holds, at this head:',
+  '• `hold:access:sql/grants.sql`',
+  '• `hold:irreversible:analytics.orders:10_rows`',
+];
+const DECISION = {
+  kind: 'warning',
+  headline: 'Retiring the legacy export button removes a menu entry clients still use.',
+  asked: 'Priya, 10-09: “tidy the export menu”',
+  does: 'The export menu loses one entry.\n\nSaved exports keep working.',
+  risk: 'clients who used the button cannot find it',
+  undo: 'Revert in 10 minutes; nothing is lost.',
+  holdingCosts: 'The menu stays cluttered another week.',
+  recommend: 'Send back: hide the button behind a setting instead.',
+  evidence: 'https://github.com/owner/repository/pull/42#issuecomment-1',
+  accept: 'a missing menu entry',
+};
+const RELEASE_DECISION = {
+  kind: 'release',
+  headline: 'Weekly release: 3 PRs across 2 repos.',
+  warnings: 'No unresolved warnings',
+  does: 'Exports finish faster for every client.\nThe regional dashboard splits West in two.',
+  undo: 'Roll back the release tag; no data changes.',
+  evidence: 'https://github.com/owner/repository/pull/42#issuecomment-2',
+};
+const PIN = `Pinned to owner/repository#42 from main at ${'a'.repeat(40)}.`;
+const SILENCE = 'Silence = nothing ships: it stays held until someone clicks.';
+const AGENT_WORDS = 'Everything above is the requesting agent’s words, not checked by the host.';
+const WARNING_BUTTONS = [
+  { label: 'Ship anyway — I accept a missing menu entry', value: 'ship', style: 'danger' },
+  { label: 'Send back', value: 'send_back', style: 'primary' },
+];
 const PLAIN_TEXT_REFUSAL =
   'decision text must be plain text: ASCII, accented Latin letters, and ‘ ’ “ ” – — • … → £ € °';
 
@@ -220,7 +243,6 @@ async function destinationOnly(mgId: string, name: string): Promise<void> {
 
 beforeEach(async () => {
   vi.clearAllMocks();
-  envFile.values = {};
   vi.mocked(sessionMessageExists).mockResolvedValue(false);
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -339,69 +361,112 @@ describe('request_choice delivery', () => {
       title: 'Hold this release',
       question: 'This text must not be shown',
       options: [{ label: 'Hold', value: 'ship', style: 'danger' }],
-      approvalScope: RELEASE_SCOPE,
+      approvalScope: WARNING_SCOPE,
+      decision: DECISION,
     }))!;
 
-    expect(JSON.parse(row.payload)).toMatchObject({ choiceId: 'choice-1', approvalScope: RELEASE_SCOPE });
+    expect(JSON.parse(row.payload)).toMatchObject({ choiceId: 'choice-1', approvalScope: WARNING_SCOPE });
     expect(
       (JSON.parse(row.options_json) as Array<{ label: string; value: string; style: string }>).map((option) => ({
         label: option.label,
         value: option.value,
         style: option.style,
       })),
-    ).toEqual([
-      { label: 'Ship', value: 'ship', style: 'primary' },
-      { label: 'Hold', value: 'hold', style: 'danger' },
-    ]);
-    expect(delivered[0].content).toEqual({
+    ).toEqual(WARNING_BUTTONS);
+    expect(delivered[0].content).toMatchObject({
       type: 'ask_question',
       questionId: row.approval_id,
-      title: 'Release approval: owner/repository#42',
-      question: `Ship owner/repository#42 from main at ${'a'.repeat(40)}?`,
-      options: [
-        { label: 'Ship', value: 'ship', style: 'primary' },
-        { label: 'Hold', value: 'hold', style: 'danger' },
-      ],
+      title: 'Held for your call: owner/repository#42',
+      options: WARNING_BUTTONS,
     });
+    expect(delivered[0].content.question).not.toContain('This text must not be shown');
   });
 
-  it('shows the decision above the host pin, labelled as the agent’s words, and a Ship still answers on scope alone', async () => {
-    const row = (await ask(session, { approvalScope: RELEASE_SCOPE, decision: DECISION }))!;
+  it('renders a warning card: the worry and silence first, every tradeoff line, the agent’s words labelled, then the pin', async () => {
+    const row = (await ask(session, {
+      approvalScope: WARNING_SCOPE,
+      decision: { ...DECISION, reviewers: 'QA agrees.' },
+    }))!;
     const shown = [
-      'The requesting agent’s brief (its words, not checked by the host):',
-      'The question: Retire the legacy export button?',
-      'If it ships:',
+      'Retiring the legacy export button removes a menu entry clients still use.',
+      SILENCE,
+      '',
+      'You asked: Priya, 10-09: “tidy the export menu”',
+      'This does:',
       '• The export menu loses one entry.',
       '• Saved exports keep working.',
+      'Risk you’d accept: clients who used the button cannot find it',
+      'Undo: Revert in 10 minutes; nothing is lost.',
+      'Holding costs: The menu stays cluttered another week.',
+      'Agents recommend: Send back: hide the button behind a setting instead.',
+      'Reviewers: QA agrees.',
       'Evidence: https://github.com/owner/repository/pull/42#issuecomment-1',
       '',
+      AGENT_WORDS,
+      ...ACCEPTS,
       PIN,
     ].join('\n');
     expect(delivered[0].content.question).toBe(shown);
-    expect(delivered[0].content.title).toBe('Release approval: owner/repository#42');
-    expect(JSON.parse(row.payload)).toEqual({ choiceId: 'choice-1', approvalScope: RELEASE_SCOPE });
+    expect(JSON.parse(row.payload)).toEqual({ choiceId: 'choice-1', approvalScope: WARNING_SCOPE });
 
     expect(await click(row.approval_id, 'ship', ADMIN)).toBe(true);
     expect(after(1).find((d) => d.content.operation === 'edit')?.content.text).toContain(shown);
     const answer = notes()[0]!.text;
     expect(answer).toContain(` value=ship `);
-    expect(answer.endsWith(` release_scope=${encodeURIComponent(JSON.stringify(RELEASE_SCOPE))}`)).toBe(true);
+    expect(answer.endsWith(` release_scope=${encodeURIComponent(JSON.stringify(WARNING_SCOPE))}`)).toBe(true);
+  });
+
+  it('shows a divergence from the ask only when the agent names one', async () => {
+    await ask(session, {
+      approvalScope: WARNING_SCOPE,
+      decision: { ...DECISION, diverges: 'Also hides the CSV option.' },
+    });
+    expect(delivered[0].content.question).toContain(
+      '• Saved exports keep working.\nDiverges: Also hides the CSV option.\nRisk you’d accept:',
+    );
+  });
+
+  it('renders a scheduled release card with its warnings and Ship release / Hold buttons', async () => {
+    const row = (await ask(session, { approvalScope: RELEASE_SCOPE, decision: RELEASE_DECISION }))!;
+    expect(delivered[0].content).toEqual({
+      type: 'ask_question',
+      questionId: row.approval_id,
+      title: 'Release: owner/repository#42',
+      question: [
+        'Weekly release: 3 PRs across 2 repos.',
+        SILENCE,
+        '',
+        'Warnings:',
+        '• No unresolved warnings',
+        'What goes to production:',
+        '• Exports finish faster for every client.',
+        '• The regional dashboard splits West in two.',
+        'Undo: Roll back the release tag; no data changes.',
+        'Evidence: https://github.com/owner/repository/pull/42#issuecomment-2',
+        '',
+        AGENT_WORDS,
+        'Ship accepts no holds: any hold keeps it held.',
+        PIN,
+      ].join('\n'),
+      options: [
+        { label: 'Ship release', value: 'ship', style: 'primary' },
+        { label: 'Hold', value: 'hold', style: 'danger' },
+      ],
+    });
   });
 
   it('renders platform link and mention syntax in the decision as plain text', async () => {
     await ask(session, {
-      approvalScope: RELEASE_SCOPE,
-      decision: { ...DECISION, question: 'Ship <!here> <https://evil.example|the tested build>?' },
+      approvalScope: WARNING_SCOPE,
+      decision: { ...DECISION, headline: 'Ship <!here> <https://evil.example|the tested build>?' },
     });
-    expect(delivered[0].content.question).toContain(
-      'The question: Ship ‹!here› ‹https://evil.example|the tested build›?',
-    );
+    expect(delivered[0].content.question).toContain('Ship ‹!here› ‹https://evil.example|the tested build›?');
   });
 
   it('keeps typographic text and renders ~ so it cannot strike a fact through', async () => {
     await ask(session, {
-      approvalScope: RELEASE_SCOPE,
-      decision: { ...DECISION, ifItShips: 'Café’s “saved” exports — kept → ~~Deletes saved exports~~ ~5% €3' },
+      approvalScope: WARNING_SCOPE,
+      decision: { ...DECISION, does: 'Café’s “saved” exports — kept → ~~Deletes saved exports~~ ~5% €3' },
     });
     expect(delivered[0].content.question).toContain(
       '• Café’s “saved” exports — kept → ∼∼Deletes saved exports∼∼ ∼5% €3',
@@ -410,27 +475,17 @@ describe('request_choice delivery', () => {
 
   it('folds look-alike spaces to a plain space, so a SHA split by one is visibly split', async () => {
     await ask(session, {
-      approvalScope: RELEASE_SCOPE,
-      decision: { ...DECISION, ifItShips: `Rebuilds at ${'e'.repeat(20)}\u200a${'e'.repeat(20)}` },
+      approvalScope: WARNING_SCOPE,
+      decision: { ...DECISION, does: `Rebuilds at ${'e'.repeat(20)}\u200a${'e'.repeat(20)}` },
     });
     expect(delivered[0].content.question).toContain(`• Rebuilds at ${'e'.repeat(20)} ${'e'.repeat(20)}`);
   });
 
-  it('posts a decision-less release card with a warning until the rule is switched on, then refuses it', async () => {
-    const warnSpy = vi.spyOn(log, 'warn');
-    expect((await ask(session, { approvalScope: RELEASE_SCOPE }))!.question).toBe(PIN);
-    expect(warnSpy).toHaveBeenCalledWith('request_choice: release card posted without a decision', {
-      choiceId: 'choice-1',
-      repository: 'owner/repository',
-      pullRequest: 42,
-    });
-
-    envFile.values = { NANOCLAW_RELEASE_CARD_DECISION_REQUIRED: '1' };
-    expect(await ask(session, { approvalScope: RELEASE_SCOPE }, 'choice-2')).toBeUndefined();
-    expect(await ask(session, { approvalScope: RELEASE_SCOPE, decision: DECISION }, 'choice-3')).toBeDefined();
-    expect(delivered).toHaveLength(2);
+  it('refuses a release card without its decision: no bare Ship button is ever posted', async () => {
+    expect(await ask(session, { approvalScope: RELEASE_SCOPE })).toBeUndefined();
+    expect(delivered).toHaveLength(0);
     expect(notes().map((n) => n.text)).toEqual([
-      'request_choice failed: a release card needs decision {question, ifItShips, evidence}',
+      'request_choice failed: a release card needs its decision: an approver must see what ships',
     ]);
   });
 
@@ -438,22 +493,22 @@ describe('request_choice delivery', () => {
     ['a decision on a generic card', { decision: DECISION }, 'decision belongs only on an approvalScope release card'],
     [
       'a SHA in the question',
-      { question: `Ship ${'b'.repeat(40)}?` },
+      { headline: `Ship ${'b'.repeat(40)}?` },
       'decision text must not hold a commit SHA: the host pins the head',
     ],
     [
       'a SHA in a changed line',
-      { ifItShips: `Rebuilds at ${'B'.repeat(40)}` },
+      { does: `Rebuilds at ${'B'.repeat(40)}` },
       'decision text must not hold a commit SHA: the host pins the head',
     ],
     [
       'a markdown link',
-      { ifItShips: 'See [the table](https://x.example)' },
+      { does: 'See [the table](https://x.example)' },
       'decision text must not hold markdown links: put the link in evidence',
     ],
     [
       'spoiler bars that would hide a fact',
-      { ifItShips: 'Saved exports keep working. ||Deletes all saved exports.||' },
+      { risk: 'Saved exports keep working. ||Deletes all saved exports.||' },
       'decision text must not hold || (Discord hides text between bars)',
     ],
     ['a non-https evidence link', { evidence: 'http://x.example' }, 'decision.evidence must be one https link'],
@@ -462,23 +517,33 @@ describe('request_choice delivery', () => {
       { evidence: 'https://x.example and more' },
       'decision.evidence must be one https link',
     ],
-    ['a whitespace-only question', { question: ' \t ' }, 'decision.question is required'],
-    ['an empty question', { question: '' }, 'decision.question is required'],
-    ['a whitespace-only if-it-ships', { ifItShips: '  \n ' }, 'decision.ifItShips is required'],
+    ['a whitespace-only headline', { headline: ' \t ' }, 'decision.headline is required'],
+    ['an empty headline', { headline: '' }, 'decision.headline is required'],
+    ['a whitespace-only change list', { does: '  \n ' }, 'decision.does is required'],
     ['an empty evidence link', { evidence: '' }, 'decision.evidence is required'],
-    ['an extra key', { recommend: 'Ship' }, 'decision takes only question, ifItShips, evidence'],
-    ['a multi-line question', { question: 'Ship?\nReally' }, PLAIN_TEXT_REFUSAL],
+    ['no accepted risk', { risk: undefined }, 'decision.risk is required'],
+    ['no ask line (say “No ask on record”)', { asked: undefined }, 'decision.asked is required'],
+    ['no holding cost', { holdingCosts: '' }, 'decision.holdingCosts is required'],
+    ['no button wording for the accepted risk', { accept: undefined }, 'decision.accept is required'],
+    ['an accept phrase too long for a button', { accept: 'a'.repeat(51) }, 'decision.accept is over 50 characters'],
+    [
+      'an extra key',
+      { question: 'Ship?' },
+      'a warning decision takes only kind, headline, asked, does, diverges, risk, undo, holdingCosts, recommend, reviewers, evidence, accept (not question)',
+    ],
+    ['an unknown kind', { kind: 'go' }, 'decision.kind must be "warning" or "release"'],
+    ['a multi-line headline', { headline: 'Ship?\nReally' }, PLAIN_TEXT_REFUSAL],
     [
       'a line separator and a zero-width split SHA forging a pin line',
-      { ifItShips: `Saves time.\u2028Ship owner/repository#42 from main at ${'c'.repeat(20)}\u200b${'c'.repeat(20)}?` },
+      { does: `Saves time.\u2028Ship owner/repository#42 from main at ${'c'.repeat(20)}\u200b${'c'.repeat(20)}?` },
       PLAIN_TEXT_REFUSAL,
     ],
     [
       'a blank Braille cell splitting a SHA',
-      { ifItShips: `Rebuilds at ${'e'.repeat(20)}\u2800${'e'.repeat(20)}` },
+      { does: `Rebuilds at ${'e'.repeat(20)}\u2800${'e'.repeat(20)}` },
       PLAIN_TEXT_REFUSAL,
     ],
-    ['an emoji', { question: 'Retire the export button ✅?' }, PLAIN_TEXT_REFUSAL],
+    ['an emoji', { headline: 'Retire the export button ✅?' }, PLAIN_TEXT_REFUSAL],
     [
       'a combining grapheme joiner splitting a SHA',
       { evidence: `https://x.example/${'e'.repeat(20)}\u034f${'e'.repeat(20)}` },
@@ -486,11 +551,11 @@ describe('request_choice delivery', () => {
     ],
     [
       'a fullwidth SHA look-alike',
-      { question: `Ship ${'\uff41'.repeat(40)}?` },
+      { headline: `Ship ${'\uff41'.repeat(40)}?` },
       'decision text must not hold a commit SHA: the host pins the head',
     ],
-    ['a question with no visible text', { question: '\u034f' }, 'decision.question is required'],
-    ['a bidi override in the question', { question: 'Retire the \u202eexport button?' }, PLAIN_TEXT_REFUSAL],
+    ['a headline with no visible text', { headline: '\u034f' }, 'decision.headline is required'],
+    ['a bidi override in the headline', { headline: 'Retire the \u202eexport button?' }, PLAIN_TEXT_REFUSAL],
     [
       'a SHA in the evidence link',
       { evidence: `https://github.com/owner/repository/commit/${'d'.repeat(40)}` },
@@ -501,61 +566,68 @@ describe('request_choice delivery', () => {
       { evidence: 'https://x.example/[a](https://y.example)' },
       'decision text must not hold markdown links: put the link in evidence',
     ],
-    ['an over-long question', { question: `${'q'.repeat(300)}?` }, 'decision.question is over 300 characters'],
+    ['an over-long headline', { headline: `${'q'.repeat(200)}?` }, 'decision.headline is over 200 characters'],
     [
       'too many changed lines',
-      { ifItShips: Array.from({ length: 11 }, (_, i) => `line ${i}`).join('\n') },
-      'decision.ifItShips has over 10 lines',
+      { does: Array.from({ length: 7 }, (_, i) => `line ${i}`).join('\n') },
+      'decision.does has over 6 lines',
+    ],
+    [
+      'a release decision carrying a warning card’s accept button',
+      { ...RELEASE_DECISION, accept: 'x' },
+      'a release decision takes only kind, headline, warnings, does, undo, reviewers, evidence (not accept)',
+    ],
+    [
+      'a release decision with no warnings line',
+      { ...RELEASE_DECISION, kind: 'release', warnings: '' },
+      'decision.warnings is required',
     ],
   ])('refuses %s without opening a row', async (_name, change, error) => {
-    const decision = 'decision' in change ? undefined : { ...DECISION, ...change };
-    await ask(session, decision ? { approvalScope: RELEASE_SCOPE, decision } : change);
+    const decision =
+      'decision' in change
+        ? undefined
+        : { ...((change as { kind?: string }).kind === 'release' ? {} : DECISION), ...change };
+    await ask(session, decision ? { approvalScope: WARNING_SCOPE, decision } : change);
     expect(delivered).toHaveLength(0);
     expect(notes().map((n) => n.text)).toEqual([`request_choice failed: ${error}`]);
   });
 
   it.each([
-    ['an empty object', {}, 'decision.question is required'],
-    ['a blank string', '   ', 'decision must be {question, ifItShips, evidence}'],
-    ['null', null, 'decision must be {question, ifItShips, evidence}'],
-  ])('refuses %s as a decision, even before the rule is switched on', async (_name, decision, error) => {
-    expect(await ask(session, { approvalScope: RELEASE_SCOPE, decision })).toBeUndefined();
+    ['an empty object', {}, 'decision.kind must be "warning" or "release"'],
+    ['a blank string', '   ', 'decision must be an object with kind "warning" or "release"'],
+    ['null', null, 'decision must be an object with kind "warning" or "release"'],
+    [
+      'the retired question/ifItShips shape',
+      { question: 'Ship?', ifItShips: 'x', evidence: 'https://x.example' },
+      'decision.kind must be "warning" or "release"',
+    ],
+  ])('refuses %s as a decision', async (_name, decision, error) => {
+    expect(await ask(session, { approvalScope: WARNING_SCOPE, decision })).toBeUndefined();
     expect(delivered).toHaveLength(0);
     expect(notes().map((n) => n.text)).toEqual([`request_choice failed: ${error}`]);
   });
 
   it('counts the title against the card budget, so an accepted decision is never cut', async () => {
-    const scope = { ...RELEASE_SCOPE, repository: `${'o'.repeat(100)}/${'r'.repeat(100)}` };
-    const title = `Release approval: ${scope.repository}#42`;
-    const pin = `Ship ${scope.repository}#42 from main at ${'a'.repeat(40)}?`;
-    const body = (lines: string[]) =>
-      [
-        'The requesting agent’s brief (its words, not checked by the host):',
-        `The question: ${DECISION.question}`,
-        'If it ships:',
-        ...lines.map((l) => `• ${l}`),
-        `Evidence: ${DECISION.evidence}`,
-        '',
-        pin,
-      ].join('\n');
-    const lines = Array.from({ length: 10 }, () => 'x'.repeat(119));
-    lines[9] = 'x'.repeat(119 - (body(lines).length + title.length + 6 - 1801));
-    expect(body(lines).length).toBeLessThanOrEqual(1800);
-    await ask(session, { approvalScope: scope, decision: { ...DECISION, ifItShips: lines.join('\n') } });
-    expect(delivered).toHaveLength(0);
+    const scope = {
+      ...RELEASE_SCOPE,
+      holds: ['hold:human'],
+      repository: `${'o'.repeat(100)}/${'r'.repeat(100)}`,
+      base: 'b'.repeat(120),
+    };
+    const decision = { ...DECISION, does: Array.from({ length: 6 }, () => 'x'.repeat(80)).join('\n') };
+    const fits = (await ask(session, { approvalScope: scope, decision }))!;
+    const used = `**${String(delivered[0].content.title)}**\n\n${String(delivered[0].content.question)}`.length;
+    expect(fits).toBeDefined();
+    const over = 1801 - used;
+    await ask(
+      session,
+      { approvalScope: scope, decision: { ...decision, headline: `${DECISION.headline}${'h'.repeat(over)}` } },
+      'choice-2',
+    );
+    expect(delivered).toHaveLength(1);
     expect(notes().map((n) => n.text)).toEqual([
       'request_choice failed: decision is too long for one card: shorten it by 1 characters',
     ]);
-  });
-
-  it('refuses a decision that would not fit on one card', async () => {
-    const long = { ...RELEASE_SCOPE, base: 'b'.repeat(255) };
-    const ifItShips = Array.from({ length: 10 }, () => 'x'.repeat(115)).join('\n');
-    await ask(session, { approvalScope: long, decision: { ...DECISION, question: `${'q'.repeat(299)}?`, ifItShips } });
-    expect(delivered).toHaveLength(0);
-    expect(notes()[0].text).toMatch(
-      /^request_choice failed: decision is too long for one card: shorten it by \d+ characters$/,
-    );
   });
 
   it('refuses a malformed request without opening a row', async () => {
@@ -574,6 +646,46 @@ describe('request_choice delivery', () => {
       'request_choice failed: approvalScope is malformed',
       'request_choice failed: approvalScope is malformed',
     ]);
+  });
+
+  it.each([
+    ['no holds', RELEASE_SCOPE],
+    ['an empty holds list', { ...RELEASE_SCOPE, holds: [] }],
+  ])('refuses a warning card with %s: its Go must name what it accepts', async (_name, scope) => {
+    expect(await ask(session, { approvalScope: scope, decision: DECISION })).toBeUndefined();
+    expect(delivered).toHaveLength(0);
+    expect(notes().map((n) => n.text)).toEqual([
+      'request_choice failed: a warning card needs approvalScope.holds: the exact hold codes its Go accepts',
+    ]);
+  });
+
+  it.each([
+    ['a repeated code', ['hold:access:a.sql', 'hold:access:a.sql']],
+    ['a code that is not a hold', ['wait:effect_check']],
+    ['a code with a space', ['hold:access:my file.sql']],
+    ['more than 12 codes', Array.from({ length: 13 }, (_, i) => `hold:access:f${i}.sql`)],
+    ['a string instead of a list', 'hold:access:a.sql'],
+  ])('refuses holds with %s as a malformed scope', async (_name, holds) => {
+    await ask(session, { approvalScope: { ...RELEASE_SCOPE, holds }, decision: DECISION });
+    expect(delivered).toHaveLength(0);
+    expect(await getPendingApprovalsByAction(REQUEST_CHOICE_ACTION)).toHaveLength(0);
+    expect(notes().map((n) => n.text)).toEqual(['request_choice failed: approvalScope is malformed']);
+  });
+
+  it('stores and returns the holds sorted, so the receipt names one canonical set', async () => {
+    const row = (await ask(session, {
+      approvalScope: { ...RELEASE_SCOPE, holds: ['hold:irreversible:b:1_rows', 'hold:access:a.sql'] },
+      decision: DECISION,
+    }))!;
+    expect(delivered[0].content.question).toContain(
+      'Ship accepts only these holds, at this head:\n• `hold:access:a.sql`\n• `hold:irreversible:b:1_rows`\nPinned to',
+    );
+    expect(await click(row.approval_id, 'ship', ADMIN)).toBe(true);
+    expect(notes()[0]!.text).toContain(
+      ` release_scope=${encodeURIComponent(
+        `{"purpose":"release_ship","repository":"owner/repository","pullRequest":42,"base":"main","headSha":"${'a'.repeat(40)}","holds":["hold:access:a.sql","hold:irreversible:b:1_rows"]}`,
+      )}`,
+    );
   });
 
   it('refuses a choiceId that already has a pending approval', async () => {
@@ -683,26 +795,57 @@ describe('request_choice click authority and resolution', () => {
     });
   });
 
-  it('appends a host-canonical release scope only for a valid scoped card', async () => {
-    const row = (await ask(session, { approvalScope: RELEASE_SCOPE }))!;
+  it.each(['ship', 'send_back'])(
+    'appends a host-canonical release scope to a %s click on a scoped card',
+    async (value) => {
+      const row = (await ask(session, { approvalScope: WARNING_SCOPE, decision: DECISION }))!;
 
-    expect(await click(row.approval_id, 'ship', ADMIN)).toBe(true);
+      expect(await click(row.approval_id, value, ADMIN)).toBe(true);
 
-    const fields = Object.fromEntries(
-      notes()[0]!
-        .text.split(' ')
-        .slice(1)
-        .map((pair) => {
-          const at = pair.indexOf('=');
-          return [pair.slice(0, at), decodeURIComponent(pair.slice(at + 1))];
-        }),
+      const fields = Object.fromEntries(
+        notes()[0]!
+          .text.split(' ')
+          .slice(1)
+          .map((pair) => {
+            const at = pair.indexOf('=');
+            return [pair.slice(0, at), decodeURIComponent(pair.slice(at + 1))];
+          }),
+      );
+      expect(JSON.parse(fields.release_scope!)).toEqual(WARNING_SCOPE);
+      expect(fields.value).toBe(value);
+    },
+  );
+
+  it('a Ship on a warning card stored without holds is relayed, and the clicker is told privately it did not count', async () => {
+    const row = (await ask(session, { approvalScope: WARNING_SCOPE, decision: DECISION }))!;
+    await getDb().run(
+      "UPDATE pending_approvals SET payload = json_remove(payload, '$.approvalScope.holds') WHERE approval_id = ?",
+      row.approval_id,
     );
-    expect(JSON.parse(fields.release_scope!)).toEqual(RELEASE_SCOPE);
-    expect(fields.value).toBe('ship');
+    const told: string[] = [];
+
+    expect(
+      await handleApprovalsResponse({
+        questionId: row.approval_id,
+        value: 'ship',
+        userId: ADMIN.slice(CHANNEL.length + 1),
+        channelType: CHANNEL,
+        platformId: '',
+        threadId: null,
+        messageId: row.platform_message_id,
+        replyToClicker: async (text) => void told.push(text),
+      }),
+    ).toBe(true);
+
+    expect(notes()).toHaveLength(1);
+    expect(notes()[0]!.text).not.toContain(' release_scope=');
+    expect(told).toEqual([
+      'This card is out of date: it does not list the risks a Ship accepts, so your click did not count. Ask for a fresh card if one does not appear.',
+    ]);
   });
 
   it('does not emit release_scope from a corrupt saved pending payload', async () => {
-    const row = (await ask(session, { approvalScope: RELEASE_SCOPE }))!;
+    const row = (await ask(session, { approvalScope: WARNING_SCOPE, decision: DECISION }))!;
     await getDb().run('UPDATE pending_approvals SET payload = ? WHERE approval_id = ?', '{not json', row.approval_id);
 
     expect(await click(row.approval_id, 'ship', ADMIN)).toBe(true);
@@ -927,6 +1070,48 @@ async function backdate(approvalId: string): Promise<void> {
     approvalId,
   );
 }
+
+describe('out-of-date release cards', () => {
+  it('closes every open release card a Ship on which would approve nothing, and only those', async () => {
+    const plain = (await ask(session, {}, 'choice-plain'))!;
+    const scoped = (await ask(session, { approvalScope: WARNING_SCOPE, decision: DECISION }, 'choice-scoped'))!;
+    const noHolds = (await ask(session, { approvalScope: WARNING_SCOPE, decision: DECISION }, 'choice-no-holds'))!;
+    const bare = (await ask(session, { approvalScope: WARNING_SCOPE, decision: DECISION }, 'choice-bare'))!;
+    // As stored by a host from before warning cards had to name their holds, and before warning cards existed.
+    await getDb().run(
+      "UPDATE pending_approvals SET payload = json_remove(payload, '$.approvalScope.holds') WHERE approval_id = ?",
+      noHolds.approval_id,
+    );
+    await getDb().run(
+      'UPDATE pending_approvals SET options_json = ? WHERE approval_id = ?',
+      JSON.stringify([
+        { label: 'Ship', value: 'ship' },
+        { label: 'Hold', value: 'hold' },
+      ]),
+      bare.approval_id,
+    );
+    const n = delivered.length;
+
+    await retireUnscopedReleaseCards();
+
+    expect(await getPendingApproval(noHolds.approval_id)).toBeUndefined();
+    expect(await getPendingApproval(bare.approval_id)).toBeUndefined();
+    expect((await getPendingApproval(scoped.approval_id))?.status).toBe('pending');
+    expect((await getPendingApproval(plain.approval_id))?.status).toBe('pending');
+    const edits = after(n).map((d) => d.content);
+    expect(edits.map((e) => e.messageId).sort()).toEqual(
+      [bare.platform_message_id, noHolds.platform_message_id].sort(),
+    );
+    for (const e of edits) {
+      expect(e.operation).toBe('edit');
+      expect(
+        String(e.text).endsWith(
+          '\n\n⚠️ Closed: this release card is out of date and cannot approve anything. Ask for a fresh card.',
+        ),
+      ).toBe(true);
+    }
+  });
+});
 
 describe('replace, never stack (key)', () => {
   it('a newer ask with the same key posts first, then supersedes the open card', async () => {

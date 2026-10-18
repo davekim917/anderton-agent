@@ -13,11 +13,14 @@ Environment:
                    gate writes, smoke-pr-gate.sh)
 
 Faults: faults.json maps "<tool>:<op>" to a list of behaviours consumed one per
-call, in order:
+call, in order (`enqueue:<first 12 of a key>` scripts only that obligation's
+sends, ahead of any plain `enqueue` entry):
   fail-before   no write; an error the controller reads as unknown/failed
   fail-after    the write happens, then the call reports an error (the
                 ambiguous case: the effect landed but the caller cannot know)
   refuse        (gate only) a definitive refusal
+  refuse:<text> (gh writes only) no write; gh exits 1 with <text> on stderr,
+                as real gh prints a refusal GitHub answered
   disposition-lands  (gate challenger-timeout only) the challenger's disposition
                 is written just before the gate reads it: the race between the
                 controller's read of the run tree and the gate's
@@ -47,6 +50,14 @@ The fakes mirror the real contracts the controller depends on:
            listing (`api` scans and `issue list`) until it is cleared -- the
            lag GitHub's listings show a fresh create; the GET still finds it.
            Fault `silent` on gh:issue-create files the issue but prints no URL.
+           `issue comment <n>` appends to issue n's comments (the same list
+           `api repos/<r>/issues/<n>/comments` reads), open or closed, and
+           fails 404 when gh.json has no issue n; nothing reopens or edits one.
+           An entry with a `pull_request` key is a PR, which GitHub's issues
+           API (and so `gh issue comment`) serves like an issue. A GET carries
+           `repository_url` for the path's repo unless the entry sets its own.
+           Fault `fail-sentinel` on gh:api runs and fails with the words
+           spawn() uses for a call it never started.
   ncl      `tasks create` returns {ok, data:{series_id}}; `tasks list` lists them.
 """
 import fcntl
@@ -154,7 +165,7 @@ def enqueue(argv):
             return "invalid", out({"ok": False, "code": "invalid", "error": "attachment missing: " + f}, 2)
     payload = {"text": text, "to": opt(argv, "--to"), "threadKey": opt(argv, "--thread-key"),
                "files": [hashlib.sha256(open(f, "rb").read()).hexdigest() for f in files]}
-    f = fault("enqueue")
+    f = fault("enqueue:" + str(mid).split("#")[0][:12]) or fault("enqueue")
     if f == "fail-before":
         return "fail-before", out({"ok": False, "code": "error", "error": "injected"}, 1)
     have = db["messages"].get(mid)
@@ -190,16 +201,23 @@ def gh(argv):
         f = fault("gh:api")
         if f == "fail-before":
             return "fail", out_err("HTTP 502")
-        single = re.match(r"repos/[^/]+/[^/]+/issues/(\d+)$", path)
+        if f == "fail-sentinel":
+            # A call that RAN and failed with the words spawn() uses for a
+            # call it never started: only the type of spawn's signal tells
+            # them apart.
+            return "fail", out_err("no time left in this fire")
+        single = re.match(r"repos/([^/]+/[^/]+)/issues/(\d+)$", path)
         if single:
-            hit = [i for i in db["issues"] if str(i["number"]) == single.group(1)]
+            hit = [i for i in db["issues"] if str(i["number"]) == single.group(2)]
             if not hit:
                 return "missing", out_err("HTTP 404: Not Found")
-            print(json.dumps(hit[0]))
+            print(json.dumps(dict({"repository_url": "https://api.github.com/repos/" + single.group(1)}, **hit[0])))
             return "get", 0
         objs = []
         if "/comments" in path:
             pr = path.split("/issues/")[1].split("/")[0]
+            if pr in [str(n) for n in db.get("deleted", [])]:
+                return "missing", out_err("HTTP 410: This issue was deleted")
             objs = db["comments"].get(pr, [])
         else:
             objs = [i for i in db["issues"] if not i.get("unlisted")]
@@ -210,6 +228,8 @@ def gh(argv):
         pr = argv[2]
         body = open(opt(argv, "--body-file")).read()
         f = fault("gh:pr-comment")
+        if f and f.startswith("refuse:"):
+            return "refused", out_err(f[len("refuse:"):])
         if f == "fail-before":
             return "fail", out_err("HTTP 502")
         n = sum(len(v) for v in db["comments"].values()) + 1
@@ -220,6 +240,24 @@ def gh(argv):
             return "fail-after", out_err("HTTP 502 after write")
         print("https://github.test/pr/{}#c{}".format(pr, n))
         return "commented", 0
+    if argv[:2] == ["issue", "comment"]:
+        n = argv[2]
+        body = open(opt(argv, "--body-file")).read()
+        f = fault("gh:issue-comment")
+        if f and f.startswith("refuse:"):
+            return "refused", out_err(f[len("refuse:"):])
+        if f == "fail-before":
+            return "fail", out_err("HTTP 502")
+        if not any(str(i["number"]) == n for i in db["issues"]):
+            return "missing", out_err("HTTP 404: Not Found")
+        c = sum(len(v) for v in db["comments"].values()) + 1
+        url = "https://github.test/issues/{}#issuecomment-{}".format(n, c)
+        db["comments"].setdefault(n, []).append({"id": c, "body": body, "html_url": url})
+        save("gh.json", db)
+        if f == "fail-after":
+            return "fail-after", out_err("HTTP 502 after write")
+        print(url)
+        return "issue-commented", 0
     if argv[:2] == ["issue", "list"]:
         f = fault("gh:issue-list")
         if f == "fail-before":
@@ -247,6 +285,8 @@ def gh(argv):
     if argv[:2] == ["issue", "create"]:
         body = open(opt(argv, "--body-file")).read()
         f = fault("gh:issue-create")
+        if f and f.startswith("refuse:"):
+            return "refused", out_err(f[len("refuse:"):])
         if f == "fail-before":
             return "fail", out_err("HTTP 502")
         missing = [x for x in opts(argv, "--label") if "labels" in db and x not in db["labels"]]
@@ -273,6 +313,8 @@ def gh(argv):
     if argv[:2] == ["pr", "close"]:
         pr = argv[2]
         f = fault("gh:pr-close")
+        if f and f.startswith("refuse:"):
+            return "refused", out_err(f[len("refuse:"):])
         if f == "fail-before":
             return "fail", out_err("HTTP 502")
         db["prs"].setdefault(pr, {"state": "OPEN"})["state"] = "CLOSED"

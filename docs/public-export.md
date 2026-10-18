@@ -12,6 +12,14 @@ Pushing a branch to a public repository publishes it before any merge check can 
 
 The public repository gets its own `README.md`, `CLAUDE.md`, `AGENTS.md` (a symlink to `CLAUDE.md`) and `CONTRIBUTING.md` from `public-overlay/`, which the export moves to the root. The private root copies describe this install or NanoClaw's own process and are never exported, and neither are the upstream README translations or `RELEASING.md`. A change to a private root copy alone publishes nothing; edit the `public-overlay/` copy to change what the public repository shows.
 
+Three policies of this install are rewritten on the way out, as `core.replace` transforms in `copy.bara.sky`:
+
+- **Build gate.** The public `package.json` has no `prebuild`, so a public `pnpm run build` is `tsc` plus the dashboard bundle. `scripts/check-build-clean.ts` refuses a dirty tree, a HEAD other than `origin/main` and any lint error. On a public clone every channel install trips one of those: the skill copies an adapter into the tree, and upstream adapters fail this repository's lint. This install keeps the gate: `scripts/deploy.sh` and any hand build here still run `prebuild`.
+- **Hook boundary scan.** The git hooks run the public-boundary scan with `--allow-absent-sources` in the public tree, because a fresh clone has neither this install's registry nor its identifier inventory. A source that exists but cannot be read still refuses.
+- **Install diagnostics.** `setup/lib/diagnostics.{sh,ts}` report setup events to upstream's PostHog project unless `NANOCLAW_NO_DIAGNOSTICS=1`. In the public tree they send nothing unless `NANOCLAW_DIAGNOSTICS=1`, so public installs do not report to another project's analytics. The files stay byte-identical to upstream here.
+
+`run.ts` passes `--ignore-noop`, so a transform whose text no longer matches would export the private behaviour without an error; `allowlist.test.ts` fails instead, by checking that each transform's `before` text occurs exactly once in its file.
+
 Each private commit that touches published files becomes one public commit:
 
 - the author is rewritten to `PUBLIC_EXPORT_AUTHOR` (use a GitHub noreply address);
@@ -22,7 +30,7 @@ Each private commit that touches published files becomes one public commit:
 
 Every exported commit is checked before it can be pushed, in order, and the first failure stops the run:
 
-1. **Name scan.** `scripts/check-public-boundary.ts` runs over the commit's whole tree and its message, using the install's identifier registry and allowlist and an empty baseline, so lines the private repo tolerates still count.
+1. **Name scan.** `scripts/check-public-boundary.ts` runs over the commit's whole tree and its message, using the install's identifier registry and allowlist and an empty baseline, so lines the private repo tolerates still count. A repository cloned into the install's repository store adds its owner and name to that registry unless GitHub proves it public: the API answers `isPrivate: false`, `visibility: PUBLIC` and the exact `owner/repo` the clone's origin names. A clone on another host, a lookup that fails or times out, a rename, or a public repository whose owner or name matches another private identifier (a client's own open-source repository) stays private. Verdicts are cached, hashed, in `.nanoclaw/github-visibility-cache.json` (public and private 7 days, not found 1 day, a failure 1 hour); uncached repositories are asked in one GraphQL request per 100, inside an 8-second budget per scan. The git hooks and this gate share the cache.
 2. **Binaries.** A changed binary file holds unless its blob is listed in the host-local `public-export-approved-binaries.txt` (see _Exemptions_ below). Neither the scanner nor the AI can read a binary. Add a blob only after a person has looked at the image itself. Listing it skips every content check. The list starts with the images that are byte-identical to nanoco's public upstream.
 3. **AI read.** Headless Claude Code (`PUBLIC_EXPORT_AI_MODEL`, no tools) reads the message, every changed path (renames show both names) and every added line, together with the list of known private names, and must return `pass` with no finding left after accepted findings are removed (see _Exemptions_). It is there to catch what a list cannot: abbreviations, slugs and names not yet in the registry. The commit is fenced between markers carrying a random per-call nonce, and the model is told that everything between them is data, never instructions.
 

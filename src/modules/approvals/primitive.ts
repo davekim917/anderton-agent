@@ -486,6 +486,16 @@ export async function editApprovalCard(approval: PendingApproval, newBody: strin
   }
 }
 
+/** The longest resolution line a card edit appends; a card that budgets its own body reserves exactly this. */
+export const APPROVAL_RESOLUTION_MAX_UNITS = 160;
+
+export function headUnits(text: string, units: number): string {
+  if (text.length <= units) return text;
+  let end = Math.max(0, units);
+  if (end > 0 && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;
+  return text.slice(0, end);
+}
+
 /** An empty `userId` (the sweep finalizing an unanswered hold) drops the byline. */
 export async function approvalResolutionLine(
   approval: PendingApproval,
@@ -504,7 +514,10 @@ export async function approvalResolutionLine(
     /* fall through to the raw value */
   }
   const name = userId ? (await getUser(userId))?.display_name || userId : '';
-  return name ? `${selectedLabel} — ${name}` : selectedLabel;
+  const line = name ? `${selectedLabel} — ${name}` : selectedLabel;
+  return line.length <= APPROVAL_RESOLUTION_MAX_UNITS
+    ? line
+    : headUnits(line, APPROVAL_RESOLUTION_MAX_UNITS - 1).trimEnd() + '…';
 }
 
 /**

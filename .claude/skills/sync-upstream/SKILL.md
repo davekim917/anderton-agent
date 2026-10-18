@@ -23,14 +23,14 @@ Reopen one only when upstream ships something that changes its premise.
 Read-only, from the live checkout:
 
 ```bash
-R=/home/ubuntu/nanoclaw-v2
-git -C $R status --porcelain --untracked-files=no   # must print nothing
-git -C $R fetch upstream --prune
-git -C $R fetch origin --prune
-PIN=$(node -p "require('$R/src/upstream-ratchet.json').upstream")
-UP=$(git -C $R rev-parse upstream/main)
-git -C $R rev-list --first-parent --count $PIN..$UP
-git -C $R log --first-parent --format='%h %cs %s' $PIN..$UP
+R="$(git rev-parse --show-toplevel)"   # run from the live checkout
+git -C "$R" status --porcelain --untracked-files=no   # must print nothing
+git -C "$R" fetch upstream --prune
+git -C "$R" fetch origin --prune
+PIN=$(node -p 'require(process.argv[1]).upstream' "$R/src/upstream-ratchet.json")
+UP=$(git -C "$R" rev-parse upstream/main)
+git -C "$R" rev-list --first-parent --count $PIN..$UP
+git -C "$R" log --first-parent --format='%h %cs %s' $PIN..$UP
 ```
 
 `$UP` is this cycle's target. Write it down: triage and the re-pin both use that head, even if upstream moves in between.
@@ -40,8 +40,8 @@ git -C $R log --first-parent --format='%h %cs %s' $PIN..$UP
 Check on every cycle:
 
 - **Upgrade tripwire:** `node_modules/.bin/tsx scripts/upgrade-state.ts get` matches `node -p "require('./package.json').version"`.
-- **Migrations:** `git -C $R diff --name-only --diff-filter=A $PIN $UP -- src/db/migrations/`. The ledger is keyed by `name`, not file number. Skip a migration whose `name` the fork already has; it has already run. A new one keeps upstream's `name` and takes the next free fork ordinal, one above the highest `NNN-` file in `src/db/migrations/`. A migration that ALTERs `container_configs` registers after the last existing `container_configs` ALTER in `src/db/migrations/index.ts` (the block that follows the aliased `containerConfigs`): the array runs in array order, that table is created late, and `src/db/migrations/registry.test.ts` requires a live upgrade and a fresh install to end with the same column order, which an earlier slot breaks.
-- **Host runtime:** `git -C $R show $UP:package.json | grep -A2 engines` against `node -v`. A Node major goes through §5.
+- **Migrations:** `git -C "$R" diff --name-only --diff-filter=A $PIN $UP -- src/db/migrations/`. The ledger is keyed by `name`, not file number. Skip a migration whose `name` the fork already has; it has already run. A new one keeps upstream's `name` and takes the next free fork ordinal, one above the highest `NNN-` file in `src/db/migrations/`. A migration that ALTERs `container_configs` registers after the last existing `container_configs` ALTER in `src/db/migrations/index.ts` (the block that follows the aliased `containerConfigs`): the array runs in array order, that table is created late, and `src/db/migrations/registry.test.ts` requires a live upgrade and a fresh install to end with the same column order, which an earlier slot breaks.
+- **Host runtime:** `git -C "$R" show $UP:package.json | grep -A2 engines` against `node -v`. A Node major goes through §5.
 - **Tooling:** call `node_modules/.bin/tsx` and `node_modules/.bin/vitest` directly. A nested `pnpm exec` costs about 80 s of CPU here.
 
 ## 2. Triage
@@ -50,11 +50,11 @@ Test each first-parent commit for a clean cherry-pick onto fork main. `merge-tre
 
 ```bash
 O=$(mktemp -d)
-for c in $(git -C $R rev-list --first-parent --reverse $PIN..$UP); do
-  GIT_OBJECT_DIRECTORY=$O GIT_ALTERNATE_OBJECT_DIRECTORIES=$R/.git/objects \
-    git -C $R merge-tree --write-tree --name-only --merge-base=$c^1 origin/main $c >/dev/null
+for c in $(git -C "$R" rev-list --first-parent --reverse $PIN..$UP); do
+  GIT_OBJECT_DIRECTORY=$O GIT_ALTERNATE_OBJECT_DIRECTORIES="$R/.git/objects" \
+    git -C "$R" merge-tree --write-tree --name-only --merge-base=$c^1 origin/main $c >/dev/null
   case $? in 0) s=clean ;; 1) s=conflict ;; *) s=error ;; esac
-  echo "$s $(git -C $R log -1 --format='%h %cs %s' $c)"
+  echo "$s $(git -C "$R" log -1 --format='%h %cs %s' $c)"
 done
 ```
 
@@ -67,7 +67,7 @@ Put every commit in exactly one place:
 - **Declined.** Not wanted. Record why, and the trigger that would reopen it, on the theme's `upstream-port` issue.
 - **Not applicable.** Code this install doesn't run, such as setup for unused channels, skills it doesn't install, or upstream-only infrastructure.
 
-**Customization contract.** List the fork customizations in files this cycle's upstream commits touch: `git -C $R log --no-merges --format='%h %s' upstream/main..origin/main -- <file>`. For each, write down its intent, its integration point, and the test that proves its behavior. If upstream now ships an equivalent, adopt upstream's version only when that test passes against it. Keep the fork's version when the intent is unclear, and write the missing test before any port touches that file.
+**Customization contract.** List the fork customizations in files this cycle's upstream commits touch: `git -C "$R" log --no-merges --format='%h %s' upstream/main..origin/main -- <file>`. For each, write down its intent, its integration point, and the test that proves its behavior. If upstream now ships an equivalent, adopt upstream's version only when that test passes against it. Keep the fork's version when the intent is unclear, and write the missing test before any port touches that file.
 
 **Channels and providers.** Installed adapters ship on upstream's `channels` and `providers` branches, which neither this triage nor the ratchet covers. Run `/update-skills` for them.
 
@@ -85,7 +85,7 @@ Open one PR per fast-lane batch (host or container) and one per theme. Work in a
 
 ```bash
 W=<scratchpad>/wt-<topic>
-git -C $R worktree add -b port/<topic> "$W" origin/main
+git -C "$R" worktree add -b port/<topic> "$W" origin/main
 (cd "$W" && pnpm install --frozen-lockfile --offline)   # the worktree's own install, seconds from the shared store; never link $R/node_modules (the install refuses through a link)
 git -C "$W" cherry-pick -x <sha>             # -m 1 for a merge commit; resolve against the customization contract
 ```
@@ -100,10 +100,10 @@ scripts/test-safe.sh lint
 scripts/test-safe.sh <targeted files>
 node_modules/.bin/tsx scripts/upstream-ratchet-report.ts --root "$W" --write [--accept <path>]   # when an upstream-owned file changed
 (cd container/agent-runner && bun install --frozen-lockfile && bun run typecheck && bun run test)   # when container/agent-runner/ changed
-(cd $R && pnpm run check:public-boundary -- --root "$W" --index)   # from the live checkout so pnpm resolves; scans $W's index
+(cd "$R" && pnpm run check:public-boundary -- --root "$W" --index)   # from the live checkout so pnpm resolves; scans $W's index
 ```
 
-Never run the full host suite on this host. Push, open the PR from `$W` (`gh pr create` takes its head branch from the working directory) with a `Replaces:` line, and drive it with the `pr-review-loop` skill, which owns review rounds, receipts and the merge (`codex-review.sh merge --head <sha>`). After the merge: `git -C $R worktree remove "$W"`. The worktree's `node_modules` is ignored, so a plain remove deletes it along with the tree; `--force` is only for untracked files you left behind.
+Never run the full host suite on this host. Push, open the PR from `$W` (`gh pr create` takes its head branch from the working directory) with a `Replaces:` line, and drive it with the `pr-review-loop` skill, which owns review rounds, receipts and the merge (`codex-review.sh merge --head <sha>`). After the merge: `git -C "$R" worktree remove "$W"`. The worktree's `node_modules` is ignored, so a plain remove deletes it along with the tree; `--force` is only for untracked files you left behind.
 
 Drift tests, green before and after every port:
 
@@ -136,7 +136,7 @@ A merge reaches production only at a deploy, and every deploy needs the operator
 If the deploy carries a migration, take a hot backup first. Never `cp` a live SQLite file, and note that `scripts/deploy.sh` takes no DB backup:
 
 ```bash
-cd $R && node -e "const D=require('better-sqlite3'); new D('data/v2.db',{readonly:true}).backup('data/v2.db.pre-sync-'+Date.now()).then(()=>process.exit(0))"
+cd "$R" && node -e "const D=require('better-sqlite3'); new D('data/v2.db',{readonly:true}).backup('data/v2.db.pre-sync-'+Date.now()).then(()=>process.exit(0))"
 ```
 
 Deploy with `scripts/deploy.sh` or the Discord `/deploy` command. It pulls, builds the host, rebuilds the agent image when `container/` changed, and restarts. Its crash guard rolls back a boot crash, but it doesn't arm when the deploy ships a migration. A host restart leaves running containers for the new host to adopt; boot stops only the ones it cannot adopt.
@@ -144,13 +144,13 @@ Deploy with `scripts/deploy.sh` or the Discord `/deploy` command. It pulls, buil
 Before launching the deploy, checkpoint both logs to a file; shell variables don't survive between tool calls:
 
 ```bash
-cd $R && echo "$(date +%s) $(wc -l < logs/nanoclaw.log) $(wc -l < logs/nanoclaw.error.log)" > <scratchpad>/log-checkpoint
+cd "$R" && echo "$(date +%s) $(wc -l < logs/nanoclaw.log) $(wc -l < logs/nanoclaw.error.log)" > <scratchpad>/log-checkpoint
 ```
 
 Gate at about 2.5 minutes after the restart. INFO lines go to `logs/nanoclaw.log` and WARN and above to `logs/nanoclaw.error.log`, so read both from the checkpoint. Daily rotation is a `copytruncate` that writes a new `.1` file, so a `.1` created after the checkpoint means the file rotated in between and its earlier lines are in `.1`:
 
 ```bash
-cd $R && read C L0 E0 < <scratchpad>/log-checkpoint
+cd "$R" && read C L0 E0 < <scratchpad>/log-checkpoint
 for pair in "logs/nanoclaw.log:$L0" "logs/nanoclaw.error.log:$E0"; do
   f=${pair%:*}; n=${pair##*:}
   if [ "$(stat -c %Z "$f.1" 2>/dev/null || echo 0)" -lt "$C" ]; then tail -n +$((n + 1)) "$f"; else tail -n +$((n + 1)) "$f.1"; cat "$f"; fi

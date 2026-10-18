@@ -61,8 +61,8 @@ function spawn(cfg: Record<string, unknown>, channel: { model?: string | null; e
 }
 
 describe('END-TO-END after the deletion', () => {
-  it('round-5 P1: a haiku group sends NO effort, and the container is what refuses it', () => {
-    const r = spawn({ model: 'haiku' });
+  it('round-5 P1: a Haiku 4.5 group sends NO effort, and the container is what refuses it', () => {
+    const r = spawn({ model: 'claude-haiku-4-5-20251001' });
     console.log('  haiku group  env=', JSON.stringify(r.env), ' -> model=', r.model, ' effort=', r.effort);
     expect(r.env.NANOCLAW_CLAUDE_MODEL).toBe('claude-haiku-4-5-20251001');
     // ...and the group's model does NOT become what the word `opus` means:
@@ -74,10 +74,18 @@ describe('END-TO-END after the deletion', () => {
   });
 
   it('round-6 P2: an explicit effort the host no longer clamps is clamped by the container', () => {
-    const r = spawn({ model: 'haiku', effort: 'high' });
+    const r = spawn({ model: 'claude-haiku-4-5-20251001', effort: 'high' });
     console.log('  haiku+high   env=', JSON.stringify(r.env), ' -> model=', r.model, ' effort=', r.effort);
     expect(r.env.NANOCLAW_EFFORT_OVERRIDE).toBe('high'); // host passes it through
     expect(r.effort).toBeUndefined(); // container clamps it
+  });
+
+  it('a haiku group runs Haiku 5.5 at its family default, and keeps an explicit effort', () => {
+    const r = spawn({ model: 'haiku' });
+    expect(r.env.NANOCLAW_CLAUDE_MODEL).toBe('claude-haiku-5-5');
+    expect(r.model).toBe('claude-haiku-5-5');
+    expect(r.effort).toBe('medium');
+    expect(spawn({ model: 'haiku', effort: 'max' }).effort).toBe('max');
   });
 
   it('round-6 P2 shape: providerConfig.model wins and the operator effort SURVIVES', () => {

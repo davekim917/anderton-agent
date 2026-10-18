@@ -6,10 +6,11 @@
   "scripts": {
     "start": "bun src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test --preload ./src/test-hermeticity.ts"
+    "test": "bun test --preload ./src/test-hermeticity.ts --path-ignore-patterns='**/*live-path*'",
+    "test:live-path": "bun test --preload ./src/test-hermeticity.ts live-path"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.290",
+    "@anthropic-ai/claude-agent-sdk": "0.3.302",
     "@anthropic-ai/sdk": "0.131.0",
     "@modelcontextprotocol/sdk": "1.32.1",
     "@opencode-ai/sdk": "1.18.34",

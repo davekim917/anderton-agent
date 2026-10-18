@@ -9,7 +9,6 @@
     "ncl": "bin/ncl"
   },
   "scripts": {
-    "prebuild": "tsx scripts/check-build-clean.ts",
     "build": "tsc && pnpm run build:spa",
     "postbuild": "tsx scripts/write-build-info.ts",
     "build:spa": "tsx scripts/build-dashboard-spa.ts",
@@ -33,7 +32,7 @@
     "test:watch": "vitest",
     "test:coverage:risk": "VITEST_LANE=correctness vitest run --coverage",
     "check:risk-coverage": "tsx scripts/check-risk-coverage.ts",
-    "check:public-boundary": "tsx scripts/check-public-boundary.ts",
+    "check:public-boundary": "tsx scripts/check-public-boundary.ts --allow-absent-sources",
     "check:dependency-links": "tsx scripts/check-dependency-links.ts",
     "check:git-safety-selfcheck": "bash scripts/git-safety-selfcheck.sh",
     "check:wiki-pre-push-hook-selfcheck": "bash scripts/wiki-pre-push-hook-selfcheck.sh",

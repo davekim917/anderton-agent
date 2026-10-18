@@ -49,15 +49,15 @@ describe('setup carries the picked provider to creation via a setup-run env var'
   });
 
   // The creation scripts run as child processes, inherit the env var, and apply
-  // it to the group's runtime config — container_configs.provider, the source of
-  // truth materialized into container.json (agent_provider is deprecated) — before
+  // it to the group's runtime config — container.json, which the spawn boots, and
+  // its container_configs projection (agent_provider is deprecated) — before
   // the welcome wakes the container, falling back to the instance default
   // (DEFAULT_AGENT_PROVIDER) when the env var is unset. No `--provider` flag in
-  // the contract (above). init-first-agent stamps directly via
-  // ensureContainerConfig; init-cli-agent threads it through initGroupFilesystem.
+  // the contract (above). Both stamp it via stampGroupProvider, which writes the
+  // projection row and the container.json the spawn boots.
   const applyPattern: Record<string, RegExp> = {
-    'scripts/init-first-agent.ts': /ensureContainerConfig\([^)]*pickedProvider/,
-    'scripts/init-cli-agent.ts': /provider:\s*pickedProvider/,
+    'scripts/init-first-agent.ts': /stampGroupProvider\(ag, created, pickedProvider\)/,
+    'scripts/init-cli-agent.ts': /stampGroupProvider\(ag, created, pickedProvider\)/,
   };
   for (const [file, pattern] of Object.entries(applyPattern)) {
     it(`${file} applies the env-carried provider to container_configs.provider`, () => {

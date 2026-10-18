@@ -64,6 +64,11 @@ const MEMORY_MANIFEST = '.memory-migration.json';
  * mount predicate: a workgroup migrated before the flag was turned off keeps its mount.
  */
 const MIGRATION_MARKER = '.migrated';
+
+/** Whether a spawn mounts this workgroup's shared tree at `/workspace/workgroup`. */
+export function workgroupSharedTreeMounted(workgroupId: string, dataDir: string = DATA_DIR): boolean {
+  return WORKGROUP_SHARED_FS || fs.existsSync(path.join(workgroupSharedDir(workgroupId, dataDir), MIGRATION_MARKER));
+}
 export const SHARED_WORK_DIR_NAME = 'artifacts';
 // `memory` has its own lifecycle; `artifacts` is created empty ahead of the
 // migrator, which would read a present-but-empty `dst` as a completed move and
@@ -835,8 +840,8 @@ function ensureOneWorkgroupWorkDir(
 ): void {
   assertTrustedPathSegment(workgroupId, 'workgroup id');
   const wgDir = workgroupSharedDir(workgroupId, ctx.dataDir);
-  // Same predicate as the container-runner.ts mount: an unmounted target is worse than no link.
-  if (!WORKGROUP_SHARED_FS && !fs.existsSync(path.join(wgDir, MIGRATION_MARKER))) return;
+  // An unmounted target is worse than no link.
+  if (!workgroupSharedTreeMounted(workgroupId, ctx.dataDir)) return;
   fs.mkdirSync(path.join(wgDir, SHARED_WORK_DIR_NAME), { recursive: true });
   const members = db.prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`).all(workgroupId) as Array<{
     folder: string;

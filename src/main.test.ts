@@ -95,6 +95,7 @@ const EXPECTED_HOST_START_REGISTRANTS = [
   'backlogCanvasHostStart',
   'commitScanHostStart',
   'dailySummaryHostStart',
+  'outOfDateReleaseCardsHostStart',
   'pluginUpdaterHostStart',
   'repoFreshnessHostStart',
   'worktreeCleanupHostStart',

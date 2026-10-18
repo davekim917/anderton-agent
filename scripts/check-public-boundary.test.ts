@@ -6,6 +6,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { cachedGithubVisibility, type VisibilityVerdict } from './lib/github-visibility.js';
 import {
   applyBaseline,
   loadInstallIdentifiers,
@@ -21,6 +22,23 @@ import {
   scanInputs,
   writeBaseline,
 } from './check-public-boundary.js';
+
+// The gh transport: a scan of a fixture store asks this instead of GitHub.
+const githubAnswers = vi.hoisted(() => new Map<string, string>());
+vi.mock('./lib/github-visibility.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./lib/github-visibility.js')>();
+  return {
+    ...real,
+    ghVisibilityLookup: (repositories: { owner: string; repo: string }[]) =>
+      new Map(
+        repositories.flatMap((repository) => {
+          const key = real.repositoryKey(repository);
+          const answer = githubAnswers.get(key);
+          return answer ? [[key, answer]] : [];
+        }),
+      ),
+  };
+});
 
 const roots: string[] = [];
 
@@ -91,6 +109,7 @@ function cloneDetached(sourceRoot: string): string {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  githubAnswers.clear();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -227,6 +246,38 @@ describe('scanInputs', () => {
     ).toEqual([{ file: '.public-boundary-allowlist.json', line: 2, category: 'private-identifier' }]);
   });
 
+  it('detects identifiers and structural values written as escape sequences', () => {
+    const findings = scanInputs(
+      [
+        input('a.json', '{\n  "client": "\\u0041cme Private"\n}'),
+        input('b.ts', 'const name = "acme\\x2dprivate";'),
+        input('c.js', 'const contact = "ops\\u{40}acme-co.com";'),
+        input('d.json', '{ "line": "\\u000a" }'),
+        input('e.py', 'NAME = "Acme \\U00000050rivate"'),
+        input('f.html', '<td>Acme&#32;Priv&#x61;te</td>'),
+        input('g.html', '<td>Acme&#32Private</td>'),
+      ],
+      new Set(['Acme Private']),
+      [],
+    );
+    expect(findings).toEqual([
+      { file: 'a.json', line: 2, category: 'private-identifier' },
+      { file: 'b.ts', line: 1, category: 'private-identifier' },
+      { file: 'c.js', line: 1, category: 'email-address' },
+      { file: 'e.py', line: 1, category: 'private-identifier' },
+      { file: 'f.html', line: 1, category: 'private-identifier' },
+      { file: 'g.html', line: 1, category: 'private-identifier' },
+    ]);
+  });
+
+  it('keeps an escaped allowlist value exempt in its own serialized form', () => {
+    const email = ['community', 'project.dev'].join(String.fromCharCode(64));
+    const allowlist = [{ path: 'CODE_OF_CONDUCT.md', value: email, reason: 'published project contact' }];
+    const serialized = JSON.stringify({ entries: allowlist }, null, 2).replace('@', '\\u0040');
+    expect(scanInputs([input('.public-boundary-allowlist.json', serialized)], new Set(), allowlist)).toEqual([]);
+    expect(scanInputs([input('other/allowlist.json', serialized)], new Set(), allowlist)).toHaveLength(1);
+  });
+
   it('rejects forbidden artifact paths', () => {
     const findings = scanInputs(
       [input('.context/specs/old.md', 'clean'), input('docs/specs/feature/qa-evidence/run.jsonl', 'clean')],
@@ -267,7 +318,12 @@ describe('install-aware inputs', () => {
       'slack-private',
       'Private Room',
     );
-    db.prepare('INSERT INTO messaging_groups VALUES (?, ?, ?, ?)').run('mg-native1', 'native-private-cli', 'cli', 'Native private cli');
+    db.prepare('INSERT INTO messaging_groups VALUES (?, ?, ?, ?)').run(
+      'mg-native1',
+      'native-private-cli',
+      'cli',
+      'Native private cli',
+    );
     db.close();
     const values = loadRegistryIdentifiers(dbPath);
     expect(values.has('Private House')).toBe(true);
@@ -458,6 +514,66 @@ describe('Git surfaces and modes', () => {
     execFileSync('git', ['add', 'structural.md'], { cwd: root });
     expect(main(['--root', root, '--index', '--allow-structural'])).toBe(1);
     expect(stderr.mock.calls.flat().join('')).toContain('structural.md:1 email-address');
+  });
+
+  describe('--allow-absent-sources', () => {
+    const leak = (root: string, file: string, text: string) => {
+      fs.writeFileSync(path.join(root, file), `${text}\n`);
+      execFileSync('git', ['add', file], { cwd: root });
+    };
+
+    it('gates a clone with no identifier source on structural patterns', () => {
+      const root = initRepo();
+      const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+      expect(main(['--root', root, '--index', '--allow-absent-sources'])).toBe(0);
+      expect(stdout.mock.calls.flat().join('')).toContain('public boundary check passed');
+
+      leak(root, 'structural.md', `person${String.fromCharCode(64)}company.dev`);
+      expect(main(['--root', root, '--index', '--allow-absent-sources'])).toBe(1);
+      expect(stderr.mock.calls.flat().join('')).toContain('structural.md:1 email-address');
+    });
+
+    it('still matches the identifiers of a source that is present', () => {
+      const root = initRepo();
+      addInstallRegistry(root, 'Synthetic Registry');
+      vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+      leak(root, 'leak.md', 'Synthetic Registry');
+      expect(main(['--root', root, '--index', '--allow-absent-sources'])).toBe(1);
+      expect(stderr.mock.calls.flat().join('')).toContain('leak.md:1 private-identifier');
+    });
+
+    it.each([
+      { source: 'install registry', file: ['data', 'v2.db'], content: 'not a database' },
+      { source: 'identifier inventory', file: ['.nanoclaw', 'public-boundary-identifiers'], content: '' },
+    ])('fails closed when the $source exists but cannot be read', ({ file, content }) => {
+      const root = initRepo();
+      fs.mkdirSync(path.join(root, file[0]), { recursive: true });
+      fs.writeFileSync(path.join(root, ...file), content);
+      const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+      expect(main(['--root', root, '--index', '--allow-absent-sources'])).toBe(1);
+      expect(stdout).not.toHaveBeenCalled();
+      expect(stderr.mock.calls.flat().join('')).toContain('an identifier source exists but could not be read');
+    });
+
+    it.each([
+      { source: 'install registry', file: ['data', 'v2.db'] },
+      { source: 'identifier inventory', file: ['.nanoclaw', 'public-boundary-identifiers'] },
+    ])('fails closed when the $source is a dangling symlink', ({ file }) => {
+      const root = initRepo();
+      fs.mkdirSync(path.join(root, file[0]));
+      fs.symlinkSync(path.join(root, 'unmounted', file[1]), path.join(root, ...file));
+      vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+      expect(main(['--root', root, '--index', '--allow-absent-sources'])).toBe(1);
+      expect(stderr.mock.calls.flat().join('')).toContain('an identifier source exists but could not be read');
+    });
   });
 });
 
@@ -769,6 +885,8 @@ describe('identifiers derived from the install', () => {
     addCanonical(dataDir, 'wg-fictional', 'WIDGET', 'https://github.com/acme-co/WIDGET.git');
     addCanonical(dataDir, 'wg-fictional', 'dbt', 'git@github.com:acme-co/dbt.git');
     addCanonical(dataDir, 'wg-fictional', 'project', 'https://github.com/open-org/project');
+    addCanonical(dataDir, 'wg-fictional', 'bootstrap', 'https://github.com/acme-co/bootstrap');
+    addCanonical(dataDir, 'wg-fictional', 'nanoclaw-scripts', 'https://github.com/open-org/nanoclaw-scripts');
     fs.mkdirSync(path.join(dataDir, 'repositories', 'wg-fictional', 'not-a-clone'), { recursive: true });
 
     const problems: string[] = [];
@@ -913,6 +1031,89 @@ describe('identifiers derived from the install', () => {
     const problems: string[] = [];
     expect(loadInstallIdentifiers(dbPath, exempt, problems)).toEqual(new Set(['Acme-Co', 'Widget']));
     expect(problems).toEqual([]);
+  });
+
+  function answering(answers: Record<string, VisibilityVerdict>, asked: string[] = []) {
+    return cachedGithubVisibility({
+      cachePath: path.join(tempRoot(), 'visibility.json'),
+      lookup: (repositories) => {
+        const keys = repositories.map((repository) => `${repository.owner}/${repository.repo}`.toLowerCase());
+        asked.push(...keys);
+        return new Map(keys.flatMap((key) => (answers[key] ? [[key, answers[key]] as const] : [])));
+      },
+    });
+  }
+
+  it('drops a store clone GitHub proves public, and keeps one it cannot', () => {
+    const dataDir = path.join(tempRoot(), 'data');
+    const dbPath = writeRegistry(dataDir);
+    addCanonical(dataDir, 'wg-fictional', 'kit', 'https://github.com/open-org/Sprocket-Kit.git');
+    addCanonical(dataDir, 'wg-fictional', 'widget', 'https://github.com/acme-co/Widget.git');
+    addCanonical(dataDir, 'wg-fictional', 'gadget', 'git@github.com:quartz-co/Gadget.git');
+    addCanonical(dataDir, 'wg-fictional', 'gizmo', 'https://github.com/zinc-co/Gizmo');
+    const problems: string[] = [];
+    const values = loadInstallIdentifiers(dbPath, publicProject, problems, {
+      publicRepositories: answering({
+        'open-org/sprocket-kit': 'public',
+        'acme-co/widget': 'private',
+        'quartz-co/gadget': 'not_found',
+      }),
+      otherIdentifiers: [],
+    });
+    expect(values).toEqual(new Set(['acme-co', 'Widget', 'quartz-co', 'Gadget', 'zinc-co', 'Gizmo']));
+    expect(problems).toEqual([]);
+  });
+
+  it.each([
+    ['owns a private clone in the store', 'https://github.com/acme-co/Widget.git', [] as string[]],
+    ['is named after a registry workgroup', 'https://github.com/fictional-house-inc/tools.git', []],
+    ['is named in the local inventory', 'https://github.com/globexinc/Toolbox.git', ['Globex']],
+    ['is a short slug of a private name', 'https://github.com/globex/Toolbox.git', ['Globex Corporation']],
+    ['shares a word with a private name', 'https://github.com/globex-labs/Toolbox.git', ['Globex Corporation']],
+  ])('keeps a public clone whose owner %s', (_, url, otherIdentifiers) => {
+    const dataDir = path.join(tempRoot(), 'data');
+    const dbPath = writeRegistry(dataDir);
+    addCanonical(dataDir, 'wg-fictional', 'widget', 'https://github.com/acme-co/Widget.git');
+    addCanonical(dataDir, 'wg-fictional', 'oss', url.replace(/\/(?:Widget|tools|Toolbox)\.git$/, '/Open-Kit.git'));
+    const owner = /github\.com\/([^/]+)\//.exec(url)?.[1] ?? '';
+    const values = loadInstallIdentifiers(dbPath, publicProject, [], {
+      publicRepositories: answering({ [`${owner}/open-kit`.toLowerCase()]: 'public' }),
+      otherIdentifiers: [...loadRegistryIdentifiers(dbPath), ...otherIdentifiers],
+    });
+    expect(values.has(owner)).toBe(true);
+    expect(values.has('Open-Kit')).toBe(true);
+  });
+
+  it('never asks GitHub about a clone on another host, which stays private', () => {
+    const dataDir = path.join(tempRoot(), 'data');
+    const dbPath = writeRegistry(dataDir);
+    addCanonical(dataDir, 'wg-fictional', 'hosted', 'https://git.example.com/acme-co/Widget.git');
+    const asked: string[] = [];
+    const everythingPublic = (repositories: { owner: string; repo: string }[]) => {
+      asked.push(...repositories.map((repository) => repository.repo));
+      return new Set(repositories.map((repository) => `${repository.owner}/${repository.repo}`.toLowerCase()));
+    };
+    const values = loadInstallIdentifiers(dbPath, publicProject, [], { publicRepositories: everythingPublic });
+    expect(values).toEqual(new Set(['acme-co', 'Widget']));
+    expect(asked).toEqual([]);
+  });
+
+  it('lets a commit mention a public repository an agent cloned into a client store', () => {
+    const root = initInstallRepo('Fictional Registry House', 'Fictional Local Team');
+    addCanonical(path.join(root, 'data'), 'main-house', 'kit', 'https://github.com/open-org/Sprocket-Kit.git');
+    addCanonical(path.join(root, 'data'), 'main-house', 'widget', 'https://github.com/acme-co/Widget.git');
+    fs.writeFileSync(path.join(root, 'notes.md'), 'Vendored from Sprocket-Kit.\n');
+    execFileSync('git', ['add', 'notes.md'], { cwd: root });
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    expect(main(['--root', root, '--index'])).toBe(1);
+    githubAnswers.set('open-org/sprocket-kit', 'public');
+    fs.rmSync(path.join(root, '.nanoclaw', 'github-visibility-cache.json'));
+    expect(main(['--root', root, '--index'])).toBe(0);
+    fs.writeFileSync(path.join(root, 'notes.md'), 'Vendored from Sprocket-Kit for Widget.\n');
+    execFileSync('git', ['add', 'notes.md'], { cwd: root });
+    expect(main(['--root', root, '--index'])).toBe(1);
   });
 
   it('records a clone whose origin form cannot be interpreted', () => {

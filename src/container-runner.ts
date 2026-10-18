@@ -37,7 +37,6 @@ import {
   ONECLI_URL,
   TASK_LIST_ENABLED,
   TASK_SCRIPT_TIMEOUT_MS,
-  WORKGROUP_SHARED_FS,
 } from './config.js';
 import {
   CONTAINER_PLUGINS_DIR,
@@ -138,6 +137,7 @@ import {
   reconcileWorkgroupMemory,
   workgroupMemoryDir,
   workgroupSharedDir,
+  workgroupSharedTreeMounted,
   WORKGROUP_CONTAINER_PATH,
   WORKGROUP_MEMORY_CONTAINER_PATH,
 } from './modules/workgroup/shared-dirs.js';
@@ -150,6 +150,7 @@ import {
   resolveWorkgroupReadAccess,
   workgroupReadAccessInstructions,
 } from './workgroup-read-access.js';
+import { workgroupVerifySkillsInstructions } from './workgroup-verify-skills.js';
 import { resolveWorkgroupWiki, workgroupWikiInstructions } from './workgroup-wiki.js';
 import {
   assertCredentialFolderInWorkgroup,
@@ -3501,6 +3502,7 @@ export async function buildMounts(
         validatedWorkgroupReadAccess,
       ),
       workgroupWikiInstructions: workgroupWikiInstructions(workgroupWiki),
+      workgroupVerifySkillsInstructions: workgroupVerifySkillsInstructions(wgKey),
       workgroupMcpServers: access.mcpServers,
       workgroupExcludePlugins: access.excludePlugins,
     });
@@ -3665,7 +3667,7 @@ export async function buildMounts(
   // `.migrated` marker, so turning the flag off does not dangle the compat symlinks.
   const wgId = wgKey;
   const wgShared = workgroupSharedDir(wgId);
-  if (WORKGROUP_SHARED_FS || fs.existsSync(path.join(wgShared, '.migrated'))) {
+  if (workgroupSharedTreeMounted(wgId)) {
     fs.mkdirSync(wgShared, { recursive: true });
     mounts.push({ hostPath: wgShared, containerPath: WORKGROUP_CONTAINER_PATH, readonly: false });
   }

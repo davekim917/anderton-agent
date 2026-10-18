@@ -234,10 +234,10 @@ verdict_digest() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
 # --- Cross-container coordinator lease -------------------------------------
 # The per-PR flock serializes gate PROCESSES; it cannot serialize CONTAINERS,
 # because two coordinators in two containers holding the same run id take that
-# lock at different moments and both proceed. That is what happened on the
-# Two campaigns: two coordinators ran the same campaign
-# concurrently and overwrote each other's markers. The shared workgroup FS is
-# the only durable medium both can see, so the lease is a file with an expiry.
+# lock at different moments and both proceed. That has happened: two
+# coordinators ran the same campaign concurrently and overwrote each other's
+# markers. The shared workgroup FS is the only durable medium both can see, so
+# the lease is a file with an expiry.
 num_env LEASE_TTL_SECONDS SMOKE_GATE_LEASE_TTL_SECONDS 900
 # Identifies the CONTAINER, not the invocation. A coordinator runs many
 # separate gate processes over a campaign and all of them must count as the

@@ -55,11 +55,19 @@ const RELEASE_SCOPE = {
   pullRequest: 42,
   base: 'main',
   headSha: 'a'.repeat(40),
+  holds: ['hold:access:sql/grants.sql', 'hold:irreversible:analytics.orders:10_rows'],
 };
 const DECISION = {
-  question: 'Retire the legacy export button?',
-  ifItShips: 'The export menu loses one entry.\nSaved exports keep working.',
+  kind: 'warning',
+  headline: 'Retiring the legacy export button removes a menu entry clients still use.',
+  asked: 'No ask on record',
+  does: 'The export menu loses one entry.\nSaved exports keep working.',
+  risk: 'clients who used the button cannot find it',
+  undo: 'Revert in 10 minutes; nothing is lost.',
+  holdingCosts: 'The menu stays cluttered another week.',
+  recommend: 'Send back: hide it behind a setting.',
   evidence: 'https://github.com/owner/repository/pull/42#issuecomment-1',
+  accept: 'a missing menu entry',
 };
 
 function inConversation(): void {
@@ -119,6 +127,42 @@ describe('request_choice', () => {
       approvalScope: RELEASE_SCOPE,
       decision: DECISION,
     });
+  });
+
+  it('transports the holds sorted, so host and runner name one canonical set', async () => {
+    inConversation();
+    const scope = { ...RELEASE_SCOPE, holds: ['hold:irreversible:b:1_rows', 'hold:access:a.sql'] };
+    expect((await requestChoice.handler({ approvalScope: scope, decision: DECISION })).isError).toBeUndefined();
+    expect((outbound('system')[0].content as { approvalScope: { holds: string[] } }).approvalScope.holds).toEqual([
+      'hold:access:a.sql',
+      'hold:irreversible:b:1_rows',
+    ]);
+  });
+
+  it('advertises exactly the fields the handler requires for each decision kind', async () => {
+    inConversation();
+    const schema = requestChoice.tool.inputSchema as {
+      properties: { decision: { oneOf: Array<{ properties: Record<string, unknown>; required: string[] }> } };
+    };
+    const filled = (variant: { properties: Record<string, unknown>; required: string[] }) =>
+      Object.fromEntries(
+        variant.required.map((k) => [
+          k,
+          k === 'kind'
+            ? (variant.properties.kind as { enum: string[] }).enum[0]
+            : k === 'evidence'
+              ? DECISION.evidence
+              : 'x',
+        ]),
+      );
+    for (const variant of schema.properties.decision.oneOf) {
+      const minimal = filled(variant);
+      expect((await requestChoice.handler({ approvalScope: RELEASE_SCOPE, decision: minimal })).isError).toBeFalsy();
+      for (const field of variant.required) {
+        const { [field]: _dropped, ...without } = minimal;
+        expect((await requestChoice.handler({ approvalScope: RELEASE_SCOPE, decision: without })).isError).toBe(true);
+      }
+    }
   });
 
   it('with `to`: resolves the channel destination into the action', async () => {
@@ -206,24 +250,89 @@ describe('request_choice', () => {
     ['a boolean PR in release scope', { approvalScope: { ...RELEASE_SCOPE, pullRequest: true } }, /approvalScope/],
     ['a zero PR in release scope', { approvalScope: { ...RELEASE_SCOPE, pullRequest: 0 } }, /approvalScope/],
     ['a fractional PR in release scope', { approvalScope: { ...RELEASE_SCOPE, pullRequest: 42.5 } }, /approvalScope/],
-    ['an unsafe PR in release scope', { approvalScope: { ...RELEASE_SCOPE, pullRequest: Number.MAX_SAFE_INTEGER + 1 } }, /approvalScope/],
-    ['a malformed repository in release scope', { approvalScope: { ...RELEASE_SCOPE, repository: 'owner repo' } }, /approvalScope/],
-    ['a malformed base in release scope', { approvalScope: { ...RELEASE_SCOPE, base: 'main branch' } }, /approvalScope/],
-    ['a short SHA in release scope', { approvalScope: { ...RELEASE_SCOPE, headSha: 'a'.repeat(39) } }, /approvalScope/],
-    ['an upper-case SHA in release scope', { approvalScope: { ...RELEASE_SCOPE, headSha: 'A'.repeat(40) } }, /approvalScope/],
-    ['a wrong purpose in release scope', { approvalScope: { ...RELEASE_SCOPE, purpose: 'other' } }, /approvalScope/],
-    ['an extra release scope key', { approvalScope: { ...RELEASE_SCOPE, extra: true } }, /approvalScope/],
-    ['a decision on a generic card', { ...ASK, decision: DECISION }, /only on an approvalScope/],
-    ['a release scope without a decision', { approvalScope: RELEASE_SCOPE }, /release card needs decision/],
     [
-      'a whitespace-only decision field',
-      { approvalScope: RELEASE_SCOPE, decision: { ...DECISION, ifItShips: ' \n ' } },
-      /exactly question, ifItShips and evidence/,
+      'an unsafe PR in release scope',
+      { approvalScope: { ...RELEASE_SCOPE, pullRequest: Number.MAX_SAFE_INTEGER + 1 } },
+      /approvalScope/,
     ],
     [
-      'a decision missing a field',
-      { approvalScope: RELEASE_SCOPE, decision: { question: 'Q?', evidence: DECISION.evidence } },
-      /exactly question, ifItShips and evidence/,
+      'a malformed repository in release scope',
+      { approvalScope: { ...RELEASE_SCOPE, repository: 'owner repo' } },
+      /approvalScope/,
+    ],
+    [
+      'a malformed base in release scope',
+      { approvalScope: { ...RELEASE_SCOPE, base: 'main branch' } },
+      /approvalScope/,
+    ],
+    ['a short SHA in release scope', { approvalScope: { ...RELEASE_SCOPE, headSha: 'a'.repeat(39) } }, /approvalScope/],
+    [
+      'an upper-case SHA in release scope',
+      { approvalScope: { ...RELEASE_SCOPE, headSha: 'A'.repeat(40) } },
+      /approvalScope/,
+    ],
+    ['a wrong purpose in release scope', { approvalScope: { ...RELEASE_SCOPE, purpose: 'other' } }, /approvalScope/],
+    ['an extra release scope key', { approvalScope: { ...RELEASE_SCOPE, extra: true } }, /approvalScope/],
+    [
+      'a warning card without holds',
+      { approvalScope: { ...RELEASE_SCOPE, holds: undefined }, decision: DECISION },
+      /warning card needs approvalScope.holds/,
+    ],
+    [
+      'a warning card with an empty holds list',
+      { approvalScope: { ...RELEASE_SCOPE, holds: [] }, decision: DECISION },
+      /warning card needs approvalScope.holds/,
+    ],
+    [
+      'a repeated hold code',
+      { approvalScope: { ...RELEASE_SCOPE, holds: ['hold:access:a.sql', 'hold:access:a.sql'] }, decision: DECISION },
+      /approvalScope/,
+    ],
+    [
+      'a wait code in holds',
+      { approvalScope: { ...RELEASE_SCOPE, holds: ['wait:effect_check'] }, decision: DECISION },
+      /approvalScope/,
+    ],
+    [
+      'more than 12 hold codes',
+      {
+        approvalScope: { ...RELEASE_SCOPE, holds: Array.from({ length: 13 }, (_, i) => `hold:access:f${i}.sql`) },
+        decision: DECISION,
+      },
+      /approvalScope/,
+    ],
+    ['a decision on a generic card', { ...ASK, decision: DECISION }, /only on an approvalScope/],
+    ['a release scope without a decision', { approvalScope: RELEASE_SCOPE }, /release card needs its decision/],
+    [
+      'a whitespace-only decision field',
+      { approvalScope: RELEASE_SCOPE, decision: { ...DECISION, does: ' \n ' } },
+      /warning decision needs does as non-empty text/,
+    ],
+    [
+      'a warning decision missing its accepted risk',
+      { approvalScope: RELEASE_SCOPE, decision: { ...DECISION, risk: undefined } },
+      /warning decision needs risk/,
+    ],
+    [
+      'the retired question/ifItShips shape',
+      { approvalScope: RELEASE_SCOPE, decision: { question: 'Q?', ifItShips: 'x', evidence: DECISION.evidence } },
+      /decision.kind must be "warning" or "release"/,
+    ],
+    [
+      'a release decision carrying a Ship anyway button',
+      {
+        approvalScope: RELEASE_SCOPE,
+        decision: {
+          kind: 'release',
+          headline: 'h',
+          warnings: 'No unresolved warnings',
+          does: 'd',
+          undo: 'u',
+          evidence: DECISION.evidence,
+          accept: 'x',
+        },
+      },
+      /release decision does not take accept/,
     ],
     ['a malformed key', { ...ASK, key: 'has spaces' }, /key must be/],
     ['an over-long key', { ...ASK, key: 'k'.repeat(129) }, /key must be/],

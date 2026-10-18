@@ -8,6 +8,7 @@ import { setTimeout as sleep } from 'timers/promises';
 
 import { log } from '../src/log.js';
 import { getDefaultContainerImage } from '../src/install-slug.js';
+import { dockerHasPlugin } from './lib/docker-plugin.js';
 import { commandExists, getPlatform } from './platform.js';
 import { emitStatus } from './status.js';
 
@@ -60,6 +61,15 @@ async function tryStartDocker(): Promise<DockerStatus> {
   }
   log.warn('Docker did not become ready within 60s');
   return 'no-daemon';
+}
+
+/** Builds through container/build.sh, which stamps the labels the host's spawn gate checks. */
+export function buildAgentImage(projectRoot: string, image: string): number | null {
+  return spawnSync('bash', [path.join(projectRoot, 'container', 'build.sh')], {
+    cwd: projectRoot,
+    stdio: 'inherit',
+    env: { ...process.env, CONTAINER_IMAGE_REF: image },
+  }).status;
 }
 
 function parseArgs(args: string[]): { runtime: string } {
@@ -162,49 +172,31 @@ export async function run(args: string[]): Promise<void> {
     }
   }
 
-  const buildCmd = 'docker build';
-  const runCmd = 'docker';
-
-  // Build-args from .env. Only INSTALL_CJK_FONTS is passed through today.
-  // Keeps /setup and ./container/build.sh in sync — both read the same source.
-  const buildArgs: string[] = [];
-  try {
-    const fs = await import('fs');
-    const envPath = path.join(projectRoot, '.env');
-    if (fs.existsSync(envPath)) {
-      const match = fs.readFileSync(envPath, 'utf-8').match(/^INSTALL_CJK_FONTS=(.+)$/m);
-      const val = match?.[1].trim().replace(/^["']|["']$/g, '').toLowerCase();
-      if (val === 'true') buildArgs.push('--build-arg INSTALL_CJK_FONTS=true');
-    }
-  } catch {
-    // .env is optional; absence is normal on a fresh checkout
+  if (!dockerHasPlugin('buildx')) {
+    log.error('Docker has no buildx plugin');
+    emitStatus('SETUP_CONTAINER', {
+      RUNTIME: runtime,
+      IMAGE: image,
+      BUILD_OK: false,
+      TEST_OK: false,
+      STATUS: 'failed',
+      ERROR: 'docker_plugin_missing',
+      MISSING: 'buildx',
+      LOG: 'logs/setup.log',
+    });
+    process.exit(1);
   }
 
-  // Build — stdio inherit so the parent setup runner can tail docker's
-  // per-step output and render it in a rolling window. Previously we used
-  // execSync which buffered everything; users couldn't tell whether a
-  // 3–10 minute build was making progress or hung.
-  let buildOk = false;
-  log.info('Building container', { runtime, buildArgs });
-  const buildRes = spawnSync(
-    buildCmd.split(' ')[0],
-    [
-      ...buildCmd.split(' ').slice(1),
-      ...buildArgs.flatMap((a) => a.split(' ')),
-      '-t',
-      image,
-      '.',
-    ],
-    {
-      cwd: path.join(projectRoot, 'container'),
-      stdio: 'inherit',
-    },
-  );
-  if (buildRes.status === 0) {
-    buildOk = true;
+  const runCmd = 'docker';
+
+  // stdio inherit so the parent setup runner can tail docker's per-step output
+  // and render it in a rolling window; a 3–10 minute build otherwise looks hung.
+  log.info('Building container', { runtime, image });
+  const buildOk = buildAgentImage(projectRoot, image) === 0;
+  if (buildOk) {
     log.info('Container build succeeded');
   } else {
-    log.error('Container build failed', { exitCode: buildRes.status });
+    log.error('Container build failed');
   }
 
   // Test

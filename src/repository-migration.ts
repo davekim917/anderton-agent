@@ -1,6 +1,7 @@
 import { execFileSync } from 'child_process';
 import { createHash, randomBytes } from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -811,7 +812,7 @@ function validateReviewedRecoverySeed(
   const seed = fs.realpathSync(unresolvedSeed);
   const seedRoot = path.resolve(
     process.env.NANOCLAW_REPOSITORY_RECOVERY_SEED_ROOT ??
-      '/home/ubuntu/backups/nanoclaw-worktree-recovery/repository-seeds',
+      path.join(os.homedir(), 'backups', 'nanoclaw-worktree-recovery', 'repository-seeds'),
   );
   if (!pathContained(seed, seedRoot)) throw new Error(`reviewed recovery seed escapes its host-only root: ${seed}`);
   const cacheKey = `${seed}\0${expectedSha256}`;

@@ -138,6 +138,8 @@ describe('codex provider container-config: agents/ mount', () => {
       expect(written).toContain('model_auto_compact_token_limit = 360000');
       expect(written.indexOf('model_context_window = 400000')).toBeLessThan(written.indexOf('[features]'));
       expect(written.indexOf('model_auto_compact_token_limit = 360000')).toBeLessThan(written.indexOf('[features]'));
+      expect(written).toContain('model_reasoning_effort = "high"');
+      expect(written.indexOf('model_reasoning_effort = "high"')).toBeLessThan(written.indexOf('[features]'));
       expect(written).toContain('[features]');
       expect(written).toContain('context_management = true');
       expect(written).toContain('fast_mode = false');

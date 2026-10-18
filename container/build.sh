@@ -3,7 +3,6 @@
 #
 # Reads one optional build flag from ../.env:
 #   INSTALL_CJK_FONTS=true   — add Chinese/Japanese/Korean fonts (~200MB)
-# setup/container.ts reads the same file, so both build paths stay in sync.
 # Callers can also override by exporting INSTALL_CJK_FONTS directly.
 
 set -e

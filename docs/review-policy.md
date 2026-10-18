@@ -70,10 +70,16 @@ the receipt's `--reviewer` copies it verbatim, e.g. `claude-opus-5 (opus)`,
 `gpt-6.1-sol high (codex exec)` or `opencode/deepseek-v4.1-flash (opencode run)`.
 Everything after the first word is free text. Nobody has to be free for this:
 the author may start that reviewer as a fresh process
-(`codex exec -m gpt-6.1-sol -c model_reasoning_effort=high`,
-`CLAUDE_CODE_EFFORT_LEVEL=high claude -p --model opus --effort high`, or
-`opencode run -m <provider/model> '<prompt>' < /dev/null`) and hand it the
-inputs above.
+(`container/skills/pr-review-loop/scripts/codex-exec.sh -m gpt-6.1-sol -c model_reasoning_effort=high`,
+which moves to the next Codex account once on a usage limit,
+`claude -p --model opus --effort high --safe-mode --no-session-persistence
+--permission-mode plan --tools '' --strict-mcp-config --output-format json < prompt`,
+or `opencode run -m <provider/model> '<prompt>' < /dev/null`) and hand it the
+inputs above. Keep the `claude -p` flags exactly as written: in a Claude-provider
+container signed in with an OAuth token only that tool-less form reaches the
+runner's credentials, and any other flag set fails with "Not logged in" (see
+[agent-runner-details.md](agent-runner-details.md)). With no tools, the prompt
+must carry the diff and the files.
 
 Record a durable review receipt tied to the exact final SHA: reviewer and
 runtime, complete-diff and relevant-file scope, outcome, and every finding with

@@ -1,6 +1,6 @@
 # Observatory / Signal design system
 
-Approved direction: `/home/ubuntu/design-artifacts/observatory-signal/artifact.html` and the `2addd684014a` desktop/mobile captures. The application adapts that composition to real variable-length records and working controls.
+Approved direction: the `observatory-signal` design artifact and its `2addd684014a` desktop/mobile captures. The application adapts that composition to real variable-length records and working controls.
 
 Canvas `#101112`; surface `#191b1d`; raised `#222527`; divider `#34383b`; text `#eef0f2`; secondary `#adb4bb`; primary action `#e8ece4`; attention `#efc181`. Mint is reserved for evidenced operational state. No purple, gradients, decorative glow or fabricated progress percentages.
 

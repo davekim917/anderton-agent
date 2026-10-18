@@ -7,11 +7,12 @@ import { log } from './log.js';
 import type { RouteCheckRequest } from './thread-route-check.js';
 
 /**
- * Calibrated on jev-1.13.0 with the check's exact question and thread view; re-tune from `thread_route_checks`.
- * On the post text the host judges, known misroutes score 0.02-0.06 and correct continues as low as 0.27, so the
- * cut sits just under the lowest correct continue and far above every misroute.
+ * 0: the score is advisory, stored in `thread_route_checks` but never a veto; only a failed check still opens a new
+ * thread. The watcher routes by workstream (the same metric, report or decision, even for a different deliverable),
+ * and Jev's same-request score cannot separate that from a misroute: on jev-1.13.0 such continues score 0.07-0.12
+ * against 0.04-0.06 for known misroutes. Raise it again only after re-tuning on a workstream question.
  */
-export const ROUTE_CHECK_THRESHOLD = 0.25;
+export const ROUTE_CHECK_THRESHOLD = 0;
 
 export type RouteCheckPoint = 'a' | 'b' | 'c';
 

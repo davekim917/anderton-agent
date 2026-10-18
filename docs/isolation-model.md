@@ -11,8 +11,14 @@ or archived conversation must not cross between agents.
 
 Agent credentials are not an isolation boundary, and were never a reliable one.
 Every container carries all three provider credentials whatever its own
-provider, so any agent can drive `claude -p`, `codex exec` or `opencode`
-headless with the fleet's own accounts:
+provider, so an agent can drive `codex exec` or `opencode` headless with the
+fleet's own accounts, and `claude -p` from any shell the Claude Code CLI did not
+start. The Claude CLI deletes `CLAUDE_CODE_OAUTH_TOKEN` (not an
+`ANTHROPIC_API_KEY`) from every child it spawns, so in a Claude-provider session
+signed in with an OAuth token a plain `claude -p` run from the Bash tool fails
+with "Not logged in". Only the tool-less review form reaches the runner's
+credentials there ([agent-runner-details.md](agent-runner-details.md)); the token
+is still in the container, which is why this is no boundary either. The credentials:
 
 - the **Claude** ring, as env;
 - the **Codex** `auth.json` from `~/.codex-<folder>` where a group has its own

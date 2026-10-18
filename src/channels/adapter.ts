@@ -23,9 +23,16 @@ export interface ChannelSetup {
 
   /**
    * A card button click. `messageId` is the clicked message's platform id, null when the platform gave none; an
-   * approval resolves only from a click on its own card.
+   * approval resolves only from a click on its own card. `replyToClicker`, when the platform can, answers the
+   * clicker alone (Slack ephemeral, Discord flags 64); a refused click uses it to say who can answer.
    */
-  onAction(questionId: string, selectedOption: string, userId: string, messageId: string | null): void;
+  onAction(
+    questionId: string,
+    selectedOption: string,
+    userId: string,
+    messageId: string | null,
+    replyToClicker?: (text: string) => Promise<void>,
+  ): void;
 
   secretIntake?: SecretIntakeHooks;
 

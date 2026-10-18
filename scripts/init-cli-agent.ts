@@ -38,7 +38,7 @@ import { upsertUser } from '../src/modules/permissions/db/users.js';
 import { initGroupFilesystem } from '../src/group-init.js';
 import type { MessagingGroup } from '../src/types.js';
 
-import { findOrCreateAgentGroup, generateId } from './lib/bootstrap-agent-group.js';
+import { findOrCreateAgentGroup, generateId, stampGroupProvider } from './lib/bootstrap-agent-group.js';
 
 const CLI_CHANNEL = 'cli';
 const CLI_PLATFORM_ID = 'local';
@@ -106,7 +106,7 @@ async function main(): Promise<void> {
   // 2. Agent group + filesystem.
   const folder = args.folder || `cli-with-${normalizeName(args.displayName)}`;
   const pickedProvider = process.env.NANOCLAW_PICKED_PROVIDER?.trim().toLowerCase();
-  const ag = await findOrCreateAgentGroup(folder, args.agentName, now);
+  const { ag, created } = await findOrCreateAgentGroup(folder, args.agentName, now);
   initGroupFilesystem(ag, {
     instructions:
       `# ${args.agentName}\n\n` +
@@ -117,6 +117,7 @@ async function main(): Promise<void> {
     // stamps it onto the fresh config row.
     provider: pickedProvider,
   });
+  await stampGroupProvider(ag, created, pickedProvider);
 
   // 3. CLI messaging group + wiring.
   let cliMg: MessagingGroup | undefined = await getMessagingGroupByPlatform(CLI_CHANNEL, CLI_PLATFORM_ID);

@@ -651,7 +651,7 @@ describe('Chat SDK bridge Discord approval actions', () => {
       'bot-token',
     );
 
-    expect(onAction).toHaveBeenCalledWith('appr-discord', 'approve', 'U1', 'discord-card-1');
+    expect(onAction).toHaveBeenCalledWith('appr-discord', 'approve', 'U1', 'discord-card-1', undefined);
     const callbackInit = fetchMock.mock.calls[0]?.[1];
     expect(callbackInit).toBeDefined();
     // type 6 (DEFERRED_UPDATE_MESSAGE), not 7: the bridge has not checked whose
@@ -677,7 +677,7 @@ describe('Chat SDK bridge Discord approval actions', () => {
       'bot-token',
     );
 
-    expect(onAction).toHaveBeenCalledWith('appr-discord-wire', 'approve', 'U1', 'discord-card-1');
+    expect(onAction).toHaveBeenCalledWith('appr-discord-wire', 'approve', 'U1', 'discord-card-1', undefined);
     const callbackInit = fetchMock.mock.calls[0]?.[1];
     expect(callbackInit).toBeDefined();
     expect(JSON.parse(callbackInit!.body as string)).toEqual({ type: 6 });

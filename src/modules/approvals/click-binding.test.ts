@@ -120,6 +120,8 @@ let deliveries: Array<Record<string, unknown>>;
 let bridgeEdits: Array<{ messageId: string; body: string }>;
 /** Discord interaction callbacks the bridge sent (type 6 acknowledges; type 7 rewrites the message). */
 let discordCallbacks: Array<Record<string, unknown>>;
+/** Replies only the clicker sees, through the adapter's ephemeral post. */
+let ephemerals: Array<{ userId: string; message: unknown }>;
 let bridgeAdapter: Adapter;
 /** Dispatches started by onAction, which main.ts fires without awaiting. */
 const dispatches: Array<Promise<void>> = [];
@@ -171,7 +173,13 @@ async function click(questionId: string, index: number, clicker: string, message
 }
 
 /** The same click on Discord, as the gateway forwards the interaction. */
-async function discordClick(questionId: string, index: number, clicker: string, messageId: string): Promise<void> {
+async function discordClick(
+  questionId: string,
+  index: number,
+  clicker: string,
+  messageId: string,
+  applicationId?: string,
+): Promise<void> {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (_url: unknown, init?: RequestInit) => {
@@ -186,6 +194,7 @@ async function discordClick(questionId: string, index: number, clicker: string, 
         type: 3,
         id: 'interaction-1',
         token: 'token-1',
+        ...(applicationId ? { application_id: applicationId } : {}),
         data: { custom_id: `ncq:${questionId}:${index}\n${index}` },
         member: { user: { id: clicker } },
         message: { id: messageId, content: 'Run this?' },
@@ -239,12 +248,12 @@ async function seedGate(
   });
 }
 
-async function seedChoice(approvalId: string, platformMessageId: string | null): Promise<void> {
+async function seedChoice(approvalId: string, platformMessageId: string | null, approvers?: string[]): Promise<void> {
   await createPendingApproval({
     approval_id: approvalId,
     request_id: `choice-${approvalId}`,
     action: CHOICE,
-    payload: '{}',
+    payload: approvers ? JSON.stringify({ approvers }) : '{}',
     created_at: now(),
     title: 'Production release',
     question: 'Ship to production?',
@@ -310,6 +319,7 @@ beforeEach(async () => {
   deliveries = [];
   bridgeEdits = [];
   discordCallbacks = [];
+  ephemerals = [];
   setDeliveryAdapter({
     async deliver(_channelType, _platformId, _threadId, _kind, content) {
       deliveries.push(JSON.parse(content) as Record<string, unknown>);
@@ -350,6 +360,10 @@ beforeEach(async () => {
     channelIdFromThreadId: (threadId: string) => `stub:${threadId}`,
     editMessage: async (_threadId: string, messageId: string, content: unknown) => {
       bridgeEdits.push({ messageId, body: JSON.stringify(content) });
+    },
+    postEphemeral: async (threadId: string, userId: string, message: unknown) => {
+      ephemerals.push({ userId, message });
+      return { id: 'eph-1', threadId, usedFallback: false, raw: {} };
     },
   } as unknown as Adapter;
   await createChatSdkBridge({ adapter: bridgeAdapter, supportsThreads: false }).setup(setupFor('slack'));
@@ -515,6 +529,9 @@ describe("a click made on the approval's own card still resolves it", () => {
     await click('oa-click03', 0, 'UUNKNOWN', 'real-credential-card');
 
     expect((await getPendingApproval('oa-click03'))?.status).toBe('pending');
+    expect(ephemerals).toEqual([
+      { userId: 'UUNKNOWN', message: 'Only Owner can answer this card. Your click did not count.' },
+    ]);
   });
 
   it('OneCLI credential approval preserves an already namespaced Slack actor', async () => {
@@ -651,6 +668,8 @@ describe('a press that is refused discloses nothing of the approval it named', (
     // approval's text went anywhere else either.
     expect(bridgeEdits).toEqual([]);
     expect(JSON.stringify(deliveries)).not.toContain('board@example.com');
+    // A counterfeit card gets no explanation either: it would name the real card's approvers.
+    expect(ephemerals).toEqual([]);
   });
 
   it('Discord: the interaction is acknowledged, never rewritten', async () => {
@@ -678,6 +697,61 @@ describe('a press that is refused discloses nothing of the approval it named', (
     expect((await getPendingApproval('appr-authz'))?.status).toBe('pending');
     expect(bridgeEdits).toEqual([]);
     expect(deliveries).toEqual([]);
+    expect(ephemerals).toEqual([
+      { userId: 'UNOBODY', message: 'Only an admin of this agent can answer this card. Your click did not count.' },
+    ]);
+  });
+
+  it('an owner pressing a card that names another approver is told who can answer, and nothing is decided', async () => {
+    await createUser({ id: 'slack:UMORGAN', kind: 'slack', display_name: 'Morgan', created_at: now() });
+    await seedChoice('appr-named', 'named-card', ['slack:UMORGAN']);
+
+    await click('appr-named', 0, 'UOWNER', 'named-card');
+
+    expect(answered).toEqual([]);
+    expect((await getPendingApproval('appr-named'))?.status).toBe('pending');
+    expect(bridgeEdits).toEqual([]);
+    expect(ephemerals).toEqual([
+      { userId: 'UOWNER', message: 'Only Morgan can answer this card. Your click did not count.' },
+    ]);
+  });
+
+  it('a card naming many long-named approvers still gets a reply within one platform message', async () => {
+    const approvers = Array.from({ length: 30 }, (_, i) => `slack:UAPPROVER${i}`);
+    for (const [i, id] of approvers.entries()) {
+      await createUser({ id, kind: 'slack', display_name: `Approver ${i} ${'x'.repeat(100)}`, created_at: now() });
+    }
+    await seedChoice('appr-many', 'many-card', approvers);
+
+    await click('appr-many', 0, 'UOWNER', 'many-card');
+
+    expect(answered).toEqual([]);
+    expect(ephemerals).toHaveLength(1);
+    const reply = String(ephemerals[0].message);
+    expect(reply).toMatch(/^Only Approver 0 x+.*… can answer this card\. Your click did not count\.$/);
+    expect(reply.length).toBeLessThanOrEqual(2000);
+  });
+
+  it('Discord: an unauthorized press on the real card gets an ephemeral follow-up, and nothing is decided', async () => {
+    await seedGate('appr-d-authz', {
+      sessionId: 'sess-dm',
+      channelType: 'discord',
+      platformId: 'discord:@me:dm-owner',
+      platformMessageId: 'discord-card',
+    });
+
+    await discordClick('appr-d-authz', 0, 'dnobody', 'discord-card', 'app-1');
+
+    expect(approved).toEqual([]);
+    expect((await getPendingApproval('appr-d-authz'))?.status).toBe('pending');
+    expect(discordCallbacks).toEqual([
+      { type: 6 },
+      {
+        content: 'Only an admin of this agent can answer this card. Your click did not count.',
+        flags: 64,
+        allowed_mentions: { parse: [] },
+      },
+    ]);
   });
 });
 

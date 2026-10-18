@@ -1,8 +1,62 @@
 # Migration: the Claude default model
 
-## Current: Sonnet default moves to 5.5 (2026-09-29)
+## Current: Haiku default moves to 5.5 (2026-10-18)
 
-This section is the current migration. Opus and Fable defaults do not move (see **History: 2026-09-24** and **History: 2026-09-22** below). Only the Sonnet family default (model and effort) and the container's pinned CLI move.
+This section is the current migration. Opus, Sonnet and Fable defaults do not move. The Haiku family default (model and effort) and the container's pinned CLI move. The host's own Haiku calls do not.
+
+**What moves.**
+- `DEFAULT_HAIKU_MODEL` (`src/flag-parser.ts`) is `claude-haiku-5-5`, was `claude-haiku-4-5-20251001`. Every Claude path whose model resolves through the word `haiku` runs Haiku 5.5: a chat `-m haiku`, a `haiku` wiring, group, task or `providerFallback` pin, a subagent's `model: haiku`, and any call the CLI itself makes through the word (the CLI resolves it through `ANTHROPIC_DEFAULT_HAIKU_MODEL`, which `claudeSpawnEnv` sets from the same constant). A frozen `claude-haiku-4-5` id or its `haiku45` alias keeps Haiku 4.5. New pinned aliases: `haiku55` / `haiku5-5` / `haiku-5-5`.
+- Haiku 5.5 takes effort (`low` through `max`); Haiku 4.5 does not. `-e` on `haiku` is now applied instead of skipped with a warning. Where no layer sets an effort, `defaultEffortForModel` returns `medium`, Anthropic's own default for 5.5, for the word and every `claude-haiku-*` id except `claude-haiku-4-*`, which still gets none and still drops an explicit effort.
+- The host's direct Haiku calls (`callHaiku`, `src/llm.ts`: Discord thread titles and dashboard session titles) stay on Haiku 4.5. They call `/v1/messages` with a subscription OAuth token, which serves Haiku 4.5 to a plain request and refuses Haiku 5.5 with `429 rate_limit_error: Error`, as it refuses Sonnet 5.5. Moving them needs an API-key credential or a route through Claude Code. Haiku 5.5 would also reject their `temperature: 0` (400 `temperature is deprecated for this model`), and its default thinking counts toward their 80-token cap.
+- Claude Code 2.1.302 turns fork subagents on in SDK sessions. The Claude spawn env (`claudeSpawnEnv`, agent and wiki containers alike) now sets `CLAUDE_CODE_FORK_SUBAGENT=0`, so container behaviour does not change.
+
+Haiku 5.5 costs $0.10 / $0.50 per MTok for prompts up to 100K tokens and $0.50 / $2.50 above, against $1 / $5 for Haiku 4.5. It has a 1M context window natively, so no `[1m]` suffix, and the same text counts as about 30% more tokens.
+
+**Detect.** A path moves when its chain ends at the word `haiku`. Check every layer:
+
+```bash
+grep -HE '"(model|defaultModel)": *"haiku"' groups/*/container.json
+pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mg.name, mga.agent_group_id, mga.default_model from messaging_group_agents mga join messaging_groups mg on mg.id = mga.messaging_group_id where lower(coalesce(mga.default_model,'')) = 'haiku'"
+ncl tasks list --json | grep -B1 -A1 '"model_pin": "haiku"'
+grep -rHE '^model: *haiku' groups/*/.claude/agents; find ~/plugins -type d -name agents -not -path '*/node_modules/*' -exec grep -rHE '^model: *haiku' {} +
+grep -E '^NANOCLAW_SESSION_TITLE_MODEL=' .env
+```
+
+For session stickies, run the sticky sweep in History: 2026-09-22 (Detect §4) and look for `haiku`. The precedence notes in History: 2026-09-29 (stickies, `providerConfig.model`, support-poller pins) apply unchanged.
+
+**Why.** Haiku 5.5 replaces Haiku 4.5 at a tenth of the price, with a larger context window and better instruction following. The container CLI must know the id. 2.1.290 has no `claude-haiku-5-5` in its model catalog, and 2.1.302 lists it with adaptive thinking and the effort ladder. This change pins exactly 2.1.302, with agent SDK 0.3.302 in the same patch.
+
+**Fix: keep Haiku 4.5 on a path, before deploying.**
+
+```bash
+ncl groups config update --id <group-id> --model claude-haiku-4-5
+ncl wirings update <wiring-id> --default-model claude-haiku-4-5
+ncl tasks repin --all --from-model haiku --to-model claude-haiku-4-5 --dry-run   # literal match; apply without --dry-run
+```
+
+Edit `providerConfig.model`, `providerFallback.model` and legacy `defaultModel` in `groups/<g>/container.json` directly.
+
+**Deploy.** Run `scripts/deploy.sh`. It rebuilds the agent image because `container/` changed, and the SDK bump changes the runner's deps hash, so spawns from the old image are refused until the image matches. Rebuild every `imageTag` group's image before the host restart (`grep -lE '"imageTag"' groups/*/container.json`). A host restart adopts running containers, which keep their spawn-time CLI and `ANTHROPIC_DEFAULT_HAIKU_MODEL`; recycle a group with `ncl groups restart --id <group-id>` at a quiet moment.
+
+**Verify.**
+
+```bash
+docker inspect <fresh claude container> --format '{{range .Config.Env}}{{println .}}{{end}}' | grep ANTHROPIC_DEFAULT_HAIKU_MODEL
+docker exec <fresh claude container> claude --version
+pnpm exec tsx scripts/q.ts data/v2.db "select model, effort, count(*) from turn_usage where ts > '<deploy time>' and model like '%haiku%' group by 1,2"
+```
+
+Expect `ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-5-5`, CLI 2.1.302, and Haiku rows from fresh containers on `claude-haiku-5-5`.
+
+**Rollback.**
+- **One path:** apply the Fix commands above, then `ncl groups restart --id <group-id>`.
+- **The fleet default:** set `DEFAULT_HAIKU_MODEL` back to `claude-haiku-4-5-20251001` and redeploy. The effort changes can stay, since Haiku 4.5 ids still get none, and so can the CLI/SDK pins, since 2.1.302 still serves Haiku 4.5.
+
+---
+
+## History: 2026-09-29 — Sonnet default moves to 5.5
+
+Opus and Fable defaults do not move (see **History: 2026-09-24** and **History: 2026-09-22** below). Only the Sonnet family default (model and effort) and the container's pinned CLI move.
 
 **What moves.** `DEFAULT_SONNET_MODEL` (`src/flag-parser.ts`) is `claude-sonnet-5-5`, was `claude-sonnet-5`. On deploy, every Claude path whose model resolves through the word `sonnet` runs Sonnet 5.5: a chat `-m sonnet`, a `sonnet` wiring, group, task or `providerFallback` pin, and a subagent's `model: sonnet` (the CLI resolves the word through `ANTHROPIC_DEFAULT_SONNET_MODEL`, which `claudeSpawnEnv`, `src/claude-spawn-defaults.ts`, sets from the same constant). Unpinned groups resolve to Opus and do not move. A frozen id (`claude-sonnet-5`) or its pinned alias (`sonnet5`) keeps Sonnet 5. Effort moves too: `defaultEffortForModel` returns `high`, not `xhigh`, for the bare word and every `claude-sonnet-*` id, wherever no layer sets an effort, so a frozen `claude-sonnet-5` pin with no effort moves to `high` as well. Every explicit effort pin keeps its value. `high` is Anthropic's own default for Sonnet 5.5, which recalibrated its levels against Sonnet 5, so an `xhigh` set on a 5.5 path is not the same amount of thinking as on 5. New pinned aliases: `sonnet55` / `sonnet5-5` / `sonnet-5-5`.
 

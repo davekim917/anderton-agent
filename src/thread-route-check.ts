@@ -1,7 +1,7 @@
 /**
  * Routing check for a route-checked post (`thread-route-split.ts`) about to land in an existing thread: Jev judges
- * whether that thread already works the post's request; below the threshold, or on any failure, the post opens a new
- * thread instead. Every decision is stored in `thread_route_checks` for re-tuning.
+ * whether that thread already works the post's request; on any failure, or below the threshold (0, so the score is
+ * advisory), the post opens a new thread instead. Every decision is stored in `thread_route_checks` for re-tuning.
  */
 import { getDb } from './db/connection.js';
 import { log } from './log.js';

@@ -18,6 +18,7 @@ import path from 'path';
 
 import { log } from '../src/log.js';
 import { readVersionPin } from './lib/version-pins.js';
+import { dockerHasPlugin } from './lib/docker-plugin.js';
 import { emitStatus } from './status.js';
 
 const LOCAL_BIN = path.join(os.homedir(), '.local', 'bin');
@@ -392,6 +393,17 @@ export async function run(args: string[]): Promise<void> {
       LOG: 'logs/setup.log',
     });
     return;
+  }
+
+  if (!dockerHasPlugin('compose')) {
+    emitStatus('ONECLI', {
+      INSTALLED: false,
+      STATUS: 'failed',
+      ERROR: 'docker_plugin_missing',
+      MISSING: 'compose',
+      LOG: 'logs/setup.log',
+    });
+    process.exit(1);
   }
 
   log.info('Installing OneCLI gateway and CLI');

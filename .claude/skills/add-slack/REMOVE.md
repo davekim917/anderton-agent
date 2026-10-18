@@ -10,11 +10,11 @@ Delete the self-registration import from `src/channels/index.ts` (skip if alread
 import './slack.js';
 ```
 
-Then delete the copied adapter, its registration test, and the `slack-formatting`
+Then delete the copied adapter, its A2A guard, its registration test, and the `slack-formatting`
 container skill (part of the channel payload — trunk doesn't ship it):
 
 ```bash
-rm -f src/channels/slack.ts src/channels/slack-registration.test.ts container/skills/slack-formatting/SKILL.md
+rm -f src/channels/slack.ts src/channels/slack-a2a-guard.ts src/channels/slack-registration.test.ts container/skills/slack-formatting/SKILL.md
 ```
 
 ## 2. Remove credentials
