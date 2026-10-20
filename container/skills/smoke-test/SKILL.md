@@ -511,6 +511,18 @@ coverage. **Browser lanes must not start if this script
 exits non-zero.** Treat that exit as `BLOCKED_BUILD_IDENTITY` and stop — do not
 dispatch the UI adversary or backend verifier lanes against an unproven build.
 
+When the served clients call a same-origin path (a Render static site that
+rewrites `/api/*` to the backend), the backend host is absent from the bundle
+by design. Set `SMOKE_BUILD_ID_API_BASE=/api`, the frozen backend commit in
+`SMOKE_BUILD_ID_EXPECTED_COMMIT`, and the static site's Render service id in
+`SMOKE_BUILD_ID_FRONTEND_SERVICE` (with `RENDER_API_KEY`). The script then
+scans the entry bundle and every chunk it reaches for the quoted base, refuses
+any direct reference to the backend host or a stale host, reads the site's
+routes to prove the first rule matching `<base><health path>` is the rewrite
+`<base>/* -> <backend>/*`, and requires both the direct and the same-origin
+health to return JSON carrying the frozen commit. Backend reachability alone is
+never proxy proof; the script's header lists every refusal.
+
 **Freeze the deployed PAIR with `scripts/smoke-pair-identity.sh`, not a
 per-run ad hoc script.** `smoke-build-identity.sh` proves the bundle/host
 binding once; it does not re-prove the environment still serves the SAME

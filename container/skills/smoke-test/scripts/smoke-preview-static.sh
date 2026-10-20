@@ -8,10 +8,12 @@
 # `<meta name="build-sha" content="...">` tag on its root page. Anything short of
 # 40 hex characters is no identity at all. A same-commit redeploy is invisible here.
 
+SERVED_SHA_JQ='(.sha // .commit // .gitSha // empty) | select(type == "string" and test("^[0-9a-f]{40}$"))'
+
 served_sha() {  # <preview url> → the 40-character commit it serves, or empty
   local url="${1%/}" out sha="" path="${SMOKE_PREVIEW_VERSION_PATH:-/version}"
   if out="$(timeout 10 curl -fsS --max-time 10 "$url$path" 2>/dev/null)"; then
-    sha="$(jq -r '(.sha // .commit // .gitSha // empty) | select(type == "string" and test("^[0-9a-f]{40}$"))' <<<"$out" 2>/dev/null)"
+    sha="$(jq -r "$SERVED_SHA_JQ" <<<"$out" 2>/dev/null)"
   fi
   if [ -z "$sha" ] && out="$(timeout 10 curl -fsS --max-time 10 "$url/" 2>/dev/null)"; then
     sha="$(grep -oiE '<meta[^>]+name="build-sha"[^>]*>' <<<"$out" | head -n 1 | sed -nE 's/.*content="([0-9a-f]{40})".*/\1/p')"
