@@ -1,3 +1,4 @@
+import { spawn } from 'child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
@@ -15,6 +16,7 @@ import {
   startNohupWrapper,
   type FlockCommandOverrides,
 } from './service.js';
+import { waitForHostStart } from './lib/host-start.js';
 
 /**
  * Tests for service configuration generation.
@@ -257,28 +259,65 @@ describe('Graphify sidecar decommission', () => {
 });
 
 describe('startNohupWrapper', () => {
-  function wrapper(body: string): { wrapperPath: string; pidFile: string } {
+  function wrapper(body: string): { wrapperPath: string; pidFile: string; logPath: string } {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-nohup-test-'));
     const pidFile = path.join(dir, 'nanoclaw.pid');
+    const logPath = path.join(dir, 'nanoclaw.error.log');
     const wrapperPath = path.join(dir, 'start-nanoclaw.sh');
-    fs.writeFileSync(wrapperPath, `#!/bin/bash\n${body.replaceAll('PIDFILE', JSON.stringify(pidFile))}\n`);
-    return { wrapperPath, pidFile };
+    const script = body.replaceAll('PIDFILE', JSON.stringify(pidFile)).replaceAll('LOGFILE', JSON.stringify(logPath));
+    fs.writeFileSync(wrapperPath, `#!/bin/bash\n${script}\n`);
+    return { wrapperPath, pidFile, logPath };
   }
+  const quick: typeof waitForHostStart = (marks, isAlive, isReady, opts) =>
+    waitForHostStart(marks, isAlive, isReady, { ...opts, timeoutMs: 1500, pollMs: 50 });
+  const ready = async () => true;
+  const notReady = async () => false;
 
-  it('reports a host that is still running after the wrapper returns', () => {
-    const { wrapperPath, pidFile } = wrapper('nohup sleep 30 >/dev/null 2>&1 &\necho $! > PIDFILE');
-    expect(startNohupWrapper(wrapperPath, pidFile, 200)).toBe(true);
+  it('reports a host that answered as ready', async () => {
+    const { wrapperPath, pidFile, logPath } = wrapper('nohup sleep 30 >/dev/null 2>&1 &\necho $! > PIDFILE');
+    expect(await startNohupWrapper(wrapperPath, pidFile, [logPath], ready, quick)).toBe('running');
     process.kill(Number(fs.readFileSync(pidFile, 'utf8')));
   });
 
-  it('reports a host that exited right after starting', () => {
-    const { wrapperPath, pidFile } = wrapper('true &\necho $! > PIDFILE');
-    expect(startNohupWrapper(wrapperPath, pidFile, 200)).toBe(false);
+  it('does not report a live host that never answered as ready', async () => {
+    const { wrapperPath, pidFile, logPath } = wrapper('nohup sleep 30 >/dev/null 2>&1 &\necho $! > PIDFILE');
+    expect(await startNohupWrapper(wrapperPath, pidFile, [logPath], notReady, quick)).toBe('timeout');
+    process.kill(Number(fs.readFileSync(pidFile, 'utf8')));
   });
 
-  it('reports a wrapper that failed', () => {
-    const { wrapperPath, pidFile } = wrapper('exit 1');
-    expect(startNohupWrapper(wrapperPath, pidFile, 200)).toBe(false);
+  it('reports a host that logged a startup failure', async () => {
+    const { wrapperPath, pidFile, logPath } = wrapper(
+      'nohup bash -c "echo FATAL Startup failed >> LOGFILE; sleep 30" >/dev/null 2>&1 &\necho $! > PIDFILE',
+    );
+    expect(await startNohupWrapper(wrapperPath, pidFile, [logPath], notReady, quick)).toBe('failed');
+    process.kill(Number(fs.readFileSync(pidFile, 'utf8')));
+  });
+
+  it('reports a host that exited right after starting', async () => {
+    const { wrapperPath, pidFile, logPath } = wrapper('true &\necho $! > PIDFILE');
+    expect(await startNohupWrapper(wrapperPath, pidFile, [logPath], notReady, quick)).toBe('exited');
+  });
+
+  it('does not take a ready answer from the host it is replacing as the new host starting', async () => {
+    const old = spawn('bash', ['-c', 'trap "" TERM; sleep 30'], { stdio: 'ignore', detached: true });
+    const { wrapperPath, pidFile, logPath } = wrapper('true &\necho $! > PIDFILE');
+    fs.writeFileSync(pidFile, String(old.pid));
+    expect(await startNohupWrapper(wrapperPath, pidFile, [logPath], ready, quick)).toBe('exited');
+    old.kill('SIGKILL');
+  });
+
+  it('accepts a ready answer once the replaced host has exited', async () => {
+    const old = spawn('bash', ['-c', 'trap "" TERM; sleep 0.3'], { stdio: 'ignore', detached: true });
+    const { wrapperPath, pidFile, logPath } = wrapper('nohup sleep 30 >/dev/null 2>&1 &\necho $! > PIDFILE');
+    fs.writeFileSync(pidFile, String(old.pid));
+    old.on('exit', () => {});
+    expect(await startNohupWrapper(wrapperPath, pidFile, [logPath], ready, quick)).toBe('running');
+    process.kill(Number(fs.readFileSync(pidFile, 'utf8')));
+  });
+
+  it('reports a wrapper that failed', async () => {
+    const { wrapperPath, pidFile, logPath } = wrapper('exit 1');
+    expect(await startNohupWrapper(wrapperPath, pidFile, [logPath], notReady, quick)).toBe('exited');
   });
 });
 

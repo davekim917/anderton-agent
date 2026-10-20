@@ -510,6 +510,19 @@ export async function getPendingApprovalByRequestId(requestId: string): Promise<
   );
 }
 
+export async function getApprovalByRequestId(
+  requestId: string,
+  sessionId: string,
+  action: string,
+): Promise<PendingApproval | undefined> {
+  return getDb().get<PendingApproval>(
+    'SELECT * FROM pending_approvals WHERE request_id = ? AND session_id = ? AND action = ?',
+    requestId,
+    sessionId,
+    action,
+  );
+}
+
 export async function updatePendingApprovalMessageId(
   approvalId: string,
   platformMessageId: string | null,
@@ -554,18 +567,40 @@ export async function transitionPendingApprovalStatus(
 }
 
 /**
- * Park an approval in the "rejected, awaiting reason" hold: the admin clicked
- * "Reject with reason…" and we're waiting for their one-line reply. `expiresAt`
- * is the deadline after which the host sweep finalizes a plain reject (so a
- * ghosted hold never strands the requesting agent). Reuses the otherwise-unused
- * `expires_at` column on module-initiated rows.
+ * Claim a pending approval into the "rejected, awaiting reason" hold: the admin
+ * clicked "Reject with reason…" and we're waiting for their one-line reply.
+ * `expiresAt` is the deadline after which the host sweep finalizes a plain
+ * reject (so a ghosted hold never strands the requesting agent). Reuses the
+ * otherwise-unused `expires_at` column on module-initiated rows. False when the
+ * row was no longer pending (another response won).
  */
-export async function markApprovalAwaitingReason(approvalId: string, expiresAt: string): Promise<void> {
-  await getDb().run(
-    "UPDATE pending_approvals SET status = 'awaiting_reason', expires_at = ? WHERE approval_id = ?",
+export async function markApprovalAwaitingReason(approvalId: string, expiresAt: string): Promise<boolean> {
+  const result = await getDb().run(
+    "UPDATE pending_approvals SET status = 'awaiting_reason', expires_at = ? WHERE approval_id = ? AND status = 'pending'",
     expiresAt,
     approvalId,
   );
+  return result.changes > 0;
+}
+
+/** False when the hold already ended (the sweep or a reply finalized it). */
+export async function restartApprovalReasonWindow(approvalId: string, expiresAt: string): Promise<boolean> {
+  const result = await getDb().run(
+    "UPDATE pending_approvals SET expires_at = ? WHERE approval_id = ? AND status = 'awaiting_reason'",
+    expiresAt,
+    approvalId,
+  );
+  return result.changes > 0;
+}
+
+/** The sweep's claim: still held, and its window (which the delivered prompt may have restarted) really elapsed. */
+export async function claimExpiredReasonHold(approvalId: string, nowIso: string): Promise<boolean> {
+  const result = await getDb().run(
+    "UPDATE pending_approvals SET status = 'rejected' WHERE approval_id = ? AND status = 'awaiting_reason' AND expires_at <= ?",
+    approvalId,
+    nowIso,
+  );
+  return result.changes > 0;
 }
 
 /** Awaiting-reason approvals whose reply window has elapsed — the sweep's ghost set. */

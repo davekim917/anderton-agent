@@ -2374,4 +2374,192 @@ jq -e 'has("observation") | not' <<<"$W2_CHECK" >/dev/null || {
   echo "W2: a non-poll verb grew an observation: $W2_CHECK" >&2; exit 1; }
 rm -rf "$W2_DIR"
 
+# --- 70. A GO that KEPT another run's hold (smoke-pr-gate.sh holdKept) -------
+# The PR gate's GO keeps a HUMAN_DECISION hold it was not authorised to clear,
+# and says so on its ledger line. Adopting that line (out of band, or into
+# this gate's own open handoff) records completedHoldKept, and the hold
+# reconciler then EXPECTS the kept hold: unchanged is fine, gone is `missing`,
+# another run's is `mismatched`. A kept hold the PR gate could not read has no
+# runId, so only its existence counts (an empty file, a dangling link). The
+# reconciler never deletes or rewrites the hold. A later line without the
+# metadata, and a direct completion, clear the expectation.
+H70_SHA="$BUILD_SHA"
+h70_setup() { # <mode: oob|own|unknown>
+  fresh_state
+  export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+  export SMOKE_GATE_HOLD_FILE="$STATE_DIR2/develop-hold.json"
+  export STUB_SOURCE_SHA="$H70_SHA"
+  bash "$GATE" poll >/dev/null
+  if [ "$1" = own ]; then
+    jq -c --arg sha "$H70_SHA" '.handoffTargetSha=$sha | .handoffFreezePr=65 | .handoffFreezeSha=("f"*40)' \
+      "$STATE_DIR2/develop-state.json" >"$STATE_DIR2/state.tmp" && mv "$STATE_DIR2/state.tmp" "$STATE_DIR2/develop-state.json"
+  fi
+  local kept='{runId:"foreign-human",reason:"undispositioned",clearHoldFor:null}'
+  [ "$1" = unknown ] && kept='{runId:null,reason:"unreadable",clearHoldFor:null}'
+  jq -cn --arg sha "$H70_SHA" "{schemaVersion:1,targetSha:\$sha,freezeSha:(\"f\"*40),freezePr:65,runId:\"kept-go\",
+    verdict:\"GO\",finishedAt:\"2026-09-24T12:00:00Z\",holdKept:$kept}" >"$STATE_DIR2/handoff-ledger.jsonl"
+  if [ "$1" = unknown ]; then printf '{bad' >"$SMOKE_GATE_HOLD_FILE"
+  else jq -cn --arg sha "$H70_SHA" '{runId:"foreign-human",sha:$sha,verdict:"HUMAN_DECISION",reason:"needs_human_decision"}' \
+    >"$SMOKE_GATE_HOLD_FILE"; fi
+}
+h70_sig() { # what the hold path is: its listing (type, size, link target) and its bytes
+  ls -l --time-style=+ "$SMOKE_GATE_HOLD_FILE" 2>&1 || true
+  { cat "$SMOKE_GATE_HOLD_FILE" 2>/dev/null || true; } | sha256sum
+}
+h70_quiet() { # <label>: this poll raises no hold alarm and leaves the hold file as it was
+  local before out
+  before="$(h70_sig)"
+  out="$(bash "$GATE" poll)"
+  ! jq -e '.data.trigger == "gate_hold_tampered"' <<<"$out" >/dev/null ||
+    { echo "70 $1: an expected kept hold raised gate_hold_tampered: $out" >&2; exit 1; }
+  [ "$before" = "$(h70_sig)" ] ||
+    { echo "70 $1: the reconciler changed the hold file" >&2; exit 1; }
+}
+h70_alarm() { # <label> <integrity>: this poll raises gate_hold_tampered with that integrity
+  local out
+  out="$(bash "$GATE" poll)"
+  jq -e --arg i "$2" '.wakeAgent == true and .data.trigger == "gate_hold_tampered" and .data.holdIntegrity == $i
+    and .data.ledgerRunId == "kept-go"' <<<"$out" >/dev/null ||
+    { echo "70 $1: expected gate_hold_tampered/$2, got: $out" >&2; exit 1; }
+}
+for mode in oob own; do
+  h70_setup "$mode"
+  h70_quiet "$mode first poll"
+  jq -e '.completedRunId == "kept-go" and .completedVerdict == "GO" and .completedHoldKept.runId == "foreign-human"' \
+    "$STATE_DIR2/develop-state.json" >/dev/null ||
+    { echo "70 $mode: adoption must record completedHoldKept: $(jq -c . "$STATE_DIR2/develop-state.json")" >&2; exit 1; }
+  h70_quiet "$mode later poll"
+  mv "$SMOKE_GATE_HOLD_FILE" "$SMOKE_GATE_HOLD_FILE.aside"
+  h70_alarm "$mode removed" missing
+  jq -cn '{runId:"wrong-human",verdict:"HUMAN_DECISION",reason:"needs_human_decision"}' >"$SMOKE_GATE_HOLD_FILE"
+  h70_alarm "$mode replaced" mismatched
+  jq -e '.runId == "wrong-human"' "$SMOKE_GATE_HOLD_FILE" >/dev/null ||
+    { echo "70 $mode: the reconciler rewrote the hold" >&2; exit 1; }
+done
+# A newer line without the metadata is an ordinary GO again: a hold is unexpected.
+jq -cn --arg sha "$H70_SHA" '{schemaVersion:1,targetSha:$sha,freezeSha:("f"*40),freezePr:66,runId:"plain-go",
+  verdict:"GO",finishedAt:"2026-09-24T13:00:00Z"}' >>"$STATE_DIR2/handoff-ledger.jsonl"
+OUT70="$(bash "$GATE" poll)"
+jq -e '.completedRunId == "plain-go" and .completedHoldKept == null' "$STATE_DIR2/develop-state.json" >/dev/null &&
+  jq -e '.data.trigger == "gate_hold_tampered" and .data.holdIntegrity == "unexpected"' <<<"$OUT70" >/dev/null ||
+  { echo "70: a later GO line without holdKept clears the expectation: $OUT70 $(jq -c . "$STATE_DIR2/develop-state.json")" >&2; exit 1; }
+# A kept hold that was unreadable: only its existence is checked.
+h70_setup unknown
+h70_quiet "unknown first poll"
+jq -e '.completedHoldKept.reason == "unreadable" and .completedHoldKept.runId == null' "$STATE_DIR2/develop-state.json" >/dev/null ||
+  { echo "70 unknown: adoption records the kept unreadable hold: $(jq -c . "$STATE_DIR2/develop-state.json")" >&2; exit 1; }
+: >"$SMOKE_GATE_HOLD_FILE"
+h70_quiet "unknown zero-byte"
+rm -f "$SMOKE_GATE_HOLD_FILE"; ln -s "$STATE_DIR2/no-such-file" "$SMOKE_GATE_HOLD_FILE"
+h70_quiet "unknown dangling link"
+rm -f "$SMOKE_GATE_HOLD_FILE"
+h70_alarm "unknown removed" missing
+# A direct completion (this gate's own finish) clears it too.
+fresh_state
+bash "$GATE" claim run-h70 "$H70_SHA" >/dev/null
+jq -c '.completedHoldKept={runId:"stale",reason:"undispositioned",clearHoldFor:null}' "$SMOKE_GATE_STATE_DIR/develop-state.json" \
+  >"$SMOKE_GATE_STATE_DIR/state.tmp" && mv "$SMOKE_GATE_STATE_DIR/state.tmp" "$SMOKE_GATE_STATE_DIR/develop-state.json"
+bash "$GATE" finish "$H70_SHA" run-h70 GO | jq -e '.ok == true' >/dev/null
+jq -e '.completedRunId == "run-h70" and .completedHoldKept == null' "$SMOKE_GATE_STATE_DIR/develop-state.json" >/dev/null ||
+  { echo "70: a direct finish clears completedHoldKept: $(jq -c . "$SMOKE_GATE_STATE_DIR/develop-state.json")" >&2; exit 1; }
+fresh_state
+
+# --- 71. A resumed PR-gate finish re-appends its adopted line ---------------
+# The first attempt's GO line is adopted (and the handoff freed) before the
+# finish completes; another run's hold then lands, and the resumed finish keeps
+# it and appends the same run, verdict and finishedAt again with holdKept. The
+# kept hold is expected, never `unexpected`. A line for another target is not
+# that finish and refreshes nothing.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+export SMOKE_GATE_HOLD_FILE="$STATE_DIR2/develop-hold.json"
+export STUB_SOURCE_SHA="$H70_SHA"
+bash "$GATE" poll >/dev/null
+H71_LINE='{schemaVersion:1,targetSha:$sha,freezeSha:("f"*40),freezePr:65,runId:"resumed-go",verdict:"GO",
+  finishedAt:"2026-09-24T12:00:00Z"}'
+H71_KEPT='{holdKept:{runId:"foreign-human",reason:"undispositioned",clearHoldFor:null}}'
+jq -cn --arg sha "$H70_SHA" "$H71_LINE" >"$STATE_DIR2/handoff-ledger.jsonl"
+h70_quiet "71 first attempt adopted"
+jq -e '.completedRunId == "resumed-go" and .completedHoldKept == null' "$STATE_DIR2/develop-state.json" >/dev/null ||
+  { echo "71: the first attempt's line is adopted: $(jq -c . "$STATE_DIR2/develop-state.json")" >&2; exit 1; }
+jq -cn --arg sha "$H70_SHA" '{runId:"foreign-human",sha:$sha,verdict:"HUMAN_DECISION",reason:"needs_human_decision"}' \
+  >"$SMOKE_GATE_HOLD_FILE"
+jq -cn --arg sha "$OLD_SHA" "$H71_LINE + $H71_KEPT | .targetSha = \$sha" >>"$STATE_DIR2/handoff-ledger.jsonl"
+OUT71="$(bash "$GATE" poll)"
+jq -e '.completedHoldKept == null' "$STATE_DIR2/develop-state.json" >/dev/null &&
+  jq -e '.data.trigger == "gate_hold_tampered" and .data.holdIntegrity == "unexpected"' <<<"$OUT71" >/dev/null ||
+  { echo "71: a line for another target refreshes nothing: $OUT71 $(jq -c . "$STATE_DIR2/develop-state.json")" >&2; exit 1; }
+jq -cn --arg sha "$H70_SHA" "$H71_LINE + $H71_KEPT" >>"$STATE_DIR2/handoff-ledger.jsonl"
+h70_quiet "71 resumed line"
+jq -e '.completedRunId == "resumed-go" and .completedHoldKept.runId == "foreign-human"' "$STATE_DIR2/develop-state.json" >/dev/null ||
+  { echo "71: the resumed line's holdKept is adopted: $(jq -c . "$STATE_DIR2/develop-state.json")" >&2; exit 1; }
+rm -f "$SMOKE_GATE_HOLD_FILE"
+h70_alarm_run() { # <label> <integrity> <run>
+  local out
+  out="$(bash "$GATE" poll)"
+  jq -e --arg i "$2" --arg r "$3" '.data.trigger == "gate_hold_tampered" and .data.holdIntegrity == $i
+    and .data.ledgerRunId == $r' <<<"$out" >/dev/null ||
+    { echo "$1: expected gate_hold_tampered/$2, got: $out" >&2; exit 1; }
+}
+h70_alarm_run "71 kept hold removed" missing resumed-go
+
+# --- 72. This gate's own finish guards the hold like the PR gate's ----------
+# Outside handoff mode, a GO keeps another run's HUMAN_DECISION hold unless
+# --clear-hold names that run, records completedHoldKept so the reconciler
+# expects it, and every raise and clear takes the same <hold>.lock: a lock it
+# cannot take records nothing, touches no hold and leaves the slot held.
+fresh_state
+export SMOKE_GATE_HOLD_FILE="$STATE_DIR2/develop-hold.json"
+h72_foreign() {
+  jq -cn --arg sha "$BUILD_SHA" '{schemaVersion:1,sha:$sha,runId:"foreign-human",verdict:"HUMAN_DECISION",
+    raisedAt:"2026-09-24T11:00:00Z",reason:"needs_human_decision"}' >"$SMOKE_GATE_HOLD_FILE"
+}
+h72_foreign
+H72_SUM="$(sha256sum <"$SMOKE_GATE_HOLD_FILE")"
+bash "$GATE" claim run-h72 "$BUILD_SHA" >/dev/null
+OUT72="$(bash "$GATE" finish "$BUILD_SHA" run-h72 GO)"
+jq -e '.ok == true and .verdict == "GO" and .holdKept.runId == "foreign-human" and .holdKept.reason == "undispositioned"' \
+  <<<"$OUT72" >/dev/null || { echo "72: a direct GO keeps a foreign HUMAN_DECISION hold: $OUT72" >&2; exit 1; }
+[ "$(sha256sum <"$SMOKE_GATE_HOLD_FILE")" = "$H72_SUM" ] || { echo "72: the kept hold changed" >&2; exit 1; }
+[ -f "$SMOKE_GATE_HOLD_FILE.lock" ] && [ ! -L "$SMOKE_GATE_HOLD_FILE.lock" ] ||
+  { echo "72: the finish took the hold's sidecar lock" >&2; exit 1; }
+jq -e '.completedRunId == "run-h72" and .completedHoldKept.runId == "foreign-human" and .activeRunId == null' \
+  "$STATE_DIR2/develop-state.json" >/dev/null ||
+  { echo "72: completedHoldKept recorded: $(jq -c . "$STATE_DIR2/develop-state.json")" >&2; exit 1; }
+OUT72="$(bash "$GATE" poll)"
+! jq -e '.data.trigger == "gate_hold_tampered"' <<<"$OUT72" >/dev/null ||
+  { echo "72: a kept hold is expected after a direct GO: $OUT72" >&2; exit 1; }
+# Named: the GO clears it.
+bash "$GATE" claim run-h72b "$BUILD_SHA" >/dev/null
+OUT72="$(bash "$GATE" finish "$BUILD_SHA" run-h72b GO --clear-hold=foreign-human)"
+jq -e '.ok == true and (has("holdKept") | not)' <<<"$OUT72" >/dev/null && [ ! -e "$SMOKE_GATE_HOLD_FILE" ] &&
+  jq -e '.completedRunId == "run-h72b" and .completedHoldKept == null' "$STATE_DIR2/develop-state.json" >/dev/null ||
+  { echo "72: --clear-hold=<that run> clears it: $OUT72" >&2; exit 1; }
+# A malformed authorization is refused before anything is recorded.
+bash "$GATE" claim run-h72c "$BUILD_SHA" >/dev/null
+h72_foreign
+OUT72="$(bash "$GATE" finish "$BUILD_SHA" run-h72c GO --clear-hold=../x || true)"
+jq -e '.ok == false' <<<"$OUT72" >/dev/null &&
+  jq -e '.activeRunId == "run-h72c"' "$STATE_DIR2/develop-state.json" >/dev/null ||
+  { echo "72: a malformed --clear-hold is refused, slot held: $OUT72" >&2; exit 1; }
+# The lock cannot be taken: nothing recorded, hold untouched, slot held, retryable.
+rm -f "$SMOKE_GATE_HOLD_FILE.lock"; mkdir "$SMOKE_GATE_HOLD_FILE.lock"
+H72_SUM="$(sha256sum <"$SMOKE_GATE_HOLD_FILE")"
+for v in GO NO_GO HUMAN_DECISION; do
+  OUT72="$(bash "$GATE" finish "$BUILD_SHA" run-h72c "$v" || true)"
+  jq -e '.ok == false and .retryable == true' <<<"$OUT72" >/dev/null &&
+    jq -e '.activeRunId == "run-h72c" and .completedRunId == "run-h72b"' "$STATE_DIR2/develop-state.json" >/dev/null &&
+    [ "$(sha256sum <"$SMOKE_GATE_HOLD_FILE")" = "$H72_SUM" ] ||
+    { echo "72: $v without the hold lock records nothing: $OUT72 $(jq -c . "$STATE_DIR2/develop-state.json")" >&2; exit 1; }
+done
+# BLOCKED takes no lock and leaves the hold as it was.
+bash "$GATE" finish "$BUILD_SHA" run-h72c BLOCKED | jq -e '.ok == true' >/dev/null &&
+  [ "$(sha256sum <"$SMOKE_GATE_HOLD_FILE")" = "$H72_SUM" ] || { echo "72: BLOCKED needs no lock" >&2; exit 1; }
+# The lock back: a GO completes and keeps the hold.
+rmdir "$SMOKE_GATE_HOLD_FILE.lock"
+bash "$GATE" claim run-h72d "$BUILD_SHA" >/dev/null
+bash "$GATE" finish "$BUILD_SHA" run-h72d GO | jq -e '.ok == true and .holdKept.runId == "foreign-human"' >/dev/null ||
+  { echo "72: with the lock back the GO completes, keeping the hold" >&2; exit 1; }
+fresh_state
+
 echo "smoke develop gate tests passed"

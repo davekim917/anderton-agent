@@ -135,6 +135,39 @@ describe('runPreToolUseChain — guardrails', () => {
   });
 });
 
+describe('runPreToolUseChain — subagents start fresh', () => {
+  const decision = async (tool_name: string, tool_input: unknown) =>
+    (
+      (await runPreToolUseChain({ tool_name, tool_input: tool_input as Record<string, unknown> })) as {
+        hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string };
+      }
+    ).hookSpecificOutput?.permissionDecision;
+
+  it.each([
+    ['spawn_agent', { message: 'x', fork_context: false }],
+    ['collaborationspawn_agent', { message: 'x', fork_turns: 'none' }],
+    ['collaborationspawn_agent', { message: 'x', fork_turns: ' NONE ' }],
+  ])('lets %s through with the fresh control %j', async (tool, input) => {
+    expect(await decision(tool, input)).toBeUndefined();
+  });
+
+  it.each([
+    ['spawn_agent', { message: 'x', fork_context: true }],
+    ['collaborationspawn_agent', { message: 'x', fork_turns: 'all' }],
+    ['collaborationspawn_agent', { message: 'x', fork_turns: '3' }],
+    ['collaborationspawn_agent', { message: 'x' }],
+    ['spawn_agent', { message: 'x', fork_context: false, fork_turns: 'none' }],
+    ['spawn_agent', { message: 'x', fork_context: 'false' }],
+    ['spawn_agent', null],
+  ])('denies %s with %j', async (tool, input) => {
+    expect(await decision(tool, input)).toBe('deny');
+  });
+
+  it('leaves other tools alone', async () => {
+    expect(await decision('send_input', { message: 'x', fork_turns: 'all' })).toBeUndefined();
+  });
+});
+
 describe('runPreToolUseChain — destructive-action guard wiring', () => {
   // Point the guard loader at the in-repo stub core (the real core lives in the
   // bootstrap repo; its verdicts are validated there). This tests that runner.ts

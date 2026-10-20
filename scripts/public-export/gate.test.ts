@@ -9,6 +9,8 @@ import type { RunReport } from '../check-public-boundary.js';
 import { allowSubprocess } from '../../src/test-hermeticity.js';
 import {
   aiBatches,
+  aiReasonKind,
+  RECORDED_HOLD,
   aiSystemPrompt,
   fenceUntrusted,
   gateCommits,
@@ -19,6 +21,9 @@ import {
   judgeCommit,
   loadStagingCommit,
   realAiRead,
+  stagingFileAt,
+  stagingOriginRev,
+  stagingMentions,
   realScanners,
   type AiResult,
   type CommitUnderReview,
@@ -113,7 +118,7 @@ describe('judgeCommit fails closed', () => {
     [
       'an AI hold with no findings',
       { aiRead: async () => aiOk('hold') },
-      { source: 'ai', where: 'ai read', category: 'possible-identifier' },
+      { source: 'ai', where: 'ai read', category: 'hold-without-finding' },
     ],
     [
       'unparseable AI output',
@@ -216,6 +221,17 @@ describe('judgeCommit reads a large diff in batches', () => {
       category: 'exit:1',
     });
   });
+
+  it('stops reading at the first batch that holds, so its flag is returned at once', async () => {
+    let calls = 0;
+    const flagged = { file: 'src/big.ts', line: 1, text: 'export const v0 = 0;', why: 'client' };
+    const verdict = await judgeCommit(
+      big,
+      deps({ aiMaxChars: limit, aiRead: async () => (++calls, aiOk('hold', [flagged])) }),
+    );
+    expect(calls).toBe(1);
+    expect(verdict).toMatchObject({ verdict: 'hold', aiFindings: [flagged] });
+  });
 });
 
 describe('gateCommits', () => {
@@ -241,6 +257,43 @@ describe('gateCommits', () => {
   it('reports no passing commit when the first one holds', async () => {
     const outcome = await gateCommits(['a'], load, deps({ scanMessage: () => scannerHit }), () => commit);
     expect(outcome).toMatchObject({ lastPassing: null, held: { sha: 'a' } });
+  });
+
+  it('reserves each read before it and settles it with its verdict before removing its checkout', async () => {
+    const flagged = { file: 'src/widget.ts', line: 1, text: 'export const widget = 1;', why: 'client' };
+    const events: string[] = [];
+    const run = gateCommits(
+      ['a', 'b'],
+      (sha) => ({
+        ...load(sha),
+        dispose: () => {
+          events.push(`dispose ${sha}`);
+          if (sha === 'b') throw new Error('worktree remove failed');
+        },
+      }),
+      deps({
+        aiRead: async () => {
+          events.push('read');
+          return events.filter((event) => event === 'read').length === 2 ? aiOk('hold', [flagged]) : aiOk('pass');
+        },
+      }),
+      () => commit,
+      {
+        reserve: (sha) => events.push(`reserve ${sha}`),
+        settle: (sha, held) => events.push(`settle ${sha} ${held ? 'hold' : 'pass'}`),
+      },
+    );
+    await expect(run).rejects.toThrow('worktree remove failed');
+    expect(events).toEqual([
+      'reserve a',
+      'read',
+      'settle a pass',
+      'dispose a',
+      'reserve b',
+      'read',
+      'settle b hold',
+      'dispose b',
+    ]);
   });
 
   describe('with an AI budget', () => {
@@ -392,9 +445,143 @@ describe('loadStagingCommit shows the AI read everything a commit publishes', ()
   });
 });
 
+describe('staging tree reads that decide whether an AI hold was fixed forward', () => {
+  const env = { PATH: process.env.PATH ?? '', HOME: os.tmpdir(), GIT_CONFIG_NOSYSTEM: '1' };
+  let work: string;
+  let bare: string;
+  let sha: string;
+  const run = (...args: string[]) => execFileSync('git', ['-C', work, ...args], { env, encoding: 'utf8' });
+
+  beforeEach(() => {
+    work = fs.mkdtempSync(path.join(os.tmpdir(), 'public-export-tree-'));
+    run('init', '-q', '-b', 'main');
+    run('config', 'user.email', 'fixture@example.com');
+    run('config', 'user.name', 'Fixture');
+    fs.mkdirSync(path.join(work, 'src'));
+    fs.writeFileSync(path.join(work, 'src', 'help.ts'), 'const help = "use the example tile";\n');
+    fs.writeFileSync(path.join(work, 'shot.png'), Buffer.from([0x89, 0x00, 0x71, 0x71, 0x2d, 0x62, 0x69, 0x6e]));
+    fs.symlinkSync('help.ts', path.join(work, 'src', 'link.ts'));
+    fs.symlinkSync('qq-link-target', path.join(work, 'src', 'dangling.ts'));
+    fs.writeFileSync(
+      path.join(work, 'src', 'intl.ts'),
+      'const tile = "zz-äcme-tile";\nconst sigma = "ZZ-CLIENT-ΟΣA";\n',
+    );
+    fs.mkdirSync(path.join(work, 'zz-acme-notes'));
+    fs.writeFileSync(path.join(work, 'zz-acme-notes', 'readme.md'), 'notes\n');
+    run('add', '-A');
+    run('commit', '-q', '-m', 'tree');
+    bare = `${work}.git`;
+    execFileSync('git', ['clone', '-q', '--bare', work, bare], { env });
+    sha = run('rev-parse', 'HEAD').trim();
+  });
+  afterEach(() => {
+    fs.rmSync(work, { recursive: true, force: true });
+    fs.rmSync(bare, { recursive: true, force: true });
+  });
+
+  it('reads a regular file, and nothing through a symlink, a directory, a missing or an unnormalized path', () => {
+    expect(stagingFileAt(bare, sha, 'src/help.ts')).toBe('const help = "use the example tile";\n');
+    for (const file of ['src/link.ts', 'src', 'src/missing.ts', './src/help.ts', 'src/../src/help.ts']) {
+      expect(stagingFileAt(bare, sha, file)).toBeNull();
+    }
+  });
+
+  it('finds text in any file, in any case, in a binary, a symlink target or a path', () => {
+    expect(stagingMentions(bare, sha, ['USE THE EXAMPLE'])).toBe(true);
+    expect(stagingMentions(bare, sha, ['QQ-BIN'])).toBe(true);
+    expect(stagingMentions(bare, sha, ['acme-notes/readme'])).toBe(true);
+    expect(stagingMentions(bare, sha, ['QQ-LINK-TARGET'])).toBe(true);
+    expect(stagingMentions(bare, sha, ['ZZ-ÄCME-TILE'])).toBe(true);
+    expect(stagingMentions(bare, sha, ['ZZ-CLIENT-ΟΣ'])).toBe(true);
+    expect(stagingMentions(bare, sha, ['-e use the zz-client tile'])).toBe(false);
+  });
+
+  it('finds text only the commit message or a deleted path still carries', () => {
+    run('rm', '-q', 'zz-acme-notes/readme.md');
+    run('commit', '-q', '-m', 'drop the qq-message-only notes');
+    execFileSync('git', ['--git-dir', bare, 'fetch', '-q', work, 'main:main'], { env });
+    const head = run('rev-parse', 'HEAD').trim();
+    expect(stagingMentions(bare, head, ['QQ-MESSAGE-ONLY'])).toBe(true);
+    expect(stagingMentions(bare, head, ['zz-acme-notes/readme'])).toBe(true);
+    expect(stagingMentions(bare, sha, ['qq-message-only'])).toBe(false);
+  });
+
+  it('finds text in a submodule path and in the read header', () => {
+    run('update-index', '--add', '--cacheinfo', `160000,${sha},vendor/zz-gitlink-path`);
+    run('commit', '-q', '-m', 'add a submodule');
+    execFileSync('git', ['--git-dir', bare, 'fetch', '-q', work, 'main:main'], { env });
+    const head = run('rev-parse', 'HEAD').trim();
+    expect(stagingMentions(bare, head, ['zz-gitlink-path'])).toBe(true);
+    expect(stagingMentions(bare, sha, ['ADDED LINES:'])).toBe(true);
+  });
+
+  it('fails the run rather than answering when a tree blob the commit did not change cannot be read', () => {
+    fs.writeFileSync(path.join(work, 'other.ts'), 'export const other = 1;\n');
+    run('add', '-A');
+    run('commit', '-q', '-m', 'add other');
+    execFileSync('git', ['--git-dir', bare, 'fetch', '-q', work, 'main:main'], { env });
+    const blob = run('rev-parse', 'HEAD:src/help.ts').trim();
+    fs.rmSync(path.join(bare, 'objects', blob.slice(0, 2), blob.slice(2)));
+    expect(() => stagingMentions(bare, run('rev-parse', 'HEAD').trim(), ['not in any message or path'])).toThrow(
+      /cannot read blob/,
+    );
+  });
+
+  it('reads the last GitOrigin-RevId trailer, and nothing from an unknown commit', () => {
+    const rev = 'b'.repeat(40);
+    run(
+      'commit',
+      '-q',
+      '--allow-empty',
+      '-m',
+      `subject\n\nGitOrigin-RevId: ${'c'.repeat(40)}\nGitOrigin-RevId: ${rev}`,
+    );
+    execFileSync('git', ['--git-dir', bare, 'fetch', '-q', work, 'main:main'], { env });
+    expect(stagingOriginRev(bare, run('rev-parse', 'HEAD').trim())).toBe(rev);
+    expect(stagingOriginRev(bare, sha)).toBeNull();
+    expect(stagingOriginRev(bare, '0'.repeat(40))).toBeNull();
+  });
+});
+
+describe('aiReasonKind', () => {
+  it.each([
+    ['possible-identifier', 'quoted-flag'],
+    ['hold-without-finding', 'flag'],
+    ['a-category-added-later', 'flag'],
+    [RECORDED_HOLD, 'recorded'],
+    ['timeout', 'read-failure'],
+    ['unparseable', 'read-failure'],
+    ['exit:1', 'read-failure'],
+    ['line-too-large>400', 'read-failure'],
+  ])('reads %s as %s', (category, kind) => {
+    expect(aiReasonKind(category)).toBe(kind);
+  });
+});
+
 describe('aiBatches with an unusable limit', () => {
   it.each([Number.NaN, 0, -5, 1.5])('holds instead of batching when the limit is %s', (limit) => {
     expect(aiBatches(commit, limit)).toBeNull();
+  });
+});
+
+describe('aiBatches and the Copybara origin trailer', () => {
+  const rev = 'a'.repeat(40);
+
+  it('leaves the exact GitOrigin-RevId trailer out of what the AI reads', () => {
+    const message = `feat: a change\n\nGitOrigin-RevId: ${rev}\n`;
+    const [batch] = aiBatches({ ...commit, message }, 400_000)!;
+    expect(batch).not.toContain('GitOrigin-RevId');
+    expect(batch).toContain('feat: a change');
+  });
+
+  it.each([
+    [`GitOrigin-RevId: ${rev} globex`],
+    [`GitOrigin-RevId: ${'a'.repeat(39)}`],
+    [`see GitOrigin-RevId: ${rev}`],
+    [`GitOrigin-RevId: ${rev.toUpperCase()}`],
+  ])('keeps a line that is not exactly the trailer: %s', (line) => {
+    const [batch] = aiBatches({ ...commit, message: `feat: a change\n\n${line}\n` }, 400_000)!;
+    expect(batch).toContain(line);
   });
 });
 

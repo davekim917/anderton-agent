@@ -34,7 +34,53 @@ import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { notifyAgent, type ApprovalHandler } from '../approvals/index.js';
 
+/** Read by the respawned container on its first poll (on_wake), after the kill that applies the change. */
+async function writeOnWakeNote(session: Session, text: string): Promise<void> {
+  await writeSessionMessage(session.agent_group_id, session.id, {
+    id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    platformId: session.agent_group_id,
+    channelType: 'agent',
+    threadId: null,
+    content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
+    onWake: 1,
+  });
+}
+
+/** Per group, so an install's image always includes the packages an earlier install recorded. */
+const installChains = new Map<string, Promise<void>>();
+
 export async function applyInstallPackages(payload: Record<string, unknown>, session: Session): Promise<void> {
+  const previous = installChains.get(session.agent_group_id) ?? Promise.resolve();
+  const run = previous.then(() => installPackagesNow(payload, session));
+  const settled = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  installChains.set(session.agent_group_id, settled);
+  void settled.then(() => {
+    if (installChains.get(session.agent_group_id) === settled) installChains.delete(session.agent_group_id);
+  });
+  return run;
+}
+
+/**
+ * Called only after the image built with these packages: merged into the lists as they are now, so a failed build
+ * stores nothing and a change another writer saved during the build is kept.
+ */
+async function recordInstalledPackages(
+  agentGroupId: string,
+  folder: string,
+  adding: { apt: string[]; npm: string[] },
+): Promise<void> {
+  await writeContainerConfigJson(agentGroupId, folder, ({ packages }) => {
+    packages.apt = [...new Set([...packages.apt, ...adding.apt])];
+    packages.npm = [...new Set([...packages.npm, ...adding.npm])];
+  });
+}
+
+async function installPackagesNow(payload: Record<string, unknown>, session: Session): Promise<void> {
   const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     await notifyAgent(session, 'install_packages approved but agent group missing.');
@@ -47,33 +93,31 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
     return;
   }
 
-  const merge = (list: string[], add: unknown) => [...new Set([...list, ...((add as string[] | undefined) ?? [])])];
-  await writeContainerConfigJson(agentGroup.id, agentGroup.folder, ({ packages }) => {
-    packages.apt = merge(packages.apt, payload.apt);
-    packages.npm = merge(packages.npm, payload.npm);
-  });
-
-  const pkgs = [
-    ...((payload.apt as string[] | undefined) || []),
-    ...((payload.npm as string[] | undefined) || []),
-  ].join(', ');
+  const requested = (add: unknown) => (add as string[] | undefined) ?? [];
+  const adding = { apt: requested(payload.apt), npm: requested(payload.npm) };
+  const pkgs = [...adding.apt, ...adding.npm].join(', ');
   log.info('Package install approved', { agentGroupId: session.agent_group_id });
   try {
-    await buildAgentGroupImage(session.agent_group_id);
-    await writeSessionMessage(session.agent_group_id, session.id, {
-      id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      kind: 'chat',
-      timestamp: new Date().toISOString(),
-      platformId: session.agent_group_id,
-      channelType: 'agent',
-      threadId: null,
-      content: JSON.stringify({
-        text: `Packages installed (${pkgs}) and container rebuilt. Verify the new packages are available (e.g. run them or check versions) and report the result to the user.`,
-        sender: 'system',
-        senderId: 'system',
-      }),
-      onWake: 1,
-    });
+    await buildAgentGroupImage(session.agent_group_id, adding);
+  } catch (e) {
+    // Not awaited: a rejection here could leave the approval row clickable, risking a second rebuild.
+    void Promise.resolve(
+      notifyAgent(
+        session,
+        `Rebuild failed, so the packages (${pkgs}) were not installed and the config is unchanged: ${e instanceof Error ? e.message : String(e)}. Tell the user; request the install again once the cause is fixed.`,
+      ),
+    ).catch((err) =>
+      log.warn('install_packages failure notification failed', { err, agentGroupId: session.agent_group_id }),
+    );
+    log.error('Bundled rebuild failed after install approval', { agentGroupId: session.agent_group_id, err: e });
+    return;
+  }
+  await recordInstalledPackages(agentGroup.id, agentGroup.folder, adding);
+  try {
+    await writeOnWakeNote(
+      session,
+      `Packages installed (${pkgs}) and container rebuilt. Verify the new packages are available (e.g. run them or check versions) and report the result to the user.`,
+    );
     killContainer(
       session.id,
       'rebuild applied',
@@ -89,17 +133,10 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
     );
     log.info('Container rebuild completed (bundled with install)', { agentGroupId: session.agent_group_id });
   } catch (e) {
-    // Not awaited: a rejection here could leave the approval row clickable,
-    // risking a second rebuild for an already-committed package list.
-    void Promise.resolve(
-      notifyAgent(
-        session,
-        `Packages added to config (${pkgs}) but rebuild failed: ${e instanceof Error ? e.message : String(e)}. Tell the user — an admin will need to retry the install_packages request or inspect the build logs.`,
-      ),
-    ).catch((err) =>
-      log.warn('install_packages failure notification failed', { err, agentGroupId: session.agent_group_id }),
-    );
-    log.error('Bundled rebuild failed after install approval', { agentGroupId: session.agent_group_id, err: e });
+    log.error('Packages installed but the agent could not be told or restarted', {
+      agentGroupId: session.agent_group_id,
+      err: e,
+    });
   }
 }
 
@@ -172,24 +209,13 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
   const needsCredential =
     serverConfig.type === 'http' && Object.values(serverConfig.headers ?? {}).some(isOneCliPlaceholder);
 
-  await writeSessionMessage(session.agent_group_id, session.id, {
-    id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    kind: 'chat',
-    timestamp: new Date().toISOString(),
-    platformId: session.agent_group_id,
-    channelType: 'agent',
-    threadId: null,
-    content: JSON.stringify({
-      text:
-        `MCP server "${name}" added. Verify it's available (e.g. list your tools) and report the result to the user.` +
-        (needsCredential
-          ? " It authenticates through the OneCLI gateway: if calls come back 401, one likely cause is that the credential exists but is not assigned to this agent group — grant it with `ncl secrets grant --name <vault name>` (your workgroup by default; it waits for admin approval). A 401 can also mean an expired or incorrect secret, a missing gateway rule, or an authentication scheme the server doesn't accept."
-          : ''),
-      sender: 'system',
-      senderId: 'system',
-    }),
-    onWake: 1,
-  });
+  await writeOnWakeNote(
+    session,
+    `MCP server "${name}" added. Verify it's available (e.g. list your tools) and report the result to the user.` +
+      (needsCredential
+        ? " It authenticates through the OneCLI gateway: if calls come back 401, one likely cause is that the credential exists but is not assigned to this agent group — grant it with `ncl secrets grant --name <vault name>` (your workgroup by default; it waits for admin approval). A 401 can also mean an expired or incorrect secret, a missing gateway rule, or an authentication scheme the server doesn't accept."
+        : ''),
+  );
   killContainer(
     session.id,
     'mcp server added',
@@ -260,22 +286,11 @@ export async function performModelChange(
     effort,
   });
 
-  await writeSessionMessage(session.agent_group_id, session.id, {
-    id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    kind: 'chat',
-    timestamp: new Date().toISOString(),
-    platformId: session.agent_group_id,
-    channelType: 'agent',
-    threadId: null,
-    content: JSON.stringify({
-      text:
-        `Model changed to "${slug}"${effort ? ` (effort: ${effort})` : ''}. Container has restarted on the new model. ` +
-        `Briefly confirm what model you're now running, then continue the work.`,
-      sender: 'system',
-      senderId: 'system',
-    }),
-    onWake: 1,
-  });
+  await writeOnWakeNote(
+    session,
+    `Model changed to "${slug}"${effort ? ` (effort: ${effort})` : ''}. Container has restarted on the new model. ` +
+      `Briefly confirm what model you're now running, then continue the work.`,
+  );
 
   killContainer(
     session.id,

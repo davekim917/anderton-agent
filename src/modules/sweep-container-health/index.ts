@@ -28,6 +28,7 @@ import {
 } from '../../container-runner.js';
 import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
+import { openGateDeadlineMs } from '../bash-gate/index.js';
 import type { Session } from '../../types.js';
 import { type ForkContainerStateRow as ContainerState, type NanoclawMailboxSession } from '../mailbox/index.js';
 import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
@@ -464,6 +465,8 @@ export function decideStuckAction(args: {
   spawnedAtMs?: number;
   // For an ADOPTED container `spawnedAtMs` is the adoption instant, not a spawn.
   adopted?: boolean;
+  // Until then the container waits on an approval gate it filed, with its heartbeat quiet.
+  gateDeadlineMs?: number | null;
 }): StuckDecision {
   const { now, heartbeatMtimeMs, containerState, claims, adopted } = args;
   const spawnedAtMs = args.spawnedAtMs ?? 0;
@@ -471,7 +474,7 @@ export function decideStuckAction(args: {
 
   // No heartbeat file means a fresh container, not an infinitely stale one;
   // a fresh container hung at the gate is the claim rule's job.
-  if (heartbeatMtimeMs !== 0) {
+  if (heartbeatMtimeMs !== 0 && !((args.gateDeadlineMs ?? 0) > now)) {
     const heartbeatAge = now - heartbeatMtimeMs;
     const ceiling = Math.max(ABSOLUTE_CEILING_MS, declaredOperationMs ?? 0);
     if (heartbeatAge > ceiling) {
@@ -575,6 +578,10 @@ async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<voi
   const session = ctx.session;
   // The decision and the telemetry see the same snapshot; the kill below runs
   // with nothing open.
+  const gateDeadlineMs = await openGateDeadlineMs(session.id).catch((err: unknown) => {
+    log.warn('Gate deadline lookup failed; the ceiling applies this tick', { sessionId: session.id, err });
+    return null;
+  });
   const observed = await ctx.runIn('session:health:sla-observe', async (mailbox) => {
     const containerState = mailbox.getContainerState();
     await runSlaObservationHooks(ctx, containerState, mailbox);
@@ -585,6 +592,7 @@ async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<voi
       claims: mailbox.getProcessingClaimRows(),
       spawnedAtMs: getContainerSpawnedAt(session.id),
       adopted: isAdoptedContainer(session.id),
+      gateDeadlineMs,
     });
     // Snapshot BEFORE the kill: the reset clears the claims.
     return {

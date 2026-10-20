@@ -71,10 +71,15 @@ export function removeUntrustedPathEntry(parent: string, entry: string): void {
 }
 
 /** `wx`: a concurrent or unexpected replacement fails closed instead of being followed. */
-export function replaceUntrustedFile(parent: string, entry: string, contents: string | Buffer): string {
+export function replaceUntrustedFile(
+  parent: string,
+  entry: string,
+  contents: string | Buffer,
+  mode: number = 0o666,
+): string {
   removeUntrustedPathEntry(parent, entry);
   const target = path.join(parent, entry);
-  fs.writeFileSync(target, contents, { flag: 'wx' });
+  fs.writeFileSync(target, contents, { flag: 'wx', mode });
   return target;
 }
 

@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, initMigratedTestDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
-import { createSession, createPendingApproval } from '../../db/sessions.js';
+import { createSession, createPendingApproval, getPendingApproval } from '../../db/sessions.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { grantRole } from '../permissions/db/user-roles.js';
 import { initSessionFolder } from '../../session-manager.js';
@@ -24,6 +24,21 @@ vi.mock('../../container-runner.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../container-runner.js')>()),
   wakeContainer: vi.fn().mockResolvedValue(undefined),
 }));
+
+const failDelete = vi.hoisted(() => ({ next: false }));
+vi.mock('../../db/sessions.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../db/sessions.js')>();
+  return {
+    ...actual,
+    deletePendingApproval: async (id: string) => {
+      if (failDelete.next) {
+        failDelete.next = false;
+        throw new Error('SQLITE_BUSY: database is locked');
+      }
+      return actual.deletePendingApproval(id);
+    },
+  };
+});
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
@@ -130,6 +145,37 @@ describe('approval-resolved callbacks', () => {
     });
 
     expect(calls).toEqual(['handler', 'resolved:approve']);
+  });
+
+  it('a declined approval resolves as neither approved nor rejected, even when finalizing it fails', async () => {
+    const calls: string[] = [];
+    registerApprovalHandler('test_decline_action', async () => {
+      calls.push('handler');
+      return { declined: 'Nothing ran.' };
+    });
+    registerApprovalResolvedHandler(({ outcome }) => {
+      calls.push(`resolved:${outcome}`);
+    });
+    const click = (questionId: string) =>
+      handleApprovalsResponse({
+        questionId,
+        value: 'approve',
+        userId: 'slack:admin-1',
+        channelType: 'slack',
+        platformId: 'slack:C1',
+        threadId: null,
+      });
+
+    await seedApproval('appr-decline-1', 'test_decline_action');
+    await click('appr-decline-1');
+    expect(calls).toEqual(['handler']);
+    expect(await getPendingApproval('appr-decline-1')).toBeUndefined();
+
+    await seedApproval('appr-decline-2', 'test_decline_action');
+    failDelete.next = true;
+    await expect(click('appr-decline-2')).rejects.toThrow('SQLITE_BUSY');
+    expect(calls).toEqual(['handler', 'handler']);
+    expect(await getPendingApproval('appr-decline-2')).toBeDefined();
   });
 
   it('isolates a throwing callback so later callbacks still fire', async () => {

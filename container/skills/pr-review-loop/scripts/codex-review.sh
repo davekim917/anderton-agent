@@ -29,7 +29,10 @@
 #                                             # (review-thread resolution alone is read as it stands now; see the audit arm)
 #   codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
 #                                             # post a substitute review's receipt for exactly that head — --reviewer
-#                                             # must start with a frontier model id (see REVIEWER_DENIED_TIERS)
+#                                             # must start with a frontier model id (see REVIEWER_DENIED_TIERS); a repo
+#                                             # named in CODEX_REVIEW_NEUTRAL_REVIEWER_REPOS, or whose base's
+#                                             # .github/pr-review-loop.json sets "neutralReviewerLabel": true, gets
+#                                             # NEUTRAL_REVIEWER_LABEL in the comment and the id in the receipt ledger
 #   codex-review.sh checkpoint --head <sha> --decision converging|churning --assessor "<model + runtime>" --assessment "<one line>"
 #
 # Exit codes, one contract across commands (0 and 3 are the originals):
@@ -658,6 +661,12 @@ INDEPENDENT_RECEIPT_JSON_RE='\A\s*```json[ \t]*\r?\n(?<json>[\s\S]*?)\n[ \t]*```
 # already names a frontier model (reviewer_model_refusal) — otherwise post a
 # fresh receipt (`codex-review.sh receipt ...`) from one.
 RECEIPT_REVIEWER_LINE_RE='\*\*Reviewer and runtime:\*\* (?<reviewer>[^\n]+)'
+# What the reviewer line shows instead of the model id where the base's
+# REVIEW_LOOP_CONFIG sets "neutralReviewerLabel": true — a repo whose rules
+# forbid naming an AI model in a PR comment. The id then lives only in the
+# receipt ledger (receipt_ledger_dir), and receipt_outcome resolves the label
+# through it before the tier rule sees a reviewer.
+NEUTRAL_REVIEWER_LABEL='independent review'
 # A conventional-commit fix title, and the body line `merge-check` requires of
 # one: the PR it fixes, or `none`. The follow-up measurement in
 # docs/specs/risk-based-review/plan.md links a fix to its PR through this line.
@@ -721,19 +730,76 @@ review_loop_value() {
   local config status=0
   config=$(base_file "${4:-$SCOPE_BASE}" "$REVIEW_LOOP_CONFIG") || status=$?
   case "$status" in
-    0)
-      printf '%s' "$config" | jq -r --arg key "$1" --argjson default "$2" "def valid: $3;"'
-        if type != "object" then error("not a JSON object")
-        elif has($key) | not then $default
-        else .[$key] | valid end'
-      ;;
+    0) printf '%s' "$config" | review_loop_parse "$1" "$2" "$3" ;;
     3) echo "$2" ;;
     *) return 1 ;;
   esac
 }
 
+# Key $1 of the REVIEW_LOOP_CONFIG text on stdin, through jq filter $3, or $2
+# when the key is absent.
+review_loop_parse() {
+  jq -rs --arg key "$1" --argjson default "$2" "def valid: $3;"'
+    if length != 1 then error("not exactly one JSON document") else .[0] end
+    | if type != "object" then error("not a JSON object")
+    elif has($key) | not then $default
+    else .[$key] | valid end'
+}
+
+REVIEW_LOOP_BOOLEAN='if type == "boolean" then . else error("not a boolean") end'
+
 review_loop_flag() {
-  review_loop_value "$1" "$2" 'if type == "boolean" then . else error("not a boolean") end' "${3:-}"
+  review_loop_value "$1" "$2" "$REVIEW_LOOP_BOOLEAN" "${3:-}"
+}
+
+# Boolean key $1 of REVIEW_LOOP_CONFIG on the PR's base branch as it is now, or
+# $2 when the file or key is absent, in one GraphQL read of the branch tip's
+# blob: a lone read needs no pinned commit. Non-zero when the base cannot be
+# read or the value is not a boolean — no verdict, never a pass. An absent file
+# comes back as `file: null` beside a NOT_FOUND error for that path, and gh
+# exits non-zero on any error, so the document is read whatever gh exits and
+# only that one error means absent.
+base_branch_review_loop_flag() {
+  local doc text
+  doc=$(gh api graphql -f query='
+    query($owner:String!,$name:String!,$pr:Int!,$path:String!){
+      repository(owner:$owner,name:$name){ pullRequest(number:$pr){
+        baseRef{ target{ ... on Commit{ file(path:$path){ object{ ... on Blob{ text } } } } } }
+      } }
+    }' -F owner="$OWNER" -F name="$NAME" -F pr="$PR" -F path="$REVIEW_LOOP_CONFIG" 2>/dev/null) || [ -n "$doc" ] || return 1
+  text=$(printf '%s' "$doc" | jq -er '
+    if any(.errors[]?; .type != "NOT_FOUND" or .path != ["repository", "pullRequest", "baseRef", "target", "file"])
+      then error("GraphQL errors: \([.errors[].message] | join("; "))") else . end
+    | .data.repository.pullRequest.baseRef | if . == null then error("the PR has no base branch") else .target.file end
+    | if . == null then "absent" else "present\n" + (.object.text | strings) end') || return 1
+  if [ "$text" = absent ]; then
+    echo "$2"
+  else
+    printf '%s' "${text#present$'\n'}" | review_loop_parse "$1" "$2" "$REVIEW_LOOP_BOOLEAN"
+  fi
+}
+
+# `listed` when CODEX_REVIEW_NEUTRAL_REVIEWER_REPOS (comma-separated owner/repo,
+# matched case-insensitively and exactly) names REPO, `malformed` when it does
+# not but holds an entry that is not owner/repo, else `unlisted`. A malformed
+# entry matches no repo, yet may have been meant for this one, so `receipt`
+# posts no model id while one is present.
+neutral_reviewer_repo_state() {
+  local entry state=unlisted entries=()
+  IFS=',' read -ra entries <<< "${CODEX_REVIEW_NEUTRAL_REVIEWER_REPOS:-}"
+  for entry in ${entries[@]+"${entries[@]}"}; do
+    entry="${entry#"${entry%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    [ -n "$entry" ] || continue
+    if ! [[ "$entry" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+      echo "receipt: CODEX_REVIEW_NEUTRAL_REVIEWER_REPOS entry '$entry' is not owner/repo and matches nothing" >&2
+      state=malformed
+    elif [ "${entry,,}" = "${REPO,,}" ]; then
+      echo listed
+      return 0
+    fi
+  done
+  echo "$state"
 }
 
 # `missing` when the base requires a `Replaces:` line and the {body} JSON
@@ -838,12 +904,48 @@ comment_rule_gate() {
 
 PUBLIC_BOUNDARY_NEEDS=(scripts/check-public-boundary.ts node_modules/.bin/tsx data/v2.db .nanoclaw/public-boundary-identifiers)
 
-# The install whose scanner and private identifier list the public-boundary
-# scan uses, as an absolute path: NANOCLAW_DIR, else the checkout this copy of
+# The install whose scanner, private identifier list and receipt ledger this
+# copy uses, as an absolute path: NANOCLAW_DIR, else the checkout this copy of
 # the script sits in. A directory that does not exist is printed as given.
-public_boundary_install() {
+install_root() {
   local dir="${NANOCLAW_DIR:-$HERE/../../../..}"
   (cd "$dir" 2>/dev/null && pwd) || printf '%s' "$dir"
+}
+
+# The one receipt ledger this copy reads and writes: where a neutral-labelled
+# receipt records its reviewer, one JSON file per posted comment at
+# <ledger>/<owner>/<repo>/<pr>/<comment id>.json. The directory
+# CODEX_REVIEW_RECEIPT_LEDGER names, else an agent container's group folder
+# (/workspace/agent, the host's groups/<folder>/, which install_root cannot
+# reach from /app/skills), else the install's data/. Never a scan of other
+# groups' folders: an entry is a reviewer claim, and a group with no write
+# access to the repo must not be able to lend one to another group's receipt.
+# A merge run anywhere else names that ledger explicitly or sees nothing.
+receipt_ledger_dir() {
+  if [ -n "${CODEX_REVIEW_RECEIPT_LEDGER:-}" ]; then
+    printf '%s' "$CODEX_REVIEW_RECEIPT_LEDGER"
+  elif [ -d /workspace/agent ]; then
+    printf '%s' /workspace/agent/review-receipts
+  else
+    printf '%s/data/review-receipts' "$(install_root)"
+  fi
+}
+
+# The reviewer the ledger recorded for the receipt comment with database id
+# $1, head $2 and outcome $3, or, non-zero, why it did not. An entry whose head
+# or outcome is not the comment's was written for another receipt, and under
+# `audit` one posted at or after GATE_AS_OF was not there at the merge.
+receipt_ledger_reviewer() {
+  local file reviewer
+  file="$(receipt_ledger_dir)/$REPO/$PR/$1.json"
+  if reviewer=$(jq -er --arg head "$2" --arg outcome "$3" --arg asof "$GATE_AS_OF" '
+      select(.head == $head and .outcome == $outcome and ($asof == "" or (.postedAt | strings) < $asof))
+      | .reviewer | strings | select(. != "")' "$file" 2>/dev/null); then
+    printf '%s' "$reviewer"
+    return 0
+  fi
+  printf 'no usable ledger entry for comment %s (head %s, outcome %s%s) at %s' "$1" "$2" "$3" "${GATE_AS_OF:+, posted before $GATE_AS_OF}" "$file"
+  return 1
 }
 
 # 0 clean, 1 a finding, 2 no verdict, for one run of the scanner: its exit 1
@@ -944,7 +1046,7 @@ public_boundary_gate() {
       exit 1
       ;;
   esac
-  install=$(public_boundary_install)
+  install=$(install_root)
   for need in "${PUBLIC_BOUNDARY_NEEDS[@]}"; do
     [ -r "$install/$need" ] || missing="$missing $need"
   done
@@ -1015,6 +1117,16 @@ final_gates() {
 #   "$SP"/container/skills/pr-review-loop/scripts/codex-review.sh ...
 REVIEWER_DENIED_TIERS=(sonnet haiku luna terra mini nano lite small)
 
+# The model id --reviewer's first token names: lowercased, without a `[1m]`
+# context-window suffix or a provider path (`opencode/`), which name the
+# window and the route, not the model.
+reviewer_model_id() {
+  local LC_ALL=C first="${1%%[[:space:]]*}" id
+  id="${first,,}"
+  id="${id%\[1m\]}"
+  printf '%s' "${id##*/}"
+}
+
 # Prints why free-text $1 may not name a reviewer, or nothing when it may. Only
 # the FIRST whitespace-delimited token is read — the documented receipt format
 # leads with the model id (SKILL.md, review-policy.md) — so "claude-sonnet-5
@@ -1034,9 +1146,7 @@ reviewer_model_refusal() {
   local LC_ALL=C text="${1:-}" first id seg denied
   local -a segs=()
   first="${text%%[[:space:]]*}"
-  id=$(printf '%s' "$first" | tr '[:upper:]' '[:lower:]')
-  id="${id%\[1m\]}"
-  id="${id##*/}"
+  id=$(reviewer_model_id "$text")
   if [[ ! "$id" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || [[ ! "$id" =~ [0-9] ]]; then
     printf '"%s" is not a concrete versioned model id — lead with the id the runtime reported (e.g. claude-opus-5), not an alias or a display name' "$first"
     return 0
@@ -1414,13 +1524,13 @@ review_claim_advisories() {
   done < <(printf '%s' "$claims" | jq -c '.[]')
 }
 
-claim_now() {
+utc_now() {
   date -u +%Y-%m-%dT%H:%M:%SZ
 }
 
 claim_marker_fields() {
   local owner="$1" ttl="$2" compact
-  CLAIM_STARTED=$(claim_now) || return 1
+  CLAIM_STARTED=$(utc_now) || return 1
   CLAIM_EXPIRES=$(date -u -d "$CLAIM_STARTED + $ttl minutes" +%Y-%m-%dT%H:%M:%SZ) || return 1
   compact="${CLAIM_STARTED//[^0-9]/}"
   CLAIM_ID="$owner-$compact"
@@ -1477,10 +1587,10 @@ receipt_comments_page() {
 # `changes` receipt posted the same second the PR merged pass as if it never
 # happened.
 receipt_outcome() {
-  local pages with_at="${2:-}"
+  local pages with_at="${2:-}" line outcome rest ledger_id reviewer
   pages=$(paginate_connection comments receipt_comments_page) || return 1
   pages=$(author_standing "$pages") || return 1
-  printf '%s\n' "$pages" | jq_here -rs --arg re "$RECEIPT_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" --arg head "$1" --arg asof "$GATE_AS_OF" --arg withAt "$with_at" '
+  line=$(printf '%s\n' "$pages" | jq_here -rs --arg re "$RECEIPT_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" --arg head "$1" --arg asof "$GATE_AS_OF" --arg withAt "$with_at" --arg label "$NEUTRAL_REVIEWER_LABEL" '
     include "receipt-order";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.standing == "yes")
@@ -1508,8 +1618,25 @@ receipt_outcome() {
           elif $unread != null then
             "unknown\t\($unread.author.login // "someone") posted a comment at \($unread.createdAt), the second the PR merged, so it may have come after the merge"
           elif $latest == null then empty
-          else "\($latest.outcome)\t\($latest.reviewer)" + (if $withAt == "" then "" else "\t\($latest.at)" end) end
-        end'
+          elif ($latest.reviewer | startswith($label)) then "\($latest.outcome)\t\($latest.idstr)\t" + (if $withAt == "" then "" else $latest.at end)
+          else "\($latest.outcome)\t-\t\($latest.reviewer)" + (if $withAt == "" then "" else "\t\($latest.at)" end) end
+        end') || return 1
+  [ -n "$line" ] || return 0
+  outcome="${line%%$'\t'*}"
+  if [ "$outcome" = unknown ]; then
+    printf '%s\n' "$line"
+    return 0
+  fi
+  rest="${line#*$'\t'}"
+  ledger_id="${rest%%$'\t'*}"
+  rest="${rest#*$'\t'}"
+  if [ "$ledger_id" = - ]; then
+    printf '%s\t%s\n' "$outcome" "$rest"
+  elif reviewer=$(receipt_ledger_reviewer "$ledger_id" "$1" "$outcome"); then
+    printf '%s\t%s%s\n' "$outcome" "$reviewer" "${with_at:+$'\t'$rest}"
+  else
+    printf 'unknown\treceipt_unresolved: the latest substitute receipt for this head shows the neutral reviewer label and %s; post it again with codex-review.sh receipt where the merge runs, or set CODEX_REVIEW_RECEIPT_LEDGER to the ledger that holds it\n' "$reviewer"
+  fi
 }
 
 # Whether any substitute receipt on this PR, for ANY head, asked for changes —
@@ -2273,7 +2400,7 @@ merge_check_main() {
   fi
   # A claim is only coordination evidence. Its read is best-effort and cannot
   # alter this command's exit code or merge decision.
-  claim_now_iso=$(claim_now) || claim_now_iso=""
+  claim_now_iso=$(utc_now) || claim_now_iso=""
   if [ -n "$claim_now_iso" ]; then
     claims=$(live_review_claims "$SCOPE_HEAD" "$claim_now_iso") || claims="[]"
     review_claim_advisories "$claims" >&2 || true
@@ -2942,7 +3069,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     claim_now_iso=""
     claims="[]"
     if [ "$SCOPE_MODE" = risk-scoped ]; then
-      claim_now_iso=$(claim_now) || claim_now_iso=""
+      claim_now_iso=$(utc_now) || claim_now_iso=""
       if [ -n "$claim_now_iso" ]; then
         claims=$(live_review_claims "$SCOPE_HEAD" "$claim_now_iso") || claims="[]"
       fi
@@ -3037,7 +3164,7 @@ $assessment
     round=$((requested + 1))
     # See a local review before burning this PR-wide round budget, but never
     # refuse: a crashed session cannot be allowed to strand the PR.
-    claim_now_iso=$(claim_now) || claim_now_iso=""
+    claim_now_iso=$(utc_now) || claim_now_iso=""
     claims="[]"
     if [ -n "$claim_now_iso" ]; then
       claims=$(live_review_claims "$SCOPE_HEAD" "$claim_now_iso") || claims="[]"
@@ -3088,7 +3215,7 @@ $assessment
       echo "claim: --head $head is not the current PR head $SCOPE_HEAD" >&2
       exit 2
     fi
-    claim_now_iso=$(claim_now) || exit 1
+    claim_now_iso=$(utc_now) || exit 1
     claim=$(current_live_review_claim_for_owner "$SCOPE_HEAD" "$claim_now_iso" "$owner") || claim=""
     if [ -n "$claim" ]; then
       echo "claim: $(review_claim_advisory "$claim"); this owner already has a live marker"
@@ -3334,9 +3461,10 @@ $assessment
     receipt_reviewer="${receipt_raw#*$'\t'}"
     if [ "$receipt" = unknown ]; then
       case "$receipt_reviewer" in
-        receipt_order_unknown:*)
+        receipt_order_unknown:*|receipt_unresolved:*)
           # A receipt's own database id can't place it in posting order — never
-          # inferred from createdAt or any other field.
+          # inferred from createdAt or any other field — or its neutral label
+          # resolves to no reviewer.
           echo "audit=violation $where: $receipt_reviewer"
           ;;
         *)
@@ -3447,21 +3575,61 @@ $assessment
     body=$(cat "$body_file")
     refusal=$(receipt_input_refusal "$reviewer" "$body")
     [ -z "$refusal" ] || { echo "receipt: $refusal" >&2; exit 2; }
+    # Read after every input check, so a refused receipt costs no GitHub read;
+    # fail closed, since a base that forbids the id must never see it.
+    repo_state=$(neutral_reviewer_repo_state)
+    if [ "$repo_state" = listed ]; then
+      neutral=true
+    else
+      neutral=$(base_branch_review_loop_flag neutralReviewerLabel false) || {
+        echo "receipt: could not read $REVIEW_LOOP_CONFIG on the PR's base branch as an object with a boolean neutralReviewerLabel; nothing posted" >&2
+        exit 1
+      }
+      if [ "$neutral" != true ] && [ "$repo_state" = malformed ]; then
+        echo "receipt: CODEX_REVIEW_NEUTRAL_REVIEWER_REPOS holds an entry that is not owner/repo (named above), so whether $REPO forbids naming the model is unknown; fix the list and post again; nothing posted" >&2
+        exit 1
+      fi
+    fi
+    shown_reviewer="$reviewer"
+    [ "$neutral" != true ] || shown_reviewer="$NEUTRAL_REVIEWER_LABEL"
     claim_completion=""
     if [ -n "$claim_id" ]; then
       claim_completion="
 <!-- pr-review-loop:claim-complete id=$claim_id owner=$claim_owner head=$head -->"
     fi
-    url=$(gh pr comment "$PR" --repo "$REPO" --body "### Substitute review receipt
+    comment="### Substitute review receipt
 
 - **Head:** \`$head\`
-- **Reviewer and runtime:** $reviewer
+- **Reviewer and runtime:** $shown_reviewer
 - **Outcome:** $outcome
 
 $body
 
-<!-- pr-review-loop:substitute-receipt head=$head outcome=$outcome -->$claim_completion")
-    echo "receipt: outcome=$outcome head=$head $url"
+<!-- pr-review-loop:substitute-receipt head=$head outcome=$outcome -->$claim_completion"
+    if [ "$neutral" = true ]; then
+      model_id=$(reviewer_model_id "$reviewer")
+      if printf '%s' "$comment" | grep -qiF -- "$model_id"; then
+        echo "receipt: the comment would name the reviewer's model id ($model_id) in its body or claim, which the base's $REVIEW_LOOP_CONFIG keeps out of PR comments; remove it and post again" >&2
+        exit 2
+      fi
+    fi
+    url=$(gh pr comment "$PR" --repo "$REPO" --body "$comment")
+    ledger=""
+    if [ "$neutral" = true ]; then
+      # The id in the comment's URL is the database id merge-check orders receipts by (canonical_id, receipt-order.jq).
+      comment_id="${url##*issuecomment-}"
+      if ! [[ "$comment_id" =~ ^[1-9][0-9]*$ ]]; then
+        echo "receipt: posted $url, but its comment id is unreadable, so no ledger entry resolves its label; post the receipt again" >&2
+        exit 1
+      fi
+      ledger="$(receipt_ledger_dir)/$REPO/$PR/$comment_id.json"
+      mkdir -p "$(dirname "$ledger")" && jq -n --arg head "$head" --arg outcome "$outcome" --arg reviewer "$reviewer" --arg url "$url" --arg at "$(utc_now)" \
+        '{ head: $head, outcome: $outcome, reviewer: $reviewer, url: $url, postedAt: $at }' > "$ledger" || {
+        echo "receipt: posted $url, but could not write its ledger entry $ledger, so nothing resolves its label; fix the ledger and post the receipt again" >&2
+        exit 1
+      }
+    fi
+    echo "receipt: outcome=$outcome head=$head $url${ledger:+ (reviewer recorded in $ledger, not in the comment)}"
     ;;
   *) echo "unknown command: $1" >&2; exit 2 ;;
 esac

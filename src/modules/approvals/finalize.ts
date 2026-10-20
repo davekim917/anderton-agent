@@ -17,6 +17,12 @@ import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { editApprovalCardResolution, notifyApprovalResolved } from './primitive.js';
 
+export async function resolveClaimed(claim: () => Promise<boolean>, resolve: () => Promise<void>): Promise<boolean> {
+  if (!(await claim())) return false;
+  await resolve();
+  return true;
+}
+
 export async function writeApprovalNote(session: Session, text: string): Promise<void> {
   await writeSessionMessage(session.agent_group_id, session.id, {
     id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,

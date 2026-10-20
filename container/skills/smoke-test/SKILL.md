@@ -1935,7 +1935,9 @@ tick a no-op.
    "laneGenerations": {"<laneId>": <contract lane generation>},
    "findings": [{"id": "F-1", "blocking": true, "confirmed": true, "disposition": "fixed-verified"}],
    "gaps": [{"lane": "<laneId>", "disposition": "not-blocking:<reason>"}],
-   "dissents": [{"id": "<challenger dissent id>", "disposition": "refuted:<run-relative evidence path>"}]}
+   "dissents": [{"id": "<challenger dissent id>", "disposition": "refuted:<run-relative evidence path>"}],
+   "holdDisposition": {"runId": "<held run>", "disposition": "resolved|not-in-range|carried",
+                       "evidence": "<run-relative evidence path>"}}
   ```
 
   Give every confirmed finding, every lane without a passing marker, and
@@ -1946,6 +1948,19 @@ tick a no-op.
   file. If an item has no closed disposition, write the item anyway and
   leave its disposition open (for example, `"open"`). The controller then
   reports that item.
+
+  `holdDisposition` is needed only for GO while `SMOKE_GATE_HOLD_FILE`
+  holds another run's `HUMAN_DECISION` and the gate has not classified this
+  run as an ordinary PR (in its wake, or, for a claim recovered after the wake
+  was lost, in the PR state's `activeFreezeProbe` for the claimed sha),
+  because a GO `finish` deletes that hold. Name the held run's `runId`.
+  `resolved` (a recorded human answer) and `not-in-range` (proof this build
+  does not contain the held sha) need `evidence`, a non-empty file inside the
+  run. `carried` keeps the question open: the run finishes `HUMAN_DECISION`
+  and the gate re-raises the hold under it. Without a matching disposition
+  the controller finishes the GO `BLOCKED` (`live hold <runId> not
+  dispositioned`), and a hold file it cannot read refuses GO too (`live hold
+  unreadable`). A `NO_GO` hold needs none.
 
 ## Continuous channel profile
 
@@ -2217,7 +2232,7 @@ block flag for promotion gating:
 |---|---|---|
 | `NO_GO` | raised | `confirmed defects on this develop lineage …` |
 | `HUMAN_DECISION` | **raised** | `needs_human_decision` |
-| `GO` | removed | — |
+| `GO` | removed, except another run's `HUMAN_DECISION` hold or one that cannot be read (kept, see below) | — |
 | `BLOCKED` | untouched | — |
 
 `HUMAN_DECISION` raises the hold as of 2026-08-25; it used to leave it alone.
@@ -2228,6 +2243,36 @@ requiring a decision, and `reason` tells the release desk "somebody has to
 choose" apart from "we found bugs". `BLOCKED` is unchanged: an infra-blocked run
 asserts nothing about the build, so it neither raises a false hold nor clears a
 real one.
+
+A `GO` finish reads the hold at the moment it would delete it, under the
+lock beside it (`<hold>.lock`), which every `GO`, `NO_GO` and
+`HUMAN_DECISION` finish takes whatever its state dir; `BLOCKED` takes none.
+The gate creates that lock as a regular file without following or replacing
+anything at its path, and never replaces it; an existing symlink, FIFO or other
+non-regular file there is refused retryably, before any open. Only the gates may
+modify that path: a swap during the open is a residual that fails closed.
+A lock it cannot take within `SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS` (default 10)
+touches no hold, writes no ledger line and answers `retryable:true` with the
+slot and lease held. A `GO` keeps another run's `HUMAN_DECISION` hold (by
+verdict or by the `needs_human_decision` reason) unless the caller passed
+`--clear-hold=<that run>` after the owner token, and it keeps a hold it
+cannot read or classify. The run still finishes `GO`; the output's
+`handoff.holdKept` and the ledger line's `holdKept` name the hold and why. The
+controller passes `--clear-hold` only for a hold its synthesis disposed of as
+`resolved` or `not-in-range` with evidence, on `finish` and on a resumed
+`finish` alike, and alarms (`controller_hold_kept`) when the gate kept one,
+reading that from the run's latest line in `SMOKE_GATE_HANDOFF_LEDGER` (the
+PR receipt only when the ledger has none), so a later finish on the PR
+cannot hide it.
+A `NO_GO` hold and the run's own hold clear as before. The develop gate,
+adopting such a line, records `completedHoldKept` and expects that hold to
+stay: its hold reconciler reports `missing` if it goes and `mismatched` if
+another run's replaces it, where an ordinary `GO` expects no hold. A resumed
+`finish` that re-appends its line (same run, verdict and `finishedAt`) after the
+first was adopted refreshes `completedHoldKept` from the latest such line. The
+develop gate's own `finish` (outside handoff mode) applies the same lock and
+rule, with `--clear-hold=<run-id>` after the verdict, and records
+`completedHoldKept` directly.
 
 Downstream rule: flag present → automatic hold on promotion; flag absent → no
 smoke objection. Absence semantics make rollout safe — history predating the
@@ -2330,7 +2375,7 @@ On every terminal verdict, the coordinator closes the gate atomically:
 
 ```bash
 bash /workspace/agent/smoke-develop-gate.sh finish \
-  <40-character-sha> <run-id> <GO|NO_GO|HUMAN_DECISION|BLOCKED>
+  <40-character-sha> <run-id> <GO|NO_GO|HUMAN_DECISION|BLOCKED> [--clear-hold=<run-id>]
 ```
 
 ### Every alarm wake ends in a disposition
@@ -2484,7 +2529,7 @@ Commands: `poll` (default), `check <pr>` (read-only, mirrors the develop
 gate's `check`), `wait-settled <pr> --head <sha> [--interval-seconds N]
 [--max-seconds N]` (read-only pinned-preview waiter), `claim <run-id> <pr> <sha> [owner-token]`,
 `progress <run-id> [owner-token]`, `release <run-id> [owner-token]`,
-`finish <sha> <run-id> <verdict> [owner-token]`. `progress`/`release`/
+`finish <sha> <run-id> <verdict> [owner-token [--clear-hold=<run-id>]]`. `progress`/`release`/
 `finish` take no PR argument — the gate recovers it by locating whichever
 PR's state currently holds that run id. That resolution is only unambiguous
 if run ids are unique across the whole gate, not just within one PR, so

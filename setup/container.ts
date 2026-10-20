@@ -8,6 +8,7 @@ import { setTimeout as sleep } from 'timers/promises';
 
 import { log } from '../src/log.js';
 import { getDefaultContainerImage } from '../src/install-slug.js';
+import { currentUserName } from './lib/current-user.js';
 import { dockerHasPlugin } from './lib/docker-plugin.js';
 import { commandExists, getPlatform } from './platform.js';
 import { emitStatus } from './status.js';
@@ -142,7 +143,7 @@ export async function run(args: string[]): Promise<void> {
       const inGroup = spawnSync('id', ['-nG'], { encoding: 'utf-8' });
       if (!(inGroup.stdout ?? '').split(/\s+/).includes('docker')) {
         log.info('Adding current user to docker group');
-        spawnSync('sudo', ['usermod', '-aG', 'docker', process.env.USER ?? ''], {
+        spawnSync('sudo', ['usermod', '-aG', 'docker', currentUserName()], {
           stdio: 'inherit',
         });
       }

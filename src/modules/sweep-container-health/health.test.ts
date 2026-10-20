@@ -426,6 +426,13 @@ describe('decideStuckAction keeps all 19 existing decisions', () => {
     expect(res.heartbeatAgeMs).toBeGreaterThan(ABSOLUTE_CEILING_MS);
   });
 
+  it('spares a container waiting on its open approval gate past the ceiling, until the gate stops waiting', () => {
+    const stale = { now: BASE, heartbeatMtimeMs: BASE - ABSOLUTE_CEILING_MS - 1_000, containerState: null, claims: [] };
+    expect(decideStuckAction({ ...stale, gateDeadlineMs: BASE + 60_000 }).action).toBe('ok');
+    expect(decideStuckAction({ ...stale, gateDeadlineMs: BASE - 1 }).action).toBe('kill-ceiling');
+    expect(decideStuckAction({ ...stale, gateDeadlineMs: null }).action).toBe('kill-ceiling');
+  });
+
   it('skips the ceiling check when no heartbeat file exists (fresh container not yet ticked)', () => {
     const res = decideStuckAction({
       now: BASE,

@@ -7,7 +7,7 @@
 import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
 import { readSessionInbound, readSessionOutbound, type MessageTailRow } from '../modules/mailbox/index.js';
-import { callHaiku, listClaudeStructuredCredentialSlots } from '../llm.js';
+import { callHaiku, claudeCliAvailable, listClaudeStructuredCredentialSlots } from '../llm.js';
 
 // Candidates per tick. They run one at a time: concurrent bursts from this sweep tripped the keys' rate limits.
 export const CONCURRENCY_CAP = 3;
@@ -17,7 +17,6 @@ const FAILURE_BACKOFF_MINUTES = 15;
 const MAX_MESSAGES_PER_SLICE = 12;
 const HAIKU_MAX_TITLE_CHARS = 60;
 const HAIKU_TIMEOUT_MS = 6000;
-const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
 
 const SYSTEM_PROMPT = `Generate a short (≤60 char) plain-text label that captures the topic of the conversation. No quotes, no prefix, no markdown — just the topic.
 
@@ -88,13 +87,13 @@ export function _getCooldownStateForTest(): { cooldownUntilMs: number; lastCoold
 }
 
 /**
- * True when ANY configured credential slot exists, resolved through the same
+ * True when the claude CLI is on PATH and ANY configured credential slot exists, resolved through the same
  * {@link listClaudeStructuredCredentialSlots} the request path rotates across, so "configured" and "what gets tried"
  * cannot drift. The test override always counts as configured.
  */
 export function isBackendConfigured(): boolean {
   if (_backendOverride !== null) return true;
-  return listClaudeStructuredCredentialSlots().length > 0;
+  return claudeCliAvailable() && listClaudeStructuredCredentialSlots().length > 0;
 }
 
 let _missingBackendLogged = false;
@@ -120,7 +119,7 @@ async function callTitleBackend(system: string, user: string): Promise<string> {
   return callHaiku(user, {
     system,
     timeoutMs: HAIKU_TIMEOUT_MS,
-    model: process.env['NANOCLAW_SESSION_TITLE_MODEL'] ?? DEFAULT_MODEL,
+    model: process.env['NANOCLAW_SESSION_TITLE_MODEL'],
   });
 }
 
@@ -278,7 +277,7 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
     if (!_missingBackendLogged) {
       _missingBackendLogged = true;
       log.info(
-        'session-title: no Anthropic backend configured — sweep is a no-op. Set ANTHROPIC_API_KEY or wire HTTPS_PROXY + CLAUDE_CODE_OAUTH_TOKEN (OneCLI gateway).',
+        'session-title: no title backend — sweep is a no-op. It needs CLAUDE_CODE_OAUTH_TOKEN (or ANTHROPIC_API_KEY) in .env and the claude CLI on PATH (setup/install-claude.sh).',
       );
     }
     return { generated: 0, skipped: 0 };

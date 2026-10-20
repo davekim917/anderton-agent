@@ -9,17 +9,21 @@
  * container-side hook blocks until its own timeout on every send.
  */
 
+import { containerStartedAtMs, getContainerIdentity, hasPendingAdoption } from '../../container-runner.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { log } from '../../log.js';
+import { SessionDbMissingError, SessionDbUnopenableError } from '../mailbox/index.js';
 import type { PendingApproval, Session } from '../../types.js';
 import {
   deletePendingApproval,
-  getPendingApprovalByRequestId,
+  getApprovalByRequestId,
+  getPendingApprovalsByAction,
   getPendingApprovalsBySession,
   getSession,
+  transitionPendingApprovalStatus,
 } from '../../db/sessions.js';
 
 import {
@@ -27,8 +31,10 @@ import {
   editApprovalCard,
   headUnits,
   registerApprovalHandler,
+  registerApprovalResolvedHandler,
   requestApproval,
   notifyAgent,
+  type ApprovalDeclined,
   type ApprovalHandlerContext,
 } from '../approvals/primitive.js';
 
@@ -48,8 +54,8 @@ const GATE_COMMAND_PREVIEW_MIN_UNITS = 600;
 const pendingTimeouts = new Map<string, NodeJS.Timeout>();
 
 /**
- * Lets the router skip the cancel query in the common case. Not persisted: on
- * host restart every container gate is already stale.
+ * Lets the router skip the cancel query in the common case. Not persisted, so after a host restart an adopted
+ * container's open gate is missing here and a follow-up message does not cancel it.
  */
 const sessionsWithActiveGates = new Set<string>();
 
@@ -171,6 +177,21 @@ function createGateHandler(category: GateCategory) {
       return { deferAck: true };
     }
 
+    if (filedByEarlierContainer(session.id, requestId)) {
+      await writeGateAck(session, requestId, 'rejected', STOPPED_BEFORE_POSTED_ERROR);
+      log.info('Gate request from a replaced container refused', { sessionId: session.id, requestId });
+      return { deferAck: true };
+    }
+    const remainingMs = Math.min(
+      BASH_GATE_TIMEOUT_MS,
+      (requestedAtMs(requestId) ?? Date.now()) + BASH_GATE_TIMEOUT_MS - Date.now(),
+    );
+    if (remainingMs <= 0) {
+      await writeGateAck(session, requestId, 'timeout', EXPIRED_BEFORE_POSTED_ERROR);
+      log.info('Gate request expired before it was posted', { sessionId: session.id, requestId });
+      return { deferAck: true };
+    }
+    await supersedeOrphanedGates(session);
     sessionsWithActiveGates.add(session.id);
 
     // Schedule the timeout before dispatching, so a throw below still
@@ -178,26 +199,11 @@ function createGateHandler(category: GateCategory) {
     const timer = setTimeout(() => {
       void (async () => {
         pendingTimeouts.delete(requestId);
-        sessionsWithActiveGates.delete(session.id);
-        log.warn(`${category.logPrefix} gate timed out`, { requestId, agentGroupId: session.agent_group_id });
-        await writeGateAck(
-          session,
-          requestId,
-          'timeout',
-          `${category.logPrefix} gate timed out after ${BASH_GATE_TIMEOUT_MS / 60_000} minutes.`,
-        );
-        const pending = await getPendingApprovalByRequestId(requestId);
-        if (pending) {
-          await editApprovalCard(
-            pending,
-            `🕒 *${pending.title}* — timed out\n\nNo approval received within ${BASH_GATE_TIMEOUT_MS / 60_000} minutes. The ${category.kindNoun} was not run.`,
-          );
-          await deletePendingApproval(pending.approval_id);
-        }
+        await expireGate(category, session.id, requestId, session);
       })().catch((err) => {
         log.error(`${category.logPrefix} gate timeout handler failed`, { requestId, err });
       });
-    }, BASH_GATE_TIMEOUT_MS);
+    }, remainingMs);
     timer.unref(); // don't block process shutdown on a pending gate
     pendingTimeouts.set(requestId, timer);
 
@@ -247,12 +253,29 @@ function createGateHandler(category: GateCategory) {
 }
 
 function createApprovalHandler(logPrefix: string) {
-  return async function handleGateApproval(ctx: ApprovalHandlerContext): Promise<void> {
+  return async function handleGateApproval(ctx: ApprovalHandlerContext): Promise<void | ApprovalDeclined> {
     const { payload, userId } = ctx;
     const p = payload as unknown as BashGatePayload;
     if (!p.requestId || !p.sessionId) {
       log.warn(`${logPrefix} gate approval with malformed payload`, { payload });
       return;
+    }
+    if (filedByEarlierContainer(p.sessionId, p.requestId)) {
+      clearPending(p.requestId);
+      try {
+        await releaseActiveGate(p.sessionId, ctx.approval.approval_id);
+        await writeGateAck(ctx.session, p.requestId, 'rejected', STOPPED_BEFORE_ANSWERED_ERROR);
+      } catch (err) {
+        log.warn('Failed to settle a gate whose container stopped', { requestId: p.requestId, err });
+      }
+      log.info(`${logPrefix} gate approved after its container stopped; nothing ran`, {
+        requestId: p.requestId,
+        userId,
+      });
+      return {
+        declined:
+          '⏭️ The agent stopped before this was answered, so nothing ran. It will ask again if it still needs this.',
+      };
     }
     clearPending(p.requestId);
     sessionsWithActiveGates.delete(p.sessionId);
@@ -306,6 +329,200 @@ registerDeliveryAction(
 );
 registerApprovalHandler(DESTRUCTIVE_GATE.approvalAction, createApprovalHandler(DESTRUCTIVE_GATE.logPrefix));
 
+// A container polls for its gate's decision, and an agent's hook that stops waiting may run the command, so a
+// reject is written as soon as the approval layer reports it.
+registerApprovalResolvedHandler(async ({ approval, session, outcome }) => {
+  if (outcome !== 'reject' || !isGateAction(approval.action)) return;
+  await writeGateAck(session, approval.request_id, 'rejected', 'Rejected by an approver.');
+  clearPending(approval.request_id);
+  await releaseActiveGate(session.id, approval.approval_id);
+  log.info('Gate rejected', { requestId: approval.request_id, action: approval.action });
+});
+
+/**
+ * Times a gate out: the waiting command reads a timeout, and the card, if its row is still pending, says nothing ran.
+ * Only an approve stops it. A reject whose own ack never landed still fails the gate here, and its row is left to the
+ * reject's owner.
+ */
+async function expireGate(
+  category: GateCategory,
+  sessionId: string,
+  requestId: string,
+  session: Session | undefined,
+  rowRequired = false,
+): Promise<boolean> {
+  const pending = await getApprovalByRequestId(requestId, sessionId, category.approvalAction);
+  const rejected = pending?.status === 'rejected' || pending?.status === 'awaiting_reason';
+  const claimed = !pending
+    ? !rowRequired
+    : rejected ||
+      pending.status === 'expired' ||
+      (await transitionPendingApprovalStatus(pending.approval_id, 'pending', 'expired'));
+  if (!claimed) return false;
+  log.warn(`${category.logPrefix} gate timed out`, { requestId, sessionId });
+  if (session) {
+    try {
+      await writeGateAck(
+        session,
+        requestId,
+        'timeout',
+        `${category.logPrefix} gate timed out after ${BASH_GATE_TIMEOUT_MS / 60_000} minutes.`,
+      );
+    } catch (err) {
+      if (!(err instanceof SessionDbMissingError || err instanceof SessionDbUnopenableError)) throw err;
+    }
+  }
+  if (pending && !rejected) {
+    await editApprovalCard(
+      pending,
+      `🕒 *${pending.title}* — timed out\n\nNo approval received within ${BASH_GATE_TIMEOUT_MS / 60_000} minutes. The ${category.kindNoun} was not run.`,
+    );
+    await deletePendingApproval(pending.approval_id);
+  }
+  if (!rejected) await releaseActiveGate(sessionId, pending?.approval_id ?? '');
+  return true;
+}
+
+/**
+ * Expires gates whose hour has passed with no timer left to do it (a host restart drops every armed timer), and
+ * finishes any gate already claimed as expired whose cleanup failed part-way.
+ */
+export async function expireOverdueGates(now: number = Date.now()): Promise<number> {
+  let expired = 0;
+  for (const category of [BASH_GATE, DESTRUCTIVE_GATE]) {
+    for (const p of await getPendingApprovalsByAction(category.approvalAction)) {
+      if (!p.session_id || pendingTimeouts.has(p.request_id)) continue;
+      if (
+        (p.status === 'approved' || p.status === 'rejected') &&
+        gateAskedAtMs(p) + BASH_GATE_TIMEOUT_MS + GATE_HOOK_MARGIN_MS <= now
+      ) {
+        try {
+          await closeAbandonedGate(category, p);
+          expired++;
+        } catch (err) {
+          log.warn('Failed to close an abandoned gate', { approvalId: p.approval_id, err });
+        }
+        continue;
+      }
+      const overdue = p.status === 'pending' && gateAskedAtMs(p) + BASH_GATE_TIMEOUT_MS <= now;
+      if (!overdue && p.status !== 'expired') continue;
+      try {
+        if (await expireGate(category, p.session_id, p.request_id, await getSession(p.session_id), true)) expired++;
+      } catch (err) {
+        log.warn('Failed to expire an overdue gate', { approvalId: p.approval_id, err });
+      }
+    }
+  }
+  return expired;
+}
+
+/**
+ * Closes a gate whose answer was claimed but never finished: the host died, or the answer's own writes failed. Its
+ * hook has stopped waiting by now, so no ack is written; for an approve, whether the command ran is only known in the
+ * agent's thread.
+ */
+async function closeAbandonedGate(category: GateCategory, p: PendingApproval): Promise<void> {
+  const outcome =
+    p.status === 'rejected'
+      ? `The ${category.kindNoun} was not run.`
+      : `Check the agent's thread to see whether the ${category.kindNoun} ran.`;
+  await editApprovalCard(p, `⏹️ *${p.title}* — closed\n\nThis answer was never finished being applied. ${outcome}`);
+  await deletePendingApproval(p.approval_id);
+  await releaseActiveGate(p.session_id!, p.approval_id);
+  log.info('Closed a gate whose answer was never finished', { approvalId: p.approval_id, status: p.status });
+}
+
+export function _dropGateTimersForTesting(): void {
+  for (const handle of pendingTimeouts.values()) clearTimeout(handle);
+  pendingTimeouts.clear();
+}
+
+async function releaseActiveGate(sessionId: string, resolvedApprovalId: string): Promise<void> {
+  const siblings = (await getPendingApprovalsBySession(sessionId)).filter(
+    (p) => isGateAction(p.action) && p.approval_id !== resolvedApprovalId,
+  );
+  if (siblings.length === 0) sessionsWithActiveGates.delete(sessionId);
+}
+
+function isGateAction(action: string): boolean {
+  return action === BASH_GATE.approvalAction || action === DESTRUCTIVE_GATE.approvalAction;
+}
+
+/**
+ * Every producer stamps a request id with the container's clock at the moment it asked, and the host names a
+ * container before starting it, so an id older than the current container's name came from a container that is gone.
+ */
+function requestedAtMs(requestId: string): number | null {
+  const match = /^gate-(\d+)-/.exec(requestId);
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * True when no live container can be waiting on this request. A container is named before it starts, so with no
+ * name the session either has no container or one still spawning, and neither filed this; an adopted survivor whose
+ * name the runtime could not report may have, so it is given the benefit of the doubt.
+ */
+function filedByEarlierContainer(sessionId: string, requestId: string): boolean {
+  const name = getContainerIdentity(sessionId);
+  if (name === null) return !hasPendingAdoption(sessionId);
+  const startedAt = containerStartedAtMs(name);
+  const askedAt = requestedAtMs(requestId);
+  return startedAt !== null && askedAt !== null && askedAt < startedAt;
+}
+
+const STOPPED_BEFORE_ANSWERED_ERROR = 'The agent stopped before this approval was answered.';
+const STOPPED_BEFORE_POSTED_ERROR = 'The agent stopped before this approval request was posted.';
+const EXPIRED_BEFORE_POSTED_ERROR = 'The approval window ran out before this request was posted.';
+
+// The plugin's gate hook waits a minute past the host's timeout for the decision it writes.
+const GATE_HOOK_MARGIN_MS = 2 * 60 * 1000;
+
+/** Never later than the host's post time, so a future-dated id cannot stretch a gate. */
+function gateAskedAtMs(p: PendingApproval): number {
+  const postedAt = Date.parse(p.created_at);
+  return Math.min(requestedAtMs(p.request_id) ?? postedAt, postedAt);
+}
+
+/**
+ * When the session's open gate stops waiting, or null with none open. A container waiting on its gate does no
+ * provider work, so its heartbeat goes quiet for up to the gate's whole window. Only gates its current container
+ * filed count: an earlier container's card has nobody waiting on it.
+ */
+export async function openGateDeadlineMs(sessionId: string): Promise<number | null> {
+  let deadline: number | null = null;
+  for (const p of await getPendingApprovalsBySession(sessionId)) {
+    if (!isGateAction(p.action) || filedByEarlierContainer(sessionId, p.request_id)) continue;
+    const at = gateAskedAtMs(p) + BASH_GATE_TIMEOUT_MS + GATE_HOOK_MARGIN_MS;
+    if (Number.isFinite(at)) deadline = Math.max(deadline ?? at, at);
+  }
+  return deadline;
+}
+
+const SUPERSEDED_ERROR = 'Superseded: the agent restarted and asked again.';
+
+/** Closes the cards an earlier container of this session filed: that container is gone, so an answer reaches nobody. */
+async function supersedeOrphanedGates(session: Session): Promise<void> {
+  for (const p of await getPendingApprovalsBySession(session.id)) {
+    if (!isGateAction(p.action) || !filedByEarlierContainer(session.id, p.request_id)) continue;
+    try {
+      await writeGateAck(session, p.request_id, 'rejected', SUPERSEDED_ERROR);
+    } catch (err) {
+      log.warn('Failed to settle superseded gate', { approvalId: p.approval_id, err });
+    }
+    clearPending(p.request_id);
+    try {
+      await editApprovalCard(
+        p,
+        `⏭️ *${p.title}* — superseded\n\nThe agent restarted before this was answered and asked again in a newer card. Answer that one.`,
+      );
+    } catch (err) {
+      log.warn('Failed to edit superseded gate card', { approvalId: p.approval_id, err });
+    }
+    await deletePendingApproval(p.approval_id);
+    log.info('Gate superseded by a restarted container', { approvalId: p.approval_id, requestId: p.request_id });
+  }
+}
+
 /**
  * A follow-up message implicitly rejects the session's open gates so the
  * agent can answer it instead of staying blocked. Card edit is best-effort;
@@ -313,8 +530,8 @@ registerApprovalHandler(DESTRUCTIVE_GATE.approvalAction, createApprovalHandler(D
  * cancelled gate.
  */
 export async function cancelPendingGatesForSession(sessionId: string, reason: string): Promise<void> {
-  const pending: PendingApproval[] = (await getPendingApprovalsBySession(sessionId)).filter(
-    (p) => p.action === BASH_GATE.approvalAction || p.action === DESTRUCTIVE_GATE.approvalAction,
+  const pending: PendingApproval[] = (await getPendingApprovalsBySession(sessionId)).filter((p) =>
+    isGateAction(p.action),
   );
   if (pending.length === 0) return;
 
@@ -331,15 +548,22 @@ export async function cancelPendingGatesForSession(sessionId: string, reason: st
   });
 
   for (const p of pending) {
-    // request_id is the gate's own outbound message id, which the container polls on.
+    if (!(await transitionPendingApprovalStatus(p.approval_id, 'pending', 'rejected'))) continue;
+    try {
+      // request_id is the gate's own outbound message id, which the container polls on.
+      await writeGateAck(session, p.request_id, 'rejected', reason);
+    } catch (err) {
+      await transitionPendingApprovalStatus(p.approval_id, 'rejected', 'pending');
+      log.warn('Failed to cancel a gate; its timeout still applies', { approvalId: p.approval_id, err });
+      continue;
+    }
     clearPending(p.request_id);
     try {
       await editApprovalCard(p, `❌ *${p.title}* — cancelled\n\n${reason}`);
     } catch (err) {
       log.warn('Failed to edit cancelled approval card', { approvalId: p.approval_id, err });
     }
-    await writeGateAck(session, p.request_id, 'rejected', reason);
     await deletePendingApproval(p.approval_id);
   }
-  sessionsWithActiveGates.delete(sessionId);
+  await releaseActiveGate(sessionId, '');
 }

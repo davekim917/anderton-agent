@@ -50,13 +50,29 @@ synthesis.json (the owner's machine-readable verdict; new contract, s2):
   {schemaVersion:1, runId, sourceSha, verdict: GO|NO_GO|HUMAN_DECISION|BLOCKED,
    laneGenerations:{<laneId>:<gen>},
    findings:[{id, blocking:bool, confirmed:bool, disposition}],
-   gaps:[{lane, disposition}], dissents:[{id, disposition}]}
+   gaps:[{lane, disposition}], dissents:[{id, disposition}],
+   holdDisposition:{runId, disposition: resolved|not-in-range|carried, evidence}}
   A closed disposition is `fixed-verified`, `not-blocking:<reason>` or
   `refuted:<run-relative evidence path>` (nonempty regular file in the run).
   The controller enumerates gaps, confirmed findings and dissent ITSELF
   (markers, contract, challenger/challenge.complete.json) and requires the
   synthesis to disposition each; it never trusts the synthesis' own list as
   complete. Anything short of that maps GO to BLOCKED naming the failed check.
+
+Live hold (holdDisposition): the develop hold is the file the gate's `finish`
+raises on NO_GO/HUMAN_DECISION and DELETES on GO, named by the same
+SMOKE_GATE_HOLD_FILE the gate reads -- this process's own environment, which
+every gate verb it spawns inherits. When it holds another run's HUMAN_DECISION
+and this run is not known to be an ordinary (non-freeze) PR, GO needs
+holdDisposition naming that hold's runId: `resolved` or `not-in-range` with
+`evidence` (run-relative, nonempty file in the run), or `carried`, which
+finishes HUMAN_DECISION so the gate re-raises the hold under this run. A hold
+file that is present but unreadable refuses GO; it is never read as absent.
+A NO_GO hold needs nothing: a GO after a fix is how those clear. The gate
+re-checks the hold it is about to delete: a GO finish (or its resume) passes
+`--clear-hold=<runId>` only for a resolved/not-in-range hold, and the gate
+keeps any other HUMAN_DECISION hold it finds (handoff.holdKept, alarmed as
+controller_hold_kept).
 
 challenger/challenge.complete.json dissent inventory (new contract, s2):
   {..., disposition: CLEAR|<other>, dissents:[<id> | {id}]}
@@ -185,6 +201,9 @@ GH_SUBCOMMANDS = (("api",), ("issue", "list"), ("issue", "create"), ("issue", "c
                   ("pr", "view"), ("pr", "comment"), ("pr", "close"))
 POST_FINISH_SLA_SECONDS = 3600
 CLOSED_DISPOSITION = re.compile(r"^(fixed-verified|not-blocking:.+|refuted:.+)$")
+HOLD_DISPOSITIONS = ("resolved", "not-in-range", "carried")
+HOLD_FILE_ENV = "SMOKE_GATE_HOLD_FILE"
+HANDOFF_LEDGER_ENV = "SMOKE_GATE_HANDOFF_LEDGER"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # First character alphanumeric: `.`, `..` and dot-files are never run ids, so a
 # run id can never name a directory outside --out-dir or --run-root.
@@ -856,6 +875,8 @@ ALARM_WORDS = {
     "controller_run_released": "this run lost its gate slot without a verdict; its open steps were abandoned",
     "controller_step_failed": "a step for this run ended in a way the controller does not know how to act on",
     "controller_finish_unconfirmed": "verdict.json exists but the gate's completed state does not confirm the finish",
+    "controller_hold_kept": ("this run finished GO, but the gate kept another run's develop hold that the "
+                             "synthesis never disposed of; promotion stays held until a human answers it"),
 }
 ONESHOT_TEXT = {
     "critic": (
@@ -1619,7 +1640,9 @@ class EffectLayer:
         token = self._claim(run_id)["token"]
         if not token:
             return {"outcome": "refused", "error": "no owner token: this controller did not receive the claim"}
-        argv = self.gate + [verb] + list(effect["args"]) + [token]
+        # `trailing` goes after the owner token, where a gate that predates
+        # it ignores it.
+        argv = self.gate + [verb] + list(effect["args"]) + [token] + list(effect.get("trailing") or [])
         rc, out, err = self._run(argv, 60)
         doc = last_json_line(out) if rc is not None else None
         if not doc:
@@ -1850,7 +1873,46 @@ class EffectLayer:
             identity = self._identity_note(run, claim)
             if identity:
                 out.append(identity)
+        if step in ("synthesis", "adjudicated"):
+            hold = self._hold_note(run_id)
+            if hold:
+                out.append(hold)
         return "".join(n + "\n\n" for n in out)
+
+    def _hold_note(self, run_id):
+        """The live develop hold this run's GO would delete, or None. The
+        controller enforces it whether or not the brief carried it
+        (validate_synthesis); this is how the owner learns of it in time."""
+        held, err = self.ctl.live_hold(run_id)
+        if err:
+            return ("**THE DEVELOP HOLD CANNOT BE READ** ({}). While it cannot, the controller refuses GO for this "
+                    "run (BLOCKED, `live hold unreadable`). Write the verdict the evidence supports and say in "
+                    "coordinator/synthesis.md that the hold could not be weighed.").format(_brief_value(err))
+        if not held:
+            return None
+        rid = held["runId"]
+        root = self.ctl.args.run_root
+        pointers = []
+        if root and RUN_ID_RE.match(rid):
+            for rel in ("coordinator/synthesis.md", "synthesis.json", "controller/verdict-bullets.md", "run-record.md"):
+                if nonempty_file(os.path.join(root, rid, rel)):
+                    pointers.append("`{}`".format(os.path.join(root, rid, rel)))
+        where = ("The held run's record: " + ", ".join(pointers) + "." if pointers else
+                 "The held run's record was not found under this run root; find it by its runId.")
+        return ("**A HUMAN_DECISION HOLD IS LIVE ON DEVELOP.** `{path}` holds run `{rid}` (sha `{sha}`, verdict "
+                "`{verdict}`, reason `{reason}`, raised {raised}). {where} A GO `finish` for this run deletes that "
+                "hold, so the controller accepts GO only when synthesis.json carries `holdDisposition` naming it: "
+                "`{{\"runId\": \"{rid}\", \"disposition\": \"resolved|not-in-range|carried\", \"evidence\": "
+                "\"<run-relative path>\"}}`. `resolved`: the held question has a recorded human answer, saved in this "
+                "run as the evidence file. `not-in-range`: this build does not contain the held sha, with the proof "
+                "saved as the evidence file (for example `git merge-base --is-ancestor <hold sha> <this build's "
+                "target sha>` failing; a freeze PR's range is `campaignRange` in controller/wake.json). `carried`: "
+                "the question is still open, so the run finishes HUMAN_DECISION and the gate re-raises the hold "
+                "under this run (no evidence needed). Without one, GO finishes BLOCKED (`live hold {rid} not "
+                "dispositioned`). Weigh the held question in coordinator/synthesis.md whatever you decide.").format(
+            path=_brief_value(self.ctl.hold_path), rid=_brief_value(rid), sha=_brief_value(held.get("sha")),
+            verdict=_brief_value(held.get("verdict")), reason=_brief_value(held.get("reason")),
+            raised=_brief_value(held.get("raisedAt")), where=where)
 
     def _identity_note(self, run, claim):
         """This run's exact pair-identity commands, or None for a run with no
@@ -1907,6 +1969,12 @@ class EffectLayer:
                                          "--session", receipt["session_id"], "--settlement", "--json"], 20)
         doc = last_json_line(out) if rc is not None else None
         return doc.get("data") if isinstance(doc, dict) and doc.get("ok") is True else None
+
+
+def _brief_value(value):
+    """A value from a file the owner did not write, made safe to quote inline
+    in a markdown brief: one line, no backticks, bounded."""
+    return re.sub(r"[`\r\n]+", " ", str(value))[:200]
 
 
 def frozen_terminal_verb(detail):
@@ -2051,7 +2119,8 @@ class GateView:
                 out[run] = {"pr": pr, "sha": st.get("activeSha"), "deadline": st.get("challengerDeadline"),
                             "disposition": st.get("challengerDisposition"), "owner": st.get("activeLeaseOwner"),
                             "claimant": st.get("activeClaimant"), "startedAt": st.get("challengerStartedAt"),
-                            "provisional": st.get("challengerProvisionalDeadline")}
+                            "provisional": st.get("challengerProvisionalDeadline"),
+                            "freezeProbe": st.get("activeFreezeProbe")}
         return out
 
     def note_challenger_start(self, run_id, deadline, started_at, provisional):
@@ -2301,8 +2370,57 @@ def dissent_inventory(challenge):
     return ids, None
 
 
-def validate_synthesis(run, claim_sha, pr_head, synthesis_barrier, identity):
-    """Returns (verdict, failed_checks). GO only when every check passes."""
+def read_live_hold(path, run_id):
+    """(hold, error) for the develop hold file at `path`, as `run_id` sees it.
+
+    hold is the record when it is another run's HUMAN_DECISION, else None.
+    error is set when the file is present but cannot be read or classified:
+    the caller refuses GO on it, because a GO finish deletes that file."""
+    if not path:
+        return None, None
+    doc, err = read_json_file(path)
+    if err == "missing" and not os.path.lexists(path):
+        return None, None
+    if err == "missing":
+        return None, "hold file {} is a dangling link".format(path)
+    if err:
+        return None, "hold file {} {}".format(path, err)
+    if not isinstance(doc, dict) or not isinstance(doc.get("runId"), str) or not doc["runId"]:
+        return None, "hold file {} names no runId".format(path)
+    human = doc.get("verdict") == "HUMAN_DECISION" or doc.get("reason") == "needs_human_decision"
+    if not human and doc.get("verdict") != "NO_GO":
+        return None, "hold file {} has verdict {!r}, neither NO_GO nor HUMAN_DECISION".format(path, doc.get("verdict"))
+    if not human or doc["runId"] == run_id:
+        return None, None
+    return doc, None
+
+
+def hold_checks(run, doc, hold):
+    """(failed_checks, carried_run_id) for a GO synthesis `doc` under the live
+    hold read by read_live_hold. Both empty when no hold is in scope."""
+    held, hold_err = hold if hold else (None, None)
+    if hold_err:
+        return ["live hold unreadable: {} (GO refused: an unreadable hold is never absent)".format(hold_err)], None
+    if not held:
+        return [], None
+    rid = held["runId"]
+    hd = doc.get("holdDisposition") if isinstance(doc, dict) else None
+    named = hd.get("runId") if isinstance(hd, dict) else None
+    disposition = hd.get("disposition") if isinstance(hd, dict) else None
+    if named != rid or disposition not in HOLD_DISPOSITIONS:
+        return ["live hold {} not dispositioned (holdDisposition must name runId {} as {}; it has runId={!r} "
+                "disposition={!r})".format(rid, rid, "|".join(HOLD_DISPOSITIONS), named, disposition)], None
+    if disposition == "carried":
+        return [], rid
+    if not safe_run_relative(run.dir, hd.get("evidence")):
+        return ["live hold {} not dispositioned ({} needs evidence naming a nonempty file inside the run, got "
+                "{!r})".format(rid, disposition, hd.get("evidence"))], None
+    return [], None
+
+
+def validate_synthesis(run, claim_sha, pr_head, synthesis_barrier, identity, hold=None):
+    """Returns (verdict, failed_checks). GO only when every check passes.
+    `hold` is read_live_hold's answer for this run (None: no hold file)."""
     doc, err = run.synthesis()
     if err:
         return "BLOCKED", ["synthesis.json {}".format(err)]
@@ -2376,8 +2494,15 @@ def validate_synthesis(run, claim_sha, pr_head, synthesis_barrier, identity):
         for did in inventory:
             if not closed(dissent_disp.get(did)):
                 failed.append("dissent {} has no closed disposition".format(did))
+    hold_failed, carried = hold_checks(run, doc, hold)
+    failed.extend(hold_failed)
     if failed:
         return "BLOCKED", failed
+    if carried:
+        # Recorded as a check so the journal, decisions and verdict post all
+        # say why a GO synthesis finished HUMAN_DECISION.
+        return "HUMAN_DECISION", ["live hold {} carried: GO finishes HUMAN_DECISION and the hold is re-raised "
+                                  "under this run".format(carried)]
     return "GO", []
 
 
@@ -2423,6 +2548,11 @@ class Controller:
         self.tasks = self._load_json_arg(args.tasks_json, [])
         self.pr_heads = {str(k): v for k, v in self._load_json_arg(args.pr_heads_json, {}).items()}
         self.poll = self._load_json_arg(args.poll_json, None)
+        # Read from the environment, never from an argument: it is the variable
+        # every gate verb this process spawns inherits, so the file judged here
+        # is the file that verb's `finish` raises or deletes.
+        self.hold_path = os.environ.get(HOLD_FILE_ENV) or None
+        self.ledger_path = os.environ.get(HANDOFF_LEDGER_ENV) or None
         self.queued_alarms = self._load_alarm_queue(getattr(args, "alarm_queue_dir", None))
         # Cutover (live only): runs the gate had claimed when this controller
         # first went live. They finish under the legacy coordinator; this
@@ -2434,6 +2564,25 @@ class Controller:
                 raise ControllerError("live mode needs a readable --cutover-json {legacyRuns:[...]} -- refusing to "
                                       "guess which claimed runs belong to the legacy coordinator")
             self.legacy = {r for r in cut["legacyRuns"] if isinstance(r, str)}
+
+    def live_hold(self, run_id):
+        """read_live_hold for this run, read afresh on every call.
+
+        Out of scope only for a run the GATE classified as an ordinary PR:
+        the gate's finish touches the hold only for a freeze PR, and its live
+        wake's isFreezePr is read off the frozen head commit itself. That
+        exemption needs a live gate wake, or (a claim recovered after the wake
+        was lost) the gate state's own classification, for the sha the gate
+        still has claimed. Anything else counts as a freeze PR -- shadow's
+        synthesized wake guesses from the branch name, which an author
+        chooses."""
+        ob = self.obligations().get(obligation_key(run_id, "run", "claim")) or {}
+        d = ob.get("detail") or {}
+        if self.live and d.get("isFreezePr") is False and d.get("origin") in ("poll-wake", "poll-reclaim", "recovered") \
+                and not (d.get("wake") or {}).get("shadowSynthesized") and d.get("sha") \
+                and d.get("sha") == (self.gate.active_claims().get(run_id) or {}).get("sha"):
+            return None, None
+        return read_live_hold(self.hold_path, run_id)
 
     @staticmethod
     def _load_json_arg(path, default):
@@ -2769,7 +2918,7 @@ class Controller:
             return "intent"
         return self._effect_failed(run_id, "gh", slot, 1, result, "controller_gh_failed")
 
-    def gate_verb(self, run_id, phase, verb, argv_tail, verdict, effect_verb=None):
+    def gate_verb(self, run_id, phase, verb, argv_tail, verdict, effect_verb=None, trailing=None):
         key = obligation_key(run_id, "gate", verb)
         ob = self.obligations().get(key)
         if ob and ob["state"] in TERMINAL_OK | {"failed_terminal"}:
@@ -2785,16 +2934,26 @@ class Controller:
         # recorded depends on its code: see GATE_REFUSALS and the refused
         # branch below.
         result = self.effects.perform({"type": "gate", "runId": run_id, "verb": effect_verb or verb,
-                                       "args": argv_tail})
+                                       "args": argv_tail, "trailing": trailing or []})
         self.decide(run_id, phase, "gate", "mechanical", "obligation due", verb=verb, args=argv_tail,
-                    effect=result["outcome"])
+                    trailing=trailing or [], effect=result["outcome"])
         crash_point("after-effect", "gate", verb)
         if result["outcome"] in ("shadow_refused", "ok"):
             detail = {"outcome": result["outcome"], "args": argv_tail, "verdict": verdict}
+            if trailing:
+                detail["trailing"] = trailing
             if result["outcome"] == "shadow_refused":
                 detail["shadowAssumed"] = True
             else:
                 detail["result"] = result.get("result")
+            kept = ((result.get("result") or {}).get("handoff") or {}).get("holdKept")
+            if kept:
+                # The verdict stands; the gate kept a hold this GO had no
+                # disposition for. A human has to see that. Journaled before
+                # the verb is done: a fire killed in between re-enters through
+                # the open intent, whose recovery reads the gate's receipt.
+                self.ensure_alarm(run_id, "controller_hold_kept", "hold-kept:{}".format(run_id[-24:]),
+                                  {"verb": verb, "verdict": verdict, "holdKept": kept})
             self.record(run_id, "gate", verb, "done", 1, detail)
             return "done"
         if result["outcome"] == "refused":
@@ -3105,6 +3264,13 @@ class Controller:
                   "sha": wake.get("sourceSha") if wake else claim["sha"]}
         if wake:
             detail["isFreezePr"] = wake.get("isFreezePr")
+        else:
+            # The gate's own classification of the claimed head, written with
+            # the slot: the only record of it once the claiming wake is lost.
+            probe = claim.get("freezeProbe")
+            if isinstance(probe, dict) and probe.get("sha") == claim["sha"] \
+                    and isinstance(probe.get("isFreezePr"), bool):
+                detail["isFreezePr"] = probe["isFreezePr"]
         if self.live:
             token = (wake or {}).get("coordinatorOwnerToken") or (claim or {}).get("owner")
             detail["ownerToken"] = token
@@ -3442,7 +3608,8 @@ class Controller:
         # An unanswered resume is simply re-offered: the gate's finish is
         # idempotent on the same terminal facts.
         self.gate_verb(run_id, "verdict", "finish-resume",
-                       [verdict_doc.get("sha") or claim.get("sha"), run_id, verdict], verdict, effect_verb="finish")
+                       [verdict_doc.get("sha") or claim.get("sha"), run_id, verdict], verdict, effect_verb="finish",
+                       trailing=self._clear_hold_arg(run_id, verdict))
         return "verdict"
 
     def _alarm_overdue(self, run_id, phase):
@@ -3576,7 +3743,11 @@ class Controller:
                 # before hold/ledger/slot cleanup. Never post_finish (and so
                 # never freeze-close) until the gate's completed state agrees.
                 return self._finish_incomplete(run_id, run_ob, claim, verdict_doc, fin)
-            for verb in TERMINAL_VERBS:
+            # Ours when this controller journaled a terminal verb for the run
+            # that ran or may have run: whichever fire gets here, and however
+            # many died on the way, reads the same answer from the journal.
+            mine = False
+            for verb in TERMINAL_VERBS + ("finish-resume",):
                 own = obs.get(obligation_key(run_id, "gate", verb))
                 if own and own["state"] == "intent":
                     # Our own terminal verb ran and the fire died before its
@@ -3587,8 +3758,10 @@ class Controller:
                     self.decide(run_id, "verdict", "gate_reconcile", "mechanical",
                                 "terminal verb outcome recovered from verdict.json", verb=verb,
                                 verdict=verdict_doc.get("verdict"))
-                    return self.post_finish(run_id, pr, verdict_doc.get("verdict"), external=False)
-            return self.post_finish(run_id, pr, verdict_doc.get("verdict"), external=True)
+                    mine = True
+                elif own and own["state"] == "done":
+                    mine = True
+            return self.post_finish(run_id, pr, verdict_doc.get("verdict"), external=not mine)
         if claim is None and pr in self.gate.error_prs:
             # Absence is only evidence when presence was readable.
             self.decide(run_id, None, "escalate", "coordination_model", "gate state for this PR is unreadable")
@@ -3752,7 +3925,8 @@ class Controller:
         early, early_err = run.synthesis()
         if not early_err and isinstance(early, dict) and early.get("verdict") in ("BLOCKED", "HUMAN_DECISION"):
             verdict, failed = validate_synthesis(run, claim.get("sha"), self.pr_heads.get(str(pr)),
-                                                 {"ready": False}, run.last_identity_check())
+                                                 {"ready": False}, run.last_identity_check(),
+                                                 hold=self.live_hold(run_id))
             if self.owner_step(run_id, "synthesis", "synthesis", done=True) != "done":
                 return "synthesis"
             return self.pre_finish(run_id, pr, verdict, failed, early)
@@ -3849,7 +4023,8 @@ class Controller:
         self._adjudication(run_id, run)
 
         head = self.pr_heads.get(str(pr))
-        verdict, failed = validate_synthesis(run, claim.get("sha"), head, syn_barrier, run.last_identity_check())
+        verdict, failed = validate_synthesis(run, claim.get("sha"), head, syn_barrier, run.last_identity_check(),
+                                             hold=self.live_hold(run_id))
         return self.pre_finish(run_id, pr, verdict, failed, synthesis_doc if not syn_err else {})
 
     def _adjudication(self, run_id, run):
@@ -3898,7 +4073,8 @@ class Controller:
         syn_doc, syn_err = run.synthesis()
         if frozen == "GO":
             verdict, failed = validate_synthesis(run, claim.get("sha"), self.pr_heads.get(str(pr)),
-                                                 run.barrier("synthesis"), run.last_identity_check())
+                                                 run.barrier("synthesis"), run.last_identity_check(),
+                                                 hold=self.live_hold(run_id))
         else:
             verdict, failed = frozen, vob["detail"].get("failedChecks") or []
         return self.pre_finish(run_id, pr, verdict, failed, syn_doc if not syn_err else {},
@@ -4108,6 +4284,10 @@ class Controller:
         # the findings matched to existing issues (_dedup_note).
         hint = {"verdict": verdict, "failedChecks": failed[:4]}
         for kind, slot in PUBLICATION_SLOTS:
+            # Before EACH post, not once before both: a hold raised while the
+            # chat post is being sent must not let the PR comment say GO.
+            if verdict == "GO" and self._hold_changed(run_id, run, phase):
+                return "verdict"
             if self._align_publication(run_id, phase, kind, slot, hint) == "superseded":
                 continue
             states.append((kind, slot, self.send(run_id, phase, slot, hint=hint) if kind == "send" else
@@ -4128,6 +4308,8 @@ class Controller:
             # Unreachable by construction; asserted so a future edit cannot
             # turn a failed check into a GO finish.
             raise ControllerError("refusing finish GO with failed checks: {}".format(failed))
+        if verdict == "GO" and self._hold_changed(run_id, run, phase):
+            return "verdict"
         terminal_verb = self._publish_verb(run_id, run, terminal_verb)
         self.decide(run_id, phase, "finish", "mechanical", "all pre-finish obligations settled",
                     verdict=verdict, failedChecks=failed, verb=terminal_verb)
@@ -4147,6 +4329,20 @@ class Controller:
             # PRP step 7: the freeze-PR close follows finish in the same turn.
             return self.post_finish(run_id, pr, verdict, external=False)
         return "verdict"
+
+    def _hold_changed(self, run_id, run, phase):
+        """True when the live hold, read again now, no longer lets this run's
+        synthesis finish GO. Validation read it earlier in this fire; a hold
+        raised or replaced since then would otherwise be deleted by this GO's
+        finish. Nothing is posted or finished this fire, and the next fire's
+        frozen-GO re-validation concludes it (BLOCKED, superseded)."""
+        doc, err = run.synthesis()
+        moved, carried = hold_checks(run, doc if not err else None, self.live_hold(run_id))
+        if not moved and not carried:
+            return False
+        self.decide(run_id, phase, "wait", "wait", "live hold changed after validation; GO is re-validated next fire",
+                    failedChecks=moved, carried=carried)
+        return True
 
     def _is_publication(self, ob):
         """A verdict post (PUBLICATION_SLOTS), or an alarm raised about one."""
@@ -4286,7 +4482,24 @@ class Controller:
 
     def _terminal_call(self, run_id, phase, verb, claim_sha, verdict):
         args = [run_id] if verb == "challenger-timeout" else [claim_sha, run_id, verdict]
-        return self.gate_verb(run_id, phase, verb, args, verdict)
+        return self.gate_verb(run_id, phase, verb, args, verdict, trailing=self._clear_hold_arg(run_id, verdict))
+
+    def _clear_hold_arg(self, run_id, verdict):
+        """The gate's --clear-hold authorization for a GO finish, re-derived at
+        the call: the live hold's runId when this run's synthesis disposes of
+        it as resolved or not-in-range with valid evidence. Otherwise nothing,
+        and the gate keeps any other run's HUMAN_DECISION hold it finds."""
+        if verdict != "GO":
+            return []
+        held, err = self.live_hold(run_id)
+        if err or not held:
+            return []
+        run = RunView(self.args.run_root, run_id)
+        doc, serr = run.synthesis()
+        failed, carried = hold_checks(run, doc if not serr else None, (held, None))
+        if failed or carried:
+            return []
+        return ["--clear-hold=" + held["runId"]]
 
     def _publish_verb(self, run_id, run, verb):
         """The terminal verb a (possibly replayed) verdict is published through.
@@ -4411,6 +4624,43 @@ class Controller:
                 self.decide(run_id, "finished", "log", "mechanical", "verdict post published after finish",
                             slot=slot, kind=kind)
 
+    def _hold_kept(self, run_id, pv, obs, ordinary):
+        """The hold this run's finish kept, or None. Sources, first answer wins:
+        the gate result this controller journaled with its own terminal verb;
+        the handoff ledger, append-only, whose latest line for the run wins as
+        it does for the develop gate; the PR receipt, which the PR's next
+        finish replaces, only while it still names the run; and the gate's own
+        classification of the PR as ordinary, since only a freeze PR's finish
+        touches the hold. With none of them and the ledger unreadable, the
+        answer is unknown and the run's step fails rather than settle."""
+        for verb in ("finish-resume",) + TERMINAL_VERBS:
+            own = obs.get(obligation_key(run_id, "gate", verb)) or {}
+            result = (own.get("detail") or {}).get("result")
+            if own.get("state") == "done" and isinstance(result, dict) and isinstance(result.get("handoff"), dict):
+                return result["handoff"].get("holdKept")
+        found, kept, unread = False, None, None
+        try:
+            with open(self.ledger_path or os.devnull, "rb") as fh:
+                for raw in fh:
+                    try:
+                        line = json.loads(raw.decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if isinstance(line, dict) and line.get("runId") == run_id:
+                        found, kept = True, line.get("holdKept")
+        except OSError as exc:
+            found, unread = False, exc
+        if found:
+            return kept
+        if isinstance(pv, dict) and pv.get("runId") == run_id and isinstance(pv.get("handoff"), dict):
+            return pv["handoff"].get("holdKept")
+        if ordinary:
+            return None
+        if unread is not None:
+            raise ControllerError("cannot tell whether {}'s finish kept a hold: handoff ledger {} unreadable ({}) "
+                                  "and the PR receipt names another run".format(run_id, self.ledger_path, unread))
+        return None
+
     def post_finish(self, run_id, pr, verdict, external):
         obs = self.obligations()
         run_key = obligation_key(run_id, "run", "claim")
@@ -4433,9 +4683,16 @@ class Controller:
                         finishedBy="holder")
             return "finished"
         is_freeze = (obs.get(run_key) or {}).get("detail", {}).get("isFreezePr")
+        ordinary = is_freeze is False
         pv = self.gate.pr_verdict(pr) if pr else None
         if isinstance(pv, dict) and pv.get("runId") == run_id and isinstance(pv.get("handoff"), dict):
             is_freeze = bool(pv["handoff"].get("written") or pv["handoff"].get("targetSha"))
+        kept = self._hold_kept(run_id, pv, obs, ordinary)
+        if kept:
+            # On every path here, deduped by its key, so no crash or recovery
+            # order can lose or repeat it.
+            self.ensure_alarm(run_id, "controller_hold_kept", "hold-kept:{}".format(run_id[-24:]),
+                              {"verb": "finish", "verdict": verdict, "holdKept": kept})
         # Required post-finish obligations are journaled BEFORE the run is
         # marked done, so a crash between the two leaves an open obligation
         # that the done early-return (step_run) still reconciles.

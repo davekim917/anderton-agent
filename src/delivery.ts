@@ -551,6 +551,9 @@ async function withThreadKeyLock<T>(
  */
 const inflightDeliveries = new Set<string>();
 
+/** In memory because the only durable home for "this was sent" is the session store whose write just failed. */
+const sentAwaitingAck = new Map<string, Awaited<ReturnType<typeof deliverMessage>>>();
+
 /**
  * Run `fn` holding the session's delivery slot, waiting (bounded) for an in-flight drain; for work that must be
  * ORDERED after the drain's sends. Past the wait it returns `undefined` without calling `fn`.
@@ -881,17 +884,33 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       continue;
     }
     try {
-      const result = await withThreadKeyLock(msg, session, () => deliverMessage(msg, session));
+      // Outbound ids are unique only within one session's mailbox.
+      const ackKey = `${session.id}:${msg.id}`;
+      const result =
+        sentAwaitingAck.get(ackKey) ?? (await withThreadKeyLock(msg, session, () => deliverMessage(msg, session)));
       // Its routing check is still running in the background: nothing was sent, and later rows wait behind it.
       if (result.routePending) break;
       // deferAck: the handler owns the `delivered` row (e.g. request_bash_gate on approval); auto-acking would
       // silently unblock a gated command.
       if (!result.deferAck) {
-        await ackDelivery(agentGroup.id, session.id, (mailbox) => {
-          mailbox.markDelivered(msg.id, result.platformMsgId ?? null, result.notice, result.taskListRoute);
-          if (msg.kind === 'chat' && !result.recordOnly)
-            for (const id of heldListPosts) mailbox.markDelivered(id, null);
-        });
+        try {
+          await ackDelivery(agentGroup.id, session.id, (mailbox) => {
+            mailbox.markDelivered(msg.id, result.platformMsgId ?? null, result.notice, result.taskListRoute);
+            if (msg.kind === 'chat' && !result.recordOnly)
+              for (const id of heldListPosts) mailbox.markDelivered(id, null);
+          });
+        } catch (ackErr) {
+          // Not an attempt: the message is out, and a capped retry would give up on a send that succeeded.
+          sentAwaitingAck.set(ackKey, result);
+          sawError = true;
+          log.warn('Delivered but not recorded — retrying the record next poll', {
+            messageId: msg.id,
+            sessionId: session.id,
+            err: ackErr,
+          });
+          break;
+        }
+        sentAwaitingAck.delete(ackKey);
         if (msg.kind === 'chat' && !result.recordOnly) heldListPosts.clear();
         deliveredNow.add(msg.id);
         // Mirror into the central row for the inbox board; only operator-visible platform sends count, or dormant

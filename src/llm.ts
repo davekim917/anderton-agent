@@ -1,13 +1,27 @@
 /**
- * Host Haiku calls go straight to `/v1/messages`, never via the OneCLI gateway: it swaps the Authorization header for
- * one fixed account's credential, which defeats key rotation.
+ * Host Haiku calls run through the Claude Code CLI on the subscription OAuth slots: on raw `/v1/messages` those tokens
+ * serve only older Haiku models to callers that are not Claude Code. Never through the OneCLI gateway: it swaps the
+ * credential for one fixed account's, which defeats key rotation.
  */
+import { spawn } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+
 import { EnvHttpProxyAgent, type Dispatcher } from 'undici';
 
+import { DATA_DIR } from './config.js';
 import { readEnvFileMatching } from './env.js';
+import { DEFAULT_HAIKU_MODEL, vocabFor } from './flag-parser.js';
 import { log } from './log.js';
 
-const HAIKU_MODEL = 'claude-haiku-4-5-20251001';
+const DEFAULT_SYSTEM_PROMPT = 'Reply with only the requested text.';
+
+let cliOverride: { executable: string; configDir: string } | null = null;
+
+/** Test-only: a fake CLI and a disposable config dir. */
+export function _setClaudeCliForTesting(cli: { executable: string; configDir: string } | null): void {
+  cliOverride = cli;
+}
 
 let _envProxyDispatcher: Dispatcher | null | undefined;
 export function getProxyDispatcher(): Dispatcher | null {
@@ -26,7 +40,6 @@ export type ClaudeCredentialSlot = 'oauth:primary' | `oauth:${number}` | 'api-ke
 
 interface StructuredCredential {
   slot: ClaudeCredentialSlot;
-  headers: Record<string, string>;
   authEnv: {
     name: 'CLAUDE_CODE_OAUTH_TOKEN' | 'ANTHROPIC_API_KEY';
     value: string;
@@ -58,7 +71,6 @@ function structuredCredentials(env: NodeJS.ProcessEnv, envFile: Record<string, s
     return [
       {
         slot,
-        headers: { authorization: `Bearer ${value}`, 'anthropic-beta': 'oauth-2025-04-20' },
         authEnv: { name: 'CLAUDE_CODE_OAUTH_TOKEN' as const, value },
       },
     ];
@@ -70,7 +82,6 @@ function structuredCredentials(env: NodeJS.ProcessEnv, envFile: Record<string, s
     ? [
         {
           slot: 'api-key:primary',
-          headers: { 'x-api-key': directApiKey },
           authEnv: { name: 'ANTHROPIC_API_KEY' as const, value: directApiKey },
         },
       ]
@@ -88,24 +99,6 @@ export function listClaudeStructuredCredentialSlots(
   return structuredCredentials(env, envFile).map((credential) => credential.slot);
 }
 
-/** Anthropic errors are `{ error: { type, message } }`; a non-JSON body still yields status and retry timing. */
-async function parseAnthropicErrorBody(
-  response: Response,
-): Promise<{ providerErrorType: string | null; providerMessage: string | null }> {
-  try {
-    const body = (await response.json()) as {
-      error?: { type?: unknown; message?: unknown };
-    };
-    return {
-      providerErrorType: typeof body.error?.type === 'string' ? body.error.type : null,
-      providerMessage: typeof body.error?.message === 'string' ? body.error.message : null,
-    };
-  } catch (error) {
-    if (!(error instanceof SyntaxError)) throw error;
-    return { providerErrorType: null, providerMessage: null };
-  }
-}
-
 const PROVIDER_MESSAGE_LOG_MAX_CHARS = 300;
 
 function truncateProviderMessage(message: string | null): string | null {
@@ -113,54 +106,39 @@ function truncateProviderMessage(message: string | null): string | null {
   return `${message.slice(0, PROVIDER_MESSAGE_LOG_MAX_CHARS)}...`;
 }
 
-const RATE_LIMIT_UNIFIED_HEADER_PREFIX = 'anthropic-ratelimit-unified-';
-
-function rateLimitUnifiedHeaders(headers: Headers): Record<string, string> | null {
-  const found: Record<string, string> = {};
-  headers.forEach((value, name) => {
-    if (name.startsWith(RATE_LIMIT_UNIFIED_HEADER_PREFIX)) found[name] = value;
-  });
-  return Object.keys(found).length > 0 ? found : null;
-}
-
-export interface CallHaikuHttpErrorDetails {
-  providerErrorType?: string | null;
-  retryAfterHeader?: string | null;
-  rateLimitUnifiedHeaders?: Record<string, string> | null;
-}
-
 export class CallHaikuHttpError extends Error {
   readonly status: number;
   readonly providerMessage: string | null;
-  readonly providerErrorType: string | null;
-  readonly retryAfterHeader: string | null;
-  readonly rateLimitUnifiedHeaders: Record<string, string> | null;
 
-  constructor(status: number, providerMessage: string | null = null, details: CallHaikuHttpErrorDetails = {}) {
-    const providerErrorType = details.providerErrorType ?? null;
+  constructor(status: number, providerMessage: string | null = null) {
     const shownMessage = truncateProviderMessage(providerMessage);
-    super(
-      `callHaiku: Anthropic returned ${status}` +
-        (providerErrorType ? ` ${providerErrorType}` : '') +
-        (shownMessage ? `: ${shownMessage}` : ''),
-    );
+    super(`callHaiku: Anthropic returned ${status}` + (shownMessage ? `: ${shownMessage}` : ''));
     this.name = 'CallHaikuHttpError';
     this.status = status;
     this.providerMessage = providerMessage;
-    this.providerErrorType = providerErrorType;
-    this.retryAfterHeader = details.retryAfterHeader ?? null;
-    this.rateLimitUnifiedHeaders = details.rateLimitUnifiedHeaders ?? null;
   }
 }
 
-async function anthropicCredentialHttpError(response: Response): Promise<CallHaikuHttpError> {
-  const { providerErrorType, providerMessage } = await parseAnthropicErrorBody(response);
-  const retryAfterHeader = response.headers.get('retry-after');
-  return new CallHaikuHttpError(response.status, providerMessage, {
-    providerErrorType,
-    retryAfterHeader,
-    rateLimitUnifiedHeaders: rateLimitUnifiedHeaders(response.headers),
-  });
+interface CliResult {
+  is_error?: boolean;
+  result?: string;
+  api_error_status?: number | null;
+  /** Set instead of `result` on an error subtype such as `error_during_execution`. */
+  errors?: unknown;
+}
+
+/** Whether the `claude` CLI these calls run is on PATH. An install that set up a pasted token may not have it. */
+export function claudeCliAvailable(): boolean {
+  if (cliOverride) return true;
+  return (process.env['PATH'] ?? '')
+    .split(path.delimiter)
+    .some((dir) => dir !== '' && fs.statSync(path.join(dir, 'claude'), { throwIfNoEntry: false })?.isFile() === true);
+}
+
+function cliConfigDir(): string {
+  const dir = cliOverride?.configDir ?? path.join(DATA_DIR, 'claude-title-cli');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
 }
 
 async function callHaikuOnce(
@@ -168,31 +146,90 @@ async function callHaikuOnce(
   options: Required<Pick<CallHaikuOptions, 'timeoutMs' | 'model'>> & Pick<CallHaikuOptions, 'system'>,
   credential: StructuredCredential,
 ): Promise<string> {
-  const baseUrl = process.env['ANTHROPIC_BASE_URL'] ?? 'https://api.anthropic.com';
+  const configDir = cliConfigDir();
+  const env: Record<string, string> = {
+    PATH: process.env['PATH'] ?? '/usr/local/bin:/usr/bin:/bin',
+    HOME: process.env['HOME'] ?? configDir,
+    // Keeps the operator's own Claude config (CLAUDE.md, plugins, hooks) out of these calls.
+    CLAUDE_CONFIG_DIR: configDir,
+    [credential.authEnv.name]: credential.authEnv.value,
+    // callHaiku rotates slots itself; the CLI's own retries would outlast the caller's timeout.
+    CLAUDE_CODE_MAX_RETRIES: '0',
+    DISABLE_AUTOUPDATER: '1',
+    // Without it every call adds a background Haiku 4.5 request of its own.
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    // Every title call shares this config dir; no settings key turns auto-memory off, so one thread could leak into another's title.
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+  };
+  if (process.env['ANTHROPIC_BASE_URL']) env['ANTHROPIC_BASE_URL'] = process.env['ANTHROPIC_BASE_URL'];
+  const args = [
+    '-p',
+    '--model',
+    options.model,
+    ...(vocabFor('claude').effortSupportFor(options.model)?.has('low') === false ? [] : ['--effort', 'low']),
+    '--system-prompt',
+    options.system ?? DEFAULT_SYSTEM_PROMPT,
+    '--tools',
+    '',
+    '--strict-mcp-config',
+    '--no-session-persistence',
+    '--setting-sources',
+    '',
+    '--output-format',
+    'json',
+  ];
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeoutMs);
+  const { code, stdout, stderr } = await new Promise<{ code: number | null; stdout: string; stderr: string }>(
+    (resolve, reject) => {
+      const child = spawn(cliOverride?.executable ?? 'claude', args, {
+        cwd: configDir,
+        env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let out = '';
+      let err = '';
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error(`callHaiku: claude CLI did not answer within ${options.timeoutMs} ms`));
+      }, options.timeoutMs);
+      child.stdout.setEncoding('utf8').on('data', (chunk: string) => (out += chunk));
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => (err += chunk));
+      child.on('error', (error) => {
+        clearTimeout(timer);
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          reject(
+            new Error('callHaiku: no claude CLI on PATH; install it with setup/install-claude.sh', { cause: error }),
+          );
+        } else reject(error);
+      });
+      child.on('close', (exitCode) => {
+        clearTimeout(timer);
+        resolve({ code: exitCode, stdout: out, stderr: err });
+      });
+      child.stdin.on('error', () => {});
+      child.stdin.end(prompt);
+    },
+  );
+
+  let parsed: CliResult;
   try {
-    const resp = await fetch(`${baseUrl}/v1/messages`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...credential.headers, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({
-        model: options.model,
-        max_tokens: 80,
-        temperature: 0,
-        ...(options.system ? { system: options.system } : {}),
-        messages: [{ role: 'user', content: prompt }],
-      }),
-      signal: controller.signal,
-    });
-    if (!resp.ok) {
-      throw await anthropicCredentialHttpError(resp);
-    }
-    const data = (await resp.json()) as { content?: Array<{ type: string; text?: string }> };
-    return (data.content?.find((c) => c.type === 'text')?.text ?? '').trim();
-  } finally {
-    clearTimeout(timer);
+    parsed = JSON.parse(stdout) as CliResult;
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw new Error(
+      `callHaiku: claude CLI exited ${code} without a result: ${truncateProviderMessage(stderr.trim())}`,
+      {
+        cause: error,
+      },
+    );
   }
+  if (parsed.is_error || typeof parsed.result !== 'string') {
+    const errors = Array.isArray(parsed.errors) ? parsed.errors.filter((e) => typeof e === 'string').join('; ') : '';
+    const message = typeof parsed.result === 'string' ? parsed.result : errors || stderr.trim() || null;
+    if (typeof parsed.api_error_status === 'number') throw new CallHaikuHttpError(parsed.api_error_status, message);
+    throw new Error(`callHaiku: claude CLI failed: ${truncateProviderMessage(message) ?? 'no result'}`);
+  }
+  return parsed.result.trim();
 }
 
 export interface CallHaikuOptions {
@@ -206,7 +243,7 @@ export async function callHaiku(prompt: string, options: CallHaikuOptions = {}):
   const resolved = {
     system: options.system,
     timeoutMs: options.timeoutMs ?? 15_000,
-    model: options.model ?? HAIKU_MODEL,
+    model: options.model ?? DEFAULT_HAIKU_MODEL,
   };
   const credentials = structuredCredentials(process.env, defaultStructuredCredentialEnvFile(process.env));
   if (credentials.length === 0) {
@@ -225,9 +262,6 @@ export async function callHaiku(prompt: string, options: CallHaikuOptions = {}):
       log.info('callHaiku: key failed, trying the next one', {
         slot: credential.slot,
         err: (err as Error).message,
-        ...(err instanceof CallHaikuHttpError
-          ? { retryAfterHeader: err.retryAfterHeader, rateLimitUnifiedHeaders: err.rateLimitUnifiedHeaders }
-          : {}),
       });
     }
   }

@@ -300,6 +300,28 @@ async function runFileProtection(
   );
 }
 
+const SPAWN_AGENT_TOOLS = new Set(['spawn_agent', 'collaborationspawn_agent']);
+
+/**
+ * Subagents start fresh: v1 takes `fork_context: false`, v2 `fork_turns: "none"`. Codex has no setting that turns
+ * forking off, and v2 inherits the whole conversation when `fork_turns` is omitted, so the control must be explicit.
+ */
+function denyInheritedSpawn(toolName: string, input: unknown): ReturnType<typeof denyDecision> | null {
+  if (!SPAWN_AGENT_TOOLS.has(toolName)) return null;
+  const args = input && typeof input === 'object' && !Array.isArray(input) ? (input as Record<string, unknown>) : null;
+  const hasContext = args !== null && Object.hasOwn(args, 'fork_context');
+  const hasTurns = args !== null && Object.hasOwn(args, 'fork_turns');
+  const fresh =
+    hasContext !== hasTurns &&
+    (hasContext
+      ? args!.fork_context === false
+      : typeof args!.fork_turns === 'string' && args!.fork_turns.trim().toLowerCase() === 'none');
+  if (fresh) return null;
+  return denyDecision(
+    'subagents start with fresh context: pass fork_context: false (v1) or fork_turns: "none" (v2), never both, and put everything the worker needs in its message.',
+  );
+}
+
 /** Stops at the first block or deny, carrying `updatedInput` forward across hooks. */
 export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown> {
   const normalized = normalizeCodexHookInput(input);
@@ -315,6 +337,8 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
   }
 
   if (normalized.tool_name !== 'Bash') {
+    const spawnDeny = denyInheritedSpawn(normalized.tool_name ?? '', normalized.tool_input);
+    if (spawnDeny) return spawnDeny;
     const fpDeny = await runFileProtection(
       normalized.tool_name ?? '',
       (normalized.tool_input ?? {}) as Record<string, unknown>,

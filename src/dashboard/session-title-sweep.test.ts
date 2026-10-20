@@ -41,21 +41,10 @@ import {
   postProcessTitle,
   CONCURRENCY_CAP,
 } from './session-title-sweep.js';
+import { installFakeClaudeCli } from '../test-fixtures/fake-claude-cli.js';
 
 function now(): string {
   return new Date().toISOString();
-}
-
-function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}): Response {
-  return new Response(JSON.stringify(body), {
-    status: init.status ?? 200,
-    headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) },
-  });
-}
-
-function authHeader(call: unknown[]): string | undefined {
-  const init = call[1] as { headers?: Record<string, string> } | undefined;
-  return init?.headers?.authorization;
 }
 
 /**
@@ -409,17 +398,16 @@ describe('runSessionTitleSweep', () => {
   describe('production credential rotation (real callTitleBackend, no test override)', () => {
     // The real callHaiku path, not setTitleBackendForTest()'s stub. beforeEach() strips ambient credential and
     // proxy env and mocks readEnvFileMatching(), so this never touches a real token.
-    let fetchMock: ReturnType<typeof vi.fn>;
+    let cli: ReturnType<typeof installFakeClaudeCli>;
 
     beforeEach(() => {
-      fetchMock = vi.fn();
-      vi.stubGlobal('fetch', fetchMock);
+      cli = installFakeClaudeCli();
       process.env.CLAUDE_CODE_OAUTH_TOKEN = 'oauth-slot-1-token';
       process.env.CLAUDE_CODE_OAUTH_TOKEN_2 = 'oauth-slot-2-token';
     });
 
     afterEach(() => {
-      vi.unstubAllGlobals();
+      cli.uninstall();
     });
 
     it('moves to the second key on a 429 instead of tripping the breaker', async () => {
@@ -428,9 +416,10 @@ describe('runSessionTitleSweep', () => {
         { kind: 'chat', content: JSON.stringify({ text: 'fix the rollout for EXAMPLE-71' }) },
       ]);
 
-      fetchMock
-        .mockResolvedValueOnce(jsonResponse({ error: { type: 'rate_limit_error' } }, { status: 429 }))
-        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'EXAMPLE-71 rollout fix' }] }));
+      cli.script({
+        'oauth-slot-1-token': { isError: true, apiErrorStatus: 429, result: 'rate_limit_error' },
+        'oauth-slot-2-token': { result: 'EXAMPLE-71 rollout fix' },
+      });
 
       const warnSpy = vi.spyOn(log, 'warn');
 
@@ -438,9 +427,10 @@ describe('runSessionTitleSweep', () => {
 
       expect(result.generated).toBe(1);
       expect(result.skipped).toBe(0);
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-1-token');
-      expect(authHeader(fetchMock.mock.calls[1])).toBe('Bearer oauth-slot-2-token');
+      expect(cli.calls().map((c) => c.env.CLAUDE_CODE_OAUTH_TOKEN)).toEqual([
+        'oauth-slot-1-token',
+        'oauth-slot-2-token',
+      ]);
 
       // The next key absorbed the 429, so the breaker and cooldown never engaged.
       const breakerWarns = warnSpy.mock.calls.filter(([msg]) => String(msg).includes('circuit breaker'));
@@ -462,13 +452,12 @@ describe('runSessionTitleSweep', () => {
 
       seedSession('sess-slot2-only', 'ag-1');
       writeInboundMessages('ag-1', 'sess-slot2-only', [{ kind: 'chat', content: '{"text":"hello"}' }]);
-      fetchMock.mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'slot 2 title' }] }));
+      cli.script({ 'oauth-slot-2-token': { result: 'slot 2 title' } });
 
       const result = await runSessionTitleSweep();
 
       expect(result.generated).toBe(1);
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-2-token');
+      expect(cli.calls().map((c) => c.env.CLAUDE_CODE_OAUTH_TOKEN)).toEqual(['oauth-slot-2-token']);
     });
   });
 
@@ -579,6 +568,22 @@ describe('runSessionTitleSweep', () => {
     const result = await runSessionTitleSweep();
     expect(result.generated).toBe(0);
     expect(backend).not.toHaveBeenCalled();
+  });
+
+  it('no-op when a credential is set but no claude CLI is on PATH', async () => {
+    seedSession('sess-no-cli', 'ag-1');
+    writeInboundMessages('ag-1', 'sess-no-cli', [{ kind: 'chat', content: '{"text":"x"}' }]);
+    _resetTitleBackendForTest();
+    const saved = { key: process.env['ANTHROPIC_API_KEY'], path: process.env['PATH'] };
+    process.env['ANTHROPIC_API_KEY'] = 'test-key';
+    process.env['PATH'] = '';
+    try {
+      expect(await runSessionTitleSweep()).toEqual({ generated: 0, skipped: 0 });
+    } finally {
+      if (saved.key === undefined) delete process.env['ANTHROPIC_API_KEY'];
+      else process.env['ANTHROPIC_API_KEY'] = saved.key;
+      process.env['PATH'] = saved.path;
+    }
   });
 
   it('no-op when no backend is configured (key missing AND no test override)', async () => {

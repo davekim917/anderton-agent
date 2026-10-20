@@ -66,6 +66,7 @@ registerResource({
         if (!id) throw new Error('--id <approval-id> is required');
         const result = await resolveApprovalFromHost(id, 'approve', 'host-operator');
         if (!result.resolved) throw new Error(result.error ?? 'approval not resolved');
+        if (result.declined) return { declined: id, reason: result.declined };
         return { approved: id };
       },
     },

@@ -160,10 +160,13 @@ function isAcceptedFinding(finding: unknown, treeDir: string, accepted: readonly
   return actual !== null && candidates.some((entry) => entry.line === actual);
 }
 
+/** Copybara's own trailer, already public on every exported commit; only the AI read skips it, the scanner reads it. */
+const ORIGIN_TRAILER = /^GitOrigin-RevId: [0-9a-f]{40}$\n?/gm;
+
 /** Null when the limit is unusable or one added line cannot fit in a call beside the message header. */
 export function aiBatches(commit: CommitDiff, maxChars: number): string[] | null {
   if (!Number.isInteger(maxChars) || maxChars <= 0) return null;
-  const header = `COMMIT MESSAGE:\n${commit.message}\nADDED LINES:\n`;
+  const header = `COMMIT MESSAGE:\n${commit.message.replace(ORIGIN_TRAILER, '')}\nADDED LINES:\n`;
   const batches: string[] = [];
   let current = header;
   for (const line of commit.addedLines) {
@@ -177,6 +180,29 @@ export function aiBatches(commit: CommitDiff, maxChars: number): string[] | null
   }
   batches.push(current);
   return batches;
+}
+
+/** A hold an earlier run's AI flag decided, with no AI read in this run. */
+export const RECORDED_HOLD = 'recorded-ai-hold';
+
+export type AiReasonKind = 'flag' | 'quoted-flag' | 'read-failure' | 'recorded';
+
+/**
+ * What an AI reason says about this run's read. Anything not known to be a failed read or a recorded hold is a
+ * flag, so a category added later is recorded rather than read again; only `possible-identifier` carries quotes.
+ */
+export function aiReasonKind(category: string): AiReasonKind {
+  if (category === RECORDED_HOLD) return 'recorded';
+  if (category === 'possible-identifier') return 'quoted-flag';
+  if (
+    category === 'timeout' ||
+    category === 'unparseable' ||
+    category.startsWith('exit:') ||
+    category.startsWith('line-too-large>')
+  ) {
+    return 'read-failure';
+  }
+  return 'flag';
 }
 
 export async function judgeCommit(commit: CommitUnderReview, deps: GateDeps): Promise<CommitVerdict> {
@@ -206,15 +232,24 @@ export async function judgeCommit(commit: CommitUnderReview, deps: GateDeps): Pr
         for (const finding of parsed.findings) {
           (isAcceptedFinding(finding, commit.treeDir, deps.acceptedFindings) ? accepted : remaining).push(finding);
         }
-        if (remaining.length > 0 || (parsed.verdict === 'hold' && parsed.findings.length === 0)) {
+        if (remaining.length > 0) {
           aiFindings.push(...remaining);
           reasons.push({ source: 'ai', where, category: 'possible-identifier' });
+        } else if (parsed.verdict === 'hold' && parsed.findings.length === 0) {
+          reasons.push({ source: 'ai', where, category: 'hold-without-finding' });
         }
       }
+      // The commit holds already; a further read would only keep a flag unrecorded for longer.
+      if (reasons.length > 0) break;
     }
   }
   const counted = accepted.length > 0 ? { accepted } : {};
   return reasons.length === 0 ? { verdict: 'pass', ...counted } : { verdict: 'hold', reasons, aiFindings, ...counted };
+}
+
+export interface ReadWatch {
+  reserve(sha: string): void;
+  settle(sha: string, held: GateOutcome['held']): void;
 }
 
 export interface GateOutcome {
@@ -229,12 +264,15 @@ export interface GateOutcome {
  * Commits oldest first; judging stops at the first hold, since a later commit carries the held one's tree. Every
  * batch the commits could send is counted before any is read, and a total over the run's budget holds the first
  * commit with no AI call at all. A commit the scanner holds still counts, so a budget hold can hide a scanner hold.
+ * `watch` brackets each commit's read: `reserve` before it and `settle` with its verdict before any cleanup, so a
+ * caller can keep a durable hold that only a settled pass releases.
  */
 export async function gateCommits(
   shas: string[],
   load: (sha: string) => CommitUnderReview & { dispose(): void },
   deps: GateDeps,
   diff: (sha: string) => CommitDiff,
+  watch: ReadWatch = { reserve: () => {}, settle: () => {} },
 ): Promise<GateOutcome> {
   const budget = deps.aiBudget;
   let planned = budget.spent;
@@ -252,11 +290,13 @@ export async function gateCommits(
   for (const sha of shas) {
     const commit = load(sha);
     try {
+      watch.reserve(sha);
       const verdict = await judgeCommit(commit, deps);
       for (const finding of verdict.accepted ?? []) accepted.push({ sha, finding });
-      if (verdict.verdict === 'hold') {
-        return { lastPassing, held: { sha, reasons: verdict.reasons, aiFindings: verdict.aiFindings }, ...counted() };
-      }
+      const held =
+        verdict.verdict === 'hold' ? { sha, reasons: verdict.reasons, aiFindings: verdict.aiFindings } : undefined;
+      watch.settle(sha, held);
+      if (held) return { lastPassing, held, ...counted() };
     } finally {
       commit.dispose();
     }
@@ -581,6 +621,84 @@ export function stagingCommitDiff(stagingGitDir: string, sha: string): Omit<Comm
   }
 
   return { sha, message, addedLines: entries, binaries };
+}
+
+interface TreeEntry {
+  mode: string;
+  oid: string;
+  path: string;
+}
+
+function stagingTree(stagingGitDir: string, sha: string): TreeEntry[] {
+  return git(stagingGitDir, ['ls-tree', '-r', '-z', '--full-tree', sha])
+    .split('\0')
+    .filter(Boolean)
+    .map((row) => {
+      const match = /^(\d+) \w+ ([0-9a-f]+)\t(.*)$/s.exec(row);
+      if (!match) throw new Error(`unreadable tree entry in ${sha}`);
+      return { mode: match[1], oid: match[2], path: match[3] };
+    });
+}
+
+/** Every blob's content, symlink targets included, read in one `cat-file --batch`; a missing blob throws. */
+function stagingBlobs(stagingGitDir: string, oids: string[]): Buffer[] {
+  if (oids.length === 0) return [];
+  const out = execFileSync('git', ['--git-dir', stagingGitDir, 'cat-file', '--batch'], {
+    input: oids.join('\n') + '\n',
+    maxBuffer: 1024 * 1024 * 1024,
+  });
+  const blobs: Buffer[] = [];
+  let at = 0;
+  for (const oid of oids) {
+    const end = out.indexOf(0x0a, at);
+    const header = out.subarray(at, end).toString('utf8');
+    const match = /^([0-9a-f]+) blob (\d+)$/.exec(header);
+    if (!match || match[1] !== oid) throw new Error(`cannot read blob ${oid}: ${header}`);
+    const size = Number(match[2]);
+    blobs.push(out.subarray(end + 1, end + 1 + size));
+    at = end + 1 + size + 1;
+  }
+  return blobs;
+}
+
+export function stagingFileAt(stagingGitDir: string, sha: string, file: string): string | null {
+  const entry = stagingTree(stagingGitDir, sha).find(
+    (candidate) => candidate.path === file && (candidate.mode === '100644' || candidate.mode === '100755'),
+  );
+  return entry ? stagingBlobs(stagingGitDir, [entry.oid])[0].toString('utf8') : null;
+}
+
+/** Lowercase with the one context-dependent mapping undone, so a quote matches inside a longer word. */
+function caseFold(text: string): string {
+  return text.toLowerCase().replaceAll('ς', 'σ');
+}
+
+/**
+ * Whether one of `texts`, ignoring case, is anywhere the commit publishes or the AI read of it would see: its
+ * message, its changed paths and added lines, and every path and blob of its tree, symlink targets included.
+ */
+export function stagingMentions(stagingGitDir: string, sha: string, texts: string[]): boolean {
+  if (texts.length === 0) return false;
+  const needles = texts.map(caseFold);
+  const seen = (haystack: string) => {
+    const folded = caseFold(haystack);
+    return needles.some((needle) => folded.includes(needle));
+  };
+  if ((aiBatches(stagingCommitDiff(stagingGitDir, sha), Number.MAX_SAFE_INTEGER) ?? []).some(seen)) return true;
+  const tree = stagingTree(stagingGitDir, sha);
+  if (tree.some((entry) => seen(entry.path))) return true;
+  return stagingBlobs(
+    stagingGitDir,
+    tree.filter((entry) => entry.mode !== '160000').map((entry) => entry.oid),
+  ).some((blob) => seen(blob.toString('utf8')));
+}
+
+export function stagingOriginRev(stagingGitDir: string, sha: string): string | null {
+  const message = spawnSync('git', ['--git-dir', stagingGitDir, 'log', '-1', '--format=%B', sha, '--'], {
+    encoding: 'utf8',
+  });
+  if (message.status !== 0) return null;
+  return [...message.stdout.matchAll(/^GitOrigin-RevId: ([0-9a-f]{40})$/gm)].at(-1)?.[1] ?? null;
 }
 
 export function loadStagingCommit(stagingGitDir: string, sha: string): CommitUnderReview & { dispose(): void } {

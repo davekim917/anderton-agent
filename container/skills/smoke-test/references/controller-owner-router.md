@@ -45,11 +45,11 @@ to the retained technical owner, verify its artifact receipt, and stop.
    writer, pass `SMOKE_GATE_OWNER=<coordinatorOwnerToken>` from
    `<run>/controller/wake.json` — **re-read that file on every wake, not once
    at intake.** `smoke-pr-gate.sh poll` mints a fresh owner token on every
-   same-SHA recovery (`smoke-pr-gate.sh:5608`, written to the lease at `:5637`,
-   the PR authority at `:5642` and the gate state at `:5689`), so the token you
+   same-SHA recovery (`smoke-pr-gate.sh:5673`, written to the lease at `:5702`,
+   the PR authority at `:5707` and the gate state at `:5755`), so the token you
    started with is then retired. The controller refreshes `wake.json` with
-   every brief it writes (`smoke-campaign-controller.py:1730-1732`, in
-   `_owner_wake` at `:1675`), which is why the file is current and your own
+   every brief it writes (`smoke-campaign-controller.py:1753-1755`, in
+   `_owner_wake` at `:1698`), which is why the file is current and your own
    copy of its value is not.
    - A brief headed **YOUR OWNER TOKEN CHANGED** means exactly that happened
      mid-step: the controller saw the step's `briefedToken` differ from the
@@ -65,7 +65,7 @@ to the retained technical owner, verify its artifact receipt, and stop.
      impersonation, not adoption.
    - Your ack does not carry over. Writing a brief removes
      `<run>/controller/brief-<step>.ack`
-     (`smoke-campaign-controller.py:1719-1729`), so a re-offered step needs a
+     (`smoke-campaign-controller.py:1742-1752`), so a re-offered step needs a
      fresh ack as its first act, exactly like any other wake.
 4. On `lanes` and `synthesis`, read `<run>/controller/barrier-<step>.json`
    before you start and again before you stop. The controller rewrites it every
@@ -186,3 +186,18 @@ suppress it.
 The controller validates it against the gates and the run's evidence. Leave
 an item open rather than change the verdict to fit: a GO the controller
 cannot validate finishes BLOCKED, never GO.
+
+A GO `finish` deletes the develop hold (`SMOKE_GATE_HOLD_FILE`). When that
+file holds another run's `HUMAN_DECISION`, the `synthesis` brief names it, and
+GO also needs `holdDisposition` naming that run: `resolved` (a recorded human
+answer) or `not-in-range` (proof the build does not contain the held sha),
+each with `evidence` pointing at a non-empty file inside this run, or
+`carried`, which finishes the run `HUMAN_DECISION` so the gate re-raises the
+hold under it. Without one, GO finishes BLOCKED (`live hold <runId> not
+dispositioned`). A hold file the controller cannot read also refuses GO. A
+`NO_GO` hold needs nothing, and neither does a PR the gate's own wake
+classified as ordinary (shadow cannot tell, so it always asks). The gate makes
+the same check when it deletes the hold: it clears another run's
+`HUMAN_DECISION` hold only for the run the controller names from your
+`resolved`/`not-in-range` disposition, so a hold raised after the controller
+last looked stays, and the controller alarms.

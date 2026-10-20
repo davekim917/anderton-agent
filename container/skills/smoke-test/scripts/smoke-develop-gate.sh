@@ -138,6 +138,7 @@ PUBLISH_FILE="${SMOKE_GATE_PUBLISH_FILE:-}"
 # (HUMAN_DECISION joined the raising set on 2026-08-25; this comment said
 # otherwise until 2026-08-26. The `finish` block below is the code.)
 HOLD_FILE="${SMOKE_GATE_HOLD_FILE:-}"
+num_env HOLD_LOCK_WAIT SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS 10
 # Optional directory of append-only JSONL where a human's decision on a hold is
 # recorded — the release desk's own gate ledger. UNSET = INERT: no file is read
 # and every campaign-open path behaves exactly as it did before this existed.
@@ -245,6 +246,7 @@ FREEZE_HELPER="${SMOKE_GATE_FREEZE_HELPER:-}"
 # `config` and in poll's gate_misconfigured alarm before any freeze is cut.
 . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"
 . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-run-path.sh"
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-hold-guard.sh"
 LAYOUT_MISSING=""
 [ "$FREEZE_HANDOFF" != true ] || LAYOUT_MISSING="$(layout_prefix_problems)"
 [ -z "$FRONTEND_PATHS" ] || LAYOUT_MISSING="$LAYOUT_MISSING$(layout_prefix_problems FRONTEND_PATHS)"
@@ -556,6 +558,7 @@ default_state() {
     completedAt: null,
     completedRunId: null,
     completedVerdict: null,
+    completedHoldKept: null,
     fetchFailures: 0,
     lastFailureWakeAt: null,
     holdAlertFor: null,
@@ -1074,6 +1077,17 @@ if [ "$COMMAND" = "finish" ]; then
   SHA="${2:-}"
   RUN_ID="${3:-}"
   VERDICT="${4:-}"
+  HOLD_CLEAR_FOR=""
+  case "${5:-}" in
+    "") ;;
+    --clear-hold=*) HOLD_CLEAR_FOR="${5#--clear-hold=}" ;;
+    *) jq -cn --arg a "${5:-}" '{ok:false,error:"finish takes only --clear-hold=<run-id> after the verdict",argument:$a}'
+       exit 2 ;;
+  esac
+  if [ -n "$HOLD_CLEAR_FOR" ] && ! run_id_ok "$HOLD_CLEAR_FOR"; then
+    jq -cn --arg run "$HOLD_CLEAR_FOR" '{ok:false,error:"--clear-hold needs a run id of 1-200 chars of [A-Za-z0-9._-]",clearHold:$run}'
+    exit 2
+  fi
   if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
     jq -cn '{ok:false,error:"finish requires a 40-character SHA"}'
     exit 2
@@ -1114,16 +1128,36 @@ if [ "$COMMAND" = "finish" ]; then
         claimedSha:(if $claimed == "" then null else $claimed end)}'
     exit 2
   fi
+  # The same lock and rule as smoke-pr-gate.sh's finish, decided before the
+  # completion is committed: a lock that cannot be taken records nothing and
+  # leaves the slot held, so the same finish can simply be re-run.
+  HOLD_KEPT=null
+  HOLD_LOCK_HELD=false
+  if [ -n "$HOLD_FILE" ] && [ "$VERDICT" != BLOCKED ]; then
+    if ! hold_lock_take "$HOLD_FILE.lock" "$HOLD_LOCK_WAIT"; then
+      jq -cn --arg run "$RUN_ID" --arg lock "$HOLD_FILE.lock" --arg why "$HOLD_LOCK_WHY" \
+        '{ok:false,retryable:true,runId:$run,
+          error:("hold lock " + $lock + " unavailable (" + $why + ") - no verdict recorded, no hold touched, slot still held")}'
+      exit 1
+    fi
+    HOLD_LOCK_HELD=true
+    if [ "$VERDICT" = GO ]; then
+      HOLD_KEEP_WHY="$(hold_clear_refusal "$HOLD_FILE" "$RUN_ID" "$HOLD_CLEAR_FOR")"
+      [ -z "$HOLD_KEEP_WHY" ] || HOLD_KEPT="$(hold_kept_record "$HOLD_FILE" "$HOLD_KEEP_WHY" "$HOLD_CLEAR_FOR")"
+    fi
+  fi
   NOW="$(iso_now)"
   STATE="$(jq -c \
     --arg sha "$SHA" \
     --arg run "$RUN_ID" \
     --arg verdict "$VERDICT" \
     --arg now "$NOW" \
+    --argjson kept "$HOLD_KEPT" \
     '.completedSha=$sha |
      .completedAt=$now |
      .completedRunId=$run |
      .completedVerdict=$verdict |
+     .completedHoldKept=$kept |
      .activeSha=null |
      .activeStartedAt=null |
      .activeRunId=null |
@@ -1157,14 +1191,15 @@ if [ "$COMMAND" = "finish" ]; then
         mv "$HOLD_TMP" "$HOLD_FILE"
         ;;
       GO)
-        rm -f "$HOLD_FILE"
+        [ "$HOLD_KEPT" != null ] || rm -f "$HOLD_FILE"
         ;;
     esac
+    if [ "$HOLD_LOCK_HELD" = true ]; then flock -u 3; exec 3<&-; fi
   fi
   [ -n "$ACTIVE_FILE" ] && rm -f "$ACTIVE_FILE"
   freeze_status "No active QA freeze."
-  jq -cn --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" \
-    '{ok:true,finishedSha:$sha,runId:$run,verdict:$verdict}'
+  jq -cn --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --argjson kept "$HOLD_KEPT" \
+    '{ok:true,finishedSha:$sha,runId:$run,verdict:$verdict} + (if $kept == null then {} else {holdKept:$kept} end)'
   exit 0
 fi
 
@@ -1950,13 +1985,18 @@ emit_handoff_unclaimed_unsettled() {
 # as this gate's own completed record and free the handoff slot — the "same
 # develop SHA never re-freezes" dedup advance.
 adopt_handoff_entry() {  # <ledger-line>
-  local target run verdict finished
+  local target run verdict finished kept
   target="$(jq -r '.handoffTargetSha // empty' <<<"$STATE")"
   run="$(jq -r '.runId' <<<"$1")"
   verdict="$(jq -r '.verdict' <<<"$1")"
   finished="$(jq -r '.finishedAt' <<<"$1")"
+  # A GO that kept another run's hold (hold_clear_refusal) says so on its
+  # line; the hold reconciler below then expects that hold.
+  kept="$(jq -c '.holdKept // null' <<<"$1")"
   STATE="$(jq -c --arg sha "$target" --arg run "$run" --arg verdict "$verdict" --arg now "$finished" \
+    --argjson kept "$kept" \
     '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
+     .completedHoldKept=$kept |
      .handoffFreezePr=null | .handoffFreezeSha=null | .handoffTargetSha=null | .handoffOpenedAt=null |
      .ledgerTamperAlertFor=null' <<<"$STATE")"
 }
@@ -2008,7 +2048,22 @@ adopt_out_of_band() {
   [ -n "$entry" ] || return 0
   STATE="$(jq -c --argjson e "$entry" \
     '.completedSha=$e.targetSha | .completedAt=$e.finishedAt | .completedRunId=$e.runId |
-     .completedVerdict=$e.verdict' <<<"$STATE")"
+     .completedVerdict=$e.verdict | .completedHoldKept=($e.holdKept // null)' <<<"$STATE")"
+}
+
+# A resumed PR-gate finish appends its line again under the same run, verdict
+# and finishedAt, after this gate may already have adopted the first one and
+# freed the handoff, so neither adoption above looks at it. The hold decision
+# on the latest such line is the one that stands.
+refresh_completed_hold_kept() {
+  local entry
+  [ -n "$(jq -r '.completedRunId // empty' <<<"$STATE")" ] && [ -s "$HANDOFF_LEDGER" ] || return 0
+  entry="$(jq -cR --argjson s "$STATE" 'fromjson? | select(type == "object") |
+      select(.runId == $s.completedRunId and .finishedAt == $s.completedAt and
+             .verdict == $s.completedVerdict and .targetSha == $s.completedSha)' \
+    "$HANDOFF_LEDGER" 2>/dev/null | tail -1)"
+  [ -n "$entry" ] || return 0
+  STATE="$(jq -c --argjson e "$entry" '.completedHoldKept=($e.holdKept // null)' <<<"$STATE")"
 }
 
 # The same selection the handoff block makes: the LAST line for the open
@@ -2028,6 +2083,7 @@ adopt_ledger_outcomes() {
     fi
   fi
   adopt_out_of_band
+  refresh_completed_hold_kept
 }
 adopt_ledger_outcomes
 
@@ -2246,7 +2302,22 @@ if [ -n "$HOLD_FILE" ]; then
       fi
       ;;
     GO)
-      [ -s "$HOLD_FILE" ] && HOLD_INTEGRITY=unexpected
+      # An ordinary GO cleared the hold. A GO that kept one (completedHoldKept,
+      # from its ledger line) expects THAT hold still standing: gone is
+      # `missing`, another run's is `mismatched`. A kept hold the PR gate
+      # could not read has no runId, so only its existence is checked -- an
+      # empty file or a dangling link still counts.
+      LEDGER_KEPT="$(jq -c '.completedHoldKept // null' <<<"$STATE")"
+      if [ "$LEDGER_KEPT" = null ]; then
+        [ -s "$HOLD_FILE" ] && HOLD_INTEGRITY=unexpected
+      elif [ ! -e "$HOLD_FILE" ] && [ ! -L "$HOLD_FILE" ]; then
+        HOLD_INTEGRITY=missing
+      else
+        KEPT_RUN="$(jq -r '.runId // empty | strings' <<<"$LEDGER_KEPT" 2>/dev/null)"
+        if [ -n "$KEPT_RUN" ] && [ "$(jq -r '.runId // empty' "$HOLD_FILE" 2>/dev/null)" != "$KEPT_RUN" ]; then
+          HOLD_INTEGRITY=mismatched
+        fi
+      fi
       ;;
     # BLOCKED deliberately leaves the hold untouched, so the ledger implies no
     # expectation and there is nothing to reconcile. HUMAN_DECISION joined the

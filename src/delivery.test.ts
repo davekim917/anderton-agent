@@ -29,6 +29,21 @@ vi.mock('./config.js', async () => {
 });
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-delivery') }));
+const ackFailures = vi.hoisted(() => ({ remaining: 0 }));
+
+vi.mock('./modules/mailbox/ops/delivery.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./modules/mailbox/ops/delivery.js')>();
+  return {
+    ...actual,
+    markDelivered: ((...args: Parameters<typeof actual.markDelivered>) => {
+      if (ackFailures.remaining > 0) {
+        ackFailures.remaining--;
+        throw new Error('SQLITE_BUSY: database is locked');
+      }
+      return actual.markDelivered(...args);
+    }) as typeof actual.markDelivered,
+  };
+});
 
 import { closeDb, createAgentGroup, createMessagingGroup, initMigratedTestDb } from './db/index.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
@@ -1085,6 +1100,47 @@ describe('deliverSessionMessages — concurrent invocations', () => {
 });
 
 describe('deliverSessionMessages — retry and permanent failure', () => {
+  it('records a send whose ack write failed on the next poll without sending it again', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-ack-lost');
+    const deliver = vi.fn().mockResolvedValue('plat-once');
+    setDeliveryAdapter({ deliver });
+
+    ackFailures.remaining = 1;
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const inDb = openInboundDb('ag-1', session.id);
+    const row = inDb
+      .prepare('SELECT status, platform_message_id FROM delivered WHERE message_out_id = ?')
+      .get('out-ack-lost');
+    inDb.close();
+    expect(row).toEqual({ status: 'delivered', platform_message_id: 'plat-once' });
+  });
+
+  it('does not hand one session’s unrecorded send to another session’s message with the same id', async () => {
+    await seedAgentAndChannel();
+    const { session: first } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session: second } = await resolveSession('ag-1', 'mg-1', 'thread-2', 'per-thread');
+    insertOutbound('ag-1', first.id, 'out-shared-id');
+    insertOutbound('ag-1', second.id, 'out-shared-id');
+    const deliver = vi.fn().mockResolvedValueOnce('plat-first').mockResolvedValueOnce('plat-second');
+    setDeliveryAdapter({ deliver });
+
+    ackFailures.remaining = 1;
+    await deliverSessionMessages(first);
+    await deliverSessionMessages(second);
+
+    expect(deliver).toHaveBeenCalledTimes(2);
+    const inDb = openInboundDb('ag-1', second.id);
+    const row = inDb.prepare('SELECT platform_message_id FROM delivered WHERE message_out_id = ?').get('out-shared-id');
+    inDb.close();
+    expect(row).toEqual({ platform_message_id: 'plat-second' });
+  });
+
   it('retries on adapter failure and marks failed after MAX_DELIVERY_ATTEMPTS (3)', async () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');

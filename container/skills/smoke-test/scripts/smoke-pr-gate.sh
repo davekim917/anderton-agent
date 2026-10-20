@@ -124,6 +124,9 @@ num_env FACTS_STUCK_TIMEOUT SMOKE_GATE_FACTS_STUCK_SECONDS 3600
 # more.
 PUBLISH_FILE="${SMOKE_GATE_PUBLISH_FILE:-}"
 HOLD_FILE="${SMOKE_GATE_HOLD_FILE:-}"
+# How long finish waits for the hold's sidecar lock (<hold>.lock) before it
+# gives up retryably, slot held.
+num_env HOLD_LOCK_WAIT SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS 10
 # Same path the develop gate reads as its own HANDOFF_LEDGER (its
 # SMOKE_GATE_STATE_DIR/handoff-ledger.jsonl) — the wrapper is responsible for
 # pointing this at that file. Single writer per file: this gate APPENDS,
@@ -2994,6 +2997,8 @@ campaign_run_id() {  # <pr> <sha> <epoch>
   printf '%s-pr%s-%s-%s' "$RUN_PREFIX" "$1" "${2:0:12}" "$(date -u -d "@$3" +%Y%m%dT%H%M%SZ)"
 }
 
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-hold-guard.sh"
+
 detect_freeze() {
   local pr="$1" sha="$2" probe
   probe="$(freeze_head_probe "$sha")"
@@ -3420,7 +3425,7 @@ if [ "$COMMAND" = "claim" ]; then
     'if (.activeSha == $sha and .challengerDisposition == null and .activeRunId == $run)
      then "true" else "false" end' <<<"$STATE")"
   STATE="$(jq -c --arg sha "$SHA" --arg now "$NOW" --arg run "$RUN_ID" --arg owner "$OWNER" --arg took "$TOOK_OVER" \
-    --arg deadline "$(challenger_deadline_from_now)" --arg claimant "$CLAIMANT" \
+    --arg deadline "$(challenger_deadline_from_now)" --arg claimant "$CLAIMANT" --argjson isFreeze "$CLAIM_FREEZE" \
     '(if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
       then .challengerDeadline else $deadline end) as $dl |
     (if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
@@ -3428,7 +3433,7 @@ if [ "$COMMAND" = "claim" ]; then
     (if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
       then (.challengerProvisionalDeadline // null) else null end) as $provisional |
      .activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=$now |
-     .activeLeaseOwner=$owner |
+     .activeLeaseOwner=$owner | .activeFreezeProbe={sha:$sha,isFreezePr:$isFreeze} |
      .activeClaimant=(if $claimant == "" then null else $claimant end) |
      .displacedRunId=(if $took == "" then null else $took end) |
      .displacedAt=(if $took == "" then null else $now end) |
@@ -4266,6 +4271,21 @@ if [ "$COMMAND" = "finish" ]; then
   RUN_ID="${3:-}"
   VERDICT="${4:-}"
   OWNER="${5:-$DEFAULT_OWNER}"
+  # The one run whose HUMAN_DECISION hold this GO may clear, named by the
+  # caller from a validated disposition (see hold_clear_refusal). An argument,
+  # not an env var: a deployment wrapper sources its env file and could
+  # overwrite one, but it passes "$@" through untouched.
+  HOLD_CLEAR_FOR=""
+  case "${6:-}" in
+    "") ;;
+    --clear-hold=*) HOLD_CLEAR_FOR="${6#--clear-hold=}" ;;
+    *) jq -cn --arg a "${6:-}" '{ok:false,error:"finish takes only --clear-hold=<run-id> after the owner token",argument:$a}'
+       exit 2 ;;
+  esac
+  if [ -n "$HOLD_CLEAR_FOR" ] && ! run_id_ok "$HOLD_CLEAR_FOR"; then
+    jq -cn --arg run "$HOLD_CLEAR_FOR" '{ok:false,error:"--clear-hold needs a run id of 1-200 chars of [A-Za-z0-9._-]",clearHold:$run}'
+    exit 2
+  fi
   if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
     jq -cn '{ok:false,error:"finish requires a 40-character SHA"}'
     exit 2
@@ -4577,6 +4597,8 @@ if [ "$COMMAND" = "finish" ]; then
   HANDOFF_WRITTEN=false
   HANDOFF_REASON=""
   HANDOFF_TARGET_SHA=""
+  HOLD_KEPT=null
+  HOLD_LOCK_FAILED=false
   HANDOFF_DIVERGENCE=""
   TERMINAL_EFFECT_ERROR=""
   if [ -n "$PUBLISH_FILE" ] || [ -n "$HOLD_FILE" ]; then
@@ -4615,7 +4637,20 @@ if [ "$COMMAND" = "finish" ]; then
             # naming that same run. Same rule smoke-develop-gate.sh's
             # hold-integrity reconciler applies to its own completed record.
             if [ "$(jq -r '.verdict' <<<"$LEDGER_HOLDING")" = GO ]; then
-              [ "$HOLD_NOW" = null ] || HANDOFF_DIVERGENCE="hold present after a GO"
+              # A GO that kept another run's hold (holdKept) leaves that hold:
+              # it must still exist, and be that run's when the kept hold had
+              # a runId (an unreadable kept hold has none; even an empty file
+              # or a dangling link is it).
+              if jq -e '.holdKept != null' <<<"$LEDGER_HOLDING" >/dev/null 2>&1; then
+                KEPT_RUN="$(jq -r '.holdKept.runId // empty | strings' <<<"$LEDGER_HOLDING" 2>/dev/null)"
+                if [ ! -e "$HOLD_FILE" ] && [ ! -L "$HOLD_FILE" ]; then
+                  HANDOFF_DIVERGENCE="the hold a GO kept is missing"
+                elif [ -n "$KEPT_RUN" ] && [ "$(jq -r '.runId // empty' <<<"$HOLD_NOW" 2>/dev/null)" != "$KEPT_RUN" ]; then
+                  HANDOFF_DIVERGENCE="hold differs from the hold a GO kept"
+                fi
+              else
+                [ "$HOLD_NOW" = null ] || HANDOFF_DIVERGENCE="hold present after a GO"
+              fi
             elif [ "$HOLD_NOW" = null ]; then
               HANDOFF_DIVERGENCE="hold missing"
             elif [ "$(jq -r '.runId // empty' <<<"$HOLD_NOW" 2>/dev/null)" != "$(jq -r '.runId' <<<"$LEDGER_HOLDING")" ]; then
@@ -4669,7 +4704,23 @@ if [ "$COMMAND" = "finish" ]; then
             "$PUBLISH_FILE" >/dev/null 2>&1 ||
             HANDOFF_ARTIFACT_ERROR="publish file $PUBLISH_FILE was not written"
         fi
-        if [ -n "$HOLD_FILE" ]; then
+        # Every raise and clear runs under one lock BESIDE the shared hold file
+        # (<hold>.lock), so finishes of any PR, from any gate state dir, never
+        # interleave a read and a write of it. BLOCKED changes no hold and
+        # takes no lock. A lock that cannot be taken touches nothing and is
+        # retryable: the slot and lease stay held, and no ledger line is
+        # written for an outcome that was never decided.
+        HOLD_LOCK_HELD=false
+        if [ -n "$HOLD_FILE" ] && [ "$VERDICT" != BLOCKED ]; then
+          HOLD_LOCK="$HOLD_FILE.lock"
+          if hold_lock_take "$HOLD_LOCK" "$HOLD_LOCK_WAIT"; then
+            HOLD_LOCK_HELD=true
+          else
+            HOLD_LOCK_FAILED=true
+            HANDOFF_ARTIFACT_ERROR="hold lock $HOLD_LOCK unavailable ($HOLD_LOCK_WHY) — hold not touched"
+          fi
+        fi
+        if [ -n "$HOLD_FILE" ] && [ "$HOLD_LOCK_FAILED" != true ]; then
           # HUMAN_DECISION raises the hold too (2026-08-25). It used to leave it
           # untouched, i.e. default-open — but a verdict whose literal meaning is
           # "the system does not know whether this is safe" defaulting open is
@@ -4700,13 +4751,22 @@ if [ "$COMMAND" = "finish" ]; then
                 HANDOFF_ARTIFACT_ERROR="hold file $HOLD_FILE was NOT raised for this $VERDICT — promotion is ungated"
               ;;
             GO)
-              rm -f "$HOLD_FILE" 2>/dev/null
-              [ ! -e "$HOLD_FILE" ] ||
-                HANDOFF_ARTIFACT_ERROR="hold file $HOLD_FILE could not be cleared for this GO"
+              # Read at deletion time, under the lock: another run's
+              # HUMAN_DECISION hold, or one that cannot be read, is a question
+              # only a human (or a disposition the caller names) can close.
+              HOLD_KEEP_WHY="$(hold_clear_refusal "$HOLD_FILE" "$RUN_ID" "$HOLD_CLEAR_FOR")"
+              if [ -n "$HOLD_KEEP_WHY" ]; then
+                HOLD_KEPT="$(hold_kept_record "$HOLD_FILE" "$HOLD_KEEP_WHY" "$HOLD_CLEAR_FOR")"
+              else
+                rm -f "$HOLD_FILE" 2>/dev/null
+                [ ! -e "$HOLD_FILE" ] ||
+                  HANDOFF_ARTIFACT_ERROR="hold file $HOLD_FILE could not be cleared for this GO"
+              fi
               ;;
             # BLOCKED leaves the hold untouched — same as the develop gate's own
             # finish.
           esac
+          if [ "$HOLD_LOCK_HELD" = true ]; then flock -u 3; exec 3>&-; fi
         fi
         if [ -n "$HANDOFF_ARTIFACT_ERROR" ]; then
           HANDOFF_REASON="$HANDOFF_ARTIFACT_ERROR — the ledger line below may record this attempt, but finish remains retryable with the slot and lease held."
@@ -4714,7 +4774,7 @@ if [ "$COMMAND" = "finish" ]; then
         else
           HANDOFF_WRITTEN=true
         fi
-        if [ -n "$HANDOFF_LEDGER" ]; then
+        if [ -n "$HANDOFF_LEDGER" ] && [ "$HOLD_LOCK_FAILED" != true ]; then
           mkdir -p "$(dirname "$HANDOFF_LEDGER")" 2>/dev/null
           LEDGER_APPENDED=false
           # One bounded retry (2 attempts total, 5s wait each): the develop
@@ -4737,9 +4797,10 @@ if [ "$COMMAND" = "finish" ]; then
               # gate's tail -1 + field reads) are unaffected.
               if jq -cn --arg target "$TARGET_SHA" --arg freeze "$SHA" --argjson pr "$PR" \
                 --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
-                --arg digest "$VERDICT_DIGEST" \
+                --arg digest "$VERDICT_DIGEST" --argjson kept "$HOLD_KEPT" \
                 '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,
-                  runId:$run,verdict:$verdict,finishedAt:$now,verdictDigest:$digest}' >> "$HANDOFF_LEDGER"; then
+                  runId:$run,verdict:$verdict,finishedAt:$now,verdictDigest:$digest}
+                  + (if $kept == null then {} else {holdKept:$kept} end)' >> "$HANDOFF_LEDGER"; then
                 LEDGER_LINE="$(tail -1 "$HANDOFF_LEDGER" 2>/dev/null || true)"
               fi
               # VERIFIED like the publish/hold writes above: taking the lock
@@ -4791,7 +4852,9 @@ if [ "$COMMAND" = "finish" ]; then
     lease_fence_end
     flock -u 9 2>/dev/null || true
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg error "$TERMINAL_EFFECT_ERROR" \
-      '{ok:false,error:("terminal artifact write failed - slot and shared lease remain held for retry: " + $error),pr:$pr,runId:$run,leaseReleased:false}'
+      --argjson retry "$HOLD_LOCK_FAILED" \
+      '{ok:false,error:("terminal artifact write failed - slot and shared lease remain held for retry: " + $error),pr:$pr,runId:$run,leaseReleased:false}
+       + (if $retry then {retryable:true} else {} end)'
     exit 1
   fi
 
@@ -4804,6 +4867,7 @@ if [ "$COMMAND" = "finish" ]; then
     --argjson status "$SUSPEND_STATUS" --arg reason "$SUSPEND_REASON" \
     --argjson handoffWritten "$HANDOFF_WRITTEN" --arg handoffReason "$HANDOFF_REASON" \
     --arg handoffTargetSha "$HANDOFF_TARGET_SHA" --arg divergence "$HANDOFF_DIVERGENCE" \
+    --argjson holdKept "$HOLD_KEPT" \
     --arg digest "$VERDICT_DIGEST" --arg runVerdictFile "$RUN_VERDICT_FILE" \
     '{schemaVersion:1,pr:$pr,sha:$sha,runId:$run,verdict:$verdict,finishedAt:$now,
       verdictDigest:$digest,runVerdictFile:$runVerdictFile,
@@ -4812,7 +4876,8 @@ if [ "$COMMAND" = "finish" ]; then
       handoff:{written:$handoffWritten,
                targetSha:(if $handoffTargetSha == "" then null else $handoffTargetSha end),
                reason:(if $handoffReason == "" then null else $handoffReason end),
-               divergenceSnapshot:(if $divergence == "" then null else $divergence end)}}')"
+               divergenceSnapshot:(if $divergence == "" then null else $divergence end),
+               holdKept:$holdKept}}')"
   VERDICT_TMP="$(mktemp "$STATE_DIR/.pr-$PR-verdict.XXXXXX" 2>/dev/null)"
   if [ -z "$VERDICT_TMP" ] || ! printf '%s\n' "$VERDICT_JSON" > "$VERDICT_TMP" 2>/dev/null ||
      ! mv "$VERDICT_TMP" "$(pr_verdict_file "$PR")" 2>/dev/null ||
@@ -5679,6 +5744,7 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
   # Same-SHA recovery keeps the original challenger deadline (see `claim`).
   STATE="$(jq -c --arg sha "$HEAD_SHA" --arg now "$NOW" --arg run "$RUN_ID" --arg owner "$OWNER_TOKEN" \
     --arg deadline "$(challenger_deadline_from_now)" --arg claimant "$CLAIMANT" \
+    --argjson isFreeze "$(jq -c '.isFreezePr == true' <<<"$FACTS")" \
     '(if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
       then .challengerDeadline else $deadline end) as $dl |
     (if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
@@ -5686,7 +5752,7 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
     (if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
       then (.challengerProvisionalDeadline // null) else null end) as $provisional |
      .activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=null |
-     .activeLeaseOwner=$owner |
+     .activeLeaseOwner=$owner | .activeFreezeProbe={sha:$sha,isFreezePr:$isFreeze} |
      .activeClaimant=(if $claimant == "" then null else $claimant end) |
      .challengerDeadline=$dl | .challengerStartedAt=$started | .challengerProvisionalDeadline=$provisional |
      .challengerDisposition=null | .challengerTimedOutAt=null | .finishIntent=null' <<<"$STATE")"

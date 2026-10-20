@@ -123,6 +123,12 @@ vi.mock('../../db/sessions.js', async (importOriginal) => ({
   getExpiredAwaitingReasonApprovals: (nowIso: string) =>
     awaitingReasonApprovals.filter((row) => row.expires_at <= nowIso),
   getSession: (id: string) => sessions.find((session) => session.id === id),
+  claimExpiredReasonHold: (approvalId: string, nowIso: string) => {
+    const i = awaitingReasonApprovals.findIndex((row) => row.approval_id === approvalId && row.expires_at <= nowIso);
+    if (i < 0) return false;
+    awaitingReasonApprovals.splice(i, 1);
+    return true;
+  },
   deletePendingApproval: (approvalId: string) => {
     deletedApprovalIds.push(approvalId);
   },

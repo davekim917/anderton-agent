@@ -94,7 +94,7 @@ function intentToString(intent: PairingIntent): string {
 function printCodeCard(code: string, reason: 'initial' | 'regenerated'): void {
   const spaced = code.split('').join('   ');
   p.note(
-    `${spaced}\n\nSend these 4 digits to your bot from Telegram.`,
+    `${spaced}\n\nSend these ${code.length} digits to your bot from Telegram.`,
     reason === 'initial' ? 'Your pairing code is ready' : 'That code was used up — here is a fresh one',
   );
   p.log.message('Waiting for you to send the code…');

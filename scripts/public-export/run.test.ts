@@ -8,7 +8,15 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { runExport, type StatusFields } from './export-flow.js';
 import type { RunReport } from '../check-public-boundary.js';
 import { judgeCommit } from './gate.js';
-import { authorPublicNames, buildDeps, imageTag, loadExportPolicy, parseAuthor, policyDir } from './run.js';
+import {
+  authorPublicNames,
+  buildDeps,
+  imageTag,
+  loadAiHolds,
+  loadExportPolicy,
+  parseAuthor,
+  policyDir,
+} from './run.js';
 
 function gitInit(dir: string): void {
   execFileSync('git', ['init', '-q', dir], {
@@ -69,7 +77,7 @@ describe('buildDeps', () => {
       statusFile: path.join(dir, 'logs', 'status.json'),
       heldDetailFile,
       acceptedDetailFile: path.join(dir, 'logs', 'nested', 'accepted.json'),
-      publicRemote: undefined,
+      publicRemote: 'file:///nonexistent',
       install: { installRoot: dir, dbPath: '', identifiersPath: '', allowlistPath: '' },
       aiMaxChars: 1000,
       aiMaxCalls: 15,
@@ -121,11 +129,104 @@ describe('buildDeps', () => {
         return 0;
       },
       newCommits: () => ['s2'],
+      originRev: () => 'a'.repeat(40),
     });
     expect(code).toBe(1);
     expect(written).toEqual([
       expect.objectContaining({ status: 'failed', error: expect.stringContaining('install registry') }),
     ]);
+  });
+});
+
+describe('the AI hold store', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'public-export-holds-'));
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const config = () => ({
+    workDir: dir,
+    statusFile: path.join(dir, 'logs', 'status.json'),
+    heldDetailFile: path.join(dir, 'logs', 'public-export', 'held.json'),
+    acceptedDetailFile: path.join(dir, 'logs', 'public-export', 'accepted.json'),
+    publicRemote: undefined,
+    install: { installRoot: dir, dbPath: '', identifiersPath: '', allowlistPath: '' },
+    aiMaxChars: 1000,
+    aiMaxCalls: 15,
+    ai: { model: 'claude-opus-5-5', timeoutMs: 1000 },
+    operatorNames: [],
+    redact: [],
+  });
+  const record = {
+    originRev: 'a'.repeat(40),
+    findings: [{ file: 'src/a.ts', text: 'use the zz-acme tile', why: 'client' }],
+    texts: ['use the zz-acme tile'],
+  };
+
+  it('saves records privately beside the held detail and reads them back', () => {
+    const deps = buildDeps(config());
+    expect(deps.loadAiHolds()).toBeNull();
+    deps.saveAiHolds([record]);
+    const file = path.join(dir, 'logs', 'public-export', 'ai-holds.json');
+    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    expect(deps.loadAiHolds()).toEqual([record]);
+  });
+
+  it('fails the run when a store a run wrote before is missing, instead of starting empty', () => {
+    const deps = buildDeps(config());
+    deps.saveAiHolds([record]);
+    fs.rmSync(path.join(dir, 'logs'), { recursive: true });
+    expect(() => deps.loadAiHolds()).toThrow(/missing, but a run wrote it before/);
+  });
+
+  it('marks a store written before the marker existed the first time it is read', () => {
+    const file = path.join(dir, 'logs', 'public-export', 'ai-holds.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify([record]));
+    const deps = buildDeps(config());
+    expect(deps.loadAiHolds()).toEqual([record]);
+    fs.rmSync(path.join(dir, 'logs'), { recursive: true });
+    expect(() => deps.loadAiHolds()).toThrow(/missing, but a run wrote it before/);
+  });
+
+  it('accepts a record whose commit could not be resolved', () => {
+    const file = path.join(dir, 'ai-holds.json');
+    fs.writeFileSync(file, JSON.stringify([{ ...record, originRev: null, texts: null }]));
+    expect(loadAiHolds(file)).toEqual([{ ...record, originRev: null, texts: null }]);
+  });
+
+  it.each([
+    ['not JSON', '{'],
+    ['not an array', '{}'],
+    ['a record with no origin', JSON.stringify([{ ...record, originRev: 'main' }])],
+    ['a record with an empty quote', JSON.stringify([{ ...record, texts: [''] }])],
+    ['JSON null', 'null'],
+    ['a record with quotes but no resolved commit', JSON.stringify([{ ...record, originRev: null }])],
+    ['a pending record that claims quotes', JSON.stringify([{ ...record, pending: true }])],
+    ['a record with no quotes to check', JSON.stringify([{ ...record, texts: [] }])],
+    ["a record whose quote is not its finding's", JSON.stringify([{ ...record, texts: ['an unrelated safe quote'] }])],
+    ['a record with fewer quotes than findings', JSON.stringify([{ ...record, findings: [], texts: record.texts }])],
+    ['a record with a quote too short to stand for its line', JSON.stringify([{ ...record, texts: ['zz-acme'] }])],
+  ])('fails the run on a store that is %s', (_name, text) => {
+    const file = path.join(dir, 'ai-holds.json');
+    fs.writeFileSync(file, text);
+    expect(() => loadAiHolds(file)).toThrow();
+  });
+
+  it('keeps a dry run from replacing the held detail a new store is seeded from', () => {
+    const live = buildDeps({ ...config(), publicRemote: 'file:///nonexistent' });
+    live.writeHeldDetail({ sha: 'abc', aiFindings: record.findings });
+    buildDeps(config()).writeHeldDetail({ sha: 'dry', aiFindings: [] });
+    expect(live.readHeldDetail()).toEqual({ sha: 'abc', aiFindings: record.findings });
+    expect(fs.existsSync(path.join(dir, 'logs', 'public-export', 'held.dry-run.json'))).toBe(true);
+  });
+
+  it('reads the last held detail, and nothing when there is none', () => {
+    const deps = buildDeps({ ...config(), publicRemote: 'file:///nonexistent' });
+    expect(deps.readHeldDetail()).toBeNull();
+    deps.writeHeldDetail({ sha: 'abc', aiFindings: record.findings });
+    expect(deps.readHeldDetail()).toEqual({ sha: 'abc', aiFindings: record.findings });
   });
 });
 

@@ -76,7 +76,11 @@ export interface ApprovalHandlerContext {
   notify: (text: string) => Promise<void>;
 }
 
-export type ApprovalHandler = (ctx: ApprovalHandlerContext) => Promise<void>;
+export interface ApprovalDeclined {
+  declined: string;
+}
+
+export type ApprovalHandler = (ctx: ApprovalHandlerContext) => Promise<void | ApprovalDeclined>;
 
 const approvalHandlers = new Map<string, ApprovalHandler>();
 
@@ -97,6 +101,9 @@ export function getApprovalHandler(action: string): ApprovalHandler | undefined 
 // registered callback after the admin's decision is applied — e.g. a module
 // clearing an "awaiting approval" status indicator it set when the card went
 // out. Callback errors are logged and isolated; they never block resolution.
+//
+// A reject with reason fires at the click, so an action held elsewhere stops at
+// once, and again when the hold ends. Handlers must tolerate the repeat.
 //
 // Only authorized clicks resolve an approval (the response handler's
 // isAuthorizedApprovalClick gate runs first), so callbacks never fire for

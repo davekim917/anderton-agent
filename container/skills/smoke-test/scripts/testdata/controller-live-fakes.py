@@ -26,6 +26,17 @@ sends, ahead of any plain `enqueue` entry):
                 controller's read of the run tree and the gate's
   partial       (gate finish only) verdict.json is written, then the call
                 dies before the hold/ledger work and the slot cleanup
+  partial-hold:<runId>  (gate finish only) `partial`, and then another run's
+                HUMAN_DECISION hold is raised before the finish is resumed
+  lock-unavailable  (gate finish only) verdict.json is written, then the call
+                answers as the real gate does when it cannot take the hold's
+                sidecar lock: ok:false, retryable:true, slot and lease held
+  hold-lands:<runId>  (gh:issue-create, enqueue, gate:finish) another run's
+                HUMAN_DECISION hold is raised at SMOKE_GATE_HOLD_FILE: before
+                the issue is filed, once the message is enqueued, or before
+                the gate's finish reads the hold -- a hold landing between the
+                controller's validation and its finish, or between its two
+                verdict posts, inside one fire
 
 The fakes mirror the real contracts the controller depends on:
   enqueue  INSERT ... ON CONFLICT(id) DO NOTHING + read-back: a repeated id
@@ -39,7 +50,21 @@ The fakes mirror the real contracts the controller depends on:
            verb's preconditions in its order (:4634-4670): a stamped deadline,
            passed by the WALL clock, a readable SMOKE_GATE_RUN_ROOT (the same
            variable the real gate reads, :1304), and no non-empty
-           challenger/disposition.md under it.
+           challenger/disposition.md under it. With SMOKE_GATE_HOLD_FILE set
+           to a path inside the case directory (the parent of FAKE_STATE;
+           any other path is left alone), `finish` keeps the develop hold as
+           the real gate does for a freeze PR: NO_GO and HUMAN_DECISION raise
+           it under this run, GO deletes it, BLOCKED leaves it. Every fake PR
+           is a freeze PR, as the suites' wakes say, unless FAKE_GATE_ORDINARY
+           is set: then, as for an ordinary PR, finish never touches it. GO
+           keeps another run's HUMAN_DECISION hold (and one it cannot read)
+           unless `--clear-hold=<that run>` is the sixth argument, right after
+           the owner token (anywhere else it is ignored, as the real gate
+           ignores it), and says so in `handoff.holdKept` of its output and
+           of pr-<n>-verdict.json (smoke-hold-guard.sh hold_clear_refusal).
+           With SMOKE_GATE_HANDOFF_LEDGER inside the case directory, a
+           completed freeze-PR finish appends its line there, holdKept and
+           all, as the real gate does.
   gh       comments/issues carry whatever body was written; `api ... --jq .[]`
            lists them one JSON object per line. With a `labels` list in
            gh.json, `label list` returns it and `issue create` refuses a label
@@ -91,6 +116,43 @@ def save(name, doc):
     with open(path + ".tmp", "w") as fh:
         json.dump(doc, fh, sort_keys=True)
     os.replace(path + ".tmp", path)
+
+
+def case_hold_file():
+    """SMOKE_GATE_HOLD_FILE when it lies inside this case's directory (the
+    parent of FAKE_STATE), else None: a fake never touches any other file."""
+    hold = os.environ.get("SMOKE_GATE_HOLD_FILE", "")
+    case_dir = os.path.realpath(os.path.dirname(os.path.abspath(STATE)))
+    return hold if hold and os.path.realpath(hold).startswith(case_dir + os.sep) else None
+
+
+def case_ledger_file():
+    """SMOKE_GATE_HANDOFF_LEDGER under the same rule as case_hold_file."""
+    ledger = os.environ.get("SMOKE_GATE_HANDOFF_LEDGER", "")
+    case_dir = os.path.realpath(os.path.dirname(os.path.abspath(STATE)))
+    return ledger if ledger and os.path.realpath(ledger).startswith(case_dir + os.sep) else None
+
+
+def hold_clear_refusal(path, run, auth):
+    """The real gate's rule: why a GO must keep the hold, or None."""
+    if not os.path.lexists(path):
+        return None
+    try:
+        doc = json.load(open(path))
+    except (OSError, ValueError):
+        return "unreadable"
+    if not isinstance(doc, dict) or not isinstance(doc.get("runId"), str) or not doc["runId"]:
+        return "unreadable"
+    if not (doc.get("verdict") == "HUMAN_DECISION" or doc.get("reason") == "needs_human_decision"):
+        return None if doc.get("verdict") == "NO_GO" else "unclassifiable"
+    return None if doc["runId"] in (run, auth) else "undispositioned"
+
+
+def raise_case_hold(run):
+    """Another run's HUMAN_DECISION hold, written where the case's gate keeps it."""
+    with open(case_hold_file(), "w") as fh:
+        json.dump({"schemaVersion": 1, "sha": "c" * 40, "runId": run, "verdict": "HUMAN_DECISION",
+                   "raisedAt": now_iso(), "reason": "needs_human_decision"}, fh)
 
 
 def fault(op):
@@ -188,6 +250,8 @@ def enqueue(argv):
     db["messages"][mid] = dict(payload, runId=run, fingerprint=fp, seq=seq, at=now_iso())
     db["fires"][fire_key] = db["fires"].get(fire_key, 0) + 1
     save("enqueue.json", db)
+    if f and f.startswith("hold-lands:") and case_hold_file():
+        raise_case_hold(f.split(":", 1)[1])
     if f == "fail-after":
         return "fail-after", out({"ok": False, "code": "error", "error": "injected after write"}, 1)
     return "enqueued", out({"ok": True, "outcome": "enqueued", "id": mid, "seq": seq})
@@ -289,6 +353,8 @@ def gh(argv):
             return "refused", out_err(f[len("refuse:"):])
         if f == "fail-before":
             return "fail", out_err("HTTP 502")
+        if f and f.startswith("hold-lands:") and case_hold_file():
+            raise_case_hold(f.split(":", 1)[1])
         missing = [x for x in opts(argv, "--label") if "labels" in db and x not in db["labels"]]
         if missing:
             return "refused", out_err("could not add label: '{}' not found".format(missing[0]))
@@ -563,18 +629,60 @@ def gate(argv):
             write(p, st)
         if f == "partial":
             return "partial", 1  # died after verdict.json, slot still held
+        if f and f.startswith("partial-hold:"):
+            if case_hold_file():
+                raise_case_hold(f.split(":", 1)[1])
+            return "partial", 1
+        if f == "lock-unavailable":
+            return "lock-unavailable", out({
+                "ok": False, "retryable": True, "leaseReleased": False, "pr": st.get("pr"), "runId": run,
+                "error": "terminal artifact write failed - slot and shared lease remain held for retry: hold lock "
+                         "{}.lock unavailable \u2014 hold not touched".format(case_hold_file() or "<hold>")}, 1)
+        if f and f.startswith("hold-lands:") and case_hold_file():
+            raise_case_hold(f.split(":", 1)[1])
+        hold = case_hold_file()
+        kept = None
+        if verb == "finish" and hold and not os.environ.get("FAKE_GATE_ORDINARY"):
+            if verdict in ("NO_GO", "HUMAN_DECISION"):
+                write(hold, {"schemaVersion": 1, "sha": st.get("activeSha"), "runId": run, "verdict": verdict,
+                             "raisedAt": at, "reason": "needs_human_decision" if verdict == "HUMAN_DECISION"
+                             else "confirmed defects on this develop lineage"})
+            elif verdict == "GO":
+                sixth = argv[5] if len(argv) > 5 else ""
+                auth = sixth.split("=", 1)[1] if sixth.startswith("--clear-hold=") else None
+                why = hold_clear_refusal(hold, run, auth)
+                if why:
+                    try:
+                        held = json.load(open(hold)).get("runId")
+                    except (OSError, ValueError, AttributeError):
+                        held = None
+                    kept = {"reason": why, "runId": held, "clearHoldFor": auth}
+                elif os.path.lexists(hold):
+                    os.unlink(hold)
         with open(vpath, "rb") as fh:
             digest = hashlib.sha256(fh.read().rstrip(b"\n")).hexdigest()
         pr = st.get("pr")
-        write(os.path.join(gs, "pr-{}-verdict.json".format(pr)), {"runId": run, "verdict": verdict,
-                                                                   "sha": st.get("activeSha")})
+        ledger = case_ledger_file()
+        if verb == "finish" and ledger and not os.environ.get("FAKE_GATE_ORDINARY"):
+            line = {"schemaVersion": 1, "runId": run, "verdict": verdict, "finishedAt": at}
+            if kept:
+                line["holdKept"] = kept
+            with open(ledger, "a") as fh:
+                fh.write(json.dumps(line, separators=(",", ":")) + "\n")
+        receipt = {"runId": run, "verdict": verdict, "sha": st.get("activeSha")}
+        if kept:
+            receipt["handoff"] = {"written": True, "holdKept": kept}
+        write(os.path.join(gs, "pr-{}-verdict.json".format(pr)), receipt)
         st.update({"completedRunId": run, "completedVerdict": verdict, "completedAt": at,
                    "completedVerdictDigest": digest, "activeRunId": None,
                    "activeSha": None, "activeLeaseOwner": None, "activeClaimant": None})
         write(p, st)
         if f == "fail-after":
             return "fail-after", 1  # killed after the write, no output
-        return verb, out({"ok": True, "verdict": verdict, "finishedAt": at})
+        done = {"ok": True, "verdict": verdict, "finishedAt": at}
+        if kept:
+            done["handoff"] = {"holdKept": kept}
+        return verb, out(done)
     return "unknown", out({"ok": False, "error": "fake gate: unsupported verb " + verb}, 2)
 
 

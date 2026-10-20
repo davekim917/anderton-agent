@@ -505,6 +505,10 @@ POLL_OWNER="$(jq -r '.data.coordinatorOwnerToken' <<<"$POLL_OUT")"
 jq -e --arg sha "$HEAD_SHA" '
   .activeSha == $sha and .activeRunId != null and .activeLeaseOwner != null and .completedSha == null
 ' "$STATE_DIR/pr-42-state.json" >/dev/null
+# The claimed head's classification rides with the slot: a controller that
+# loses the wake recovers it from here.
+jq -e --arg sha "$HEAD_SHA" '.activeFreezeProbe == {sha:$sha,isFreezePr:false}' "$STATE_DIR/pr-42-state.json" >/dev/null ||
+  { echo "2: poll records the ordinary head's classification: $(cat "$STATE_DIR/pr-42-state.json")" >&2; exit 1; }
 jq -e --arg owner "$POLL_OWNER" '.owner == $owner' "$SMOKE_GATE_LEASE_DIR/lease-$POLL_RUN.json" >/dev/null
 # Same head, immediately after claiming: already active, no re-wake.
 bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates" and .observation.kind == "empty"' >/dev/null
@@ -862,6 +866,8 @@ jq -e --arg base "$BASE_SHA" --arg parent "$PARENT_SHA" '
   .data.migrationsInRange == ["api/migrations/222_undo_edit_prior_actor.sql"]
 ' <<<"$T5A_POLL" >/dev/null || { echo "5a: poll did not settle the freeze with its range: $T5A_POLL" >&2; exit 1; }
 jq -e '.refusedAlertSha == null' "$STATE_DIR/pr-10-state.json" >/dev/null
+jq -e '.activeFreezeProbe == {sha:.activeSha,isFreezePr:true} and .activeSha != null' "$STATE_DIR/pr-10-state.json" >/dev/null ||
+  { echo "5a: poll records the freeze head's classification: $(cat "$STATE_DIR/pr-10-state.json")" >&2; exit 1; }
 # 5a-list. SMOKE_GATE_MIGRATIONS_PREFIX may list several trees: a file under
 # ANY of them is a migration, and the single-tree result above is unchanged.
 fresh_state
@@ -2134,6 +2140,8 @@ bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for
 fresh_state
 CLAIM_SHA="$(sha 2)"
 bash "$GATE" claim run-x 5 "$CLAIM_SHA" | jq -e '.ok == true and .pr == 5 and .tookOverFrom == null' >/dev/null
+jq -e --arg sha "$CLAIM_SHA" '.activeFreezeProbe == {sha:$sha,isFreezePr:false}' "$STATE_DIR/pr-5-state.json" >/dev/null ||
+  { echo "7: claim records the head's classification: $(cat "$STATE_DIR/pr-5-state.json")" >&2; exit 1; }
 bash "$GATE" claim run-y 5 "$CLAIM_SHA" | jq -e '.ok == false' >/dev/null   # slot already owned
 bash "$GATE" progress run-wrong | jq -e '.ok == false and .pr == null' >/dev/null
 bash "$GATE" progress run-x | jq -e '.ok == true and .pr == 5' >/dev/null
@@ -2839,9 +2847,12 @@ bash "$GATE" claim run-freeze-bl 60 "$FREEZE_HEAD_SHA" >/dev/null
 bash "$GATE" finish "$FREEZE_HEAD_SHA" run-freeze-bl BLOCKED | jq -e '.ok == true' >/dev/null
 jq -e '.runId == "run-freeze-hd" and .verdict == "HUMAN_DECISION"' "$DEV_HOLD" >/dev/null
 
-# --- 13. GO clears the hold, keyed the same way.
+# --- 13. GO clears the hold, keyed the same way. The standing hold is
+# run-freeze-hd's HUMAN_DECISION, which a GO clears only when the caller names
+# that run (65a-65f cover the hold it keeps otherwise).
 bash "$GATE" claim run-freeze-2 60 "$FREEZE_HEAD_SHA" >/dev/null
-bash "$GATE" finish "$FREEZE_HEAD_SHA" run-freeze-2 GO | jq -e --arg target "$TARGET_SHA" '
+bash "$GATE" finish "$FREEZE_HEAD_SHA" run-freeze-2 GO "$(jq -r '.activeLeaseOwner' "$STATE_DIR/pr-60-state.json")" \
+  --clear-hold=run-freeze-hd | jq -e --arg target "$TARGET_SHA" '
   .ok == true and .handoff.written == true and .handoff.targetSha == $target
 ' >/dev/null
 [ ! -e "$DEV_HOLD" ]
@@ -6147,6 +6158,389 @@ for WAIT_BAD_FIELD in pr head interval max; do
   fi
   jq -e '.ok == false' "$STATE_DIR/bad-$WAIT_BAD_FIELD.json" >/dev/null
 done
+
+fi
+
+# --- 65a-65f. A GO finish clears the develop hold only when that is safe ----------
+# GO deletes the hold, so before it does, the gate reads the hold it is about to
+# delete: another run's HUMAN_DECISION hold stays (handoff.holdKept, and on the
+# ledger line) unless the caller names exactly that run with --clear-hold, and
+# so does a hold it cannot read. A NO_GO hold and the run's own hold clear as
+# before. The check runs in the hold block itself, so a resumed finish and a
+# hold raised after the caller's last look are both judged at deletion time.
+g65_setup() {
+  fresh_state
+  export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+    SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+  G65_TARGET="$(sha 3)"
+  G65_HEAD="$(sha 4)"
+  export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
+  export STUB_PARENT_SHA="$G65_TARGET"
+  G65_HOLD="$STATE_DIR/g65/develop-hold.json"
+  G65_LEDGER="$STATE_DIR/g65/handoff-ledger.jsonl"
+  export SMOKE_GATE_PUBLISH_FILE="$STATE_DIR/g65/latest-verdict.json" SMOKE_GATE_HOLD_FILE="$G65_HOLD" \
+    SMOKE_GATE_HANDOFF_LEDGER="$G65_LEDGER"
+  mkdir -p "$STATE_DIR/g65"
+  g65_hold() { # <run-id> <verdict> [reason]
+    jq -cn --arg run "$1" --arg v "$2" --arg r "${3:-needs_human_decision}" --arg sha "$G65_TARGET" \
+      '{schemaVersion:1,sha:$sha,runId:$run,verdict:$v,raisedAt:"2026-09-01T00:00:00Z",reason:$r}' >"$G65_HOLD"
+  }
+  g65_go() { # <run-id>: claim, then finish GO; the finish output on stdout
+    bash "$GATE" claim "$1" 65 "$G65_HEAD" >/dev/null
+    bash "$GATE" finish "$G65_HEAD" "$1" GO
+  }
+  g65_go_auth() { # <run-id> <clear-hold run-id>: the same, authorizing one hold (after the owner token)
+    bash "$GATE" claim "$1" 65 "$G65_HEAD" >/dev/null
+    bash "$GATE" finish "$G65_HEAD" "$1" GO "$(jq -r '.activeLeaseOwner' "$STATE_DIR/pr-65-state.json")" "--clear-hold=$2"
+  }
+}
+if smoke_case 65a-hold-resume; then
+g65_setup
+# 65a. Crash before the hold block, a foreign HUMAN_DECISION hold appears, and
+# the retry resumes from verdict.json: it must keep that hold.
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-65\",\"name\":\"backend-preview PR #65\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
+export STUB_SUSPEND_CODE=202
+bash "$GATE" claim run-g65-resume 65 "$G65_HEAD" >/dev/null
+export STUB_SUSPEND_SLEEP=5
+timeout 2 bash "$GATE" finish "$G65_HEAD" run-g65-resume GO >/dev/null 2>&1 || true
+unset STUB_SUSPEND_SLEEP
+[ -s "$STATE_DIR/runs/run-g65-resume/verdict.json" ] && [ ! -e "$G65_HOLD" ] ||
+  { echo "65a fixture: verdict.json written, hold block not reached" >&2; exit 1; }
+g65_hold run-g65-held HUMAN_DECISION
+G65_OUT="$(bash "$GATE" finish "$G65_HEAD" run-g65-resume GO)"
+jq -e '.ok == true and .verdict == "GO" and .handoff.holdKept.reason == "undispositioned"
+  and .handoff.holdKept.runId == "run-g65-held"' <<<"$G65_OUT" >/dev/null ||
+  { echo "65a: the resumed GO must report the kept hold: $G65_OUT" >&2; exit 1; }
+jq -e '.runId == "run-g65-held" and .verdict == "HUMAN_DECISION"' "$G65_HOLD" >/dev/null ||
+  { echo "65a: the resumed GO deleted another run's HUMAN_DECISION hold" >&2; exit 1; }
+tail -n 1 "$G65_LEDGER" | jq -e '.runId == "run-g65-resume" and .verdict == "GO" and .holdKept.runId == "run-g65-held"' >/dev/null ||
+  { echo "65a: the ledger line must record the kept hold: $(tail -n 1 "$G65_LEDGER")" >&2; exit 1; }
+unset STUB_SERVICES STUB_SUSPEND_CODE
+
+unset SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+if smoke_case 65b-hold-late; then
+g65_setup
+# 65b. A foreign HUMAN_DECISION hold raised just before finish, no
+# authorization: kept.
+g65_hold run-g65-held HUMAN_DECISION
+G65_OUT="$(g65_go run-g65-late)"
+jq -e '.ok == true and .handoff.holdKept.reason == "undispositioned"' <<<"$G65_OUT" >/dev/null &&
+  jq -e '.runId == "run-g65-held"' "$G65_HOLD" >/dev/null ||
+  { echo "65b: an unauthorized GO must keep the hold: $G65_OUT" >&2; exit 1; }
+# A hold that is HUMAN_DECISION only by its reason is the same question.
+g65_hold run-g65-held "" needs_human_decision
+G65_OUT="$(g65_go run-g65-reason)"
+jq -e '.handoff.holdKept.reason == "undispositioned"' <<<"$G65_OUT" >/dev/null && [ -e "$G65_HOLD" ] ||
+  { echo "65b: a needs_human_decision hold must be kept: $G65_OUT" >&2; exit 1; }
+
+unset SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+if smoke_case 65c-hold-authorized; then
+g65_setup
+# 65c. Authorization names another run: kept. Names this hold's run: cleared.
+g65_hold run-g65-held HUMAN_DECISION
+G65_OUT="$(g65_go_auth run-g65-other run-g65-someone-else)"
+jq -e '.ok == true and .handoff.holdKept.clearHoldFor == "run-g65-someone-else"' <<<"$G65_OUT" >/dev/null &&
+  [ -e "$G65_HOLD" ] || { echo "65c: authorization for another run must not clear this hold: $G65_OUT" >&2; exit 1; }
+G65_OUT="$(g65_go_auth run-g65-auth run-g65-held)"
+jq -e '.ok == true and .handoff.holdKept == null' <<<"$G65_OUT" >/dev/null && [ ! -e "$G65_HOLD" ] ||
+  { echo "65c: an authorized GO clears the hold it names: $G65_OUT" >&2; exit 1; }
+
+unset SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+if smoke_case 65d-hold-unchanged; then
+g65_setup
+# 65d. Unchanged: a NO_GO hold and the run's own hold clear on GO.
+g65_hold run-g65-defects NO_GO "confirmed defects on this develop lineage"
+G65_OUT="$(g65_go run-g65-fixed)"
+jq -e '.ok == true and .handoff.holdKept == null' <<<"$G65_OUT" >/dev/null && [ ! -e "$G65_HOLD" ] ||
+  { echo "65d: GO after a NO_GO hold clears it: $G65_OUT" >&2; exit 1; }
+g65_hold run-g65-own HUMAN_DECISION
+G65_OUT="$(g65_go run-g65-own)"
+jq -e '.ok == true and .handoff.holdKept == null' <<<"$G65_OUT" >/dev/null && [ ! -e "$G65_HOLD" ] ||
+  { echo "65d: the run's own hold clears on GO: $G65_OUT" >&2; exit 1; }
+
+unset SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+if smoke_case 65e-hold-unreadable; then
+g65_setup
+# 65e. A hold that cannot be read is kept, never taken as absent.
+printf '{"schemaVersion":1,"runId":' >"$G65_HOLD"
+G65_OUT="$(g65_go run-g65-torn)"
+jq -e '.ok == true and .handoff.holdKept.reason == "unreadable"' <<<"$G65_OUT" >/dev/null && [ -s "$G65_HOLD" ] ||
+  { echo "65e: an unreadable hold must be kept: $G65_OUT" >&2; exit 1; }
+rm -f "$G65_HOLD"
+
+unset SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+if smoke_case 65f-hold-badarg; then
+g65_setup
+# 65f. Anything else after the owner token is refused before any effect.
+bash "$GATE" claim run-g65-badarg 65 "$G65_HEAD" >/dev/null
+G65_OWNER="$(jq -r '.activeLeaseOwner' "$STATE_DIR/pr-65-state.json")"
+set +e
+G65_OUT="$(bash "$GATE" finish "$G65_HEAD" run-g65-badarg GO "$G65_OWNER" --clear-hold-everything)"
+G65_RC=$?
+set -e
+[ "$G65_RC" = 2 ] && jq -e '.ok == false' <<<"$G65_OUT" >/dev/null && [ ! -s "$STATE_DIR/runs/run-g65-badarg/verdict.json" ] ||
+  { echo "65f: an unknown finish argument must be refused with no verdict recorded (rc=$G65_RC): $G65_OUT" >&2; exit 1; }
+unset SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+# Holds the hold's sidecar lock and the earlier revision's state-dir lock
+# (fds 7 and 8 of a sleeping process), so a case fails on either revision for
+# the reason it names, until g65_release_locks.
+g65_hold_locks() {
+  : >>"$G65_HOLD.lock"; : >>"$STATE_DIR/develop-hold.lock"
+  rm -f "$STATE_DIR/g65-locked" "$STATE_DIR/g65-release"
+  # Holds both locks (r3's sidecar and r2's private one) until released
+  # explicitly, or the case dir goes, or ten minutes pass.
+  ( exec 7<"$G65_HOLD.lock" 8<"$STATE_DIR/develop-hold.lock"; flock 7; flock 8; : >"$STATE_DIR/g65-locked"
+    n=0; while [ ! -e "$STATE_DIR/g65-release" ] && [ -d "$STATE_DIR" ] && [ "$n" -lt 6000 ]; do sleep 0.1; n=$((n+1)); done
+  ) >/dev/null 2>&1 </dev/null &
+  G65_HOLDER=$!
+  for _ in $(seq 50); do [ -e "$STATE_DIR/g65-locked" ] && return 0; sleep 0.1; done
+  echo "fixture: could not take the hold locks" >&2; exit 1
+}
+g65_release_locks() { : >"$STATE_DIR/g65-release"; wait "$G65_HOLDER" 2>/dev/null || true; }
+if smoke_case 65g-hold-lock-shared; then
+g65_setup
+# 65g. Two gates with DIFFERENT private state roots finish against one shared
+# hold file. One GO is clearing a NO_GO hold; while its delete is paused WITH
+# the hold lock held, another gate finishes HUMAN_DECISION. That raise must
+# be refused (bounded, retryable) -- a handshake, not a race: a gate whose
+# lock is not shared raises at once, and the clear then deletes the human
+# hold, whatever the scheduling. Retried after the clear, the raise lands.
+G65G_OTHER="$STATE_DIR/other-state"
+mkdir -p "$G65G_OTHER"
+SMOKE_GATE_STATE_DIR="$G65G_OTHER" bash "$GATE" claim run-g65g-raiser 66 "$G65_HEAD" >/dev/null
+export G65G_HOLD="$G65_HOLD" G65G_GATE="$GATE" G65G_HEAD="$G65_HEAD" G65G_OTHER
+export G65G_RM="$(command -v rm)" G65G_TRIGGER="$STATE_DIR/g65g-trigger" G65G_RAISED="$STATE_DIR/g65g-raised.json"
+cat >"$STUB_BIN/rm" <<'STUB'
+#!/usr/bin/env bash
+if [ "$*" = "-f $G65G_HOLD" ] && [ ! -e "$G65G_TRIGGER" ]; then
+  : >"$G65G_TRIGGER"
+  SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS=1 SMOKE_GATE_STATE_DIR="$G65G_OTHER" \
+    bash "$G65G_GATE" finish "$G65G_HEAD" run-g65g-raiser HUMAN_DECISION >"$G65G_RAISED" 2>/dev/null </dev/null
+  printf '%s\n' "$?" >"$G65G_RAISED.rc"
+  cat "$G65G_HOLD" >"$G65G_RAISED.hold" 2>/dev/null || true
+fi
+exec "$G65G_RM" "$@"
+STUB
+chmod +x "$STUB_BIN/rm"
+g65_hold run-g65g-defects NO_GO "confirmed defects on this develop lineage"
+G65_OUT="$(g65_go run-g65g-clearer)"
+"$G65G_RM" -f "$STUB_BIN/rm"
+[ -e "$G65G_TRIGGER" ] && [ -s "$G65G_RAISED.rc" ] || { echo "65g fixture: the clear never reached its delete" >&2; exit 1; }
+[ "$(cat "$G65G_RAISED.rc")" = 1 ] &&
+  jq -e '.ok == false and .retryable == true and .leaseReleased == false and (.error | test("hold lock"))' "$G65G_RAISED" >/dev/null &&
+  jq -e '.runId == "run-g65g-defects"' "$G65G_RAISED.hold" >/dev/null ||
+  { echo "65g: a raise from another state root during the clear must be refused retryably, hold untouched: rc=$(cat "$G65G_RAISED.rc") $(cat "$G65G_RAISED")" >&2; exit 1; }
+jq -e '.ok == true and .verdict == "GO"' <<<"$G65_OUT" >/dev/null && [ ! -e "$G65_HOLD" ] ||
+  { echo "65g: the clear completes and clears the NO_GO hold: $G65_OUT" >&2; exit 1; }
+G65_RAISE="$(SMOKE_GATE_STATE_DIR="$G65G_OTHER" bash "$GATE" finish "$G65_HEAD" run-g65g-raiser HUMAN_DECISION)"
+jq -e '.ok == true and .verdict == "HUMAN_DECISION"' <<<"$G65_RAISE" >/dev/null &&
+  jq -e '.runId == "run-g65g-raiser" and .verdict == "HUMAN_DECISION"' "$G65_HOLD" >/dev/null ||
+  { echo "65g: the retried raise lands its HUMAN_DECISION hold: $G65_RAISE" >&2; exit 1; }
+unset SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+if smoke_case 65h-hold-lock-retry; then
+g65_setup
+# 65h. The hold lock cannot be taken (held elsewhere past the wait): finish
+# touches no hold and writes no ledger line, keeps the slot and lease, and
+# says retryable:true. Once the lock is free the same finish completes.
+export SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS=1
+g65_hold run-g65-held HUMAN_DECISION
+G65_BEFORE="$(sha256sum <"$G65_HOLD")"
+bash "$GATE" claim run-g65h 65 "$G65_HEAD" >/dev/null
+g65_hold_locks
+set +e
+G65_OUT="$(bash "$GATE" finish "$G65_HEAD" run-g65h GO)"
+G65_RC=$?
+set -e
+[ "$G65_RC" = 1 ] && jq -e '.ok == false and .retryable == true and .leaseReleased == false
+  and (.error | test("hold lock"))' <<<"$G65_OUT" >/dev/null ||
+  { echo "65h: a lock failure must be retryable with the slot held (rc=$G65_RC): $G65_OUT" >&2; exit 1; }
+[ "$(sha256sum <"$G65_HOLD")" = "$G65_BEFORE" ] &&
+  jq -e '.activeRunId == "run-g65h"' "$STATE_DIR/pr-65-state.json" >/dev/null &&
+  ! grep -q '"runId":"run-g65h"' "$G65_LEDGER" 2>/dev/null ||
+  { echo "65h: the failed attempt touched the hold, released the slot or wrote a ledger line" >&2; exit 1; }
+g65_release_locks
+G65_OUT="$(bash "$GATE" finish "$G65_HEAD" run-g65h GO)"
+jq -e '.ok == true and .verdict == "GO" and .handoff.holdKept.runId == "run-g65-held"' <<<"$G65_OUT" >/dev/null &&
+  [ "$(grep -c '"runId":"run-g65h"' "$G65_LEDGER")" = 1 ] ||
+  { echo "65h: the retry completes, keeps the hold and writes one ledger line: $G65_OUT" >&2; exit 1; }
+unset SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+if smoke_case 65i-blocked-no-lock; then
+g65_setup
+# 65i. BLOCKED changes no hold, so it never waits on or fails for the lock.
+export SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS=1
+g65_hold run-g65-held HUMAN_DECISION
+G65_BEFORE="$(sha256sum <"$G65_HOLD")"
+bash "$GATE" claim run-g65i 65 "$G65_HEAD" >/dev/null
+g65_hold_locks
+set +e
+G65_OUT="$(bash "$GATE" finish "$G65_HEAD" run-g65i BLOCKED)"
+G65_RC=$?
+set -e
+g65_release_locks
+[ "$G65_RC" = 0 ] && jq -e '.ok == true and .verdict == "BLOCKED"' <<<"$G65_OUT" >/dev/null &&
+  [ "$(sha256sum <"$G65_HOLD")" = "$G65_BEFORE" ] ||
+  { echo "65i: BLOCKED must finish without the hold lock, hold unchanged (rc=$G65_RC): $G65_OUT" >&2; exit 1; }
+unset SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+if smoke_case 65j-kept-hold-divergence; then
+g65_setup
+# 65j. The next finish's divergence snapshot branches on whether the last GO
+# line kept a hold, not on whether that hold had a runId. An unreadable kept
+# hold left as it was is no divergence; the same hold gone missing is one.
+printf '{"schemaVersion":1,"runId":' >"$G65_HOLD"
+G65_OUT="$(g65_go run-g65j-kept)"
+jq -e '.handoff.holdKept.reason == "unreadable" and .handoff.holdKept.runId == null' <<<"$G65_OUT" >/dev/null ||
+  { echo "65j fixture: the GO kept the unreadable hold: $G65_OUT" >&2; exit 1; }
+bash "$GATE" claim run-g65j-next 65 "$G65_HEAD" >/dev/null
+G65_OUT="$(bash "$GATE" finish "$G65_HEAD" run-g65j-next NO_GO)"
+jq -e '.ok == true and .handoff.divergenceSnapshot == null' <<<"$G65_OUT" >/dev/null ||
+  { echo "65j: an unchanged unreadable kept hold is not a divergence: $G65_OUT" >&2; exit 1; }
+printf '{"schemaVersion":1,"runId":' >"$G65_HOLD"
+G65_OUT="$(g65_go run-g65j-kept2)"
+rm -f "$G65_HOLD"
+bash "$GATE" claim run-g65j-after 65 "$G65_HEAD" >/dev/null
+G65_OUT="$(bash "$GATE" finish "$G65_HEAD" run-g65j-after NO_GO)"
+jq -e '.ok == true and .handoff.divergenceSnapshot != null' <<<"$G65_OUT" >/dev/null &&
+  jq -e '.divergence == "the hold a GO kept is missing"' "$(jq -r '.handoff.divergenceSnapshot' <<<"$G65_OUT")" >/dev/null ||
+  { echo "65j: a kept hold that went missing is a divergence: $G65_OUT" >&2; exit 1; }
+unset SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+if smoke_case 65k-hold-lock-paths; then
+g65_setup
+# 65k. The lock's own paths. A hold whose directory does not exist yet is
+# raised with its lock beside it. A lock that cannot be opened at all (a
+# dangling link into a missing directory) fails GO retryably, touching
+# nothing; BLOCKED, which takes no lock, still finishes under that failure.
+G65K_HOLD="$STATE_DIR/g65k/new/develop-hold.json"
+export SMOKE_GATE_HOLD_FILE="$G65K_HOLD"
+bash "$GATE" claim run-g65k-raise 65 "$G65_HEAD" >/dev/null
+G65_OUT="$(bash "$GATE" finish "$G65_HEAD" run-g65k-raise NO_GO)"
+jq -e '.ok == true' <<<"$G65_OUT" >/dev/null && [ -f "$G65K_HOLD.lock" ] &&
+  jq -e '.runId == "run-g65k-raise" and .verdict == "NO_GO"' "$G65K_HOLD" >/dev/null ||
+  { echo "65k: a hold in a missing directory must be raised under its sidecar lock: $G65_OUT" >&2; exit 1; }
+export SMOKE_GATE_HOLD_FILE="$G65_HOLD"
+g65_hold run-g65-held HUMAN_DECISION
+G65_BEFORE="$(sha256sum <"$G65_HOLD")"
+ln -s "$STATE_DIR/g65k/absent/lock" "$G65_HOLD.lock"
+bash "$GATE" claim run-g65k-go 65 "$G65_HEAD" >/dev/null
+set +e
+G65_OUT="$(bash "$GATE" finish "$G65_HEAD" run-g65k-go GO)"
+G65_RC=$?
+set -e
+[ "$G65_RC" = 1 ] && jq -e '.ok == false and .retryable == true and .leaseReleased == false' <<<"$G65_OUT" >/dev/null &&
+  [ "$(sha256sum <"$G65_HOLD")" = "$G65_BEFORE" ] && ! grep -q '"runId":"run-g65k-go"' "$G65_LEDGER" 2>/dev/null ||
+  { echo "65k: a lock that cannot be opened must be retryable and touch nothing (rc=$G65_RC): $G65_OUT" >&2; exit 1; }
+bash "$GATE" release run-g65k-go >/dev/null
+bash "$GATE" claim run-g65k-blocked 65 "$G65_HEAD" >/dev/null
+G65_OUT="$(bash "$GATE" finish "$G65_HEAD" run-g65k-blocked BLOCKED)" &&
+  jq -e '.ok == true and .verdict == "BLOCKED"' <<<"$G65_OUT" >/dev/null && [ "$(sha256sum <"$G65_HOLD")" = "$G65_BEFORE" ] ||
+  { echo "65k: BLOCKED must finish under an unopenable lock, hold unchanged: $G65_OUT" >&2; exit 1; }
+rm "$G65_HOLD.lock"
+unset SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+if smoke_case 65l-hold-lock-symlink; then
+g65_setup
+# 65l. The sidecar is a symlink to a file that is then atomically replaced
+# (as the publish file is on every finish): following it would lock whichever
+# inode the name points at that moment. GO refuses it retryably and touches
+# nothing; the link stays (a lock is never replaced). Once it is removed the
+# retry makes a regular sidecar and completes.
+export SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS=1
+g65_hold run-g65-defects NO_GO "confirmed defects on this develop lineage"
+G65_BEFORE="$(sha256sum <"$G65_HOLD")"
+printf 'a\n' >"$STATE_DIR/g65/lock-target"
+ln -s "$STATE_DIR/g65/lock-target" "$G65_HOLD.lock"
+printf 'b\n' >"$STATE_DIR/g65/lock-target.new" && mv "$STATE_DIR/g65/lock-target.new" "$STATE_DIR/g65/lock-target"
+bash "$GATE" claim run-g65l 65 "$G65_HEAD" >/dev/null
+set +e
+G65_OUT="$(bash "$GATE" finish "$G65_HEAD" run-g65l GO)"
+G65_RC=$?
+set -e
+[ "$G65_RC" = 1 ] && jq -e '.ok == false and .retryable == true and .leaseReleased == false
+  and (.error | test("not a regular file"))' <<<"$G65_OUT" >/dev/null &&
+  [ "$(sha256sum <"$G65_HOLD")" = "$G65_BEFORE" ] && [ -L "$G65_HOLD.lock" ] &&
+  jq -e '.activeRunId == "run-g65l"' "$STATE_DIR/pr-65-state.json" >/dev/null &&
+  ! grep -q '"runId":"run-g65l"' "$G65_LEDGER" 2>/dev/null ||
+  { echo "65l: a symlinked sidecar must be refused retryably, nothing touched (rc=$G65_RC): $G65_OUT" >&2; exit 1; }
+"$(command -v rm)" -f "$G65_HOLD.lock"
+G65_OUT="$(bash "$GATE" finish "$G65_HEAD" run-g65l GO)"
+jq -e '.ok == true and .verdict == "GO"' <<<"$G65_OUT" >/dev/null && [ ! -e "$G65_HOLD" ] &&
+  [ -f "$G65_HOLD.lock" ] && [ ! -L "$G65_HOLD.lock" ] ||
+  { echo "65l: the retry after repair completes with a regular sidecar: $G65_OUT" >&2; exit 1; }
+unset SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+if smoke_case 65m-hold-lock-special; then
+g65_setup
+# 65m. A FIFO at the sidecar path would block an open forever, before the
+# bounded flock. It is refused before any open, within the lock wait, and
+# retryably; so is a directory. Neither is replaced.
+export SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS=1
+g65_hold run-g65-defects NO_GO "confirmed defects on this develop lineage"
+G65_BEFORE="$(sha256sum <"$G65_HOLD")"
+bash "$GATE" claim run-g65m 65 "$G65_HEAD" >/dev/null
+for kind in fifo directory; do
+  "$(command -v rm)" -rf "$G65_HOLD.lock"
+  if [ "$kind" = fifo ]; then mkfifo "$G65_HOLD.lock"; else mkdir "$G65_HOLD.lock"; fi
+  G65_T0="$(date +%s)"
+  set +e
+  G65_OUT="$(timeout 15 bash "$GATE" finish "$G65_HEAD" run-g65m GO </dev/null)"
+  G65_RC=$?
+  set -e
+  G65_DT=$(( $(date +%s) - G65_T0 ))
+  [ "$G65_RC" = 1 ] && [ "$G65_DT" -le 5 ] && jq -e '.ok == false and .retryable == true and .leaseReleased == false
+    and (.error | test("not a regular file"))' <<<"$G65_OUT" >/dev/null &&
+    [ "$(sha256sum <"$G65_HOLD")" = "$G65_BEFORE" ] &&
+    { [ "$kind" != fifo ] || [ -p "$G65_HOLD.lock" ]; } && { [ "$kind" != directory ] || [ -d "$G65_HOLD.lock" ]; } ||
+    { echo "65m: a $kind sidecar must be refused within the wait, retryably, nothing touched (rc=$G65_RC, ${G65_DT}s): $G65_OUT" >&2; exit 1; }
+done
+jq -e '.activeRunId == "run-g65m"' "$STATE_DIR/pr-65-state.json" >/dev/null ||
+  { echo "65m: the refused finishes keep the slot" >&2; exit 1; }
+"$(command -v rm)" -rf "$G65_HOLD.lock"
+unset SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+if smoke_case 65n-hold-lock-denied; then
+g65_setup
+# 65n. A regular sidecar this gate may not read is refused retryably, nothing
+# touched. (Root reads it anyway, so the case needs an ordinary user.)
+export SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS=1
+g65_hold run-g65-defects NO_GO "confirmed defects on this develop lineage"
+G65_BEFORE="$(sha256sum <"$G65_HOLD")"
+: >"$G65_HOLD.lock"; chmod 000 "$G65_HOLD.lock"
+if [ -r "$G65_HOLD.lock" ]; then
+  echo "65n: skipped -- this user can read a mode-000 file" >&2
+else
+  bash "$GATE" claim run-g65n 65 "$G65_HEAD" >/dev/null
+  set +e
+  G65_OUT="$(bash "$GATE" finish "$G65_HEAD" run-g65n GO)"
+  G65_RC=$?
+  set -e
+  [ "$G65_RC" = 1 ] && jq -e '.ok == false and .retryable == true and .leaseReleased == false' <<<"$G65_OUT" >/dev/null &&
+    [ "$(sha256sum <"$G65_HOLD")" = "$G65_BEFORE" ] && jq -e '.activeRunId == "run-g65n"' "$STATE_DIR/pr-65-state.json" >/dev/null ||
+    { echo "65n: an unreadable sidecar must be refused retryably (rc=$G65_RC): $G65_OUT" >&2; exit 1; }
+fi
+chmod 600 "$G65_HOLD.lock"
+unset SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
 
 fi
 smoke_cases_done

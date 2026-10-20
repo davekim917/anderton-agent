@@ -4,7 +4,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { failedStatus, runExport, type ExportDeps, type Status, type StatusFields } from './export-flow.js';
+import {
+  failedStatus,
+  isAiHoldRecord,
+  runExport,
+  type AiHoldRecord,
+  type ExportDeps,
+  type Status,
+  type StatusFields,
+} from './export-flow.js';
 import {
   gateCommits,
   knownPrivateNames,
@@ -13,9 +21,13 @@ import {
   loadPublicNames,
   loadStagingCommit,
   stagingCommitDiff,
+  stagingFileAt,
+  stagingMentions,
+  stagingOriginRev,
   realAiRead,
   realScanners,
   type AcceptedFinding,
+  type AiFinding,
   type AiReadOptions,
   type InstallPaths,
 } from './gate.js';
@@ -185,11 +197,44 @@ export function loadExportPolicy(installRoot: string): {
 function writePrivate(file: string, data: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   fs.chmodSync(path.dirname(file), 0o700);
-  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
-  fs.chmodSync(file, 0o600);
+  const temp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600, flush: true });
+  fs.chmodSync(temp, 0o600);
+  fs.renameSync(temp, file);
+}
+
+/** Undefined only when the file does not exist; anything unreadable throws. */
+function readJson(file: string): unknown {
+  let text: string;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`${file}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
+}
+
+/** A record that cannot be read would let its commit be read again, so a malformed store fails the run. */
+export function loadAiHolds(file: string): AiHoldRecord[] | null {
+  const parsed = readJson(file);
+  if (parsed === undefined) return null;
+  const valid = Array.isArray(parsed) && parsed.every(isAiHoldRecord);
+  if (!valid) throw new Error(`${file}: expected an array of AI hold records`);
+  return parsed as AiHoldRecord[];
 }
 
 export function buildDeps(config: RunConfig): ExportDeps {
+  const aiHoldsFile = path.join(path.dirname(config.heldDetailFile), 'ai-holds.json');
+  // Kept apart from the store, so losing the store's directory cannot also erase the sign that it existed.
+  const storeWritten = path.join(config.workDir, 'ai-holds.written');
+  // held.json seeds a store that does not exist yet, so a run that publishes nothing must not replace it.
+  const dryRunHeldDetailFile = path.join(path.dirname(config.heldDetailFile), 'held.dry-run.json');
+  const origin = path.join(config.workDir, 'origin.git');
   const staging = path.join(config.workDir, 'staging.git');
   const remote = config.publicRemote ?? '';
   const aiBudget = { cap: config.aiMaxCalls, spent: 0 };
@@ -202,7 +247,8 @@ export function buildDeps(config: RunConfig): ExportDeps {
       fs.writeFileSync(config.statusFile, JSON.stringify(full, null, 2) + '\n');
     },
     clearStatus: () => fs.rmSync(config.statusFile, { force: true }),
-    writeHeldDetail: (detail) => writePrivate(config.heldDetailFile, detail),
+    writeHeldDetail: (detail) =>
+      writePrivate(config.publicRemote === undefined ? dryRunHeldDetailFile : config.heldDetailFile, detail),
     writeAcceptedDetail: (accepted) =>
       writePrivate(config.acceptedDetailFile, { at: new Date().toISOString(), accepted }),
     stagingHead: () => headOf(staging),
@@ -216,7 +262,32 @@ export function buildDeps(config: RunConfig): ExportDeps {
       git(staging, ['rev-list', '--reverse', base ? `${base}..${head}` : head])
         .split('\n')
         .filter(Boolean),
-    gate: async (shas) => {
+    fileAt: (sha, file) => stagingFileAt(staging, sha, file),
+    mentions: (sha, texts) => stagingMentions(staging, sha, texts),
+    originRev: (sha) => stagingOriginRev(staging, sha),
+    originContains: (head, rev) =>
+      spawnSync('git', ['--git-dir', origin, 'merge-base', '--is-ancestor', rev, head]).status === 0,
+    loadAiHolds: () => {
+      const records = loadAiHolds(aiHoldsFile);
+      if (records === null && fs.existsSync(storeWritten)) {
+        throw new Error(`${aiHoldsFile} is missing, but a run wrote it before; restore it rather than lose its holds`);
+      }
+      if (records !== null) fs.writeFileSync(storeWritten, '');
+      return records;
+    },
+    saveAiHolds: (records) => {
+      writePrivate(aiHoldsFile, records);
+      fs.writeFileSync(storeWritten, '');
+    },
+    readHeldDetail: () => {
+      const detail = readJson(config.heldDetailFile) as { sha?: unknown; aiFindings?: unknown } | null | undefined;
+      if (detail === undefined) return null;
+      if (typeof detail?.sha !== 'string' || !Array.isArray(detail.aiFindings)) {
+        throw new Error(`${config.heldDetailFile}: expected { sha, aiFindings }`);
+      }
+      return { sha: detail.sha, aiFindings: detail.aiFindings as AiFinding[] };
+    },
+    gate: async (shas, watch) => {
       const policy = loadExportPolicy(config.install.installRoot);
       const publicNames = [...policy.publicNames, ...config.operatorNames];
       const names = knownPrivateNames(config.install, publicNames);
@@ -235,6 +306,7 @@ export function buildDeps(config: RunConfig): ExportDeps {
             aiBudget,
           },
           (sha) => stagingCommitDiff(staging, sha),
+          watch,
         );
       } finally {
         scanners.dispose();

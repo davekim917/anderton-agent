@@ -1356,6 +1356,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     ['duty', 'usage-rollup', 'tick:post-session', 40],
     ['duty', 'orphaned-repo-fence-release', 'tick:post-session', 50],
     ['duty', 'approvals-reason-sweep', 'tick:housekeeping', 10],
+    ['duty', 'gate-expiry', 'tick:housekeeping', 12],
     ['duty', 'github-app-token-refresh', 'tick:housekeeping', 20],
     ['duty', 'github-token-file-refresh', 'tick:housekeeping', 25],
     ['duty', 'mcp-oauth-refresh', 'tick:housekeeping', 27],
@@ -1402,17 +1403,17 @@ describe('sweep duty registry (S2-PR2)', () => {
     // Surface, name, phase AND order, in run order — a swap anywhere fails.
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
 
-    // 46 registrations: the 38 from the seam-2 port (37 unique names, one
-    // registered twice — see below) plus eight fork additions,
+    // The 38 registrations from the seam-2 port (37 unique names, one
+    // registered twice — see below) plus the fork additions:
     // github-token-file-refresh, cli-request-execution-prune,
     // coordination-orphans (seam 4 series A', issue #430),
     // task-failure-escalation, mcp-oauth-refresh, promise-watch,
-    // provider-fallback-return and orphan-containers.
-    expect(actual).toHaveLength(47);
+    // provider-fallback-return, orphan-containers and gate-expiry.
+    expect(actual).toHaveLength(48);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(46);
+    expect(names.size).toBe(47);
     expect(names).toEqual(new Set(Object.values(SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(46);
+    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(47);
     // The one duty registered twice is the orphan-claim reset: once in the tail
     // window, once as the post-kill follow-up (rev-3 grounding §2, S17).
     expect(actual.filter((r) => r[1] === SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
@@ -1837,12 +1838,12 @@ describe('sweep duty registry (S2-PR2)', () => {
     // `provider-fallback-return` from `sweep-provider-return`. The numbers here
     // said 39/38/38 from before those landed; the tuple comparison above was
     // already right, which is why it never failed.
-    expect(actual).toHaveLength(47);
+    expect(actual).toHaveLength(48);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(46);
+    expect(names.size).toBe(47);
     // The inventory comes from the same fresh instance, not this file's binding.
     expect(names).toEqual(new Set(Object.values(hs.SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(46);
+    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(47);
     expect(actual.filter((r) => r[1] === hs.SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
     expect(h.spawns).toEqual([]);
   });

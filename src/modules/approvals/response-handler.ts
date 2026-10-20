@@ -21,24 +21,31 @@
 import { withCentralSync } from '../../db/central-lease.js';
 import { requestWake } from '../../request-wake.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { deletePendingApproval, getPendingApproval, getSession } from '../../db/sessions.js';
+import {
+  deletePendingApproval,
+  getPendingApproval,
+  getSession,
+  transitionPendingApprovalStatus,
+} from '../../db/sessions.js';
 import type { ResponsePayload } from '../../response-registry.js';
 import { log } from '../../log.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
 import { getUser } from '../permissions/db/users.js';
 import { choiceApprovers, choiceClickAllowed, getChoiceHandler, resolveChoice } from './choices.js';
-import { finalizeReject, writeApprovalNote } from './finalize.js';
+import { finalizeReject, resolveClaimed, writeApprovalNote } from './finalize.js';
 import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
 import {
   APPROVAL_RESOLUTION_MAX_UNITS,
+  type ApprovalDeclined,
+  editApprovalCard,
   editApprovalCardResolution,
   getApprovalHandler,
   headUnits,
   notifyApprovalResolved,
   REJECT_WITH_REASON_VALUE,
 } from './primitive.js';
-import { armReasonCapture } from './reason-capture.js';
+import { armReasonCapture, claimReasonHold } from './reason-capture.js';
 
 /** Thread-target cards live in the originating chat, where thread access IS the approval authority. */
 async function isThreadDelivery(approval: PendingApproval, session: Session): Promise<boolean> {
@@ -118,7 +125,9 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
     return true;
   }
 
-  await handleRegisteredApproval(approval, payload.value, namespacedUserId(payload) ?? '');
+  if (!(await handleRegisteredApproval(approval, payload.value, namespacedUserId(payload) ?? '')).claimed) {
+    await tellClicker(payload, 'Someone already answered this card. Your click did not count.');
+  }
   return true;
 }
 
@@ -131,7 +140,7 @@ export async function resolveApprovalFromHost(
   approvalId: string,
   decision: 'approve' | 'reject',
   userId: string,
-): Promise<{ resolved: boolean; error?: string }> {
+): Promise<{ resolved: boolean; error?: string; declined?: string }> {
   const approval = await getPendingApproval(approvalId);
   if (!approval) return { resolved: false, error: `No pending approval ${approvalId}` };
   if (approval.action === ONECLI_ACTION) {
@@ -143,46 +152,86 @@ export async function resolveApprovalFromHost(
   if (getChoiceHandler(approval.action)) {
     return { resolved: false, error: 'Choice cards resolve by clicking one of their options, not approve/reject.' };
   }
-  await handleRegisteredApproval(approval, decision, userId);
-  return { resolved: true };
+  if (approval.status === 'awaiting_reason') {
+    return { resolved: false, error: `Approval ${approvalId} was already rejected; it is waiting for the reason.` };
+  }
+  const { claimed, declined } = await handleRegisteredApproval(approval, decision, userId);
+  if (!claimed) return { resolved: false, error: `Approval ${approvalId} was already answered by someone else.` };
+  return declined ? { resolved: true, declined } : { resolved: true };
 }
 
+const CLAIMED_STATUS: Record<string, PendingApproval['status']> = {
+  approve: 'approved',
+  reject: 'rejected',
+  [REJECT_WITH_REASON_VALUE]: 'awaiting_reason',
+};
+
+/** `claimed` is false only when another response already claimed the approval; `declined` is a handler's refusal. */
 async function handleRegisteredApproval(
   approval: PendingApproval,
   selectedOption: string,
   userId: string,
-): Promise<void> {
+): Promise<{ claimed: boolean; declined?: string }> {
   if (!approval.session_id) {
     await deletePendingApproval(approval.approval_id);
-    return;
+    return { claimed: true };
   }
   const session = await getSession(approval.session_id);
   if (!session) {
     await deletePendingApproval(approval.approval_id);
-    return;
-  }
-
-  // "Reject with reason…" — hold the row and capture the admin's next DM
-  // instead of finalizing now. The agent is notified exactly once: after the
-  // reason arrives, or after the sweep's timeout if the admin ghosts.
-  if (selectedOption === REJECT_WITH_REASON_VALUE) {
-    await armReasonCapture(approval, session, userId);
-    return;
+    return { claimed: true };
   }
 
   // Unknown values are untrusted transport input: the approval stays pending.
-  if (selectedOption === 'reject') {
-    await finalizeReject(approval, session, userId);
-    return;
-  }
-
-  if (selectedOption !== 'approve') {
+  const claimedStatus = CLAIMED_STATUS[selectedOption];
+  if (!claimedStatus) {
     log.warn('Ignoring approval response with an unknown option', {
       approvalId: approval.approval_id,
       action: approval.action,
       selectedOption,
       userId,
     });
+    return { claimed: true };
+  }
+
+  let declined: string | undefined;
+  const claimed = await resolveClaimed(
+    () =>
+      claimedStatus === 'awaiting_reason'
+        ? claimReasonHold(approval)
+        : transitionPendingApprovalStatus(approval.approval_id, 'pending', claimedStatus),
+    async () => {
+      declined = await applyResponse(approval, session, selectedOption, userId);
+    },
+  );
+  if (!claimed) {
+    log.warn('Ignoring a response to an approval already answered', {
+      approvalId: approval.approval_id,
+      selectedOption,
+      userId,
+    });
+  }
+  return { claimed, declined };
+}
+
+async function applyResponse(
+  approval: PendingApproval,
+  session: Session,
+  selectedOption: string,
+  userId: string,
+): Promise<string | undefined> {
+  // "Reject with reason…" — hold the row and capture the admin's next DM
+  // instead of finalizing now. The agent is notified exactly once: after the
+  // reason arrives, or after the sweep's timeout if the admin ghosts.
+  if (selectedOption === REJECT_WITH_REASON_VALUE) {
+    // Decided at the click: a gated command waiting in its container stands down now, not after a reason arrives.
+    await notifyApprovalResolved({ approval, session, outcome: 'reject', userId });
+    await armReasonCapture(approval, session, userId);
+    return;
+  }
+
+  if (selectedOption === 'reject') {
+    await finalizeReject(approval, session, userId);
     return;
   }
 
@@ -204,14 +253,22 @@ async function handleRegisteredApproval(
   }
 
   const payload = JSON.parse(approval.payload);
+  let result: void | ApprovalDeclined = undefined;
   try {
-    await handler({ session, payload, approval, userId, notify });
-    log.info('Approval handled', { approvalId: approval.approval_id, action: approval.action, userId });
+    result = await handler({ session, payload, approval, userId, notify });
+    if (!result) log.info('Approval handled', { approvalId: approval.approval_id, action: approval.action, userId });
   } catch (err) {
     log.error('Approval handler threw', { approvalId: approval.approval_id, action: approval.action, err });
     await notify(
       `Your ${approval.action} was approved, but applying it failed: ${err instanceof Error ? err.message : String(err)}.`,
     );
+  }
+
+  if (result) {
+    log.info('Approval declined by its handler', { approvalId: approval.approval_id, action: approval.action, userId });
+    await editApprovalCard(approval, [approval.title, approval.question, result.declined].filter(Boolean).join('\n\n'));
+    await deletePendingApproval(approval.approval_id);
+    return result.declined;
   }
 
   // The bridge edits no approval card on click; the card shows live buttons until this lands.

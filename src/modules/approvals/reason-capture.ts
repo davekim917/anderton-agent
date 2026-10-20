@@ -22,16 +22,19 @@ import type { InboundEvent } from '../../channels/adapter.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import {
   deletePendingApproval,
+  claimExpiredReasonHold,
   getExpiredAwaitingReasonApprovals,
   getPendingApproval,
   getSession,
   markApprovalAwaitingReason,
+  restartApprovalReasonWindow,
+  transitionPendingApprovalStatus,
 } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { registerMessageInterceptor } from '../../router.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { ensureUserDm } from '../permissions/user-dm.js';
-import { finalizeReject } from './finalize.js';
+import { finalizeReject, resolveClaimed } from './finalize.js';
 import { editApprovalCardResolution, REJECT_WITH_REASON_VALUE } from './primitive.js';
 
 /** How long an awaiting-reason hold waits for the admin's reply before the sweep finalizes a plain reject. */
@@ -77,11 +80,17 @@ function extractText(event: InboundEvent): string {
   }
 }
 
+export async function claimReasonHold(approval: PendingApproval): Promise<boolean> {
+  const expiresAt = new Date(Date.now() + REASON_CAPTURE_WINDOW_MS).toISOString();
+  return markApprovalAwaitingReason(approval.approval_id, expiresAt);
+}
+
 /**
  * Begin the reject-with-reason hold for an approval the admin chose not to
- * finalize outright. Prompts the admin's DM, then parks the row and arms
- * capture. If we can't reach the admin (no DM, no adapter, delivery throws) we
- * finalize a plain reject immediately rather than strand the requesting agent.
+ * finalize outright, after `claimReasonHold` parked the row. Prompts the
+ * admin's DM, then arms capture. If we can't reach the admin (no DM, no
+ * adapter, delivery throws) we finalize a plain reject immediately rather than
+ * strand the requesting agent.
  */
 export async function armReasonCapture(approval: PendingApproval, session: Session, userId: string): Promise<void> {
   const dm = userId ? await ensureUserDm(userId) : null;
@@ -93,7 +102,7 @@ export async function armReasonCapture(approval: PendingApproval, session: Sessi
       hasDm: Boolean(dm),
       hasAdapter: Boolean(adapter),
     });
-    await finalizeReject(approval, session, userId);
+    if (await claimHeldReject(approval)) await finalizeReject(approval, session, userId);
     return;
   }
 
@@ -104,18 +113,19 @@ export async function armReasonCapture(approval: PendingApproval, session: Sessi
       approvalId: approval.approval_id,
       err,
     });
-    await finalizeReject(approval, session, userId);
+    if (await claimHeldReject(approval)) await finalizeReject(approval, session, userId);
     return;
   }
 
-  // Prompt is out — now hold the row and arm capture. Order matters: a reply
-  // can't arrive before the prompt is read, so there's no lost-message window.
+  // The window counts from the prompt the admin can read, not the click; a hold the sweep already closed while the
+  // prompt was in flight is not re-armed.
   const expiresAt = new Date(Date.now() + REASON_CAPTURE_WINDOW_MS).toISOString();
-  await markApprovalAwaitingReason(approval.approval_id, expiresAt);
+  if (!(await restartApprovalReasonWindow(approval.approval_id, expiresAt))) return;
+  // Armed before the card edit is awaited, so a reply typed during it is still captured.
+  awaitingReason.set(dmKey(dm.channel_type, dm.platform_id), { approvalId: approval.approval_id, userId });
   // The bridge edits no card on click; without this the held card shows live
   // buttons while the approver types. finalizeReject edits it again.
   await editApprovalCardResolution(approval, REJECT_WITH_REASON_VALUE, userId);
-  awaitingReason.set(dmKey(dm.channel_type, dm.platform_id), { approvalId: approval.approval_id, userId });
   log.info('reject-with-reason: awaiting reason reply', { approvalId: approval.approval_id, userId });
 }
 
@@ -133,26 +143,30 @@ export async function captureReasonReply(event: InboundEvent): Promise<boolean> 
   // This DM is an armed reason channel — disarm regardless of outcome.
   awaitingReason.delete(dmKey(event.channelType, event.platformId));
 
+  // Already finalized (e.g. ghosted by the sweep): the reply is no longer a
+  // reason — let it route normally instead of swallowing it.
   const approval = await getPendingApproval(arming.approvalId);
-  if (!approval || approval.status !== 'awaiting_reason') {
-    // Already finalized (e.g. ghosted by the sweep). The reply is no longer a
-    // reason — let it route normally instead of swallowing it.
-    return false;
-  }
+  if (!approval) return false;
+  return resolveClaimed(
+    () => claimHeldReject(approval),
+    async () => {
+      const session = approval.session_id ? await getSession(approval.session_id) : null;
+      if (!session) {
+        await deletePendingApproval(approval.approval_id);
+        return;
+      }
+      const reason = clampReason(extractText(event));
+      await finalizeReject(approval, session, arming.userId, reason || undefined);
+      log.info('reject-with-reason: reason captured and relayed', {
+        approvalId: approval.approval_id,
+        hasReason: reason.length > 0,
+      });
+    },
+  );
+}
 
-  const session = approval.session_id ? await getSession(approval.session_id) : null;
-  if (!session) {
-    await deletePendingApproval(approval.approval_id);
-    return true;
-  }
-
-  const reason = clampReason(extractText(event));
-  await finalizeReject(approval, session, arming.userId, reason || undefined);
-  log.info('reject-with-reason: reason captured and relayed', {
-    approvalId: approval.approval_id,
-    hasReason: reason.length > 0,
-  });
-  return true;
+function claimHeldReject(approval: PendingApproval): Promise<boolean> {
+  return transitionPendingApprovalStatus(approval.approval_id, 'awaiting_reason', 'rejected');
 }
 
 registerMessageInterceptor(captureReasonReply);
@@ -164,15 +178,21 @@ registerMessageInterceptor(captureReasonReply);
  * requesting agent always gets its decision. Called once per sweep tick.
  */
 export async function sweepAwaitingReasonRejects(): Promise<void> {
-  const rows = await getExpiredAwaitingReasonApprovals(new Date().toISOString());
+  const nowIso = new Date().toISOString();
+  const rows = await getExpiredAwaitingReasonApprovals(nowIso);
   for (const approval of rows) {
-    const session = approval.session_id ? await getSession(approval.session_id) : null;
-    if (!session) {
-      await deletePendingApproval(approval.approval_id);
-      continue;
-    }
-    // Plain reject, unknown resolver — the admin opted in but never typed.
-    await finalizeReject(approval, session, '');
-    log.info('reject-with-reason: window elapsed, finalized as plain reject', { approvalId: approval.approval_id });
+    await resolveClaimed(
+      () => claimExpiredReasonHold(approval.approval_id, nowIso),
+      async () => {
+        const session = approval.session_id ? await getSession(approval.session_id) : null;
+        if (!session) {
+          await deletePendingApproval(approval.approval_id);
+          return;
+        }
+        // Plain reject, unknown resolver — the admin opted in but never typed.
+        await finalizeReject(approval, session, '');
+        log.info('reject-with-reason: window elapsed, finalized as plain reject', { approvalId: approval.approval_id });
+      },
+    );
   }
 }

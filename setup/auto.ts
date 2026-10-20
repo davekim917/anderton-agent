@@ -438,6 +438,17 @@ async function main(): Promise<void> {
           res.rawLog,
         );
       }
+      if (fields?.ERROR === 'service_not_running' && fields.DOCKER_GROUP_STALE === 'true') {
+        await fail(
+          'service',
+          "NanoClaw can't reach Docker yet.",
+          'Your account was just added to the docker group, which takes effect after a reboot. ' +
+            'Reboot, or grant access now and restart NanoClaw:\n' +
+            '  sudo setfacl -m u:$(whoami):rw /var/run/docker.sock   # needs the acl package\n' +
+            `  systemctl --user restart ${fields.SERVICE_UNIT ?? getSystemdUnit()}`,
+          res.rawLog,
+        );
+      }
       if (fields?.ERROR === 'service_not_running') {
         const start =
           fields.SERVICE_TYPE === 'nohup'
@@ -456,13 +467,8 @@ async function main(): Promise<void> {
       }
       await fail('service', "Couldn't start NanoClaw.", 'See logs/nanoclaw.error.log for details.');
     }
-    if (res.terminal?.fields.DOCKER_GROUP_STALE === 'true') {
-      p.log.warn(brandBody("NanoClaw's permissions need a tweak before it can reach Docker."));
-      p.log.message(
-        brandBody(
-          '  sudo setfacl -m u:$(whoami):rw /var/run/docker.sock\n' + `  systemctl --user restart ${getSystemdUnit()}`,
-        ),
-      );
+    if (res.terminal?.fields.DOCKER_SOCKET_ACL === 'true') {
+      p.log.info(brandBody('Docker access is granted for now. Reboot once when convenient so it survives a Docker restart.'));
     }
   }
 

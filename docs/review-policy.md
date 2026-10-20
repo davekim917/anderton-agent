@@ -85,6 +85,41 @@ Record a durable review receipt tied to the exact final SHA: reviewer and
 runtime, complete-diff and relevant-file scope, outcome, and every finding with
 its disposition. A local completion claim is not substitute-review coverage.
 
+A repo whose rules forbid naming an AI model in a PR comment sets
+`"neutralReviewerLabel": true` in its base branch's `.github/pr-review-loop.json`,
+or, where the repo should carry no such file, the install names it in
+`CODEX_REVIEW_NEUTRAL_REVIEWER_REPOS`: comma-separated `owner/repo`, matched
+case-insensitively and exactly, e.g. `ExampleOrg/web,ExampleOrg/data`. Set it
+in the install's `.env`: the host forwards it to every agent container it spawns
+(Claude, Codex and OpenCode alike; not the wiki-maintenance runtime), so a change reaches a container at its first
+spawn after a host restart, and at boot a malformed entry is logged at WARN and
+DMed to the owner while the list is still forwarded as written. A listed
+repo skips the file read. An entry that is not `owner/repo` matches nothing,
+and while one is present `receipt` refuses (exit 1, nothing posted) any repo
+that neither the list nor the file opts in, since the bad entry may have meant
+it. `codex-review.sh receipt` then still takes `--reviewer` with the model id and
+still refuses a small tier, but the posted comment's reviewer line reads
+`independent review`, and the id goes to the receipt ledger instead: one file
+per posted comment, `<ledger>/<owner>/<repo>/<pr>/<comment id>.json`. The
+ledger is one directory: what `CODEX_REVIEW_RECEIPT_LEDGER` names, else an
+agent container's group folder (`/workspace/agent/review-receipts`, the host's
+`groups/<folder>/review-receipts/`), else the install's `data/review-receipts/`
+on the host. It is never a scan of other groups' folders: an entry is a
+reviewer claim, and a group with no write access to the repo must not be able
+to lend one to another group's receipt. The comment must not name the id
+anywhere else either; `receipt` refuses a body or claim that does, and the
+reviewer's report is the author's to keep clean beyond that. `merge-check`
+resolves the label through the ledger before the tier rule, so a labelled
+receipt with no entry for its comment — posted by hand, from another group or
+install, or into a ledger the merge does not read — is `receipt_unresolved`
+and unlocks nothing: post it again where the merge runs, or run the merge with
+`CODEX_REVIEW_RECEIPT_LEDGER` naming the ledger that holds it (on the host,
+`groups/<folder>/review-receipts` for a receipt that group's container posted). `audit` reads the
+same way, so the gate-audit job, which runs from a fresh checkout with no
+ledger, flags every merge on such a receipt: a repo that runs that job does
+not opt in. A repo with neither the flag nor a list entry is unchanged: the id stays in the comment,
+and a hand-written `independent review` line there resolves nowhere.
+
 ## Changing who may review
 
 There is no longer a worker-policy file, in this repo or in the bootstrap

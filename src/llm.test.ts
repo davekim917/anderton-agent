@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path from 'path';
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // callHaiku resolves credentials through structuredCredentials(), which
@@ -11,90 +14,146 @@ vi.mock('./env.js', async (importOriginal) => ({
   readEnvFileMatching: vi.fn(() => ({})),
 }));
 
-import { callHaiku, CallHaikuHttpError } from './llm.js';
+import { DEFAULT_HAIKU_MODEL } from './flag-parser.js';
+import { _setClaudeCliForTesting, callHaiku, CallHaikuHttpError, claudeCliAvailable } from './llm.js';
+import { installFakeClaudeCli, type FakeClaudeCall } from './test-fixtures/fake-claude-cli.js';
+import { allowSubprocess } from './test-hermeticity.js';
 
-function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}): Response {
-  return new Response(JSON.stringify(body), {
-    status: init.status ?? 200,
-    headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) },
-  });
-}
-
-function authHeader(call: unknown[]): string | undefined {
-  const init = call[1] as { headers?: Record<string, string> } | undefined;
-  return init?.headers?.authorization;
+function flag(call: FakeClaudeCall, name: string): string | undefined {
+  const i = call.argv.indexOf(name);
+  return i === -1 ? undefined : call.argv[i + 1];
 }
 
 describe('callHaiku', () => {
-  const originalApiKey = process.env.ANTHROPIC_API_KEY;
-  const originalOauthPrimary = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-  const originalOauth2 = process.env.CLAUDE_CODE_OAUTH_TOKEN_2;
-  const originalHttpsProxy = process.env.HTTPS_PROXY;
-  const originalHttpProxy = process.env.HTTP_PROXY;
-  let fetchMock: ReturnType<typeof vi.fn>;
+  const saved: Record<string, string | undefined> = {};
+  const KEYS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN_2', 'HTTPS_PROXY', 'GH_TOKEN'];
+  let cli: ReturnType<typeof installFakeClaudeCli>;
 
   beforeEach(() => {
+    for (const k of KEYS) saved[k] = process.env[k];
     process.env.ANTHROPIC_API_KEY = 'test-key';
-    // No OAuth slots by default — single api-key:primary slot, matching the
-    // pre-rotation test expectations below.
     delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
     delete process.env.CLAUDE_CODE_OAUTH_TOKEN_2;
-    // No proxy dispatcher — makes callHaikuOnce use bare global `fetch`
-    // directly, which is what we stub below.
-    delete process.env.HTTPS_PROXY;
-    delete process.env.https_proxy;
-    delete process.env.HTTP_PROXY;
-    delete process.env.http_proxy;
-    fetchMock = vi.fn();
-    vi.stubGlobal('fetch', fetchMock);
+    cli = installFakeClaudeCli();
   });
 
   afterEach(() => {
-    vi.unstubAllGlobals();
-    if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
-    else process.env.ANTHROPIC_API_KEY = originalApiKey;
-    if (originalOauthPrimary === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
-    else process.env.CLAUDE_CODE_OAUTH_TOKEN = originalOauthPrimary;
-    if (originalOauth2 === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN_2;
-    else process.env.CLAUDE_CODE_OAUTH_TOKEN_2 = originalOauth2;
-    if (originalHttpsProxy === undefined) delete process.env.HTTPS_PROXY;
-    else process.env.HTTPS_PROXY = originalHttpsProxy;
-    if (originalHttpProxy === undefined) delete process.env.HTTP_PROXY;
-    else process.env.HTTP_PROXY = originalHttpProxy;
+    cli.uninstall();
+    for (const k of KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
   });
 
-  it('calls Anthropic directly even when a proxy is configured, so the gateway cannot swap the key', async () => {
+  it('asks the CLI for Haiku at low effort with no tools, settings or session, prompt on stdin', async () => {
+    cli.script({ 'test-key': { result: '  Snowflake auto-suspend  ' } });
+
+    expect(await callHaiku('label this')).toBe('Snowflake auto-suspend');
+
+    const [call] = cli.calls();
+    expect(flag(call, '--model')).toBe(DEFAULT_HAIKU_MODEL);
+    expect(flag(call, '--effort')).toBe('low');
+    expect(flag(call, '--tools')).toBe('');
+    expect(flag(call, '--setting-sources')).toBe('');
+    expect(call.argv).toEqual(expect.arrayContaining(['-p', '--strict-mcp-config', '--no-session-persistence']));
+    expect(flag(call, '--output-format')).toBe('json');
+    expect(call.stdin).toBe('label this');
+  });
+
+  it.each(['claude-haiku-4-5', 'claude-haiku-4-5-20251001'])(
+    'sends no effort to %s, which takes none',
+    async (model) => {
+      cli.script({ 'test-key': { result: 'ok' } });
+
+      await callHaiku('hello', { model });
+
+      const [call] = cli.calls();
+      expect(flag(call, '--model')).toBe(model);
+      expect(call.argv).not.toContain('--effort');
+    },
+  );
+
+  it('keeps low effort for a model the effort table does not list', async () => {
+    cli.script({ 'test-key': { result: 'ok' } });
+
+    await callHaiku('hello', { model: 'claude-haiku-9-9' });
+
+    expect(flag(cli.calls()[0], '--effort')).toBe('low');
+  });
+
+  it("passes the slot's credential and an isolated config, and nothing else from the host env", async () => {
     process.env.HTTPS_PROXY = 'http://127.0.0.1:1';
-    fetchMock.mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'ok' }] }));
+    process.env.GH_TOKEN = 'unrelated-secret';
+    cli.script({ 'test-key': { result: 'ok' } });
 
-    expect(await callHaiku('hello')).toBe('ok');
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await callHaiku('hello');
+
+    const { env } = cli.calls()[0];
+    expect(env.ANTHROPIC_API_KEY).toBe('test-key');
+    expect(env.CLAUDE_CONFIG_DIR).toBe(cli.configDir);
+    expect(env.CLAUDE_CODE_MAX_RETRIES).toBe('0');
+    expect(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1');
+    expect(env.HTTPS_PROXY).toBeUndefined();
+    expect(env.GH_TOKEN).toBeUndefined();
   });
 
-  it('makes one request and throws when the only configured key fails', async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({}, { status: 429, headers: { 'retry-after': '2' } }));
+  it('sends the optional system prompt and model', async () => {
+    cli.script({ 'test-key': { result: 'ok' } });
 
-    const promise = callHaiku('hello');
-    promise.catch(() => {});
+    await callHaiku('user text', { system: 'be brief', model: 'claude-test-model' });
 
-    await expect(promise).rejects.toMatchObject({ status: 429 });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [call] = cli.calls();
+    expect(flag(call, '--system-prompt')).toBe('be brief');
+    expect(flag(call, '--model')).toBe('claude-test-model');
   });
 
-  it('carries the provider error type and message into the thrown error', async () => {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse(
-        { error: { type: 'rate_limit_error', message: 'This request would exceed your rate limit' } },
-        { status: 429, headers: { 'retry-after': '3600' } },
-      ),
-    );
+  it('carries the API status and message of a failed call into the thrown error', async () => {
+    cli.script({
+      'test-key': { isError: true, apiErrorStatus: 429, result: 'This request would exceed your rate limit' },
+    });
 
     const err = await callHaiku('hello').catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(CallHaikuHttpError);
-    expect((err as Error).message).toBe(
-      'callHaiku: Anthropic returned 429 rate_limit_error: This request would exceed your rate limit',
-    );
+    expect((err as CallHaikuHttpError).status).toBe(429);
+    expect((err as Error).message).toBe('callHaiku: Anthropic returned 429: This request would exceed your rate limit');
+    expect(cli.calls()).toHaveLength(1);
+  });
+
+  it.each([
+    ['output that is not JSON', { raw: 'Not logged in', exitCode: 1 }, 10_000, /exited 1 without a result/],
+    ['an error with no API status', { isError: true, result: 'boom' }, 10_000, /claude CLI failed: boom/],
+    [
+      'an error subtype that carries errors instead of a result',
+      { raw: JSON.stringify({ is_error: true, subtype: 'error_during_execution', errors: ['tool loop failed'] }) },
+      10_000,
+      /claude CLI failed: tool loop failed/,
+    ],
+    ['no answer within the timeout', { result: 'late', delayMs: 2_000 }, 300, /did not answer within 300 ms/],
+  ])('rejects on %s', async (_label, reply, timeoutMs, message) => {
+    cli.script({ 'test-key': reply });
+
+    await expect(callHaiku('hello', { timeoutMs })).rejects.toThrow(message);
+  });
+
+  it('names the install script when no claude CLI is on PATH', async () => {
+    allowSubprocess(['missing-claude']);
+    _setClaudeCliForTesting({ executable: '/nonexistent/missing-claude', configDir: cli.configDir });
+
+    await expect(callHaiku('hello')).rejects.toThrow(/no claude CLI on PATH; install it with setup\/install-claude.sh/);
+  });
+
+  it('claudeCliAvailable() reads PATH', () => {
+    _setClaudeCliForTesting(null);
+    const savedPath = process.env.PATH;
+    try {
+      process.env.PATH = cli.configDir;
+      expect(claudeCliAvailable()).toBe(false);
+      fs.writeFileSync(path.join(cli.configDir, 'claude'), '');
+      expect(claudeCliAvailable()).toBe(true);
+    } finally {
+      process.env.PATH = savedPath;
+    }
   });
 
   describe('trying each key in turn', () => {
@@ -105,54 +164,46 @@ describe('callHaiku', () => {
     });
 
     it.each([
-      ['a weekly-quota 429', () => jsonResponse({}, { status: 429, headers: { 'retry-after': '400000' } })],
-      ['a short-retry 429', () => jsonResponse({}, { status: 429, headers: { 'retry-after': '1' } })],
-      ['a 401', () => jsonResponse({}, { status: 401 })],
-      ['a 529', () => jsonResponse({}, { status: 529 })],
+      ['a 429', { isError: true, apiErrorStatus: 429, result: 'limit' }],
+      ['a 401', { isError: true, apiErrorStatus: 401, result: 'auth' }],
+      ['a 529', { isError: true, apiErrorStatus: 529, result: 'overloaded' }],
+      ['a CLI failure', { raw: 'crashed', exitCode: 1 }],
     ])('moves to the next key on %s', async (_label, failure) => {
-      fetchMock
-        .mockResolvedValueOnce(failure())
-        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'from slot 2' }] }));
+      cli.script({ 'oauth-slot-1-token': failure, 'oauth-slot-2-token': { result: 'from slot 2' } });
 
       expect(await callHaiku('hello')).toBe('from slot 2');
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-1-token');
-      expect(authHeader(fetchMock.mock.calls[1])).toBe('Bearer oauth-slot-2-token');
+      expect(cli.calls().map((c) => c.env.CLAUDE_CODE_OAUTH_TOKEN)).toEqual([
+        'oauth-slot-1-token',
+        'oauth-slot-2-token',
+      ]);
     });
 
     it('rethrows a 429 over a later key’s different failure', async () => {
-      fetchMock
-        .mockResolvedValueOnce(jsonResponse({}, { status: 429 }))
-        .mockResolvedValueOnce(jsonResponse({}, { status: 401 }));
+      cli.script({
+        'oauth-slot-1-token': { isError: true, apiErrorStatus: 429, result: 'limit' },
+        'oauth-slot-2-token': { isError: true, apiErrorStatus: 401, result: 'auth' },
+      });
 
       await expect(callHaiku('hello')).rejects.toMatchObject({ status: 429 });
     });
 
-    it('throws the last error after one request per key', async () => {
-      fetchMock.mockImplementation(() => jsonResponse({}, { status: 429, headers: { 'retry-after': '3600' } }));
+    it('throws the last error after one call per key', async () => {
+      const limit = { isError: true, apiErrorStatus: 429, result: 'limit' };
+      cli.script({ 'oauth-slot-1-token': limit, 'oauth-slot-2-token': limit });
 
       await expect(callHaiku('hello')).rejects.toMatchObject({ status: 429 });
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(cli.calls()).toHaveLength(2);
     });
 
     it('starts from the first key on every call', async () => {
-      fetchMock
-        .mockResolvedValueOnce(jsonResponse({}, { status: 429 }))
-        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'first' }] }))
-        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'second' }] }));
+      cli.script({ 'oauth-slot-1-token': { result: 'first' } });
 
       expect(await callHaiku('hello')).toBe('first');
-      expect(await callHaiku('hello again')).toBe('second');
-      expect(authHeader(fetchMock.mock.calls[2])).toBe('Bearer oauth-slot-1-token');
-    });
-
-    it('sends the optional system prompt and model', async () => {
-      fetchMock.mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'ok' }] }));
-
-      await callHaiku('user text', { system: 'be brief', model: 'claude-test-model' });
-
-      const body = JSON.parse((fetchMock.mock.calls[0]![1] as { body: string }).body) as Record<string, unknown>;
-      expect(body).toMatchObject({ system: 'be brief', model: 'claude-test-model' });
+      expect(await callHaiku('hello again')).toBe('first');
+      expect(cli.calls().map((c) => c.env.CLAUDE_CODE_OAUTH_TOKEN)).toEqual([
+        'oauth-slot-1-token',
+        'oauth-slot-1-token',
+      ]);
     });
   });
 });

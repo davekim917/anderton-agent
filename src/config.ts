@@ -31,6 +31,8 @@ const envConfig = readEnvFile([
   'NANOCLAW_POST_DEPLOY_INBOUND_WINDOW_MS',
   'ONECLI_GATEWAY_CONTAINER',
   'NANOCLAW_ONECLI_APPROVALS',
+  'BROWSER_TAKEOVER_ORIGIN',
+  'BROWSER_TAKEOVER_PORT',
 ]);
 
 /**
@@ -184,6 +186,19 @@ export const EGRESS_NETWORK =
   process.env.NANOCLAW_EGRESS_NETWORK || envConfig.NANOCLAW_EGRESS_NETWORK || 'nanoclaw-egress';
 export const ONECLI_GATEWAY_CONTAINER =
   process.env.ONECLI_GATEWAY_CONTAINER || envConfig.ONECLI_GATEWAY_CONTAINER || 'onecli';
+
+// Browser takeover: the public origin a tunnel serves the takeover proxy on (e.g. https://browser.example.com). Empty =
+// feature off. It must be its own hostname: the agent-browser dashboard behind it is container-served code that
+// expects to own `/`, and on the dashboard's origin it could call that API with the owner's cookie.
+export const BROWSER_TAKEOVER_ORIGIN = (
+  process.env.BROWSER_TAKEOVER_ORIGIN ||
+  envConfig.BROWSER_TAKEOVER_ORIGIN ||
+  ''
+).replace(/\/+$/, '');
+export const BROWSER_TAKEOVER_PORT = parseInt(
+  process.env.BROWSER_TAKEOVER_PORT || envConfig.BROWSER_TAKEOVER_PORT || '3001',
+  10,
+);
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.

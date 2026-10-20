@@ -23,9 +23,12 @@ import {
   deletePendingApproval,
   getPendingApproval,
   markApprovalAwaitingReason,
+  restartApprovalReasonWindow,
 } from '../../db/sessions.js';
 import { setDeliveryAdapter, type ChannelDeliveryAdapter } from '../../delivery.js';
-import { writeSessionMessage } from '../../session-manager.js';
+import { initSessionFolder, writeSessionMessage } from '../../session-manager.js';
+import { openInboundDb as openInboundDbAt } from '../mailbox/openers.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { grantRole } from '../permissions/db/user-roles.js';
@@ -264,6 +267,119 @@ describe('reject-with-reason host sweep', () => {
   });
 });
 
+describe('a reject-with-reason racing another answer', () => {
+  it('does not run the action when Approve lands while the reason prompt is still being sent', async () => {
+    const { registerApprovalHandler } = await import('./primitive.js');
+    const { handleApprovalsResponse } = await import('./response-handler.js');
+    const handler = vi.fn().mockResolvedValue(undefined);
+    registerApprovalHandler('install_packages_held', handler);
+    await seedApproval('appr-held', 'install_packages_held');
+    let releasePrompt!: () => void;
+    setDeliveryAdapter({
+      deliver: () => new Promise<string>((resolve) => (releasePrompt = () => resolve('pm-1'))),
+    });
+
+    const hold = clickRejectWithReason('appr-held');
+    await vi.waitFor(() => expect(releasePrompt).toBeDefined());
+    await handleApprovalsResponse({
+      questionId: 'appr-held',
+      value: 'approve',
+      userId: 'admin-1',
+      channelType: DM_CHANNEL,
+      platformId: '',
+      threadId: null,
+    });
+    releasePrompt();
+    await hold;
+
+    expect(handler).not.toHaveBeenCalled();
+    expect((await getPendingApproval('appr-held'))?.status).toBe('awaiting_reason');
+  });
+
+  it('tells the agent once when the reason reply and the expiry sweep finalize together', async () => {
+    const { captureReasonReply, sweepAwaitingReasonRejects } = await import('./reason-capture.js');
+    await seedApproval('appr-both');
+    await clickRejectWithReason('appr-both');
+    await restartApprovalReasonWindow('appr-both', new Date(Date.now() - 1000).toISOString());
+
+    await Promise.all([captureReasonReply(dmReply('not now')), sweepAwaitingReasonRejects()]);
+
+    expect(vi.mocked(writeSessionMessage)).toHaveBeenCalledTimes(1);
+    expect(await getPendingApproval('appr-both')).toBeUndefined();
+  });
+});
+
+describe('a reason prompt still in flight when the hold expires', () => {
+  it('is not re-armed, and its finished card not reopened, after the sweep closed the hold', async () => {
+    const { captureReasonReply, sweepAwaitingReasonRejects } = await import('./reason-capture.js');
+    await createPendingApproval({
+      approval_id: 'appr-slow-prompt',
+      session_id: 'sess-1',
+      request_id: 'appr-slow-prompt',
+      action: 'create_agent',
+      payload: JSON.stringify({ name: 'child' }),
+      created_at: now(),
+      title: 'Approval',
+      options_json: JSON.stringify([]),
+      channel_type: DM_CHANNEL,
+      platform_id: DM_PLATFORM,
+      platform_message_id: 'card-1',
+    });
+    let releasePrompt!: () => void;
+    const cardEdits: string[] = [];
+    setDeliveryAdapter({
+      deliver: (_channelType, _platformId, _threadId, _kind, content) => {
+        if (!releasePrompt) return new Promise<string>((resolve) => (releasePrompt = () => resolve('pm-1')));
+        cardEdits.push(content);
+        return Promise.resolve('pm-edit');
+      },
+    });
+
+    const { handleApprovalsResponse } = await import('./response-handler.js');
+    const hold = handleApprovalsResponse({
+      questionId: 'appr-slow-prompt',
+      value: REJECT_WITH_REASON_VALUE,
+      userId: 'admin-1',
+      channelType: DM_CHANNEL,
+      platformId: '',
+      threadId: null,
+      messageId: 'card-1',
+    });
+    await vi.waitFor(() => expect(releasePrompt).toBeDefined());
+    await restartApprovalReasonWindow('appr-slow-prompt', new Date(Date.now() - 1000).toISOString());
+    await sweepAwaitingReasonRejects();
+    const editsWhenClosed = cardEdits.length;
+    releasePrompt();
+    await hold;
+
+    expect(cardEdits).toHaveLength(editsWhenClosed);
+    expect(await captureReasonReply(dmReply('late'))).toBe(false);
+  });
+});
+
+describe('the expiry sweep', () => {
+  it('leaves a hold whose window was restarted after the sweep listed it', async () => {
+    const { sweepAwaitingReasonRejects } = await import('./reason-capture.js');
+    await seedApproval('appr-a');
+    await seedApproval('appr-b');
+    const past = new Date(Date.now() - 1000).toISOString();
+    await markApprovalAwaitingReason('appr-a', past);
+    await markApprovalAwaitingReason('appr-b', past);
+    let releaseNote!: () => void;
+    vi.mocked(writeSessionMessage).mockImplementationOnce(
+      () => new Promise<void>((resolve) => (releaseNote = resolve)),
+    );
+
+    const sweep = sweepAwaitingReasonRejects();
+    await vi.waitFor(() => expect(releaseNote).toBeDefined());
+    await restartApprovalReasonWindow('appr-b', new Date(Date.now() + 60_000).toISOString());
+    releaseNote();
+    await sweep;
+
+    expect((await getPendingApproval('appr-b'))?.status).toBe('awaiting_reason');
+  });
+});
+
 describe('plain reject (regression)', () => {
   it('finalizes immediately with no reason and no DM prompt', async () => {
     const { handleApprovalsResponse } = await import('./response-handler.js');
@@ -281,5 +397,93 @@ describe('plain reject (regression)', () => {
     expect(await getPendingApproval('appr-plain')).toBeUndefined();
     expect(delivered).toHaveLength(0);
     expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin.');
+  });
+});
+
+describe('a rejected command gate', () => {
+  async function seedGateApproval(): Promise<void> {
+    await import('../bash-gate/index.js');
+    initSessionFolder('ag-1', 'sess-1');
+    await createPendingApproval({
+      approval_id: 'appr-gate',
+      session_id: 'sess-1',
+      request_id: 'gate-1',
+      action: 'bash-gate',
+      payload: JSON.stringify({
+        requestId: 'gate-1',
+        sessionId: 'sess-1',
+        label: 'Email send',
+        summary: '',
+        command: '',
+      }),
+      created_at: now(),
+      title: 'Email send',
+      options_json: JSON.stringify([]),
+    });
+  }
+
+  function gateAck(): unknown {
+    const inbound = openInboundDbAt(inboundDbPath('ag-1', 'sess-1'));
+    try {
+      return inbound.prepare('SELECT status, error FROM delivered WHERE message_out_id = ?').get('gate-1');
+    } finally {
+      inbound.close();
+    }
+  }
+
+  it.each([['reject'], [REJECT_WITH_REASON_VALUE]])(
+    'fails the waiting container’s gate at the click (%s), before any reason arrives',
+    async (value) => {
+      await seedGateApproval();
+      const { handleApprovalsResponse } = await import('./response-handler.js');
+
+      await handleApprovalsResponse({
+        questionId: 'appr-gate',
+        value,
+        userId: 'admin-1',
+        channelType: DM_CHANNEL,
+        platformId: '',
+        threadId: null,
+      });
+
+      expect(gateAck()).toEqual({ status: 'failed', error: 'Rejected by an approver.' });
+    },
+  );
+
+  it('ignores an Approve that arrives while the reject waits for its reason', async () => {
+    await seedGateApproval();
+    const { handleApprovalsResponse, resolveApprovalFromHost } = await import('./response-handler.js');
+    const click = (value: string) =>
+      handleApprovalsResponse({
+        questionId: 'appr-gate',
+        value,
+        userId: 'admin-1',
+        channelType: DM_CHANNEL,
+        platformId: '',
+        threadId: null,
+      });
+
+    await click(REJECT_WITH_REASON_VALUE);
+    expect((await getPendingApproval('appr-gate'))?.status).toBe('awaiting_reason');
+
+    await click('approve');
+    expect(await resolveApprovalFromHost('appr-gate', 'approve', 'slack:admin-1')).toEqual({
+      resolved: false,
+      error: 'Approval appr-gate was already rejected; it is waiting for the reason.',
+    });
+
+    expect(gateAck()).toEqual({ status: 'failed', error: 'Rejected by an approver.' });
+    expect((await getPendingApproval('appr-gate'))?.status).toBe('awaiting_reason');
+  });
+
+  it('fails the gate when a hold parked before this version ends at the sweep', async () => {
+    await seedGateApproval();
+    await markApprovalAwaitingReason('appr-gate', new Date(Date.now() - 1000).toISOString());
+    const { sweepAwaitingReasonRejects } = await import('./reason-capture.js');
+
+    await sweepAwaitingReasonRejects();
+
+    expect(await getPendingApproval('appr-gate')).toBeUndefined();
+    expect(gateAck()).toEqual({ status: 'failed', error: 'Rejected by an approver.' });
   });
 });

@@ -40,6 +40,7 @@ import type { ChannelNameSource, MessagingGroupUpdates } from './db/messaging-gr
 import { ensureContainerRuntimeRunning } from './container-runtime.js';
 import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } from './host-restart-warn.js';
 import { notifyOwner } from './notify-owner.js';
+import { checkNeutralReviewerRepos } from './neutral-reviewer-repos.js';
 import { requestWake } from './request-wake.js';
 import { getActiveSessions, resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
@@ -82,6 +83,7 @@ import { secretIntakeHooks } from './modules/secret-intake/service.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { startDashboard } from './dashboard/index.js';
+import { startBrowserTakeoverProxy } from './modules/browser-takeover/proxy.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 import { reconcilePendingUpgradeContexts } from './session-manager.js';
 import { releaseOrphanedRepoIngressFencesAtStartup } from './repo-fence-recovery.js';
@@ -533,6 +535,7 @@ export async function main(): Promise<void> {
 
   // Shell-set values take precedence over .env.
   loadEnvIntoProcess();
+  await checkNeutralReviewerRepos();
 
   registerSecretsFromEnv();
 
@@ -651,6 +654,7 @@ export async function main(): Promise<void> {
 
   // After migrations (028) and before channel adapters, so the HTTP server is up regardless of channel config.
   startDashboard();
+  startBrowserTakeoverProxy();
 
   // Recovers tasks left 'pending' with admitted_at set but no child_session_id (host crashed mid-completion).
   await runDispatchReconcilerOnStartup();

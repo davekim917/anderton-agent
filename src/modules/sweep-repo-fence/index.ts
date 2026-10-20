@@ -34,6 +34,20 @@ function registerSweepRepoFenceDuties(): void {
       }
     },
   });
+
+  registerSweepDuty({
+    name: id.FORK8,
+    phase: 'tick:housekeeping',
+    order: 12,
+    run: async () => {
+      try {
+        const { expireOverdueGates } = await import('../bash-gate/index.js');
+        await expireOverdueGates();
+      } catch (err) {
+        log.error('Gate expiry sweep failed', { err });
+      }
+    },
+  });
 }
 
 registerSweepDutySource('sweep-repo-fence', registerSweepRepoFenceDuties);

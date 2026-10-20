@@ -104,6 +104,15 @@ describe('buildAgentGroupImage', () => {
     expect(fs.existsSync(`${TEST_DIR}/Dockerfile.ag-1`)).toBe(false);
   });
 
+  it('builds the packages being added on top of the stored lists without storing them', async () => {
+    await updateContainerConfigJson('ag-1', 'packages_apt', ['curl']);
+
+    await buildAgentGroupImage('ag-1', { apt: ['jq', 'curl'], npm: [] });
+
+    expect(built.dockerfiles.at(-1)).toContain('apt-get install -y curl jq');
+    expect(JSON.parse((await getContainerConfig('ag-1'))!.packages_apt)).toEqual(['curl']);
+  });
+
   it('lets the next queued build run after one fails', async () => {
     await updateContainerConfigJson('ag-1', 'packages_apt', []);
     await expect(buildAgentGroupImage('ag-1')).rejects.toThrow('No packages to install');

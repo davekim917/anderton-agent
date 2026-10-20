@@ -256,3 +256,103 @@ describe('approval response authorization', () => {
     expect(await getPendingApproval('appr-4')).toBeUndefined();
   });
 });
+
+describe('answering an approval twice', () => {
+  it('runs the handler once when a CLI answer races a click still applying it', async () => {
+    await upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
+    await grantRole({
+      user_id: 'telegram:owner',
+      role: 'owner',
+      agent_group_id: null,
+      granted_by: null,
+      granted_at: now(),
+    });
+
+    const { registerApprovalHandler } = await import('./primitive.js');
+    const { handleApprovalsResponse, resolveApprovalFromHost } = await import('./response-handler.js');
+    let release!: () => void;
+    const handler = vi
+      .fn()
+      .mockImplementationOnce(() => new Promise<void>((resolve) => (release = resolve)))
+      .mockResolvedValue(undefined);
+    registerApprovalHandler('install_packages_raced', handler);
+    await createPendingApproval({
+      approval_id: 'appr-race',
+      session_id: 'sess-1',
+      request_id: 'appr-race',
+      action: 'install_packages_raced',
+      payload: JSON.stringify({ packages: ['left-pad'] }),
+      created_at: now(),
+      title: 'Install packages',
+      options_json: JSON.stringify([]),
+    });
+
+    const click = handleApprovalsResponse({
+      questionId: 'appr-race',
+      value: 'approve',
+      userId: 'owner',
+      channelType: 'telegram',
+      platformId: 'dm-owner',
+      threadId: null,
+    });
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+    const cli = await resolveApprovalFromHost('appr-race', 'approve', 'telegram:owner');
+    release();
+    await click;
+
+    expect(cli).toEqual({ resolved: false, error: 'Approval appr-race was already answered by someone else.' });
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it('tells a second clicker the card was already answered', async () => {
+    await upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
+    await grantRole({
+      user_id: 'telegram:owner',
+      role: 'owner',
+      agent_group_id: null,
+      granted_by: null,
+      granted_at: now(),
+    });
+
+    const { registerApprovalHandler } = await import('./primitive.js');
+    const { handleApprovalsResponse } = await import('./response-handler.js');
+    let release!: () => void;
+    registerApprovalHandler(
+      'install_packages_double',
+      vi
+        .fn()
+        .mockImplementationOnce(() => new Promise<void>((resolve) => (release = resolve)))
+        .mockResolvedValue(undefined),
+    );
+    await createPendingApproval({
+      approval_id: 'appr-double',
+      session_id: 'sess-1',
+      request_id: 'appr-double',
+      action: 'install_packages_double',
+      payload: JSON.stringify({ packages: ['left-pad'] }),
+      created_at: now(),
+      title: 'Install packages',
+      options_json: JSON.stringify([]),
+    });
+    const click = (replyToClicker?: (text: string) => Promise<void>) =>
+      handleApprovalsResponse({
+        questionId: 'appr-double',
+        value: 'approve',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+        replyToClicker,
+      });
+
+    const first = click();
+    await vi.waitFor(() => expect(release).toBeDefined());
+    const replyToClicker = vi.fn().mockResolvedValue(undefined);
+    await click(replyToClicker);
+    release();
+    await first;
+
+    expect(replyToClicker).toHaveBeenCalledWith('Someone already answered this card. Your click did not count.');
+  });
+});

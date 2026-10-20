@@ -1,7 +1,35 @@
 import { describe, expect, it } from 'vitest';
 
-import { NO_CHANGES_EXIT, redactText, runExport, type ExportDeps, type StatusFields } from './export-flow.js';
-import type { AcceptedDetail, GateOutcome, HoldReason } from './gate.js';
+import {
+  NO_CHANGES_EXIT,
+  redactText,
+  runExport,
+  type AiHoldRecord,
+  type ExportDeps,
+  type StatusFields,
+} from './export-flow.js';
+import type { RunReport } from '../check-public-boundary.js';
+import {
+  gateCommits,
+  RECORDED_HOLD,
+  type AcceptedDetail,
+  type AiFinding,
+  type CommitDiff,
+  type GateOutcome,
+  type HoldReason,
+} from './gate.js';
+
+const cleanScan: RunReport = {
+  findings: [],
+  mode: 'install-aware',
+  registryOrigin: 'explicit',
+  identifiersOrigin: 'explicit',
+  registryPathsTried: [],
+  identifiersPathsTried: [],
+  baseline: { held: 0, heldFiles: 0, exceeded: [], below: [], counts: {}, missing: false },
+  discoveryProblems: [],
+  contextOnlyIdentifiers: 0,
+};
 
 type Workflow = 'export' | 'export_squash';
 
@@ -14,6 +42,18 @@ interface World {
   status: StatusFields | null;
   accepted?: AcceptedDetail[];
   heldDetails: string[];
+  /** Exported file contents by staging commit. */
+  trees: Record<string, Record<string, string>>;
+  /** The private commit each staging commit came from; `rev-<sha>` when unlisted. */
+  origins: Record<string, string>;
+  /** Private history, oldest first. */
+  originHistory: string[];
+  aiHolds: AiHoldRecord[] | null;
+  lastHeld: { sha: string; aiFindings: AiFinding[] } | null;
+  /** Replaces the harness's gate verdicts; the harness still records the call and reports holds. */
+  judge?: (shas: string[]) => GateOutcome | Promise<GateOutcome>;
+  /** The saved store as the last judged read began. */
+  reservedAtRead?: AiHoldRecord[] | null;
 }
 
 function harness(
@@ -41,6 +81,7 @@ function harness(
       }),
     writeHeldDetail: (detail) => {
       world.heldDetails.push(detail.sha);
+      world.lastHeld = detail;
     },
     writeAcceptedDetail: (accepted) => {
       world.accepted = accepted;
@@ -58,9 +99,29 @@ function harness(
     },
     newCommits: (base, head) =>
       world.staging.slice(base ? world.staging.indexOf(base) + 1 : 0, world.staging.indexOf(head) + 1),
-    gate: async (shas) => {
+    fileAt: (sha, file) => world.trees[sha]?.[file] ?? null,
+    mentions: (sha, texts) =>
+      Object.entries(world.trees[sha] ?? {}).some(([file, content]) =>
+        texts.some((text) => `${file}\n${content}`.toLowerCase().includes(text.toLowerCase())),
+      ),
+    originRev: (sha) => world.origins[sha] ?? `rev-${sha}`,
+    originContains: (head, rev) => {
+      const at = world.originHistory.indexOf(rev);
+      return at >= 0 && at <= world.originHistory.indexOf(head);
+    },
+    loadAiHolds: () => world.aiHolds,
+    saveAiHolds: (records) => {
+      world.aiHolds = records;
+    },
+    readHeldDetail: () => world.lastHeld,
+    gate: async (shas, watch) => {
       world.gated.push(shas);
-      return opts.gate ? opts.gate(shas) : { lastPassing: shas.at(-1) ?? null };
+      const judge = world.judge ?? opts.gate ?? ((all: string[]): GateOutcome => ({ lastPassing: all.at(-1) ?? null }));
+      for (const sha of shas) watch.reserve(sha);
+      world.reservedAtRead = world.aiHolds;
+      const outcome = await judge(shas);
+      for (const sha of shas) watch.settle(sha, outcome.held?.sha === sha ? outcome.held : undefined);
+      return outcome;
     },
     remoteHead: () => world.remote,
     push: (sha) => {
@@ -79,6 +140,11 @@ function world(overrides: Partial<World> = {}): World {
     gated: [],
     status: null,
     heldDetails: [],
+    trees: {},
+    origins: {},
+    originHistory: [],
+    aiHolds: null,
+    lastHeld: null,
     ...overrides,
   };
 }
@@ -101,7 +167,8 @@ const holdWith =
     };
   };
 const holdOn = holdWith([{ source: 'scanner', where: 'a.ts:1', category: 'private-identifier' }]);
-const aiHoldOn = holdWith([{ source: 'ai', where: 'ai read', category: 'possible-identifier' }]);
+const aiFlag: HoldReason = { source: 'ai', where: 'ai read', category: 'possible-identifier' };
+const aiHoldOn = holdWith([aiFlag]);
 
 describe('runExport publishes only what this run gated on top of the public head', () => {
   it('pushes every commit gated after the public head', async () => {
@@ -209,7 +276,7 @@ describe('runExport holds and recovers within one run', () => {
 });
 
 describe('runExport never re-reads an AI hold as a squash', () => {
-  it('holds a per-commit AI hold without a squash retry, pushing only the passing prefix', async () => {
+  it('holds a per-commit AI hold with no quote without a squash retry, publishing none of the prefix', async () => {
     const w = world({ staging: ['s1'], remote: 's1' });
     const code = await runExport(
       harness(w, {
@@ -221,7 +288,7 @@ describe('runExport never re-reads an AI hold as a squash', () => {
     expect(code).toBe(2);
     expect(w.workflows).toEqual(['export']);
     expect(w.gated).toEqual([['s2', 's3', 's4']]);
-    expect(w.pushes).toEqual(['s2']);
+    expect(w.pushes).toEqual([]);
     expect(w.heldDetails).toEqual(['s3']);
     expect(w.status).toMatchObject({ status: 'held', workflow: 'export', held: { sha: 's3' } });
   });
@@ -257,6 +324,451 @@ describe('runExport never re-reads an AI hold as a squash', () => {
     expect(w.pushes).toEqual(['sq']);
     expect(w.heldDetails).toEqual(['s2']);
     expect(w.status).toMatchObject({ status: 'ok', perCommitHold: { sha: 's2' } });
+  });
+});
+
+describe('runExport retries an AI hold as a squash only when the held text is provably gone', () => {
+  const leak = 'use the zz-acme tile';
+  const finding = { file: 'src/browser.ts', line: 1, text: `  ${leak} `, why: 'client name' };
+  const aiHoldFinding =
+    (...findings: AiFinding[]) =>
+    (held: string) =>
+    (shas: string[]): GateOutcome => {
+      const outcome = aiHoldOn(held)(shas);
+      return outcome.held ? { ...outcome, held: { ...outcome.held, aiFindings: findings } } : outcome;
+    };
+  const leakyRun = (squashTree: Record<string, string>, ...findings: AiFinding[]) => {
+    const w = world({
+      staging: ['s1'],
+      remote: 's1',
+      trees: { leak: { 'src/browser.ts': `const help = "${leak}";\nconst tile = "zz-acme";\n` }, sq: squashTree },
+    });
+    const deps = harness(w, {
+      publicRemote: true,
+      copybara: (cw, workflow) => (workflow === 'export' ? adds('leak', 'fix')(cw) : adds('sq')(cw)),
+      gate: aiHoldFinding(...(findings.length > 0 ? findings : [finding]))('leak'),
+    });
+    return { w, deps };
+  };
+
+  it('publishes the squash when a later commit removed the held text, and never the leaky commit', async () => {
+    const { w, deps } = leakyRun({ 'src/browser.ts': 'const help = "use the example tile";\n' });
+    expect(await runExport(deps)).toBe(0);
+    expect(w.workflows).toEqual(['export', 'export_squash']);
+    expect(w.gated).toEqual([['leak', 'fix'], ['sq']]);
+    expect(w.pushes).toEqual(['sq']);
+    expect(w.staging).toEqual(['s1', 'sq']);
+    expect(w.heldDetails).toEqual(['leak']);
+    expect(w.status).toMatchObject({
+      status: 'ok',
+      workflow: 'export_squash',
+      perCommitHold: { sha: 'leak' },
+      squashReason: 'ai-hold-fixed-forward',
+    });
+  });
+
+  it('holds without gating the squash when the held text is still in the file', async () => {
+    const { w, deps } = leakyRun({ 'src/browser.ts': `const help = "${leak}";\nconst other = 1;\n` });
+    expect(await runExport(deps)).toBe(2);
+    expect(w.gated).toEqual([['leak', 'fix']]);
+    expect(w.pushes).toEqual([]);
+    expect(w.staging).toEqual(['s1']);
+    expect(w.status).toMatchObject({ status: 'held', workflow: 'export', held: { sha: 'leak' } });
+    expect(w.status).not.toHaveProperty('perCommitHold');
+  });
+
+  it('holds when the held text moved to another file', async () => {
+    const { w, deps } = leakyRun({
+      'src/browser.ts': 'const help = "use the example tile";\n',
+      'src/moved.ts': `export const help = "${leak}";\n`,
+    });
+    expect(await runExport(deps)).toBe(2);
+    expect(w.gated).toEqual([['leak', 'fix']]);
+    expect(w.pushes).toEqual([]);
+  });
+
+  it('holds when the held text survives in another case or in a path', async () => {
+    const squashTrees: Array<Record<string, string>> = [
+      { 'src/browser.ts': `const help = "${leak.toUpperCase()}";\n` },
+      { [`docs/${leak}.md`]: 'renamed\n' },
+    ];
+    for (const squashTree of squashTrees) {
+      const { w, deps } = leakyRun(squashTree);
+      expect(await runExport(deps)).toBe(2);
+      expect(w.pushes).toEqual([]);
+    }
+  });
+
+  it.each([
+    ['empty', { ...finding, text: '   ' }],
+    ['too short to be specific', { ...finding, text: 'zz-acme' }],
+    ['missing', { file: finding.file, why: 'client name' }],
+    ['spread over several lines', { ...finding, text: `${leak}";\nconst tile` }],
+    ['not quoted from its file', { ...finding, text: 'the zz-acme okta tile' }],
+    ['attributed to no file', { text: finding.text, why: 'client name' }],
+    ['attributed to a file that does not hold it', { ...finding, file: 'src/other.ts' }],
+    ['attributed to another line of its file', { ...finding, line: 2 }],
+    ['attributed to no line', { file: finding.file, text: finding.text, why: 'client name' }],
+  ])('holds when a finding text is %s, even though the squash lacks it', async (_name, bad) => {
+    const { w, deps } = leakyRun({ 'src/browser.ts': 'const help = "use the example tile";\n' }, finding, bad);
+    expect(await runExport(deps)).toBe(2);
+    expect(w.gated).toEqual([['leak', 'fix']]);
+    expect(w.pushes).toEqual([]);
+  });
+
+  it('holds when any AI reason carries no finding to prove gone', async () => {
+    const { w, deps } = leakyRun({ 'src/browser.ts': 'const help = "use the example tile";\n' });
+    w.judge = (shas) => {
+      const outcome = aiHoldFinding(finding)('leak')(shas);
+      if (!outcome.held) return outcome;
+      const reasons: HoldReason[] = [
+        { source: 'ai', where: 'ai read batch 1/2', category: 'possible-identifier' },
+        { source: 'ai', where: 'ai read batch 2/2', category: 'hold-without-finding' },
+      ];
+      return { ...outcome, held: { ...outcome.held, reasons } };
+    };
+    expect(await runExport(deps)).toBe(2);
+    expect(w.gated).toEqual([['leak', 'fix']]);
+    expect(w.pushes).toEqual([]);
+  });
+
+  it('holds when the squash of a fixed-forward hold flags something new', async () => {
+    const { w, deps } = leakyRun({ 'src/browser.ts': 'const help = "use the example tile";\n' });
+    const perCommit = aiHoldFinding(finding)('leak');
+    w.judge = (shas) => (shas.includes('sq') ? aiHoldFinding(finding)('sq')(shas) : perCommit(shas));
+    expect(await runExport(deps)).toBe(2);
+    expect(w.pushes).toEqual([]);
+    expect(w.staging).toEqual(['s1']);
+    expect(w.heldDetails).toEqual(['leak', 'sq']);
+    expect(w.status).toMatchObject({ status: 'held', held: { sha: 'sq' }, squashReason: 'ai-hold-fixed-forward' });
+  });
+});
+
+describe('runExport never reads again what an earlier run AI-held', () => {
+  const leak = 'use the zz-acme tile';
+  const finding = { file: 'src/browser.ts', line: 1, text: leak, why: 'client name' };
+  const record = (overrides: Partial<AiHoldRecord> = {}): AiHoldRecord => ({
+    originRev: 'rev-leak',
+    findings: [finding],
+    texts: [leak],
+    ...overrides,
+  });
+  const fixedTree = { 'src/browser.ts': 'const help = "use the example tile";\n' };
+  const leakyTree = { 'src/browser.ts': `const help = "${leak}";\n` };
+  const nextRun = (overrides: Partial<World>, squashTree: Record<string, string> = fixedTree) => {
+    const w = world({ staging: ['s1'], remote: 's1', trees: { leak: leakyTree, sq: squashTree }, ...overrides });
+    const deps = harness(w, {
+      publicRemote: true,
+      copybara: (cw, workflow) => (workflow === 'export' ? adds('leak', 'fix')(cw) : adds('sq')(cw)),
+    });
+    return { w, deps };
+  };
+
+  it('holds the flagged commit without a read, though a fresh read would pass it, and publishes the fix as a squash', async () => {
+    const { w, deps } = nextRun({ aiHolds: [record()] });
+    expect(await runExport(deps)).toBe(0);
+    expect(w.gated).toEqual([['sq']]);
+    expect(w.pushes).toEqual(['sq']);
+    expect(w.status).toMatchObject({
+      status: 'ok',
+      perCommitHold: { sha: 'leak', reasons: [{ source: 'ai', category: RECORDED_HOLD }] },
+      squashReason: 'ai-hold-fixed-forward',
+    });
+  });
+
+  it('reads neither the flagged commit nor the squash while the flagged text remains', async () => {
+    const { w, deps } = nextRun({ aiHolds: [record()] }, leakyTree);
+    expect(await runExport(deps)).toBe(2);
+    expect(w.gated).toEqual([]);
+    expect(w.pushes).toEqual([]);
+    expect(w.status).toMatchObject({ status: 'held', held: { sha: 'leak' } });
+  });
+
+  it('holds a later commit that still carries a flagged quote, though its own origin was never flagged', async () => {
+    const { w, deps } = nextRun({ aiHolds: [record({ originRev: 'rev-elsewhere' })] }, leakyTree);
+    expect(await runExport(deps)).toBe(2);
+    expect(w.gated).toEqual([]);
+    expect(w.pushes).toEqual([]);
+    expect(w.aiHolds).toEqual([record({ originRev: 'rev-elsewhere' })]);
+  });
+
+  it('records no new flag for a hold an earlier flag decided, so the fix still publishes as a squash', async () => {
+    const { w, deps } = nextRun({ aiHolds: [record({ originRev: 'rev-elsewhere' })] });
+    expect(await runExport(deps)).toBe(0);
+    expect(w.gated).toEqual([['sq']]);
+    expect(w.pushes).toEqual(['sq']);
+    expect(w.aiHolds).toEqual([record({ originRev: 'rev-elsewhere' })]);
+  });
+
+  it('starts the store from the last held detail, so a hold made before records were kept is not read again', async () => {
+    const { w, deps } = nextRun({ lastHeld: { sha: 'leak', aiFindings: [finding] } });
+    expect(await runExport(deps)).toBe(0);
+    expect(w.gated).toEqual([['sq']]);
+    expect(w.pushes).toEqual(['sq']);
+    expect(w.aiHolds).toEqual([record()]);
+  });
+
+  it('seeds a held commit it cannot resolve as a flag without a provable quote, which holds every commit', async () => {
+    for (const aiFindings of [[finding], [{ ...finding, text: 'the zz-acme okta tile, paraphrased' }]]) {
+      const { w, deps } = nextRun({ lastHeld: { sha: 'gone', aiFindings } });
+      deps.originRev = (sha) => (sha === 'gone' ? null : `rev-${sha}`);
+      expect(await runExport(deps)).toBe(2);
+      expect(w.workflows).toEqual(['export']);
+      expect(w.gated).toEqual([]);
+      expect(w.pushes).toEqual([]);
+      expect(w.aiHolds).toEqual([{ originRev: null, findings: aiFindings, texts: null }]);
+    }
+  });
+
+  it('never drops a record whose commit could not be resolved, however far the public head has moved', async () => {
+    const unresolved = record({ originRev: null, texts: null });
+    const w = world({
+      staging: ['s1'],
+      remote: 's1',
+      origins: { s1: 'rev-s1' },
+      originHistory: ['rev-leak', 'rev-s1'],
+      aiHolds: [unresolved],
+      trees: { s2: fixedTree },
+    });
+    expect(await runExport(harness(w, { publicRemote: true, copybara: adds('s2') }))).toBe(2);
+    expect(w.gated).toEqual([]);
+    expect(w.aiHolds).toEqual([unresolved]);
+  });
+
+  it('gives the squash its own AI read, and holds when that read flags it', async () => {
+    const reads: string[] = [];
+    const { w, deps } = nextRun({ aiHolds: [] });
+    const diffs: Record<string, CommitDiff> = {
+      leak: { message: 'leak', addedLines: [`src/browser.ts:1: const help = "${leak}";`] },
+      fix: { message: 'fix', addedLines: ['src/browser.ts:1: const help = "use the example tile";'] },
+      sq: { message: 'squash', addedLines: ['src/browser.ts:1: const help = "use the example tile";'] },
+    };
+    const aiOk = (verdict: 'pass' | 'hold', findings: AiFinding[]) => ({
+      exitCode: 0,
+      timedOut: false,
+      stdout: JSON.stringify({ subtype: 'success', is_error: false, structured_output: { verdict, findings } }),
+    });
+    deps.gate = (shas, watch) =>
+      gateCommits(
+        shas,
+        (sha) => ({ ...diffs[sha], sha, treeDir: '/nonexistent', binaries: [], dispose: () => {} }),
+        {
+          scanTree: () => cleanScan,
+          scanMessage: () => cleanScan,
+          aiRead: async (payload) => {
+            const sha = payload.includes('COMMIT MESSAGE:\nsquash') ? 'sq' : payload.includes(leak) ? 'leak' : 'fix';
+            reads.push(sha);
+            return sha === 'fix' ? aiOk('pass', []) : aiOk('hold', [finding]);
+          },
+          aiMaxChars: 10_000,
+          approvedBinaries: new Set(),
+          acceptedFindings: [],
+          aiBudget: { cap: 15, spent: 0 },
+        },
+        (sha) => diffs[sha],
+        watch,
+      );
+    expect(await runExport(deps)).toBe(2);
+    expect(reads).toEqual(['leak', 'sq']);
+    expect(w.pushes).toEqual([]);
+    expect(w.staging).toEqual(['s1']);
+    expect(w.status).toMatchObject({ status: 'held', held: { sha: 'sq' }, squashReason: 'ai-hold-fixed-forward' });
+  });
+
+  it('keeps a flag whose run failed before it finished, so the next run does not read it again', async () => {
+    const { w, deps } = nextRun({ aiHolds: [] });
+    w.judge = (shas) =>
+      shas.includes('leak')
+        ? { lastPassing: null, held: { sha: 'leak', reasons: [aiFlag], aiFindings: [finding] } }
+        : { lastPassing: shas.at(-1) ?? null };
+    deps.copybara = (workflow) => {
+      w.workflows.push(workflow);
+      return workflow === 'export' ? adds('leak', 'fix')(w) : 1;
+    };
+    expect(await runExport(deps)).toBe(1);
+    expect(w.aiHolds).toEqual([record()]);
+    w.staging = ['s1'];
+    w.gated = [];
+    deps.copybara = (workflow) => (workflow === 'export' ? adds('leak', 'fix')(w) : adds('sq')(w));
+    expect(await runExport(deps)).toBe(0);
+    expect(w.gated).toEqual([['sq']]);
+    expect(w.pushes).toEqual(['sq']);
+  });
+
+  it('keeps a flag when resetting staging after the hold fails', async () => {
+    const { w, deps } = nextRun({ aiHolds: [] });
+    w.judge = () => ({ lastPassing: null, held: { sha: 'leak', reasons: [aiFlag], aiFindings: [finding] } });
+    deps.resetStaging = () => {
+      throw new Error('update-ref failed');
+    };
+    expect(await runExport(deps)).toBe(1);
+    expect(w.aiHolds).toEqual([record()]);
+  });
+
+  it('records nothing on a dry run, which publishes nothing', async () => {
+    const w = world({ trees: { sq: leakyTree } });
+    const deps = harness(w, {
+      publicRemote: false,
+      copybara: adds('sq'),
+      gate: () => ({ lastPassing: null, held: { sha: 'sq', reasons: [aiFlag], aiFindings: [finding] } }),
+    });
+    expect(await runExport(deps)).toBe(2);
+    expect(w.aiHolds).toBeNull();
+  });
+
+  it('records no flag and tries no squash for a read that failed', async () => {
+    const { w, deps } = nextRun({ aiHolds: [] });
+    w.judge = holdWith([{ source: 'ai', where: 'ai read', category: 'timeout' }])('leak');
+    expect(await runExport(deps)).toBe(2);
+    expect(w.workflows).toEqual(['export']);
+    expect(w.aiHolds).toEqual([]);
+  });
+
+  it('records an AI reason it does not know as a flag that cannot be pinned to a quote', async () => {
+    const { w, deps } = nextRun({ aiHolds: [] });
+    w.judge = (shas) => ({
+      lastPassing: null,
+      held: {
+        sha: shas[0],
+        reasons: [{ source: 'ai', where: 'ai read', category: 'new-kind' }],
+        aiFindings: [finding],
+      },
+    });
+    expect(await runExport(deps)).toBe(2);
+    expect(w.workflows).toEqual(['export']);
+    expect(w.aiHolds).toEqual([record({ texts: null })]);
+  });
+
+  it('holds every commit of the run, and tries no squash, while any flag cannot be pinned to a quote', async () => {
+    const { w, deps } = nextRun({ aiHolds: [record({ originRev: 'rev-x', texts: null })] });
+    expect(await runExport(deps)).toBe(2);
+    expect(w.workflows).toEqual(['export']);
+    expect(w.gated).toEqual([]);
+    expect(w.pushes).toEqual([]);
+  });
+
+  it('holds an unpinnable commit flag without a squash retry', async () => {
+    const { w, deps } = nextRun({ aiHolds: [record({ texts: null })] });
+    expect(await runExport(deps)).toBe(2);
+    expect(w.workflows).toEqual(['export']);
+    expect(w.pushes).toEqual([]);
+  });
+
+  it('drops from the passing prefix a commit that carries the quote a later commit was flagged for', async () => {
+    const w = world({
+      staging: ['s1'],
+      remote: 's1',
+      aiHolds: [],
+      trees: { a: { 'docs/a.md': `${leak}\n` }, b: { 'docs/a.md': `${leak}\n`, ...leakyTree }, sq: fixedTree },
+    });
+    w.judge = (shas) =>
+      shas.includes('b')
+        ? { lastPassing: 'a', held: { sha: 'b', reasons: [aiFlag], aiFindings: [finding] } }
+        : { lastPassing: shas.at(-1) ?? null };
+    const deps = harness(w, {
+      publicRemote: true,
+      copybara: (cw, workflow) => (workflow === 'export' ? adds('a', 'b', 'c')(cw) : adds('sq')(cw)),
+    });
+    expect(await runExport(deps)).toBe(0);
+    expect(w.pushes).toEqual(['sq']);
+    expect(w.staging).toEqual(['s1', 'sq']);
+  });
+
+  it('publishes none of the passing prefix while a new flag cannot be pinned to a quote', async () => {
+    const w = world({ staging: ['s1'], remote: 's1', aiHolds: [], trees: { a: fixedTree, b: leakyTree } });
+    w.judge = (shas) =>
+      shas.includes('b')
+        ? {
+            lastPassing: 'a',
+            held: { sha: 'b', reasons: [aiFlag], aiFindings: [finding, { text: leak, why: 'no location' }] },
+          }
+        : { lastPassing: shas.at(-1) ?? null };
+    const deps = harness(w, {
+      publicRemote: true,
+      copybara: (cw, workflow) => (workflow === 'export' ? adds('a', 'b')(cw) : adds('sq')(cw)),
+    });
+    expect(await runExport(deps)).toBe(2);
+    expect(w.workflows).toEqual(['export']);
+    expect(w.pushes).toEqual([]);
+    expect(w.aiHolds).toEqual([
+      record({ originRev: 'rev-b', findings: [finding, { text: leak, why: 'no location' }], texts: null }),
+    ]);
+  });
+
+  it('drops from the passing prefix a commit carrying a quote the squash read was flagged for', async () => {
+    const w = world({
+      staging: ['s1'],
+      remote: 's1',
+      aiHolds: [],
+      trees: { a: { 'docs/a.md': `${leak}\n` }, b: {}, sq: { 'docs/a.md': `${leak}\n`, ...leakyTree } },
+    });
+    w.judge = (shas) =>
+      shas.includes('sq')
+        ? { lastPassing: null, held: { sha: 'sq', reasons: [aiFlag], aiFindings: [finding] } }
+        : holdOn('b')(shas);
+    const deps = harness(w, {
+      publicRemote: true,
+      copybara: (cw, workflow) => (workflow === 'export' ? adds('a', 'b', 'c')(cw) : adds('sq')(cw)),
+    });
+    expect(await runExport(deps)).toBe(2);
+    expect(w.pushes).toEqual([]);
+    expect(w.staging).toEqual(['s1']);
+  });
+
+  it('saves a pending hold before each read, so a run that dies mid-read leaves every commit held', async () => {
+    const { w, deps } = nextRun({ aiHolds: [] });
+    expect(await runExport(deps)).toBe(0);
+    expect(w.reservedAtRead).toEqual([
+      { originRev: 'rev-leak', findings: [], texts: null, pending: true },
+      { originRev: 'rev-fix', findings: [], texts: null, pending: true },
+    ]);
+    expect(w.aiHolds).toEqual([]);
+    const crashed = nextRun({ aiHolds: [{ originRev: 'rev-leak', findings: [], texts: null, pending: true }] });
+    expect(await runExport(crashed.deps)).toBe(2);
+    expect(crashed.w.gated).toEqual([]);
+    expect(crashed.w.pushes).toEqual([]);
+  });
+
+  it('records a squash AI hold so the next run reads none of it', async () => {
+    const w = world({
+      staging: ['s1'],
+      remote: 's1',
+      trees: { s2: leakyTree, sq: leakyTree },
+    });
+    const deps = harness(w, {
+      publicRemote: true,
+      copybara: (cw, workflow) => (workflow === 'export' ? adds('s2')(cw) : adds('sq')(cw)),
+      gate: (shas) =>
+        shas.includes('sq')
+          ? { lastPassing: null, held: { sha: 'sq', reasons: [aiFlag], aiFindings: [finding] } }
+          : holdOn('s2')(shas),
+    });
+    expect(await runExport(deps)).toBe(2);
+    expect(w.aiHolds).toEqual([record({ originRev: 'rev-sq' })]);
+    w.gated = [];
+    expect(await runExport(deps)).toBe(2);
+    expect(w.gated).toEqual([]);
+  });
+
+  it('drops a record once the public head contains its commit', async () => {
+    const w = world({
+      staging: ['s1'],
+      remote: 's1',
+      origins: { s1: 'rev-s1' },
+      originHistory: ['rev-leak', 'rev-s1'],
+      aiHolds: [record()],
+      trees: { s2: leakyTree },
+    });
+    expect(await runExport(harness(w, { publicRemote: true, copybara: adds('s2') }))).toBe(0);
+    expect(w.pushes).toEqual(['s2']);
+    expect(w.aiHolds).toEqual([]);
+  });
+
+  it('fails the run rather than gate a commit whose origin is unknown while records exist', async () => {
+    const { w, deps } = nextRun({ aiHolds: [record()] });
+    deps.originRev = (sha) => (sha === 'leak' ? null : `rev-${sha}`);
+    expect(await runExport(deps)).toBe(1);
+    expect(w.pushes).toEqual([]);
   });
 });
 

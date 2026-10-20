@@ -27,7 +27,8 @@ T="$(mktemp -d)"
 export PYTHONDONTWRITEBYTECODE=1
 
 unset SMOKE_CONTROLLER_MODE SMOKE_CONTROLLER_CRASH_AT SMOKE_CONTROLLER_SHADOW_DIR SMOKE_GATE_CLAIMANT \
-  SMOKE_GATE_STATE_DIR SMOKE_GATE_RUN_ROOT SMOKE_CONTROLLER_OUT_DIR || true
+  SMOKE_GATE_STATE_DIR SMOKE_GATE_RUN_ROOT SMOKE_CONTROLLER_OUT_DIR SMOKE_GATE_HOLD_FILE \
+  SMOKE_GATE_HANDOFF_LEDGER || true
 export SMOKE_GATE_LEASE_DIR="$T/leases"
 mkdir -p "$SMOKE_GATE_LEASE_DIR"
 
@@ -68,8 +69,10 @@ new_case() { # name [mode]
 claim() { # [deadline] [claimant] [owner]
   jq -cn --arg run "$RUN" --arg sha "$SHA" --arg dl "${1:-2026-09-18T11:30:00Z}" --argjson pr "$PR" \
     --arg cl "${2-controller}" --arg owner "${3:-$TOKEN}" \
+    --argjson freeze "${WAKE_FREEZE:-true}" \
     '{schemaVersion:1,pr:$pr,activeRunId:$run,activeSha:$sha,challengerDeadline:$dl,challengerDisposition:null,
-      activeLeaseOwner:$owner,activeClaimant:(if $cl == "" then null else $cl end)}' >"$C/state/pr-$PR-state.json"
+      activeLeaseOwner:$owner,activeClaimant:(if $cl == "" then null else $cl end),
+      activeFreezeProbe:{sha:$sha,isFreezePr:$freeze}}' >"$C/state/pr-$PR-state.json"
 }
 
 gate_finished_elsewhere() { # completedRunId
@@ -82,7 +85,7 @@ gate_finished_elsewhere() { # completedRunId
 }
 wake_json() {
   jq -cn --arg run "$RUN" --arg sha "$SHA" --argjson pr "$PR" --arg tok "$TOKEN" \
-    '{wakeAgent:true,data:{trigger:"pr_build_settled",runId:$run,pr:$pr,sourceSha:$sha,isFreezePr:true,
+    '{wakeAgent:true,data:{trigger:"pr_build_settled",runId:$run,pr:$pr,sourceSha:$sha,isFreezePr:'"${WAKE_FREEZE:-true}"',
       coordinatorOwnerToken:$tok,previewUrl:"https://preview.test"}}' >"$C/wake.json"
 }
 
@@ -200,7 +203,7 @@ world() { # tick
       synthesis "$VERDICT" ".findings=[{id:\"$FINDING\",confirmed:true,blocking:false,disposition:\"not-blocking:cosmetic\"}
         + (if \"${TRACKER:-}\" == \"\" then {} else {existingIssue:(\"${TRACKER:-0}\" | tonumber),severity:\"P3\"} end)]"
     else
-      synthesis "$VERDICT"
+      synthesis "$VERDICT" "${SYN_MERGE:-.}"
     fi
   fi
 }
@@ -292,10 +295,13 @@ WAKES=()
 # (the second run is a retry of the same fire, so it must perform and journal
 # nothing new -- only gate progress, which is not an effect). CRASH (a
 # SMOKE_CONTROLLER_CRASH_AT spec) kills the first fire that reaches it; that
-# tick is then re-run without it. The second run of each fire must perform
-# nothing.
+# tick is then re-run without it (CRASH_LOSES_WAKE: and without the fire's
+# extra inputs, as the gate latched the wake the dead fire was given;
+# CRASH_RETRY: and that retry is killed too, at its own spec, before a third
+# run, with AFTER_RETRY_CRASH run in between; AFTER_CRASH runs before the first
+# retry). The second run of each fire must perform nothing.
 campaign() { # last-tick   (CRASH2: a second kill, armed once CRASH has fired)
-  local n now crashed=false crashed2=false w1 w2
+  local n now crashed=false crashed2=false crashed_retry=false w1 w2
   WAKES=()
   WAKE_TIMES=()
   claim "${DEADLINE:-}"
@@ -318,7 +324,18 @@ campaign() { # last-tick   (CRASH2: a second kill, armed once CRASH has fired)
       [ "$STEP_RC" = 0 ] || [ "$STEP_RC" = 137 ] || fail "crash fire $now rc=$STEP_RC $STEP_OUT"
       if [ "$STEP_RC" = 137 ]; then
         crashed=true
+        [ -z "${AFTER_CRASH:-}" ] || "$AFTER_CRASH"
         inputs_from_fakes  # the retry is a later process: it sees what the dead one did
+        [ -z "${CRASH_LOSES_WAKE:-}" ] || extra=()
+        if [ -n "${CRASH_RETRY:-}" ]; then
+          SMOKE_CONTROLLER_CRASH_AT="$CRASH_RETRY" step "$now" "${extra[@]}"
+          [ "$STEP_RC" = 0 ] || [ "$STEP_RC" = 137 ] || fail "crash retry fire $now rc=$STEP_RC $STEP_OUT"
+          if [ "$STEP_RC" = 137 ]; then
+            crashed_retry=true
+            [ -z "${AFTER_RETRY_CRASH:-}" ] || "$AFTER_RETRY_CRASH"
+            inputs_from_fakes
+          fi
+        fi
         step_ok "$now" "${extra[@]}"
       fi
     elif [ -n "${CRASH2:-}" ] && [ "$crashed" = true ] && [ "$crashed2" = false ]; then
@@ -344,6 +361,7 @@ campaign() { # last-tick   (CRASH2: a second kill, armed once CRASH has fired)
   done
   [ -z "${CRASH:-}" ] || [ "$crashed" = true ] || fail "crash point $CRASH was never reached"
   [ -z "${CRASH2:-}" ] || [ "$crashed2" = true ] || fail "second crash point $CRASH2 was never reached"
+  [ -z "${CRASH_RETRY:-}" ] || [ "$crashed_retry" = true ] || fail "retry crash point $CRASH_RETRY was never reached"
 }
 
 # Each external effect exactly once: every message id's key once (no second
@@ -1373,19 +1391,19 @@ cite() { # <file> <line> <literal substring the cited line must contain>
     || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
 }
 ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
-for c in 'smoke-pr-gate.sh:5608' 'smoke-campaign-controller.py:1730-1732' \
-         'smoke-run-scaffold.sh:270-272' 'smoke-campaign-controller.py:1719-1729'; do
+for c in 'smoke-pr-gate.sh:5673' 'smoke-campaign-controller.py:1753-1755' \
+         'smoke-run-scaffold.sh:270-272' 'smoke-campaign-controller.py:1742-1752'; do
   grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
 done
-cite smoke-pr-gate.sh 5608 'OWNER_TOKEN="$(new_owner_token'
-cite smoke-pr-gate.sh 5637 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5642 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5689 '.activeLeaseOwner=$owner'
+cite smoke-pr-gate.sh 5673 'OWNER_TOKEN="$(new_owner_token'
+cite smoke-pr-gate.sh 5702 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5707 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5755 '.activeLeaseOwner=$owner'
 cite smoke-run-scaffold.sh 271 '[ "$owner" = "$DEFAULT_OWNER" ]'
 cite smoke-run-scaffold.sh 710 'adds NO new authority check of its own'
-cite smoke-campaign-controller.py 1675 'def _owner_wake'
-cite smoke-campaign-controller.py 1725 'os.unlink("brief-{}.ack"'
-cite smoke-campaign-controller.py 1730 'if c.get("wake"):'
+cite smoke-campaign-controller.py 1698 'def _owner_wake'
+cite smoke-campaign-controller.py 1748 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1753 'if c.get("wake"):'
 
 
 fi
@@ -2381,6 +2399,301 @@ jr '[.[] | select(.kind=="gh" and .slot=="issue:F1" and .state=="done") | .detai
   | grep -qx true || fail "tracker-comment: done via tracker-comment"
 [ "$(finish_verdict)" = '"GO"' ] || fail "tracker-comment: GO"
 unset TRACKER
+
+fi
+# --- 29. a live HUMAN_DECISION hold, end to end through the gate's finish -------
+# The fake gate keeps SMOKE_GATE_HOLD_FILE as the real one does for a freeze
+# PR (GO deletes it, HUMAN_DECISION re-raises it under the finishing run), and
+# reads it from the environment the controller hands every gate verb.
+HELD=acme-pr-pr5-cccccccccccc-20260917T090000Z
+live_hold_case() { # name
+  new_case "$1"
+  export SMOKE_GATE_HOLD_FILE="$C/hold.json"
+  jq -cn --arg run "$HELD" --arg sha "$SHA2" \
+    '{schemaVersion:1,sha:$sha,runId:$run,verdict:"HUMAN_DECISION",raisedAt:"2026-09-17T09:30:00Z",reason:"needs_human_decision"}' \
+    >"$C/hold.json"
+  mkdir -p "$C/runs/$HELD/coordinator"
+  printf 'HUMAN_DECISION: the held repairs need a human ratification.\n' >"$C/runs/$HELD/coordinator/synthesis.md"
+  HOLD_SUM="$(sha256sum <"$C/hold.json")"
+}
+hold_briefed() { # label: the synthesis brief named the live hold and the held run's record
+  local b="$R/controller/brief-synthesis.md"
+  grep -q 'A HUMAN_DECISION HOLD IS LIVE ON DEVELOP' "$b" && grep -qF "$HELD" "$b" \
+    && grep -qF "$C/runs/$HELD/coordinator/synthesis.md" "$b" && grep -qF 'holdDisposition' "$b" \
+    || fail "$1: the synthesis brief must carry the live hold: $(head -c 600 "$b" 2>/dev/null)"
+}
+if smoke_case 29-hold-undispositioned; then
+live_hold_case hold-undispositioned
+campaign 9
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "hold-undispositioned: GO over a live hold must finish BLOCKED: $(finish_verdict)"
+dq '[.[] | select(.type=="finish") | .failedChecks[]] | any(contains("live hold '"$HELD"' not dispositioned"))' \
+  | grep -qx true || fail "hold-undispositioned: failed checks: $(dq '[.[] | select(.type=="finish")]')"
+[ "$(sha256sum <"$C/hold.json")" = "$HOLD_SUM" ] || fail "hold-undispositioned: the hold must survive: $(cat "$C/hold.json" 2>&1)"
+hold_briefed hold-undispositioned
+unset SMOKE_GATE_HOLD_FILE
+
+fi
+if smoke_case 29-hold-carried; then
+live_hold_case hold-carried
+SYN_MERGE=".holdDisposition = {runId:\"$HELD\",disposition:\"carried\"}" campaign 9
+[ "$(finish_verdict)" = '"HUMAN_DECISION"' ] || fail "hold-carried: a carried hold finishes HUMAN_DECISION: $(finish_verdict)"
+jq -e --arg run "$RUN" '.runId == $run and .verdict == "HUMAN_DECISION" and .reason == "needs_human_decision"' \
+  "$C/hold.json" >/dev/null || fail "hold-carried: the gate re-raises the hold under this run: $(cat "$C/hold.json" 2>&1)"
+dq '[.[] | select(.type=="finish") | .failedChecks[]] | any(contains("live hold '"$HELD"' carried"))' \
+  | grep -qx true || fail "hold-carried: the finish records why: $(dq '[.[] | select(.type=="finish")]')"
+hold_briefed hold-carried
+unset SMOKE_GATE_HOLD_FILE
+
+fi
+if smoke_case 29-hold-resolved; then
+live_hold_case hold-resolved
+mkdir -p "$R/coordinator"
+printf 'Ratified by the product owner on 2026-09-17 (recorded here).\n' >"$R/coordinator/hold-ratification.md"
+SYN_MERGE=".holdDisposition = {runId:\"$HELD\",disposition:\"resolved\",evidence:\"coordinator/hold-ratification.md\"}" \
+  campaign 9
+[ "$(finish_verdict)" = '"GO"' ] || fail "hold-resolved: a resolved hold with evidence finishes GO: $(finish_verdict) $(dq '[.[] | select(.type=="finish")]')"
+[ ! -e "$C/hold.json" ] || fail "hold-resolved: the GO finish clears the hold"
+# The sixth gate argument, right after the owner token: the only place the
+# real gate reads it.
+jq -s -e --arg a "--clear-hold=$HELD" --arg tok "$TOKEN" '[.[] | select(.tool=="gate" and .op=="finish")]
+  | length == 1 and .[0].argv[4] == $tok and .[0].argv[5] == $a and (.[0].argv | length) == 6' \
+  "$FAKE_LOG" >/dev/null || fail "hold-resolved: finish names the disposed hold as its sixth argument: $(jq -s -c '[.[] | select(.tool=="gate")]' "$FAKE_LOG")"
+hold_briefed hold-resolved
+unset SMOKE_GATE_HOLD_FILE
+
+fi
+if smoke_case 29-hold-lands-mid-fire; then
+# The hold is raised between validation and finish, inside the validating
+# fire (scripted while that fire files the finding's issue). Nothing says GO:
+# no GO post goes out, the frozen GO falls to BLOCKED, and the hold survives.
+new_case hold-lands-mid-fire
+export SMOKE_GATE_HOLD_FILE="$C/hold.json"
+jq -cn --arg h "hold-lands:$HELD" '{"gh:issue-create":[$h]}' >"$C/fake/faults.json"
+FAULTY=1 FINDING=F1 campaign 11
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "hold-lands-mid-fire: must finish BLOCKED: $(finish_verdict)"
+jq -e --arg run "$HELD" '.runId == $run' "$C/hold.json" >/dev/null \
+  || fail "hold-lands-mid-fire: the hold that landed must survive: $(cat "$C/hold.json" 2>&1)"
+dq '[.[] | select(.reason=="live hold changed after validation; GO is re-validated next fire")] | length >= 1' \
+  | grep -qx true || fail "hold-lands-mid-fire: the in-fire re-check held the posts: $(dq '[.[] | select(.type=="wait")]')"
+jq -e --arg k "$(key "$RUN" send verdict)" \
+  '[.messages | to_entries[] | select(.key | startswith($k)) | .value.text] | length >= 1 and all(contains("Safe to ship") | not)' \
+  "$C/fake/enqueue.json" >/dev/null || fail "hold-lands-mid-fire: no GO verdict post: $(jq -c '.messages' "$C/fake/enqueue.json")"
+unset SMOKE_GATE_HOLD_FILE
+
+fi
+if smoke_case 29-hold-ordinary-live; then
+# The gate's own wake classifies the frozen head as an ordinary PR, whose
+# finish never touches the hold: GO needs no disposition, and the hold stays.
+live_hold_case hold-ordinary-live
+export FAKE_GATE_ORDINARY=1
+WAKE_FREEZE=false campaign 9
+[ "$(finish_verdict)" = '"GO"' ] || fail "hold-ordinary-live: a gate-classified ordinary PR finishes GO: $(finish_verdict) $(dq '[.[] | select(.type=="finish")]')"
+[ "$(sha256sum <"$C/hold.json")" = "$HOLD_SUM" ] || fail "hold-ordinary-live: the hold is untouched"
+unset SMOKE_GATE_HOLD_FILE FAKE_GATE_ORDINARY
+
+fi
+if smoke_case 29-hold-lands-mid-post; then
+# The hold is raised while the chat verdict post is being enqueued, before the
+# PR comment is rendered in the same fire. The chat post had already gone out
+# as GO (no hold existed when it was prepared): it is superseded, never
+# re-sent. The PR comment must never say GO, and the run finishes BLOCKED.
+new_case hold-lands-mid-post
+export SMOKE_GATE_HOLD_FILE="$C/hold.json"
+jq -cn --arg k "enqueue:$(key "$RUN" send verdict | cut -c1-12)" --arg h "hold-lands:$HELD" '{($k):[$h]}' \
+  >"$C/fake/faults.json"
+FAULTY=1 campaign 11
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "hold-lands-mid-post: must finish BLOCKED: $(finish_verdict)"
+jq -e --arg run "$HELD" '.runId == $run' "$C/hold.json" >/dev/null \
+  || fail "hold-lands-mid-post: the hold survives: $(cat "$C/hold.json" 2>&1)"
+jq -e --arg k "$(key "$RUN" send verdict)" \
+  '[.messages | to_entries[] | select(.key | startswith($k)) | .value.text] | length == 1 and (.[0] | contains("Safe to ship"))' \
+  "$C/fake/enqueue.json" >/dev/null \
+  || fail "hold-lands-mid-post: precondition -- the one chat post went out as GO before the hold: $(jq -c .messages "$C/fake/enqueue.json")"
+jq -e '(.comments["7"] // []) | length >= 1 and all(.body | contains("Safe to ship") | not)' "$C/fake/gh.json" >/dev/null \
+  || fail "hold-lands-mid-post: no PR comment may say GO: $(jq -c '.comments["7"]' "$C/fake/gh.json")"
+dq '[.[] | select(.type=="alarm" and .reason=="controller_publication_superseded")] | length == 1' | grep -qx true \
+  || fail "hold-lands-mid-post: the GO chat post is superseded: $(dq '[.[] | select(.type=="alarm")]')"
+unset SMOKE_GATE_HOLD_FILE
+
+fi
+if smoke_case 29-hold-resume-authorized; then
+# finish dies after verdict.json, before the hold block; the resumed finish
+# must carry the same authorization, or the gate keeps the disposed hold.
+live_hold_case hold-resume-authorized
+mkdir -p "$R/coordinator"
+printf 'Ratified by the product owner on 2026-09-17 (recorded here).\n' >"$R/coordinator/hold-ratification.md"
+jq -cn '{"gate:finish":["partial"]}' >"$C/fake/faults.json"
+SYN_MERGE=".holdDisposition = {runId:\"$HELD\",disposition:\"resolved\",evidence:\"coordinator/hold-ratification.md\"}" \
+  FAULTY=1 campaign 11
+[ "$(finish_verdict)" = '"GO"' ] || fail "hold-resume-authorized: GO: $(finish_verdict)"
+jr '[.[] | select(.kind=="gate" and .slot=="finish-resume" and .state=="done") | .detail.trailing] | first == ["--clear-hold='"$HELD"'"]' \
+  | grep -qx true || fail "hold-resume-authorized: the resume carries the authorization: $(jr '[.[] | select(.kind=="gate")]')"
+[ ! -e "$C/hold.json" ] || fail "hold-resume-authorized: the resumed GO clears the disposed hold: $(cat "$C/hold.json")"
+jq -s -e --arg a "--clear-hold=$HELD" '[.[] | select(.tool=="gate" and .argv[0]=="finish")] | length == 2 and all(.argv[5] == $a)' \
+  "$FAKE_LOG" >/dev/null || fail "hold-resume-authorized: both finish calls carry it sixth: $(jq -s -c '[.[] | select(.tool=="gate" and .argv[0]=="finish")]' "$FAKE_LOG")"
+unset SMOKE_GATE_HOLD_FILE
+
+fi
+if smoke_case 29-hold-resume-foreign; then
+# finish dies after verdict.json, then another run raises a HUMAN_DECISION
+# hold this synthesis never saw. The resumed GO stands (verdict.json is
+# write-once), the gate keeps the hold, and the controller alarms.
+new_case hold-resume-foreign
+export SMOKE_GATE_HOLD_FILE="$C/hold.json"
+jq -cn --arg f "partial-hold:$HELD" '{"gate:finish":[$f]}' >"$C/fake/faults.json"
+FAULTY=1 campaign 11
+[ "$(finish_verdict)" = '"GO"' ] || fail "hold-resume-foreign: the write-once GO finishes: $(finish_verdict)"
+jq -e --arg run "$HELD" '.runId == $run' "$C/hold.json" >/dev/null \
+  || fail "hold-resume-foreign: the gate keeps the foreign hold: $(cat "$C/hold.json" 2>&1)"
+jr '[.[] | select(.kind=="gate" and .slot=="finish-resume" and .state=="done") | .detail.trailing // []] | first == []' \
+  | grep -qx true || fail "hold-resume-foreign: no authorization for a hold the synthesis never disposed of"
+dq '[.[] | select(.type=="alarm" and .reason=="controller_hold_kept")] | length == 1' | grep -qx true \
+  || fail "hold-resume-foreign: a GO that left a hold standing is alarmed once: $(dq '[.[] | select(.type=="alarm")]')"
+unset SMOKE_GATE_HOLD_FILE
+
+fi
+if smoke_case 29-hold-crash-after-finish; then
+# Another run's hold lands as the gate's finish reads it, so the GO keeps it,
+# and the fire dies before it reads the finish output. The recovering fire
+# learns of the kept hold from the gate's durable receipt and alarms once.
+new_case hold-crash-after-finish
+export SMOKE_GATE_HOLD_FILE="$C/hold.json"
+jq -cn --arg h "hold-lands:$HELD" '{"gate:finish":[$h]}' >"$C/fake/faults.json"
+CRASH=after-effect:gate:finish campaign 10
+assert_once hold-crash-after-finish
+[ "$(finish_verdict)" = '"GO"' ] || fail "hold-crash-after-finish: GO: $(finish_verdict)"
+jq -e --arg run "$HELD" '.runId == $run' "$C/hold.json" >/dev/null \
+  || fail "hold-crash-after-finish: the gate keeps the foreign hold: $(cat "$C/hold.json" 2>&1)"
+jq -e --arg run "$HELD" '.handoff.holdKept.runId == $run' "$C/state/pr-$PR-verdict.json" >/dev/null \
+  || fail "hold-crash-after-finish: precondition -- the receipt names the kept hold: $(cat "$C/state/pr-$PR-verdict.json" 2>&1)"
+dq '[.[] | select(.type=="alarm" and .reason=="controller_hold_kept")] | length == 1' | grep -qx true \
+  || fail "hold-crash-after-finish: the kept hold is alarmed once after recovery: $(dq '[.[] | select(.type=="alarm")]')"
+unset SMOKE_GATE_HOLD_FILE
+
+fi
+# The kept-hold alarm, with no crash and with the fire killed just before its
+# send is journaled: either way it is raised once and delivered once, and the
+# controller's own finish never reads as a foreign one.
+# The double kills: the fire dies before the alarm is journaled, and the fire
+# recovering it dies there too, after it has closed the gate verb -- for a
+# finish, and for a finish-resume after a partial finish. The successor
+# variants add a later campaign's finish replacing the PR's receipt before the
+# last recovery: the alarm's source is the append-only ledger line for the run.
+successor_receipt() {
+  jq -cn --arg sha "$SHA2" '{runId:"acme-pr-pr7-bbbbbbbbbbbb-20260918T120000Z",verdict:"GO",sha:$sha,
+    handoff:{written:true,holdKept:null}}' >"$C/state/pr-$PR-verdict.json"
+}
+# ...and when the ledger cannot be read at that point, the recovering fire
+# settles nothing: the run stays open until a fire can read it.
+successor_ledger_gone() {
+  successor_receipt
+  mv "$C/ledger.jsonl" "$C/ledger.away"
+  step "$now" "${extra[@]}"
+  mv "$C/ledger.away" "$C/ledger.jsonl"
+  jq -e --arg run "$RUN" '([.runs[] | select(.runId==$run) | .phase] == ["error"])
+      and ([.stepErrors[] | select(.runId==$run)] | length == 1)' <<<"$STEP_OUT" >/dev/null \
+    || fail "hold-kept-delivery-$crash: an unreadable ledger settled the fire: $STEP_OUT"
+  ! jr '[.[] | select(.kind=="run")] | last | .state == "done"' | grep -qx true \
+    || fail "hold-kept-delivery-$crash: the run was settled without its ledger"
+}
+for crash in none before-alarm finish-double resume-double finish-successor resume-successor finish-ledger-gone; do
+  smoke_case "29-hold-kept-delivery-$crash" || continue
+  new_case "hold-kept-delivery-$crash"
+  export SMOKE_GATE_HOLD_FILE="$C/hold.json" SMOKE_GATE_HANDOFF_LEDGER="$C/ledger.jsonl"
+  if [ "${crash%-*}" = resume ]; then
+    # The first resume, in the same fire's second run, dies too, so the one
+    # that keeps the hold runs in a later fire's first run, where CRASH is armed.
+    jq -cn --arg h "partial-hold:$HELD" '{"gate:finish":[$h,"partial"]}' >"$C/fake/faults.json"
+  else
+    jq -cn --arg h "hold-lands:$HELD" '{"gate:finish":[$h]}' >"$C/fake/faults.json"
+  fi
+  ALARM_SLOT="alarm:hold-kept:${RUN: -24}"
+  case "$crash" in
+    none) campaign 10 ;;
+    before-alarm) CRASH="before-intent:send:$ALARM_SLOT" campaign 10 ;;
+    finish-double) CRASH="before-intent:send:$ALARM_SLOT" CRASH_RETRY="before-intent:send:$ALARM_SLOT" campaign 10 ;;
+    finish-successor) CRASH="before-intent:send:$ALARM_SLOT" CRASH_RETRY="before-intent:send:$ALARM_SLOT" \
+      AFTER_RETRY_CRASH=successor_receipt campaign 10 ;;
+    finish-ledger-gone) CRASH="before-intent:send:$ALARM_SLOT" CRASH_RETRY="before-intent:send:$ALARM_SLOT" \
+      AFTER_RETRY_CRASH=successor_ledger_gone campaign 10 ;;
+    resume-double|resume-successor)
+      if [ "$crash" = resume-successor ]; then export AFTER_RETRY_CRASH=successor_receipt; fi
+      FAULTY=1 CRASH="before-intent:send:$ALARM_SLOT" CRASH_RETRY="before-intent:send:$ALARM_SLOT" campaign 11
+      unset AFTER_RETRY_CRASH
+      jr '[.[] | select(.kind=="gate" and .slot=="finish-resume")] | length > 0' | grep -qx true \
+        || fail "hold-kept-delivery-$crash: precondition -- the finish was resumed: $(jr '[.[] | select(.kind=="gate")]')" ;;
+  esac
+  case "$crash" in *-successor|*-ledger-gone)
+    jq -e --arg run "$RUN" '.runId != $run' "$C/state/pr-$PR-verdict.json" >/dev/null \
+      || fail "hold-kept-delivery-$crash: precondition -- a successor's receipt replaced this run's" ;;
+  esac
+  assert_once "hold-kept-delivery-$crash"
+  [ "$(finish_verdict)" = '"GO"' ] || fail "hold-kept-delivery-$crash: GO: $(finish_verdict)"
+  jq -e --arg run "$HELD" '.runId == $run' "$C/hold.json" >/dev/null \
+    || fail "hold-kept-delivery-$crash: the gate keeps the foreign hold: $(cat "$C/hold.json" 2>&1)"
+  jq -s -e --arg s "$ALARM_SLOT" '[.[] | select(.kind=="send" and .slot==$s and .detail.fingerprint != null)] | length == 1' \
+    "$C/out/journal.ndjson" >/dev/null \
+    || fail "hold-kept-delivery-$crash: journaled once: $(jq -s -c --arg s "$ALARM_SLOT" '[.[] | select(.slot==$s)]' "$C/out/journal.ndjson")"
+  jq -e --arg k "$(key "$RUN" send "$ALARM_SLOT")" \
+    '[.messages | to_entries[] | select(.key | startswith($k))] | length == 1' "$C/fake/enqueue.json" >/dev/null \
+    || fail "hold-kept-delivery-$crash: delivered once: $(jq -c '.messages | keys' "$C/fake/enqueue.json")"
+  ! dq '[.[] | select(.reason=="controller_foreign_finish")] | length > 0' | grep -qx true \
+    || fail "hold-kept-delivery-$crash: the controller's own finish read as a foreign one"
+  unset SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+done
+if smoke_case 29-hold-ordinary-recovered; then
+# The fire that got the gate's wake for an ordinary PR dies before journaling
+# the claim, and the gate has latched that wake. The next fire recovers the
+# claim from gate state, whose classification of the claimed head keeps the
+# ordinary PR out of the hold's scope: GO, and the hold is untouched.
+live_hold_case hold-ordinary-recovered
+export FAKE_GATE_ORDINARY=1
+WAKE_FREEZE=false CRASH=before-run-record CRASH_LOSES_WAKE=1 campaign 9
+[ "$(finish_verdict)" = '"GO"' ] || fail "hold-ordinary-recovered: a recovered ordinary PR finishes GO: $(finish_verdict) $(dq '[.[] | select(.type=="finish")]')"
+jr '[.[] | select(.kind=="run" and .slot=="claim")] | first | .detail | .origin == "recovered" and .isFreezePr == false' \
+  | grep -qx true || fail "hold-ordinary-recovered: the claim was recovered from gate state: $(jr '[.[] | select(.kind=="run")]')"
+[ "$(sha256sum <"$C/hold.json")" = "$HOLD_SUM" ] || fail "hold-ordinary-recovered: the hold is untouched"
+unset SMOKE_GATE_HOLD_FILE FAKE_GATE_ORDINARY
+
+fi
+if smoke_case 29-hold-ordinary-no-ledger; then
+# An ordinary PR's finish never writes the handoff ledger, so a configured
+# ledger may not exist. The fire dies after the gate's finish, a successor
+# replaces the PR receipt, and the recovery still settles the run: only a
+# freeze PR's finish can keep a hold, and the gate called this one ordinary.
+live_hold_case hold-ordinary-no-ledger
+export FAKE_GATE_ORDINARY=1 SMOKE_GATE_HANDOFF_LEDGER="$C/ledger.jsonl"
+WAKE_FREEZE=false CRASH=after-effect:gate:finish AFTER_CRASH=successor_receipt campaign 9
+[ ! -e "$C/ledger.jsonl" ] || fail "hold-ordinary-no-ledger: precondition -- no ledger was written"
+jq -e --arg run "$RUN" '.runId != $run' "$C/state/pr-$PR-verdict.json" >/dev/null \
+  || fail "hold-ordinary-no-ledger: precondition -- a successor's receipt replaced this run's"
+jr '[.[] | select(.kind=="run")] | last | .state == "done"' | grep -qx true \
+  || fail "hold-ordinary-no-ledger: the run settles: $(jr '[.[] | select(.kind=="run")]')"
+! dq '[.[] | select(.reason=="controller_step_failed")] | length > 0' | grep -qx true \
+  || fail "hold-ordinary-no-ledger: no step failed on the absent ledger"
+[ "$(sha256sum <"$C/hold.json")" = "$HOLD_SUM" ] || fail "hold-ordinary-no-ledger: the hold is untouched"
+unset SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER FAKE_GATE_ORDINARY
+
+fi
+if smoke_case 29-hold-lock-retry; then
+# The gate cannot take the hold's sidecar lock twice (verdict.json written,
+# slot held, retryable:true), then the lock is back. The controller retries
+# each time through its authority check and re-derives the authorization from
+# the live hold, and the third finish completes GO and clears the disposed hold.
+live_hold_case hold-lock-retry
+mkdir -p "$R/coordinator"
+printf 'Ratified by the product owner on 2026-09-17 (recorded here).\n' >"$R/coordinator/hold-ratification.md"
+jq -cn '{"gate:finish":["lock-unavailable","lock-unavailable"]}' >"$C/fake/faults.json"
+SYN_MERGE=".holdDisposition = {runId:\"$HELD\",disposition:\"resolved\",evidence:\"coordinator/hold-ratification.md\"}" \
+  FAULTY=1 campaign 12
+[ "$(finish_verdict)" = '"GO"' ] || fail "hold-lock-retry: GO once the lock is back: $(finish_verdict) $(jr '[.[] | select(.kind=="gate")]')"
+[ ! -e "$C/hold.json" ] || fail "hold-lock-retry: the completed GO clears the disposed hold"
+jq -s -e --arg a "--clear-hold=$HELD" --arg tok "$TOKEN" '[.[] | select(.tool=="gate" and .argv[0]=="finish")]
+  | length == 3 and ([.[].op] == ["lock-unavailable","lock-unavailable","finish"]) and all(.argv[4] == $tok and .argv[5] == $a)' \
+  "$FAKE_LOG" >/dev/null || fail "hold-lock-retry: three finishes, each with the owner token and the authorization: $(jq -s -c '[.[] | select(.tool=="gate" and .argv[0]=="finish") | [.op, .argv[4:]]]' "$FAKE_LOG")"
+jr '[.[] | select(.kind=="gate" and .state=="failed_terminal")] | length == 0' | grep -qx true \
+  || fail "hold-lock-retry: a retryable lock failure is never terminal: $(jr '[.[] | select(.kind=="gate")]')"
+unset SMOKE_GATE_HOLD_FILE
 
 fi
 smoke_cases_done

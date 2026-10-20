@@ -17,7 +17,7 @@ T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 
 unset SMOKE_CONTROLLER_MODE SMOKE_CONTROLLER_CRASH_AT SMOKE_CONTROLLER_SHADOW_DIR \
-  SMOKE_GATE_STATE_DIR SMOKE_GATE_RUN_ROOT || true
+  SMOKE_GATE_STATE_DIR SMOKE_GATE_RUN_ROOT SMOKE_GATE_HOLD_FILE || true
 export SMOKE_GATE_LEASE_DIR="$T/leases"
 mkdir -p "$SMOKE_GATE_LEASE_DIR"
 
@@ -535,6 +535,128 @@ step_ok 2026-09-18T10:00:00Z
 [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "superseded GO must finish BLOCKED"
 echo "$STEP_OUT" | jq -e '[.alarms[] | select(.trigger=="controller_verdict_superseded")] | length == 1' >/dev/null \
   || fail "superseded GO alarm: $STEP_OUT"
+
+# --- a live HUMAN_DECISION hold needs a holdDisposition before GO ------------
+# The gate's GO finish deletes SMOKE_GATE_HOLD_FILE (smoke-pr-gate.sh finish),
+# so a GO that never weighed another run's open human decision would clear it.
+HELD=acme-pr-pr5-cccccccccccc-20260917T090000Z
+hold() { # verdict reason [runId]
+  jq -cn --arg run "${3:-$HELD}" --arg v "$1" --arg r "$2" --arg sha "$SHA2" \
+    '{schemaVersion:1,sha:$sha,runId:$run,verdict:$v,raisedAt:"2026-09-17T09:30:00Z",reason:$r}' >"$C/hold.json"
+}
+hd_hold() { hold HUMAN_DECISION needs_human_decision; }
+ratified() { hd_hold; printf 'The operator ratified the held repairs on 2026-09-17.\n' >"$R/evidence/ratified.md"; }
+expect_hold() { # name synthesis-jq-merge setup-fn expected-verdict [failed-check substring]
+  new_case "hold-$1"
+  ready_run CLEAR
+  synthesis GO "$2"
+  "$3"
+  export SMOKE_GATE_HOLD_FILE="$C/hold.json"
+  step_ok 2026-09-18T10:00:00Z
+  step_ok 2026-09-18T10:10:00Z
+  unset SMOKE_GATE_HOLD_FILE
+  [ "$(finish_verdict)" = "\"$4\"" ] || fail "hold-$1: expected $4, got $(finish_verdict): $(dq '[.[] | select(.type=="finish")]')"
+  [ -z "${5:-}" ] || dq '[.[] | select(.type=="finish") | .failedChecks[]]' | grep -qF -- "$5" \
+    || fail "hold-$1: failed checks must name '$5': $(dq '[.[] | select(.type=="finish")]')"
+}
+expect_hold nodisp '.' hd_hold BLOCKED "live hold $HELD not dispositioned"
+expect_hold wrongrun '.holdDisposition = {runId:"acme-pr-pr6-other",disposition:"carried"}' hd_hold BLOCKED \
+  "live hold $HELD not dispositioned"
+expect_hold baddisp ".holdDisposition = {runId:\"$HELD\",disposition:\"waived\",evidence:\"evidence/A1.png\"}" hd_hold \
+  BLOCKED "live hold $HELD not dispositioned"
+expect_hold noevidence ".holdDisposition = {runId:\"$HELD\",disposition:\"resolved\"}" hd_hold BLOCKED \
+  "live hold $HELD not dispositioned (resolved needs evidence"
+expect_hold escape ".holdDisposition = {runId:\"$HELD\",disposition:\"resolved\",evidence:\"../../hold.json\"}" hd_hold \
+  BLOCKED "live hold $HELD not dispositioned (resolved needs evidence"
+expect_hold absolute ".holdDisposition = {runId:\"$HELD\",disposition:\"not-in-range\",evidence:\"/etc/hostname\"}" \
+  hd_hold BLOCKED "live hold $HELD not dispositioned (not-in-range needs evidence"
+expect_hold missing-evidence \
+  ".holdDisposition = {runId:\"$HELD\",disposition:\"not-in-range\",evidence:\"evidence/ancestry.txt\"}" hd_hold BLOCKED \
+  "live hold $HELD not dispositioned (not-in-range needs evidence"
+expect_hold carried ".holdDisposition = {runId:\"$HELD\",disposition:\"carried\"}" hd_hold HUMAN_DECISION \
+  "live hold $HELD carried"
+# A hold identified only by its reason is a human-decision hold too.
+reason_only() { hold "" needs_human_decision; }
+expect_hold reasononly '.' reason_only BLOCKED "live hold $HELD not dispositioned"
+garbage_hold() { printf '{"schemaVersion":1,"runId":' >"$C/hold.json"; }
+expect_hold unreadable ".holdDisposition = {runId:\"$HELD\",disposition:\"carried\"}" garbage_hold BLOCKED \
+  "live hold unreadable"
+anon_hold() { jq -cn '{schemaVersion:1,verdict:"HUMAN_DECISION",reason:"needs_human_decision"}' >"$C/hold.json"; }
+expect_hold norunid '.' anon_hold BLOCKED "live hold unreadable"
+odd_hold() { hold GO "" ; }
+expect_hold oddverdict '.' odd_hold BLOCKED "neither NO_GO nor HUMAN_DECISION"
+dangling_hold() { rm -f "$C/hold.json"; ln -s "$C/no-such-hold.json" "$C/hold.json"; }
+expect_hold dangling '.' dangling_hold BLOCKED "live hold unreadable"
+# The controls: what a hold must NOT block.
+expect_hold resolved ".holdDisposition = {runId:\"$HELD\",disposition:\"resolved\",evidence:\"evidence/ratified.md\"}" \
+  ratified GO
+expect_hold notinrange ".holdDisposition = {runId:\"$HELD\",disposition:\"not-in-range\",evidence:\"evidence/A1.png\"}" \
+  hd_hold GO
+nogo_hold() { hold NO_GO "confirmed defects on this develop lineage"; }
+expect_hold nogo '.' nogo_hold GO
+own_hold() { hold HUMAN_DECISION needs_human_decision "$RUN"; }
+expect_hold ownrun '.' own_hold GO
+no_hold() { rm -f "$C/hold.json"; }
+expect_hold absent '.' no_hold GO
+# Shadow never has the gate's own freeze classification: its isFreezePr is
+# inferred, so even a recorded false keeps the hold in scope. (A live gate
+# wake's false is honoured: 29-hold-ordinary-live.)
+ordinary_pr() { hd_hold; seed run claim enqueued 1 '{"pr":7,"isFreezePr":false}'; }
+expect_hold ordinary-shadow '.' ordinary_pr BLOCKED "live hold $HELD not dispositioned"
+
+# A marker freeze on a branch outside the smoke/freeze- convention, driven
+# through the real shadow wrapper: its branch-name guess says "not a freeze",
+# but the gate's finish (which reads the marker commit) would delete the hold,
+# so the GO must still be refused.
+new_case hold-shadow-marker-freeze
+ready_run CLEAR
+claim 2099-01-01T00:00:00Z
+synthesis GO
+hd_hold
+mkdir -p "$C/leases"
+cp "$SHIM/gh" "$C/gh.effect-trap"
+cat >"$SHIM/gh" <<SH
+#!/usr/bin/env bash
+printf '{"headRefOid":"%s","headRefName":"feature/freezer"}\n' '$SHA'
+SH
+cat >"$C/env.sh" <<SH
+export SMOKE_CONTROLLER_MODE=shadow
+export SMOKE_GATE_STATE_DIR='$C/state'
+export SMOKE_GATE_RUN_ROOT='$C/runs'
+export SMOKE_GATE_LEASE_DIR='$C/leases'
+export SMOKE_GATE_REPO=acme/app
+export SMOKE_GATE_HOLD_FILE='$C/hold.json'
+export SMOKE_CONTROLLER_SHADOW_DIR='$C/out'
+SH
+for n in 1 2 3 4 5; do
+  SMOKE_CONTROLLER_ENV_FILE="$C/env.sh" bash "$SCRIPT_DIR/smoke-controller-shadow.sh" >"$C/wrapper-out" 2>"$C/wrapper-err" \
+    || fail "hold-shadow-marker-freeze: wrapper exited non-zero: $(tail -n 3 "$C/wrapper-err")"
+done
+cp "$C/gh.effect-trap" "$SHIM/gh"
+[ "$(jr '[.[] | select(.kind=="run" and .slot=="claim") | .detail.isFreezePr] | first')" = false ] \
+  || fail "hold-shadow-marker-freeze: precondition -- the wrapper guessed not-a-freeze: $(jr '[.[] | select(.kind=="run")]')"
+[ "$(finish_verdict)" = '"BLOCKED"' ] \
+  || fail "hold-shadow-marker-freeze: a branch-name guess must not exempt the hold: $(finish_verdict) $(cat "$C/wrapper-out")"
+dq '[.[] | select(.type=="finish") | .failedChecks[]] | any(contains("live hold '"$HELD"' not dispositioned"))' \
+  | grep -qx true || fail "hold-shadow-marker-freeze: failed checks: $(dq '[.[] | select(.type=="finish")]')"
+
+# A hold raised after GO was validated is caught when the frozen GO is
+# re-validated before finish: BLOCKED, superseded, and the hold stays.
+new_case hold-after-validation
+ready_run CLEAR
+synthesis GO
+seed run claim enqueued 1 '{"pr":7}'
+seed verdict validated done 1 '{"verdict":"GO","failedChecks":[]}'
+hd_hold
+export SMOKE_GATE_HOLD_FILE="$C/hold.json"
+step_ok 2026-09-18T10:00:00Z
+unset SMOKE_GATE_HOLD_FILE
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "hold-after-validation: a frozen GO must fall to BLOCKED: $(finish_verdict)"
+dq '[.[] | select(.type=="finish") | .failedChecks[]] | any(contains("live hold '"$HELD"' not dispositioned"))
+  and any(contains("verdict changed after validation"))' | grep -qx true \
+  || fail "hold-after-validation: failed checks: $(dq '[.[] | select(.type=="finish")]')"
+echo "$STEP_OUT" | jq -e '[.alarms[] | select(.trigger=="controller_verdict_superseded")] | length == 1' >/dev/null \
+  || fail "hold-after-validation: superseded alarm: $STEP_OUT"
 
 # --- ambiguous dispatch: never recreated, escalated, BLOCKED only ------------
 

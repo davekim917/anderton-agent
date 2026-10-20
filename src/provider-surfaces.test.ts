@@ -526,6 +526,31 @@ describe('initGroupFilesystem legacy seed isolation', async () => {
 });
 
 describe('buildMounts agent surfaces', async () => {
+  it("mounts the workgroup's saved browser logins, and only that workgroup's, read-write", async () => {
+    const member = group('ag-browser-member', 'browser-member');
+    const outsider = group('ag-browser-outsider', 'browser-outsider');
+    for (const ag of [member, outsider]) await createAgentGroup(ag);
+    assignWorkgroup(member, 'logins-a');
+    assignWorkgroup(outsider, 'logins-b');
+    for (const ag of [member, outsider]) {
+      await ensureContainerConfig(ag.id);
+      initGroupFilesystem(ag, {});
+    }
+    for (const [ag, wg] of [
+      [member, 'logins-a'],
+      [outsider, 'logins-b'],
+    ] as const) {
+      const mounts = await buildMounts(ag, session(`s-browser-${wg}`, ag.id), containerConfig(), 'claude', {}, wg);
+      expect(mounts.filter((m) => m.containerPath === '/workspace/browser-state')).toEqual([
+        {
+          hostPath: path.join(DATA_DIR, 'browser-state', wg),
+          containerPath: '/workspace/browser-state',
+          readonly: false,
+        },
+      ]);
+    }
+  });
+
   it('applies one workgroup policy to every provider sibling through the real additional-mount allowlist', async () => {
     const recipient = group('ag-read-main', 'read-main');
     const sibling = group('ag-read-codex', 'read-codex');

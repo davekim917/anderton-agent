@@ -15,7 +15,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { getAgentMailbox } from './mailbox/index.js';
 import { withExistingMailboxSession } from './session-manager.js';
 import { closeDb, initMigratedTestDb } from './db/index.js';
-import { createSession } from './db/sessions.js';
+import { createPendingApproval, createSession } from './db/sessions.js';
 import {
   ABSOLUTE_CEILING_MS,
   _resetSweepRegistryForTesting,
@@ -127,6 +127,8 @@ vi.mock('./container-runner.js', async (importOriginal) => {
   return {
     ...real,
     isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(...args),
+    getContainerIdentity: (sessionId: string) =>
+      mockIsContainerRunning(sessionId) ? 'nanoclaw-v2-sla-1' : real.getContainerIdentity(sessionId),
     // `containerOwnsOutbound` moved from host-sweep.ts into container-runner.ts
     // (it now has a second caller, thread-close's finalizer). Composed here from
     // the MOCKED running check plus the real spawning one, which is exactly what
@@ -413,6 +415,33 @@ describe('sweepSession on a session with no mailbox', () => {
     expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-ceiling', 'absolute-ceiling', expect.any(Function));
     // Claim intact and no restart notice written: both writes were skipped.
     expect(f.claims()).toBe(before);
+    await closeDb();
+  });
+
+  it('a container past the ceiling while waiting on its own approval gate is not killed', async () => {
+    await initMigratedTestDb();
+    getRawDb()
+      .prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`)
+      .run(new Date().toISOString());
+    mockKillContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
+
+    const f = slaFixture('sess-sla-gate', ABSOLUTE_CEILING_MS + 60_000, ABSOLUTE_CEILING_MS + 120_000);
+    await createSession(f.session);
+    const askedAt = Date.now() - ABSOLUTE_CEILING_MS - 90_000;
+    await createPendingApproval({
+      approval_id: 'appr-sla-gate',
+      session_id: f.session.id,
+      request_id: `gate-${askedAt}-aa`,
+      action: 'destructive-gate',
+      payload: '{}',
+      created_at: new Date(askedAt).toISOString(),
+      title: 'Drop database',
+      options_json: '[]',
+    });
+    await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+    expect(mockKillContainer).not.toHaveBeenCalled();
     await closeDb();
   });
 

@@ -141,6 +141,7 @@ import {
   WORKGROUP_CONTAINER_PATH,
   WORKGROUP_MEMORY_CONTAINER_PATH,
 } from './modules/workgroup/shared-dirs.js';
+import { browserStateMount } from './modules/browser-takeover/state-dir.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 import { protectReadonlyHostPaths, readWorkgroupReadonlyPaths } from './workgroup-readonly-paths.js';
 import {
@@ -227,6 +228,7 @@ import { acquireStorageActivityLease, type StorageActivityLease } from './storag
 import { handleStoragePressureAlert } from './storage-pressure-alert.js';
 import { MemoryAdmissionController, type MemoryAdmissionPriority } from './memory-admission.js';
 import { effectiveMcpServers, excludedFleetMcpServers } from './fleet-mcp-servers.js';
+import { neutralReviewerReposEnvArgs } from './neutral-reviewer-repos.js';
 import { effectiveExcludePlugins, WORKGROUP_EXCLUDE_PLUGINS_ENV } from './plugin-exclusions.js';
 import type { AgentGroup, Session } from './types.js';
 
@@ -3675,6 +3677,9 @@ export async function buildMounts(
   // every provider and sibling flocks the same inode.
   mounts.push(...resolveWorkgroupMemoryMounts(wgId));
 
+  const browserState = browserStateMount(wgId);
+  if (browserState) mounts.push(browserState);
+
   // Nested RO mount over the RW group dir: the agent can read its config but not modify it.
   const containerJsonPath = path.join(groupDir, 'container.json');
   if (fs.existsSync(containerJsonPath)) {
@@ -4909,6 +4914,8 @@ async function buildContainerArgs(
     }
   }
 
+  args.push(...neutralReviewerReposEnvArgs());
+
   // Spawn-only capability: old containers retain their existing explicit-human reply path.
   if (effectiveOutcomeReporting(containerConfig)) args.push('-e', 'NANOCLAW_OUTCOME_REPORTING=1');
   // Spawn-only too: an adopted container keeps the tool list it started with; the
@@ -5579,10 +5586,16 @@ const execAsync = promisify(exec);
 
 const imageBuildChains = new Map<string, Promise<void>>();
 
-/** One build per group at a time, reading the package lists once it holds the turn: the last to finish owns the tag. */
-export function buildAgentGroupImage(agentGroupId: string): Promise<void> {
+/**
+ * One build per group at a time, reading the package lists once it holds the turn: the last to finish owns the tag.
+ * `adding` is built on top of the stored lists without being stored, so a caller records it only once the build worked.
+ */
+export function buildAgentGroupImage(
+  agentGroupId: string,
+  adding: { apt: string[]; npm: string[] } = { apt: [], npm: [] },
+): Promise<void> {
   const previous = imageBuildChains.get(agentGroupId) ?? Promise.resolve();
-  const run = previous.then(() => buildAgentGroupImageNow(agentGroupId));
+  const run = previous.then(() => buildAgentGroupImageNow(agentGroupId, adding));
   const settled = run.then(
     () => undefined,
     () => undefined,
@@ -5594,14 +5607,14 @@ export function buildAgentGroupImage(agentGroupId: string): Promise<void> {
   return run;
 }
 
-async function buildAgentGroupImageNow(agentGroupId: string): Promise<void> {
+async function buildAgentGroupImageNow(agentGroupId: string, adding: { apt: string[]; npm: string[] }): Promise<void> {
   const agentGroup = await getAgentGroup(agentGroupId);
   if (!agentGroup) throw new Error('Agent group not found');
 
   const configRow = await getContainerConfig(agentGroup.id);
   if (!configRow) throw new Error('Container config not found');
-  const aptPackages = JSON.parse(configRow.packages_apt) as string[];
-  const npmPackages = JSON.parse(configRow.packages_npm) as string[];
+  const aptPackages = [...new Set([...(JSON.parse(configRow.packages_apt) as string[]), ...adding.apt])];
+  const npmPackages = [...new Set([...(JSON.parse(configRow.packages_npm) as string[]), ...adding.npm])];
   if (aptPackages.length === 0 && npmPackages.length === 0) {
     throw new Error('No packages to install. Use install_packages first.');
   }

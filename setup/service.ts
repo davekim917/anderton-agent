@@ -14,6 +14,17 @@ import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
 import { writeUpgradeState } from '../src/upgrade-state.js';
 import { cleanupUnhealthyPeers } from './peer-cleanup.js';
 import { commandExists, getPlatform, getNodePath, getServiceManager, isRoot } from './platform.js';
+import { grantDockerSocketAccess } from './lib/docker-socket-access.js';
+import {
+  hostLogPaths,
+  hostSocketPath,
+  markLogs,
+  pidAlive,
+  probeHostReady,
+  readyAfterExit,
+  waitForHostStart,
+  type HostStart,
+} from './lib/host-start.js';
 import { emitStatus } from './status.js';
 
 export async function run(_args: string[]): Promise<void> {
@@ -77,9 +88,9 @@ export async function run(_args: string[]): Promise<void> {
   }
 
   if (platform === 'macos') {
-    setupLaunchd(projectRoot, nodePath, homeDir, flockPath);
+    await setupLaunchd(projectRoot, nodePath, homeDir, flockPath);
   } else if (platform === 'linux') {
-    setupLinux(projectRoot, nodePath, homeDir, flockPath);
+    await setupLinux(projectRoot, nodePath, homeDir, flockPath);
   } else {
     emitStatus('SETUP_SERVICE', {
       SERVICE_TYPE: 'unknown',
@@ -216,7 +227,7 @@ function installCliSymlink(projectRoot: string, homeDir: string): void {
   }
 }
 
-function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): void {
+async function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): Promise<void> {
   // Per-checkout service label so multiple NanoClaw installs can coexist
   // without clobbering each other's plist.
   const label = getLaunchdLabel(projectRoot);
@@ -265,6 +276,14 @@ function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string, fl
   // relaunching the old binary and the CLI socket landed in the wrong dir.
   // unload succeeds whether or not the service was previously loaded; the
   // failure case is "Could not find specified service" which is harmless.
+  const listedPid = (): number | null => {
+    try {
+      return launchdPid(execSync('launchctl list', { encoding: 'utf-8' }), label);
+    } catch {
+      return null;
+    }
+  };
+  const oldPid = listedPid();
   try {
     execSync(`launchctl unload ${JSON.stringify(plistPath)}`, {
       stdio: 'ignore',
@@ -274,6 +293,7 @@ function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string, fl
     log.info('launchctl unload noop (plist was not previously loaded)');
   }
 
+  const marks = markLogs(hostLogPaths(projectRoot));
   try {
     execSync(`launchctl load ${JSON.stringify(plistPath)}`, {
       stdio: 'ignore',
@@ -283,14 +303,12 @@ function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string, fl
     log.error('launchctl load failed', { err });
   }
 
-  // A loaded KeepAlive job stays listed while it crash-loops; only a running one has a PID.
-  settle(2000);
-  let serviceLoaded = false;
-  try {
-    serviceLoaded = launchdPid(execSync('launchctl list', { encoding: 'utf-8' }), label) !== null;
-  } catch {
-    // launchctl list failed
-  }
+  const hostStart = await waitForHostStart(
+    marks,
+    () => listedPid() !== null,
+    readyAfterExit(oldPid, () => probeHostReady(hostSocketPath(projectRoot))),
+  );
+  const serviceLoaded = hostStart === 'running';
 
   emitStatus('SETUP_SERVICE', {
     SERVICE_TYPE: 'launchd',
@@ -299,20 +317,21 @@ function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string, fl
     PROJECT_PATH: projectRoot,
     PLIST_PATH: plistPath,
     SERVICE_LOADED: serviceLoaded,
+    HOST_START: hostStart,
     ...loadedStatus(serviceLoaded),
     LOG: 'logs/setup.log',
   });
   if (!serviceLoaded) process.exit(1);
 }
 
-function setupLinux(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): void {
+async function setupLinux(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): Promise<void> {
   const serviceManager = getServiceManager();
 
   if (serviceManager === 'systemd') {
-    setupSystemd(projectRoot, nodePath, homeDir, flockPath);
+    await setupSystemd(projectRoot, nodePath, homeDir, flockPath);
   } else {
     // WSL without systemd or other Linux without systemd
-    setupNohupFallback(projectRoot, nodePath, homeDir, flockPath);
+    await setupNohupFallback(projectRoot, nodePath, homeDir, flockPath);
   }
 }
 
@@ -402,7 +421,7 @@ StandardError=append:${projectRoot}/logs/nanoclaw.error.log
 WantedBy=${isSystem ? 'multi-user.target' : 'default.target'}`;
 }
 
-function setupSystemd(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): void {
+async function setupSystemd(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): Promise<void> {
   const runningAsRoot = isRoot();
   const unitName = getSystemdUnit(projectRoot);
   const unitFileName = `${unitName}.service`;
@@ -421,7 +440,7 @@ function setupSystemd(projectRoot: string, nodePath: string, homeDir: string, fl
       execSync('systemctl --user daemon-reload', { stdio: 'pipe' });
     } catch {
       log.warn('systemd user session not available — falling back to nohup wrapper');
-      setupNohupFallback(projectRoot, nodePath, homeDir, flockPath);
+      await setupNohupFallback(projectRoot, nodePath, homeDir, flockPath);
       return;
     }
     const unitDir = path.join(homeDir, '.config', 'systemd', 'user');
@@ -443,29 +462,18 @@ function setupSystemd(projectRoot: string, nodePath: string, homeDir: string, fl
     log.info('Wrote logrotate config', { logrotatePath });
   }
 
-  // Detect stale docker group before starting (user systemd only). The user
-  // systemd manager is a long-running process whose group list is frozen at
-  // login, so `usermod -aG docker` mid-session doesn't reach it. Rather than
-  // require the user to log out + back in, punch a POSIX ACL onto the socket
-  // that grants the current user rw directly. This is temporary — the socket
-  // is recreated by dockerd on restart (and by then the user has relogged, so
-  // normal group perms apply again).
   let dockerGroupStale = !runningAsRoot && checkDockerGroupStale();
+  let dockerSocketAcl = false;
   if (dockerGroupStale) {
     log.warn('Docker group not active in systemd session — user was likely added to docker group mid-session');
-    if (commandExists('setfacl')) {
-      const user = execSync('whoami', { encoding: 'utf-8' }).trim();
-      try {
-        execSync(`sudo setfacl -m u:${user}:rw /var/run/docker.sock`, {
-          stdio: 'inherit',
-        });
-        log.info('Applied temporary ACL to /var/run/docker.sock (resets on docker restart or reboot)');
-        dockerGroupStale = false;
-      } catch (err) {
-        log.warn('Failed to apply setfacl workaround', { err });
-      }
+    const user = os.userInfo().username;
+    const access = grantDockerSocketAccess(user);
+    if (access === 'granted') {
+      log.info('Granted this user rw on the Docker socket (an ACL entry, dropped when dockerd restarts)');
+      dockerGroupStale = false;
+      dockerSocketAcl = true;
     } else {
-      log.warn('setfacl not installed — cannot apply automatic workaround');
+      log.warn('Could not grant Docker socket access', { access });
     }
   }
 
@@ -501,20 +509,27 @@ function setupSystemd(projectRoot: string, nodePath: string, homeDir: string, fl
   // the old ExecStart / WorkingDirectory in effect even after daemon-reload.
   // `restart` on a stopped unit is equivalent to `start`, so this is safe
   // as a first-install path too.
+  const marks = markLogs(hostLogPaths(projectRoot));
   try {
     execSync(`${systemctlPrefix} restart ${unitName}`, { stdio: 'ignore' });
   } catch (err) {
     log.error('systemctl restart failed', { err });
   }
 
-  // Verify
-  let serviceLoaded = false;
-  try {
-    execSync(`${systemctlPrefix} is-active ${unitName}`, { stdio: 'ignore' });
-    serviceLoaded = true;
-  } catch {
-    // Not active
-  }
+  const hostStart = await waitForHostStart(
+    marks,
+    () => {
+      try {
+        execSync(`${systemctlPrefix} is-active ${unitName}`, { stdio: 'ignore' });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    () => probeHostReady(hostSocketPath(projectRoot)),
+  );
+  const serviceLoaded = hostStart === 'running';
+  if (!serviceLoaded) log.error('NanoClaw did not start', { hostStart });
 
   emitStatus('SETUP_SERVICE', {
     SERVICE_TYPE: runningAsRoot ? 'systemd-system' : 'systemd-user',
@@ -524,7 +539,9 @@ function setupSystemd(projectRoot: string, nodePath: string, homeDir: string, fl
     UNIT_PATH: unitPath,
     SERVICE_LOADED: serviceLoaded,
     ...(logrotatePath ? { LOGROTATE_PATH: logrotatePath } : {}),
+    HOST_START: hostStart,
     ...(dockerGroupStale ? { DOCKER_GROUP_STALE: true } : {}),
+    ...(dockerSocketAcl ? { DOCKER_SOCKET_ACL: true } : {}),
     LINGER_ENABLED: !runningAsRoot,
     ...loadedStatus(serviceLoaded),
     LOG: 'logs/setup.log',
@@ -566,7 +583,12 @@ export function renderNohupWrapper(projectRoot: string, nodePath: string, homeDi
   return lines.join('\n') + '\n';
 }
 
-function setupNohupFallback(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): void {
+async function setupNohupFallback(
+  projectRoot: string,
+  nodePath: string,
+  homeDir: string,
+  flockPath: string,
+): Promise<void> {
   log.warn('No systemd detected — generating nohup wrapper script');
 
   const wrapperPath = path.join(projectRoot, 'start-nanoclaw.sh');
@@ -575,22 +597,25 @@ function setupNohupFallback(projectRoot: string, nodePath: string, homeDir: stri
   fs.writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
   log.info('Wrote nohup wrapper script', { wrapperPath });
 
-  const serviceLoaded = startNohupWrapper(wrapperPath, path.join(projectRoot, 'nanoclaw.pid'));
+  const hostStart = await startNohupWrapper(
+    wrapperPath,
+    path.join(projectRoot, 'nanoclaw.pid'),
+    hostLogPaths(projectRoot),
+    () => probeHostReady(hostSocketPath(projectRoot)),
+  );
+  const serviceLoaded = hostStart === 'running';
   emitStatus('SETUP_SERVICE', {
     SERVICE_TYPE: 'nohup',
     NODE_PATH: nodePath,
     PROJECT_PATH: projectRoot,
     WRAPPER_PATH: wrapperPath,
     SERVICE_LOADED: serviceLoaded,
+    HOST_START: hostStart,
     FALLBACK: 'wsl_no_systemd',
     ...loadedStatus(serviceLoaded),
     LOG: 'logs/setup.log',
   });
   if (!serviceLoaded) process.exit(1);
-}
-
-function settle(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /** The PID column of `launchctl list` for `label`, or null when the job is not listed or not running ("-"). */
@@ -607,26 +632,33 @@ function loadedStatus(serviceLoaded: boolean): { STATUS: string; ERROR?: string 
   return serviceLoaded ? { STATUS: 'success' } : { STATUS: 'failed', ERROR: 'service_not_running' };
 }
 
-/** Runs the wrapper, then reports whether the pid it recorded is still alive after `settleMs`. */
-export function startNohupWrapper(wrapperPath: string, pidFile: string, settleMs = 2000): boolean {
+function readPid(pidFile: string): number | null {
+  try {
+    const pid = Number.parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Runs the wrapper, then waits for the host it started to answer as ready. */
+export async function startNohupWrapper(
+  wrapperPath: string,
+  pidFile: string,
+  logPaths: string[],
+  isReady: () => Promise<boolean>,
+  wait: typeof waitForHostStart = waitForHostStart,
+): Promise<HostStart> {
+  const marks = markLogs(logPaths);
+  const oldPid = readPid(pidFile);
   const res = spawnSync('bash', [wrapperPath], { stdio: 'ignore' });
   if (res.status !== 0) {
     log.error('nohup wrapper failed', { status: res.status });
-    return false;
+    return 'exited';
   }
-  settle(settleMs);
-  let pid: number;
-  try {
-    pid = Number.parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
-  } catch {
-    return false;
-  }
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    log.error('NanoClaw exited right after the nohup wrapper started it', { pid });
-    return false;
-  }
+  const pid = readPid(pidFile);
+  if (pid === null || pid === oldPid) return 'exited';
+  const hostStart = await wait(marks, () => pidAlive(pid), readyAfterExit(oldPid, isReady), { started: true });
+  if (hostStart !== 'running') log.error('NanoClaw did not start under the nohup wrapper', { pid, hostStart });
+  return hostStart;
 }

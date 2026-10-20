@@ -36,7 +36,7 @@ vi.mock('../../session-manager.js', async () => {
   return { ...actual, writeSessionMessage: vi.fn() };
 });
 
-import { readContainerConfig, writeContainerConfig } from '../../container-config.js';
+import { readContainerConfig, writeContainerConfig, writeContainerConfigJson } from '../../container-config.js';
 import { buildAgentGroupImage } from '../../container-runner.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
@@ -203,7 +203,7 @@ describe('applyAddMcpServer', () => {
 });
 
 describe('applyInstallPackages', () => {
-  it('appends to the package lists in container.json AND the DB projection before the build', async () => {
+  it('records the packages in container.json AND the DB projection only after the build succeeds', async () => {
     writeContainerConfig('agent', { ...readContainerConfig('agent'), packages: { apt: ['curl'], npm: [] } });
     await updateContainerConfigJson('ag-1', 'packages_apt', ['curl']);
     let atBuild: unknown;
@@ -213,6 +213,8 @@ describe('applyInstallPackages', () => {
 
     await applyInstallPackages({ apt: ['jq', 'curl'], npm: ['left-pad'] }, session);
 
+    expect(buildAgentGroupImage).toHaveBeenLastCalledWith('ag-1', { apt: ['jq', 'curl'], npm: ['left-pad'] });
+    expect(atBuild).toEqual(['curl']);
     const file = readContainerConfig('agent');
     expect(file.packages).toEqual({ apt: ['curl', 'jq'], npm: ['left-pad'] });
     expect(file.onecliSecrets).toEqual(['Keep-Me']);
@@ -221,7 +223,62 @@ describe('applyInstallPackages', () => {
       file.packages.apt,
       file.packages.npm,
     ]);
-    expect(atBuild).toEqual(['curl', 'jq']);
+  });
+
+  it('keeps a package another writer saved while a build that fails was running', async () => {
+    writeContainerConfig('agent', { ...readContainerConfig('agent'), packages: { apt: [], npm: [] } });
+    await updateContainerConfigJson('ag-1', 'packages_apt', []);
+    let failBuild!: () => void;
+    vi.mocked(buildAgentGroupImage).mockImplementationOnce(
+      () => new Promise<void>((_resolve, reject) => (failBuild = () => reject(new Error('E: build failed')))),
+    );
+
+    const install = applyInstallPackages({ apt: ['jq', 'jqq'] }, session);
+    await vi.waitFor(() => expect(failBuild).toBeDefined());
+    await writeContainerConfigJson('ag-1', 'agent', ({ packages }) => {
+      packages.apt = [...packages.apt, 'jq'];
+    });
+    failBuild();
+    await install;
+
+    expect(readContainerConfig('agent').packages.apt).toEqual(['jq']);
+  });
+
+  it('builds a second install on top of the packages the first one recorded', async () => {
+    writeContainerConfig('agent', { ...readContainerConfig('agent'), packages: { apt: [], npm: [] } });
+    await updateContainerConfigJson('ag-1', 'packages_apt', []);
+    let finishFirst!: () => void;
+    let storedAtSecondBuild: unknown;
+    vi.mocked(buildAgentGroupImage)
+      .mockImplementationOnce(() => new Promise<void>((resolve) => (finishFirst = resolve)))
+      .mockImplementationOnce(async () => {
+        storedAtSecondBuild = JSON.parse((await getContainerConfig('ag-1'))!.packages_apt);
+      });
+
+    const first = applyInstallPackages({ apt: ['jq'] }, session);
+    await vi.waitFor(() => expect(finishFirst).toBeDefined());
+    const second = applyInstallPackages({ apt: ['ripgrep'] }, session);
+    // Long enough for an unserialized second install to reach its build; a serialized one never does.
+    await vi
+      .waitFor(() => expect(buildAgentGroupImage).toHaveBeenCalledTimes(2), { timeout: 500 })
+      .catch(() => undefined);
+    finishFirst();
+    await Promise.all([first, second]);
+
+    expect(storedAtSecondBuild).toEqual(['jq']);
+    expect(readContainerConfig('agent').packages.apt).toEqual(['jq', 'ripgrep']);
+  });
+
+  it('leaves the config untouched when the rebuild fails', async () => {
+    writeContainerConfig('agent', { ...readContainerConfig('agent'), packages: { apt: ['curl'], npm: [] } });
+    await updateContainerConfigJson('ag-1', 'packages_apt', ['curl']);
+    vi.mocked(buildAgentGroupImage).mockRejectedValueOnce(new Error('E: Unable to locate package jqq'));
+
+    await applyInstallPackages({ apt: ['jqq', 'curl'], npm: ['left-pad'] }, session);
+
+    expect(readContainerConfig('agent').packages).toEqual({ apt: ['curl'], npm: [] });
+    const row = (await getContainerConfig('ag-1'))!;
+    expect([JSON.parse(row.packages_apt), JSON.parse(row.packages_npm)]).toEqual([['curl'], []]);
   });
 });
 

@@ -33,7 +33,7 @@ case "$(uname -s)" in
     echo "STEP: docker-get-script"
     curl -fsSL https://get.docker.com | sh
     echo "STEP: usermod-docker-group"
-    sudo usermod -aG docker "$USER"
+    sudo usermod -aG docker "${USER:-$(id -un)}"
     echo "NOTE: you may need to log out and back in for docker group membership to take effect"
     ;;
   *)

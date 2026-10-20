@@ -2,12 +2,12 @@
 
 ## Current: Haiku default moves to 5.5 (2026-10-18)
 
-This section is the current migration. Opus, Sonnet and Fable defaults do not move. The Haiku family default (model and effort) and the container's pinned CLI move. The host's own Haiku calls do not.
+This section is the current migration. Opus, Sonnet and Fable defaults do not move. The Haiku family default (model and effort), the container's pinned CLI, and the host's own Haiku calls (thread and session titles, now through the Claude Code CLI) move.
 
 **What moves.**
 - `DEFAULT_HAIKU_MODEL` (`src/flag-parser.ts`) is `claude-haiku-5-5`, was `claude-haiku-4-5-20251001`. Every Claude path whose model resolves through the word `haiku` runs Haiku 5.5: a chat `-m haiku`, a `haiku` wiring, group, task or `providerFallback` pin, a subagent's `model: haiku`, and any call the CLI itself makes through the word (the CLI resolves it through `ANTHROPIC_DEFAULT_HAIKU_MODEL`, which `claudeSpawnEnv` sets from the same constant). A frozen `claude-haiku-4-5` id or its `haiku45` alias keeps Haiku 4.5. New pinned aliases: `haiku55` / `haiku5-5` / `haiku-5-5`.
 - Haiku 5.5 takes effort (`low` through `max`); Haiku 4.5 does not. `-e` on `haiku` is now applied instead of skipped with a warning. Where no layer sets an effort, `defaultEffortForModel` returns `medium`, Anthropic's own default for 5.5, for the word and every `claude-haiku-*` id except `claude-haiku-4-*`, which still gets none and still drops an explicit effort.
-- The host's direct Haiku calls (`callHaiku`, `src/llm.ts`: Discord thread titles and dashboard session titles) stay on Haiku 4.5. They call `/v1/messages` with a subscription OAuth token, which serves Haiku 4.5 to a plain request and refuses Haiku 5.5 with `429 rate_limit_error: Error`, as it refuses Sonnet 5.5. Moving them needs an API-key credential or a route through Claude Code. Haiku 5.5 would also reject their `temperature: 0` (400 `temperature is deprecated for this model`), and its default thinking counts toward their 80-token cap.
+- The host's Haiku calls (`callHaiku`, `src/llm.ts`: Discord thread titles and dashboard session titles) run Haiku 5.5 through the Claude Code CLI (`claude -p`, effort `low`, no tools, settings or session, config isolated in `data/claude-title-cli/`), one subscription slot at a time. On raw `/v1/messages` a subscription OAuth token refuses Haiku 5.5 with `429 rate_limit_error: Error` for a caller that is not Claude Code, so the raw call they used to make stays on Haiku 4.5 or nothing. The host needs `claude` on the service `PATH`. `NANOCLAW_SESSION_TITLE_MODEL` still overrides the model for session titles.
 - Claude Code 2.1.302 turns fork subagents on in SDK sessions. The Claude spawn env (`claudeSpawnEnv`, agent and wiki containers alike) now sets `CLAUDE_CODE_FORK_SUBAGENT=0`, so container behaviour does not change.
 
 Haiku 5.5 costs $0.10 / $0.50 per MTok for prompts up to 100K tokens and $0.50 / $2.50 above, against $1 / $5 for Haiku 4.5. It has a 1M context window natively, so no `[1m]` suffix, and the same text counts as about 30% more tokens.
@@ -46,7 +46,7 @@ docker exec <fresh claude container> claude --version
 pnpm exec tsx scripts/q.ts data/v2.db "select model, effort, count(*) from turn_usage where ts > '<deploy time>' and model like '%haiku%' group by 1,2"
 ```
 
-Expect `ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-5-5`, CLI 2.1.302, and Haiku rows from fresh containers on `claude-haiku-5-5`.
+Expect `ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-5-5`, CLI 2.1.302, and Haiku rows from fresh containers on `claude-haiku-5-5`. For titles, new dashboard session titles keep appearing, and `logs/nanoclaw.log` shows no new `callHaiku: claude CLI` failures.
 
 **Rollback.**
 - **One path:** apply the Fix commands above, then `ncl groups restart --id <group-id>`.
