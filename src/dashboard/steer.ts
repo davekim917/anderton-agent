@@ -120,6 +120,7 @@ async function _writeAndEchoSteer(
   ctx: AuthedRequestContext,
 ): Promise<SteerResult> {
   const userId = ctx.user.id;
+  const displayName = ctx.user.display_name ?? userId;
   const text = body.text;
   const idempotencyKey = body.idempotency_key;
 
@@ -167,7 +168,7 @@ async function _writeAndEchoSteer(
       setImmediate(() => {
         void (async () => {
           try {
-            await _fireEchoAsync(exec, trimmedText, ctx);
+            await _fireEchoAsync(exec, trimmedText, displayName);
           } catch {
             // outer catch covers sync throws — claim already committed
           }
@@ -197,6 +198,7 @@ async function _writeAndEchoSteer(
         timestamp: now,
         content: JSON.stringify({
           text: trimmedText,
+          sender: displayName,
           _via: 'dashboard',
           _steer: exec.envelope,
         }),
@@ -257,7 +259,7 @@ async function _writeAndEchoSteer(
     setImmediate(() => {
       void (async () => {
         try {
-          await _fireEchoAsync(exec, trimmedText, ctx);
+          await _fireEchoAsync(exec, trimmedText, displayName);
         } catch {
           // outer catch covers sync throws — claim already committed; nothing to roll back
         }
@@ -281,7 +283,7 @@ function _responseShapeForTarget(r: SteerResponse): Record<string, unknown> {
   return base;
 }
 
-async function _fireEchoAsync(exec: SteerExecution, text: string, ctx: AuthedRequestContext): Promise<void> {
+async function _fireEchoAsync(exec: SteerExecution, text: string, displayName: string): Promise<void> {
   if (exec.echo.kind !== 'thread' || !exec.echo.messagingGroupId || !exec.echo.platformThreadId) {
     await _emitEchoStatus('skipped_headless', exec);
     return;
@@ -299,7 +301,6 @@ async function _fireEchoAsync(exec: SteerExecution, text: string, ctx: AuthedReq
     return;
   }
 
-  const displayName = ctx.user.display_name ?? ctx.user.id;
   try {
     await adapter.deliver(mg.platform_id, exec.echo.platformThreadId, {
       kind: 'chat',

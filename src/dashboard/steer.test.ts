@@ -239,9 +239,8 @@ describe('applySessionSteer — C5', () => {
     expect(r.body['error']).toBe('session_not_found');
   });
 
-  it('echoes to the session messaging group + thread when present', async () => {
-    // Re-seed the session WITH a messaging_group + thread_id so the echo
-    // picks up the thread-mode branch.
+  // Re-seed the session WITH a messaging_group + thread_id so the echo picks up the thread-mode branch.
+  function seedMessagingGroupAndEchoSession(): void {
     getRawDb()
       .prepare(
         `INSERT OR IGNORE INTO messaging_groups
@@ -256,8 +255,6 @@ describe('applySessionSteer — C5', () => {
          VALUES ('sess-echo', 'ag-1', 'mg-s', 'thread-42', 'active', ?)`,
       )
       .run(now());
-
-    const deliverMock = vi.fn().mockResolvedValue(undefined);
     mockGetMessagingGroup.mockResolvedValue({
       id: 'mg-s',
       channel_type: 'slack',
@@ -267,6 +264,11 @@ describe('applySessionSteer — C5', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
+  }
+
+  it('echoes to the session messaging group + thread when present', async () => {
+    seedMessagingGroupAndEchoSession();
+    const deliverMock = vi.fn().mockResolvedValue(undefined);
     mockGetChannelAdapter.mockReturnValue({ deliver: deliverMock } as unknown as ReturnType<typeof _gcaRaw>);
 
     const ctx = makeCtx('owner-s', { no_filter: true });
@@ -282,6 +284,40 @@ describe('applySessionSteer — C5', () => {
         content: expect.objectContaining({ text: expect.stringContaining('check in') }),
       }),
     );
+  });
+
+  async function steerAndCapture(
+    ctx: AuthedRequestContext,
+    text: string,
+  ): Promise<{ written: Record<string, unknown>; echoed: string }> {
+    seedMessagingGroupAndEchoSession();
+    const deliverMock = vi.fn().mockResolvedValue(undefined);
+    mockGetChannelAdapter.mockReturnValue({ deliver: deliverMock } as unknown as ReturnType<typeof _gcaRaw>);
+    await applySessionSteer('sess-echo', { idempotency_key: VALID_IKEY, text }, ctx);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const written = JSON.parse((mockWriteSessionMessage.mock.calls[0]![2] as { content: string }).content) as Record<
+      string,
+      unknown
+    >;
+    const echoed = (deliverMock.mock.calls[0]![2] as { content: { text: string } }).content.text;
+    return { written, echoed };
+  }
+
+  it('the inbound row names the steering user, and the echo signs with the same name', async () => {
+    const { written, echoed } = await steerAndCapture(makeCtx('owner-s', { no_filter: true }), 'who is this');
+    expect(written['sender']).toBe('user-owner-s');
+    expect(echoed.endsWith(` — ${written['sender'] as string}`)).toBe(true);
+    // The central user id is namespaced (`slack-<instance>:U…`), not the platform-native id senderId promises.
+    expect(written).not.toHaveProperty('senderId');
+    expect((written['_steer'] as Record<string, unknown>)['user_id']).toBe('owner-s');
+  });
+
+  it('a user with no display name is named by id in both places', async () => {
+    const ctx = makeCtx('owner-s', { no_filter: true });
+    ctx.user.display_name = null;
+    const { written, echoed } = await steerAndCapture(ctx, 'anon');
+    expect(written['sender']).toBe('owner-s');
+    expect(echoed.endsWith(' — owner-s')).toBe(true);
   });
 
   it('agent-shared sessions (no MG) skip echo as headless', async () => {
