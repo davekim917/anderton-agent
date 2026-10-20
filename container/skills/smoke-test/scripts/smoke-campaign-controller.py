@@ -188,8 +188,9 @@ DISPATCH_UNCONFIRMED_ALARM_SECONDS = 1800
 RECEIPT_SLA_SECONDS = 1800
 CRITIC_WAIT_SECONDS = 1200
 # The fresh critic's machine-readable output (new contract; its brief asks for
-# {screens:[{screen, grade, reason}]}). Today its lines live only in
-# run-record.md prose and the workgroup design-critic-log.ndjson.
+# {screens:[{screen, grade, reason, baseline?, existingIssue?}]}). Today its
+# lines live only in run-record.md prose and the workgroup
+# design-critic-log.ndjson.
 CRITIC_ARTIFACT = "contact-sheet/critic.json"
 # Open issues listed for title dedup; a listing that reaches it is incomplete
 # and files nothing (EffectLayer._gh).
@@ -887,8 +888,11 @@ ONESHOT_TEXT = {
         "*-full.png; an `unsettled` tile is not BROKEN evidence on its own. Then write its lines to "
         "{run}/contact-sheet/critic.json as {{\"screens\":[{{\"screen\":...,\"grade\":...,\"reason\":...}}],"
         "\"notes\":[...]}} and append each to {critic_log} as "
-        "{{runId, screen, grade, reason, ts}}. Write {run}/controller/dispatch-critic.started first. Never post, "
-        "finish, file issues or touch any other run file."),
+        "{{runId, screen, grade, reason, ts}}. When a screen's reason says its defect looks the same in the "
+        "baseline, add \"baseline\":\"same\" to that screen, and when an issue still open in {repo} already "
+        "tracks that defect on that screen, add its number as \"existingIssue\". Write "
+        "{run}/controller/dispatch-critic.started first. Never post, finish, file issues or touch any other run "
+        "file."),
     "adjudicator": (
         "Fresh dispute adjudication for smoke run {runId} (PR #{pr}, build {sha12}). Dispatch a fresh "
         "provider-native `qa-adjudicator` at its installed model/effort in the foreground on the "
@@ -1143,12 +1147,11 @@ class EffectLayer:
             lines = []
             critic, err = read_json_file(os.path.join(run, CRITIC_ARTIFACT))
             if not err and isinstance(critic, dict):
-                for s in critic.get("screens") or []:
-                    if isinstance(s, dict):
-                        lines.append("- {} · {} — {}".format(s.get("grade"), s.get("screen"), s.get("reason")))
-                for note in critic.get("notes") or []:
-                    lines.append("- NOTE · {}".format(note))
-            design = "\n".join(lines[:12]) if lines else "- not in by the root post; see the run record"
+                open_issues = None
+                if any(known_design_issue(x, self.cfg["repo"]) for x in critic.get("screens") or []):
+                    open_issues, _ = self._open_issues(self.cfg["repo"])
+                lines = design_check_lines(critic, open_issues, self.cfg["repo"])
+            design = "\n".join(lines) if lines else "- not in by the root post; see the run record"
             text = ("**Smoke campaign started — {}**\n{}\n{} please challenge every declared lane once its evidence "
                     "lands, and file your own disposition before reading the preliminary. Deadline {}. The frozen "
                     "build identity and both preview hosts are in the run record.\nDesign check:\n{}\n{}").format(
@@ -1670,7 +1673,8 @@ class EffectLayer:
         if not tmpl:
             return {"outcome": "failed", "error": "no one-shot brief for slot {!r}".format(slot)}
         prompt = tmpl.format(runId=run_id, pr=c["pr"], sha12=(c["sha"] or "")[:12], run=self._run_dir(run_id),
-                           critic_log=self.cfg.get("critic_log") or "the workgroup design-critic log") + \
+                           critic_log=self.cfg.get("critic_log") or "the workgroup design-critic log",
+                           repo=self.cfg["repo"]) + \
             "\n\n" + effect["marker"]
         argv = self.ncl + ["tasks", "create", "--name", effect["name"], "--prompt", prompt,
                            "--process-after", iso(self.ctl.now), "--isolated", "--mute-chat", "--json"]
@@ -2008,6 +2012,37 @@ def tracker_number(field, value, repo):
 def publication_label(kind, slot):
     """`kind:slot` for a verdict post (PUBLICATION_SLOTS), else None."""
     return "{}:{}".format(kind, slot) if (kind, slot) in PUBLICATION_SLOTS else None
+
+
+def known_design_issue(screen, repo):
+    """The issue a critic screen names as already tracking a defect it saw
+    unchanged in the baseline, or None."""
+    if not isinstance(screen, dict) or screen.get("baseline") != "same":
+        return None
+    return tracker_number("existingIssue", screen.get("existingIssue"), repo)
+
+
+def design_check_lines(critic, open_issues, repo, limit=12):
+    """The root post's design-check bullets, at most `limit`. A
+    baseline-identical screen whose named issue is in `open_issues` folds into
+    one KNOWN line after the other screens, so the build's own findings lead;
+    with no listing (None) nothing folds."""
+    open_numbers = {i.get("number") for i in open_issues or [] if isinstance(i, dict)}
+    lines, known = [], {}
+    for s in critic.get("screens") or []:
+        if not isinstance(s, dict):
+            continue
+        number = known_design_issue(s, repo)
+        if number is not None and number in open_numbers:
+            known.setdefault(number, []).append(str(s.get("screen")))
+            continue
+        lines.append("- {} · {} — {}".format(s.get("grade"), s.get("screen"), s.get("reason")))
+    if known:
+        lines = lines[:limit - 1] + ["- KNOWN · " + ", ".join(
+            "{}#{} ({})".format(repo.split("/")[-1], n, ", ".join(names)) for n, names in known.items())]
+    for note in critic.get("notes") or []:
+        lines.append("- NOTE · {}".format(note))
+    return lines[:limit]
 
 
 def normalize_title(title):

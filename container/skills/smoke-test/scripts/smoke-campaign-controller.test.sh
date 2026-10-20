@@ -1098,5 +1098,70 @@ dq '[.[] | select(.type=="dispatch")] | length == 1' | grep -qx true \
 dq '[.[] | select(.type=="escalate" and .reason=="controller_dispatch_ambiguous")] | length >= 1' | grep -qx true \
   || fail "the bare intent is escalated as ambiguous once a later listing still lacks it"
 
+# --- root post design check: known baseline defects fold into one KNOWN line --
+
+DC="$T/design-check"
+mkdir -p "$DC/$RUN/contact-sheet"
+python3 -B - "$CTL" "$DC" "$RUN" <<'PY' || fail "design check KNOWN fold"
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location("ctl", sys.argv[1]); m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+root, run_id = sys.argv[2], sys.argv[3]
+own = {"screen": "checkout", "grade": "BROKEN", "reason": "pay button clipped at 390"}
+untracked = {"screen": "orders", "grade": "BROKEN", "reason": "same as baseline", "baseline": "same"}
+known_a = {"screen": "ledger", "grade": "BROKEN", "reason": "filter overflows at 390, same in baseline",
+           "baseline": "same", "existingIssue": 41}
+known_b = {"screen": "ledger-planner", "grade": "DEGRADED", "reason": "label truncates, same in baseline",
+           "baseline": "same", "existingIssue": "#41"}
+changed = {"screen": "reports", "grade": "BROKEN", "reason": "new overlap", "existingIssue": 41}
+critic = {"screens": [known_a, own, untracked, known_b, changed], "notes": ["design system changed"]}
+open_issues = [{"number": 41, "title": "Ledger filter overflows"}]
+
+lines = m.design_check_lines(critic, open_issues, "acme/widget")
+assert lines == [
+    "- BROKEN · checkout — pay button clipped at 390",
+    "- BROKEN · orders — same as baseline",
+    "- BROKEN · reports — new overlap",
+    "- KNOWN · widget#41 (ledger, ledger-planner)",
+    "- NOTE · design system changed",
+], lines
+
+# A named issue that is not open, or no listing at all, folds nothing.
+for listing in ([{"number": 7}], None):
+    lines = m.design_check_lines(critic, listing, "acme/widget")
+    assert not any(l.startswith("- KNOWN") for l in lines), lines
+    assert lines[0] == "- BROKEN · ledger — filter overflows at 390, same in baseline", lines
+
+# Twelve unfolded screens still leave the KNOWN line inside the line limit.
+many = [{"screen": "s{}".format(n), "grade": "BROKEN", "reason": "r"} for n in range(12)]
+lines = m.design_check_lines({"screens": many + [known_a]}, open_issues, "acme/widget")
+assert len(lines) == 12 and lines[-1] == "- KNOWN · widget#41 (ledger)", lines
+lines = m.design_check_lines({"screens": many}, open_issues, "acme/widget")
+assert len(lines) == 12 and lines[-1] == "- BROKEN · s11 — r", lines
+
+# Through the root render: the open-issue listing is read only when a screen
+# could fold, and the KNOWN line follows the build's own findings.
+el = object.__new__(m.EffectLayer)
+el.cfg = {"repo": "acme/widget", "challenger_mention": "Challenger:"}
+el._claim = lambda rid: {"pr": 7, "sha": "a" * 40, "deadline": None}
+el._run_dir = lambda rid: os.path.join(root, rid)
+listed = []
+el._open_issues = lambda repo: (listed.append(repo), (open_issues, None))[1]
+critic_path = os.path.join(root, run_id, m.CRITIC_ARTIFACT)
+with open(critic_path, "w") as fh:
+    json.dump(critic, fh)
+text, _ = el._render({"runId": run_id, "slot": "root"})
+design = text.split("Design check:\n", 1)[1].splitlines()
+assert design[:4] == ["- BROKEN · checkout — pay button clipped at 390", "- BROKEN · orders — same as baseline",
+                      "- BROKEN · reports — new overlap", "- KNOWN · widget#41 (ledger, ledger-planner)"], design
+assert listed == ["acme/widget"], listed
+with open(critic_path, "w") as fh:
+    json.dump({"screens": [own, untracked]}, fh)
+listed.clear()
+text, _ = el._render({"runId": run_id, "slot": "root"})
+assert "- BROKEN · orders — same as baseline" in text and "KNOWN" not in text, text
+assert listed == [], listed
+PY
+
 [ ! -e "$T/effects.log" ] || fail "shadow invoked an effect command: $(cat "$T/effects.log")"
 echo "smoke campaign controller tests passed"

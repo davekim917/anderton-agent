@@ -1391,8 +1391,8 @@ cite() { # <file> <line> <literal substring the cited line must contain>
     || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
 }
 ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
-for c in 'smoke-pr-gate.sh:5673' 'smoke-campaign-controller.py:1753-1755' \
-         'smoke-run-scaffold.sh:270-272' 'smoke-campaign-controller.py:1742-1752'; do
+for c in 'smoke-pr-gate.sh:5673' 'smoke-campaign-controller.py:1757-1759' \
+         'smoke-run-scaffold.sh:270-272' 'smoke-campaign-controller.py:1746-1756'; do
   grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
 done
 cite smoke-pr-gate.sh 5673 'OWNER_TOKEN="$(new_owner_token'
@@ -1401,9 +1401,9 @@ cite smoke-pr-gate.sh 5707 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
 cite smoke-pr-gate.sh 5755 '.activeLeaseOwner=$owner'
 cite smoke-run-scaffold.sh 271 '[ "$owner" = "$DEFAULT_OWNER" ]'
 cite smoke-run-scaffold.sh 710 'adds NO new authority check of its own'
-cite smoke-campaign-controller.py 1698 'def _owner_wake'
-cite smoke-campaign-controller.py 1748 'os.unlink("brief-{}.ack"'
-cite smoke-campaign-controller.py 1753 'if c.get("wake"):'
+cite smoke-campaign-controller.py 1702 'def _owner_wake'
+cite smoke-campaign-controller.py 1752 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1757 'if c.get("wake"):'
 
 
 fi
