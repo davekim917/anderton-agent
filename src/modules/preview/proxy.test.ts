@@ -187,14 +187,16 @@ describe('preview proxy routing', () => {
     expect(opened).toEqual([]);
   });
 
+  it('forwards an /@fs/ path, since a pnpm workspace serves the Vite client through it', async () => {
+    const path = '/@fs/workspace/app/node_modules/.pnpm/vite@7.0.0/node_modules/vite/dist/client/env.mjs';
+    expect((await request(path)).status).toBe(201);
+    expect(hits[0].url).toBe(path);
+  });
+
   it.each([
-    '/@fs/etc/passwd',
-    '/@FS/etc/passwd',
-    '/%40fs/etc/passwd',
-    '/%2540fs/etc/passwd',
-    '/@id//@fs/etc/passwd',
-    '/@id/__x00__/@fs/etc/passwd',
     '/src/../../etc/passwd',
+    '/@fs/workspace/app/../../../etc/passwd',
+    '/%40fs/workspace/%2e%2e/secret',
     '/src/%2e%2e/secret',
     '/src/%252e%252e/secret',
     '/src\\..\\secret',
@@ -306,7 +308,7 @@ describe('preview proxy routing', () => {
     expect((await upgrade('/', `ffffffffffffffffffffffffffffffff.preview.example.test`)).first).toMatch(
       /^HTTP\/1\.1 404 /,
     );
-    expect((await upgrade('/@id//@fs/etc/passwd')).first).toMatch(/^HTTP\/1\.1 403 /);
+    expect((await upgrade('/src/%2e%2e/secret')).first).toMatch(/^HTTP\/1\.1 403 /);
     expect(opened).toEqual([]);
   });
 });
@@ -318,6 +320,7 @@ describe('pathVerdict / previewIdFromHost', () => {
       '/src/main.tsx?t=123',
       '/@vite/client',
       '/@id/react',
+      '/@fs/workspace/node_modules/vite/dist/client/client.mjs',
       '/node_modules/.vite/deps/react.js?v=1',
     ])
       expect(pathVerdict(p)).toBeNull();

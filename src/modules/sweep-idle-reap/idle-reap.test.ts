@@ -174,6 +174,7 @@ vi.mock('../../config.js', async (importOriginal) => {
     get DATA_DIR() {
       return h.dataDir;
     },
+    PREVIEW_ORIGIN_SUFFIX: 'preview.example.test',
   };
 });
 
@@ -341,6 +342,7 @@ import {
   type SweepSessionContext,
 } from '../../host-sweep.js';
 import { _mailboxSessionDepthForTesting } from '../../host-sweep-depth-probe.js';
+import { closePreview, openPreview, PREVIEW_TTL_MS } from '../preview/service.js';
 
 probe.depth = _mailboxSessionDepthForTesting;
 
@@ -592,6 +594,25 @@ describe('the idle reaps win over ceiling enforcement in the exclusive chain', (
 
       expect(h.kills).toEqual([{ sessionId: 'sess-direct', reason: 'chat-idle-reap', depth: 0 }]);
       expect(h.spawns).toEqual([]);
+    });
+
+    it('S13 does not reap a quiet chat session with an open live preview, until it closes or expires', async () => {
+      const duty = getHealthDuty(SWEEP_DUTY_INVENTORY.S13);
+      const longQuiet = Date.now() - CHAT_IDLE_REAP_MS - 1;
+      const quietCtx = fakeHealthCtx({ lastOutboundAtMs: longQuiet, lastInboundAtMs: longQuiet });
+      const preview = { sessionId: 'sess-direct', agentGroupId: 'ag-1', containerName: 'nanoclaw-v2-ag-1', port: 5173 };
+
+      const opened = Date.now();
+      openPreview(preview);
+      expect(await duty.claims!(quietCtx)).toBe(false);
+      closePreview('sess-direct');
+      expect(await duty.claims!(quietCtx)).toBe(true);
+
+      openPreview(preview);
+      vi.spyOn(Date, 'now').mockReturnValue(opened + PREVIEW_TTL_MS + 60_000);
+      expect(await duty.claims!(quietCtx)).toBe(true);
+      vi.restoreAllMocks();
+      closePreview('sess-direct');
     });
 
     describe('a parked continuation does not hold a container open', () => {

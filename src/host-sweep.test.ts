@@ -58,6 +58,7 @@ import './modules/sweep-session-core/index.js';
 import { getRawDb } from './db/connection.js';
 import { withCentralSync } from './db/central-lease.js';
 import type { Session } from './types.js';
+import { closePreview, openPreview } from './modules/preview/service.js';
 
 // ─── Module mocks for C3 watchdog integration tests ──────────────────────────
 // These mocks are hoisted and only affect tests that use them. The existing
@@ -86,6 +87,7 @@ vi.mock('./config.js', async (importOriginal) => {
     get DATA_DIR() {
       return testDataDir.dir;
     },
+    PREVIEW_ORIGIN_SUFFIX: 'preview.example.test',
   };
 });
 
@@ -442,6 +444,27 @@ describe('sweepSession on a session with no mailbox', () => {
     });
     await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
     expect(mockKillContainer).not.toHaveBeenCalled();
+    await closeDb();
+  });
+
+  it('a container past the ceiling with an open live preview is not killed, and is once the preview closes', async () => {
+    await initMigratedTestDb();
+    getRawDb()
+      .prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`)
+      .run(new Date().toISOString());
+    mockKillContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
+
+    const f = slaFixture('sess-sla-preview', ABSOLUTE_CEILING_MS + 60_000, ABSOLUTE_CEILING_MS + 120_000);
+    await createSession(f.session);
+    openPreview({ sessionId: f.session.id, agentGroupId: 'ag-sla', containerName: 'nanoclaw-v2-sla-1', port: 5173 });
+    await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+    expect(mockKillContainer).not.toHaveBeenCalled();
+
+    closePreview(f.session.id);
+    await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+    expect(mockKillContainer).toHaveBeenCalled();
     await closeDb();
   });
 

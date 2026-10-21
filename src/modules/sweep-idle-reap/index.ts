@@ -15,6 +15,7 @@ import {
 } from '../../host-sweep.js';
 
 import { CHAT_IDLE_REAP_KILL } from '../sweep-continuation/kill-state.js';
+import { heldAwakeUntilMs } from '../sweep-container-health/held-awake.js';
 import { startChatReapFollowUp } from './reap-follow-up.js';
 import { shouldReapIdleTaskContainer } from './task-idle.js';
 export { shouldReapIdleTaskContainer } from './task-idle.js';
@@ -79,8 +80,9 @@ function registerIdleReapSweepDuties(): void {
     name: id.S13,
     phase: 'session:health',
     order: 30,
-    claims: (ctx) =>
-      shouldReapIdleChatContainer(
+    claims: async (ctx) => {
+      const now = Date.now();
+      const quiet = shouldReapIdleChatContainer(
         ctx.session.thread_id,
         ctx.plan.dueCount,
         ctx.observed!.processingClaimCount,
@@ -88,8 +90,12 @@ function registerIdleReapSweepDuties(): void {
         holdsLiveContinuation(ctx.plan.workContinuation),
         ctx.observed!.lastOutboundAtMs,
         ctx.observed!.lastInboundAtMs,
-        Date.now(),
-      ),
+        now,
+      );
+      if (!quiet) return false;
+      const heldUntil = await heldAwakeUntilMs(ctx.session.id);
+      return heldUntil === null || heldUntil <= now;
+    },
     run: (ctx) => {
       const sessionCtx = ctx as SweepSessionContext;
       const { session } = sessionCtx;

@@ -51,8 +51,9 @@ function endToEndHeaders(raw: string[], drop: ReadonlySet<string> = HOP_BY_HOP):
 }
 
 /**
- * The second layer behind Vite's own `server.fs.allow`: `/@fs/` serves any file the dev server can read, and `..` or
- * a backslash is how a path escapes its root. Decoded to a fixed point, so no encoding of either gets through.
+ * `..` or a backslash is how a path escapes the app's root, decoded to a fixed point so no encoding of either gets
+ * through. `/@fs/` is not refused: in a pnpm workspace Vite serves its own client and deps through it, and which files
+ * it may serve is the app's `server.fs.allow`.
  */
 export function pathVerdict(target: string | undefined): 400 | 403 | null {
   if (!target?.startsWith('/')) return 400;
@@ -69,7 +70,7 @@ export function pathVerdict(target: string | undefined): 400 | 403 | null {
     if (next === path) break;
     path = next;
   }
-  if (path.toLowerCase().includes('/@fs/') || path.includes('..') || path.includes('\\')) return 403;
+  if (path.includes('..') || path.includes('\\')) return 403;
   return null;
 }
 

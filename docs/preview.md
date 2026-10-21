@@ -15,6 +15,10 @@ running app in their own browser, hot reload included, while the agent keeps edi
 4. `ncl preview status` shows the session's open preview. The preview ends on `ncl preview close`, when the
    container exits, or 8 hours after it opened. A new `open` from the same session replaces the old one, and the old
    URL stops working at once.
+5. While a preview is open, the session counts as active: the host withholds the chat idle reap and the stuck
+   ceiling until the preview ends, for up to 8 hours (`heldAwakeUntilMs`). An agent should run `ncl preview close`
+   as soon as nobody needs the app, or its container stays up for the rest of those 8 hours. A scheduled-task
+   session is not held.
 
 Previews live in host memory. A host restart ends them all; the agent opens a new one.
 
@@ -22,6 +26,7 @@ Previews live in host memory. A host restart ends them all; the agent opens a ne
 
 - Listen on `127.0.0.1`, not `localhost`: Node can resolve `localhost` to `::1` only, which the bridge does not reach.
 - Accept the preview host. Vite: `server.allowedHosts: ['.<suffix>']`. The proxy passes `Host` through unchanged.
+- Keep `server.fs.allow` to the app and its packages (see Security model).
 - Leave HMR on the page's own origin (Vite's default when `server.hmr` sets no port), so the browser connects to
   `wss://<id>.<suffix>`.
 
@@ -37,9 +42,13 @@ Previews live in host memory. A host restart ends them all; the agent opens a ne
 - **Ending a preview cuts what is open through it.** Close, replacement and expiry also end WebSockets and
   streaming responses already open on the old URL, not just new requests. Each preview holds at most 32 live
   WebSockets, since every one is its own `docker exec`; the next gets 503.
-- **A second layer behind Vite's `server.fs.allow`.** Before forwarding, the proxy refuses with 403 any path
-  containing `/@fs/` (case-insensitive, including `/@id/` prefixed forms), `..`, or a backslash. It checks the path
-  after URL-decoding it to a fixed point, so no encoding of these gets through.
+- **The app owns which files it serves.** Vite's `server.fs.allow` and its real-path check decide what `/@fs/` may
+  read; the proxy forwards `/@fs/` paths, because in a pnpm workspace Vite serves its own client and dependencies
+  through them. Before forwarding, the proxy refuses with 403 only a path containing `..` or a backslash, checked
+  after URL-decoding it to a fixed point, so no encoding of either gets through. Anyone with the URL can
+  request any path the app will serve, so `server.fs.allow` must hold only the app and the packages it builds from,
+  never a directory with the agent's own instructions, memory or credentials. `ncl preview open`'s help tells the
+  agent so.
 - **Only the opening session's container.** `open` resolves the calling session's running container. An agent cannot
   point a preview at another container or at the host.
 - **Previews are same-site with each other.** Every preview is a sibling subdomain of one suffix, and with any other

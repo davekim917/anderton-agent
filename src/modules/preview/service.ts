@@ -100,6 +100,11 @@ export function closePreview(sessionId: string): { closed: boolean } {
   return { closed: preview !== undefined };
 }
 
+/** When the session's open preview expires, or null with none open. */
+export function previewHeldUntilMs(sessionId: string): number | null {
+  return bySession.get(sessionId)?.expiresAt ?? null;
+}
+
 export function previewStatus(sessionId: string): PreviewInfo | null {
   const preview = bySession.get(sessionId);
   return preview ? info(preview) : null;
