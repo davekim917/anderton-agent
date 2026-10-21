@@ -2,9 +2,8 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * One row per routing check (`src/thread-route-check.ts`): the score Jev gave a candidate thread for a post, and what
- * the host did with it, kept so the threshold can be re-tuned on live decisions. `score` is NULL when the check
- * failed; `error` says why.
+ * One row per Jev routing check on an `lb-` keyed post: the score Jev gave a candidate thread for a post, and what
+ * the host did with it. `score` is NULL when the check failed; `error` says why.
  */
 export const migration086: Migration = {
   version: 86,

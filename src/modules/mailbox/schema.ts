@@ -65,9 +65,6 @@ export function migrateDeliveredTable(db: Database.Database): void {
   if (!cols.has('lifecycle_terminal_at')) {
     db.prepare('ALTER TABLE delivered ADD COLUMN lifecycle_terminal_at TEXT').run();
   }
-  if (!cols.has('notice')) {
-    db.prepare('ALTER TABLE delivered ADD COLUMN notice TEXT').run();
-  }
   if (!cols.has('task_list_route')) {
     db.prepare('ALTER TABLE delivered ADD COLUMN task_list_route TEXT').run();
   }

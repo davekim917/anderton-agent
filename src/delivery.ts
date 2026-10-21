@@ -48,9 +48,6 @@ import { scrubSecrets } from './secret-scrubber.js';
 import { humanizeOutboundContent } from './verdict-tokens.js';
 import { archiveMessage } from './message-archive.js';
 import { resolveContinueThread } from './continue-thread.js';
-import type { RouteCheckRequest } from './thread-route-check.js';
-import { forgetRouteVerdict, routeVerdict, routeVetoNotice, type RouteCheckVerdict } from './thread-route-verdict.js';
-import { isRouteCheckedKey, splitThreadKey } from './thread-route-split.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
 import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './modules/mailbox/index.js';
@@ -888,14 +885,12 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       const ackKey = `${session.id}:${msg.id}`;
       const result =
         sentAwaitingAck.get(ackKey) ?? (await withThreadKeyLock(msg, session, () => deliverMessage(msg, session)));
-      // Its routing check is still running in the background: nothing was sent, and later rows wait behind it.
-      if (result.routePending) break;
       // deferAck: the handler owns the `delivered` row (e.g. request_bash_gate on approval); auto-acking would
       // silently unblock a gated command.
       if (!result.deferAck) {
         try {
           await ackDelivery(agentGroup.id, session.id, (mailbox) => {
-            mailbox.markDelivered(msg.id, result.platformMsgId ?? null, result.notice, result.taskListRoute);
+            mailbox.markDelivered(msg.id, result.platformMsgId ?? null, result.taskListRoute);
             if (msg.kind === 'chat' && !result.recordOnly)
               for (const id of heldListPosts) mailbox.markDelivered(id, null);
           });
@@ -1098,15 +1093,12 @@ async function deliverMessage(
     thread_id: string | null;
     content: string;
     in_reply_to: string | null;
-    timestamp?: string;
   },
   session: Session,
 ): Promise<{
   platformMsgId?: string;
   deferAck?: true;
   recordOnly?: true;
-  notice?: string;
-  routePending?: true;
   taskListRoute?: string;
 }> {
   if (msg.kind === 'work_log') return { recordOnly: true };
@@ -1610,46 +1602,11 @@ async function deliverMessage(
   let effectiveThreadId = baseThreadId;
   let usedAnchor = false;
   let adoptedThreadPlatformId: string | undefined;
-  // A vetoed post lands at root; a veto of the key's own thread also moves the post to a split key, so the earlier
-  // request keeps its anchor and this one gets its own.
-  let routeVeto: { verdict: RouteCheckVerdict; candidateThreadId: string; splitAddr?: ThreadKeyAddress } | undefined;
   if (keyAddr) {
-    const checked = !isInPlaceOp && isRouteCheckedKey(keyAddr.threadKey);
-    const { channel_type: channelType, platform_id: platformId } = msg;
-    const routeCheck = (via: RouteCheckRequest['via'], threadPlatformId: string, split?: string) =>
-      routeVerdict({
-        via,
-        threadKey: keyAddr.threadKey,
-        postText: typeof content.text === 'string' ? content.text : '',
-        channelType,
-        platformId,
-        threadPlatformId,
-        agentGroupId: session.agent_group_id,
-        messagingGroupId: keyAddr.messagingGroupId,
-        sessionId: session.id,
-        messageOutId: msg.id,
-        queuedAt: msg.timestamp,
-        splitThreadKey: split,
-      });
     const anchor = await getThreadKeyAnchor(keyAddr, new Date().toISOString());
     if (anchor && !(isInPlaceOp && content.messageId === anchor.threadPlatformId)) {
-      // Only a `handoff` post is judged: work sessions post their results as `decision` into their own thread, and
-      // judging those would veto legitimate results. A routing post sent as `decision` therefore goes unchecked; the
-      // current watcher routes only by handoff, but did post `decision` before it split dispatch from triage.
-      const split =
-        checked && content.reporting?.purpose === 'handoff' ? splitThreadKey(keyAddr.threadKey, msg.id) : null;
-      const verdict = split !== null ? routeCheck('anchor', anchor.threadPlatformId, split) : undefined;
-      if (verdict === 'pending') return { routePending: true };
-      if (split !== null && verdict && !verdict.keep) {
-        routeVeto = {
-          verdict,
-          candidateThreadId: anchor.threadPlatformId,
-          splitAddr: { ...keyAddr, threadKey: split },
-        };
-      } else {
-        effectiveThreadId = `${msg.platform_id}:${anchor.threadPlatformId}`;
-        usedAnchor = true;
-      }
+      effectiveThreadId = `${msg.platform_id}:${anchor.threadPlatformId}`;
+      usedAnchor = true;
     } else if (!anchor && !isInPlaceOp && content.continueThread !== undefined) {
       // No live anchor: the key may adopt an existing thread the host confirms is on
       // this messaging group (src/continue-thread.ts); unconfirmed posts at root as before.
@@ -1658,11 +1615,7 @@ async function deliverMessage(
         { messagingGroupId: keyAddr.messagingGroupId, channelType: msg.channel_type, platformId: msg.platform_id },
         { id: msg.id, sessionId: session.id, threadKey },
       );
-      const verdict = adopted && checked ? routeCheck('adopt', adopted.threadPlatformId) : undefined;
-      if (verdict === 'pending') return { routePending: true };
-      if (adopted && verdict && !verdict.keep) {
-        routeVeto = { verdict, candidateThreadId: adopted.threadPlatformId };
-      } else if (adopted) {
+      if (adopted) {
         effectiveThreadId = adopted.threadId;
         adoptedThreadPlatformId = adopted.threadPlatformId;
         usedAnchor = true;
@@ -1844,7 +1797,7 @@ async function deliverMessage(
   // Record only a fresh ROOT post as the anchor; overwriting it with a threaded reply would chain later posts off
   // the wrong message.
   if (keyAddr && !isInPlaceOp) {
-    await settleThreadKeyAnchor(routeVeto?.splitAddr ?? keyAddr, {
+    await settleThreadKeyAnchor(keyAddr, {
       threaded: effectiveThreadId !== null,
       fellBack: usedAnchor && effectiveThreadId === null,
       platformMsgId,
@@ -1911,22 +1864,9 @@ async function deliverMessage(
   }
 
   clearOutbox(session.agent_group_id, session.id, msg.id);
-  if (keyAddr && isRouteCheckedKey(keyAddr.threadKey)) forgetRouteVerdict(msg.id);
 
-  const notice =
-    routeVeto && keyAddr
-      ? routeVetoNotice({
-          verdict: routeVeto.verdict,
-          threadKey: keyAddr.threadKey,
-          candidateThreadId: routeVeto.candidateThreadId,
-          platformId: msg.platform_id,
-          rootMessageId: platformMsgId,
-          splitThreadKey: routeVeto.splitAddr?.threadKey,
-        })
-      : undefined;
   return {
     platformMsgId: platformMsgId ?? undefined,
-    ...(notice ? { notice } : {}),
     ...taskListPostReceipt(msg.kind, content, msg.channel_type, msg.platform_id, effectiveThreadId, deliverInstance),
   };
 }

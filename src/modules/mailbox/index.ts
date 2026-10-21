@@ -301,8 +301,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
   setRouting(routing: UpstreamSessionRouting): void;
   /** Fence-aware: epoch-tagged rows are inert and never counted. */
   countDueMessages(): number;
-  /** UPSERT over an earlier 'pending'/'failed' row; clears `error` and sets `notice` (null when absent). */
-  markDelivered(messageOutId: string, platformMessageId: string | null, notice?: string, taskListRoute?: string): void;
+  /** UPSERT over an earlier 'pending'/'failed' row; clears `error`. */
+  markDelivered(messageOutId: string, platformMessageId: string | null, taskListRoute?: string): void;
   /** UPSERT that records the adapter's error message. */
   markDeliveryFailed(messageOutId: string, errorMessage?: string): void;
   /** Preserve the delivery receipt while marking its activity line terminal. */
@@ -824,8 +824,8 @@ function forkOps(
         thread_id: routing.threadId,
       }),
     countDueMessages: () => countDueMessages(inbound),
-    markDelivered: (messageOutId, platformMessageId, notice, taskListRoute) =>
-      markDelivered(inbound, messageOutId, platformMessageId, notice, taskListRoute),
+    markDelivered: (messageOutId, platformMessageId, taskListRoute) =>
+      markDelivered(inbound, messageOutId, platformMessageId, taskListRoute),
     markDeliveryFailed: (messageOutId, errorMessage) => markDeliveryFailed(inbound, messageOutId, errorMessage),
     markLifecycleTerminal: (messageOutId) => markLifecycleTerminal(inbound, messageOutId),
     insertMessage: async (message) => {

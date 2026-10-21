@@ -555,7 +555,7 @@ CREATE INDEX idx_mcp_oauth_integrations_status ON mcp_oauth_integrations (status
 
 ### 1.23 `thread_route_checks`
 
-One row per routing check on an `lb-` keyed post (`src/thread-route-check.ts`; see [agent-runner-details.md](agent-runner-details.md), "Keyed threads"): the Jev score a candidate thread got for the post, the threshold, and what the host did, kept so the threshold can be re-tuned on live decisions. Added by migration 086; written only by the check. `score` is NULL when the check failed and `error` says why; `split_thread_key` is set when a `handoff` into a key's own thread was vetoed.
+**Retired — no writer, no reader.** Added by migration 086 for the host's Jev routing check on `lb-` keyed posts, which has since been removed; `lb-` keys now route like every other thread key. The table is left in place with the rows the check wrote (one per check: the Jev score a candidate thread got for the post, the threshold, and what the host did). `score` is NULL when the check failed and `error` says why; `split_thread_key` is set when a `handoff` into a key's own thread was vetoed.
 
 ```sql
 CREATE TABLE thread_route_checks (

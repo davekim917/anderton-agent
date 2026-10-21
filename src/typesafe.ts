@@ -8,7 +8,7 @@ import { fetch as undiciFetch } from 'undici';
 import { getProxyDispatcher } from './llm.js';
 
 /** Pinned: a threshold tuned against one model means nothing after an alias moves. */
-export const JEV_MODEL = 'jev-1.13.0';
+const JEV_MODEL = 'jev-1.13.0';
 const ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
 
 /** An object holds the question in one field and the data it refers to in others ("structured instructions"). */
