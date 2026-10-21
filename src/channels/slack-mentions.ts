@@ -209,6 +209,16 @@ export function resolveSlackMentions(
   const USERNAME = String.raw`[${WORD}-]+(?:\.[${WORD}-]+)*`;
   const BRACKETED_RE = new RegExp(String.raw`(?<![${WORD}/:=?&#])<@(${USERNAME})>`, 'gu');
   const BARE_RE = new RegExp(String.raw`(?<![${WORD}/:=?&#])@(${USERNAME})`, 'gu');
+  // Inbound rewriting renders `<@U…>` as the display name, which may contain spaces (`@The Quiet Heron`); USERNAME
+  // stops at the first space and would resolve `@The` instead. Known spaced aliases match whole, longest first.
+  const spacedAliases = [...byName.keys()].filter((alias) => /\s/.test(alias)).sort((a, b) => b.length - a.length);
+  const SPACED_RE =
+    spacedAliases.length > 0
+      ? new RegExp(
+          String.raw`(?<![${WORD}/:=?&#])<?@(${spacedAliases.map((a) => escapeRegExp(a).replace(/\s+/g, String.raw`\s+`)).join('|')})(?:>|(?![${WORD}]))`,
+          'giu',
+        )
+      : null;
 
   const botNameById = new Map<string, string>();
   for (const ident of bots.values()) {
@@ -226,7 +236,13 @@ export function resolveSlackMentions(
       return id ? `<@${id}>` : match;
     };
 
-    const afterBracketed = segment.replace(BRACKETED_RE, rewriteByName);
+    const afterSpaced = SPACED_RE
+      ? segment.replace(SPACED_RE, (match, name: string) => {
+          const id = byName.get(name.toLowerCase().replace(/\s+/g, ' '));
+          return id ? `<@${id}>` : match;
+        })
+      : segment;
+    const afterBracketed = afterSpaced.replace(BRACKETED_RE, rewriteByName);
     return afterBracketed.replace(BARE_RE, (match, name: string, offset: number) => {
       // Pass 1 already handled bracketed forms.
       if (offset > 0 && afterBracketed[offset - 1] === '<') return match;

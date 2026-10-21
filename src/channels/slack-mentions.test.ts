@@ -442,6 +442,27 @@ describe('resolveSlackMentions', () => {
       );
     });
 
+    it('resolves a multi-word display name whole, the form inbound rewriting hands the agent', () => {
+      const humans = new Map<string, SlackBotIdentity[]>();
+      humans.set(LABS_TEAM, [
+        {
+          userId: 'U-HERON',
+          username: 'heron',
+          displayName: 'The Quiet Heron',
+          realName: 'Hal Heron',
+          teamId: LABS_TEAM,
+        },
+        // A one-word username equal to the first word: the longer name must still win.
+        { userId: 'U-THE', username: 'the', displayName: '', realName: '', teamId: LABS_TEAM },
+      ]);
+      const resolve = (text: string) => resolveSlackMentions(text, 'slack-example-labs', makeBots(), humans);
+      expect(resolve('Hi @The Quiet Heron 👋')).toBe('Hi <@U-HERON> 👋');
+      expect(resolve('say hi to @the quiet heron.')).toBe('say hi to <@U-HERON>.');
+      expect(resolve('cc <@The Quiet Heron> and @Hal Heron')).toBe('cc <@U-HERON> and <@U-HERON>');
+      expect(resolve('ping @the')).toBe('ping <@U-THE>');
+      expect(resolve('run `@The Quiet Heron` literally')).toBe('run `@The Quiet Heron` literally');
+    });
+
     it('unknown Unicode names stay untouched', () => {
       expect(resolveSlackMentions('ping @Zoë', 'slack-example-labs', makeBots(), makeHumans())).toBe('ping @Zoë');
     });
