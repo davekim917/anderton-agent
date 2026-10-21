@@ -25,6 +25,7 @@ export const GROUP_SCOPE_RESOURCES = new Set([
   'tasks',
   'secrets',
   'browser',
+  'preview',
 ]);
 
 export type Access = 'open' | 'approval' | 'hidden';

@@ -21,3 +21,4 @@ import './usage.js';
 import './integrations.js';
 import './secrets.js';
 import './browser.js';
+import './preview.js';

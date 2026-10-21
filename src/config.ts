@@ -33,6 +33,8 @@ const envConfig = readEnvFile([
   'NANOCLAW_ONECLI_APPROVALS',
   'BROWSER_TAKEOVER_ORIGIN',
   'BROWSER_TAKEOVER_PORT',
+  'PREVIEW_ORIGIN_SUFFIX',
+  'PREVIEW_PORT',
 ]);
 
 /**
@@ -199,6 +201,14 @@ export const BROWSER_TAKEOVER_PORT = parseInt(
   process.env.BROWSER_TAKEOVER_PORT || envConfig.BROWSER_TAKEOVER_PORT || '3001',
   10,
 );
+
+// Live app preview: the DNS suffix a wildcard tunnel routes to the preview proxy (e.g. preview.example.com, serving
+// https://<id>.preview.example.com). Empty = feature off.
+export const PREVIEW_ORIGIN_SUFFIX = (process.env.PREVIEW_ORIGIN_SUFFIX || envConfig.PREVIEW_ORIGIN_SUFFIX || '')
+  .trim()
+  .toLowerCase()
+  .replace(/^\.+|\.+$/g, '');
+export const PREVIEW_PORT = parseInt(process.env.PREVIEW_PORT || envConfig.PREVIEW_PORT || '3002', 10);
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.

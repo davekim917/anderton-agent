@@ -84,6 +84,7 @@ import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { startDashboard } from './dashboard/index.js';
 import { startBrowserTakeoverProxy } from './modules/browser-takeover/proxy.js';
+import { startPreviewProxy } from './modules/preview/proxy.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 import { reconcilePendingUpgradeContexts } from './session-manager.js';
 import { releaseOrphanedRepoIngressFencesAtStartup } from './repo-fence-recovery.js';
@@ -655,6 +656,7 @@ export async function main(): Promise<void> {
   // After migrations (028) and before channel adapters, so the HTTP server is up regardless of channel config.
   startDashboard();
   startBrowserTakeoverProxy();
+  startPreviewProxy();
 
   // Recovers tasks left 'pending' with admitted_at set but no child_session_id (host crashed mid-completion).
   await runDispatchReconcilerOnStartup();

@@ -142,6 +142,7 @@ import {
   WORKGROUP_MEMORY_CONTAINER_PATH,
 } from './modules/workgroup/shared-dirs.js';
 import { browserStateMount } from './modules/browser-takeover/state-dir.js';
+import { endPreviewForContainer } from './modules/preview/service.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 import { protectReadonlyHostPaths, readWorkgroupReadonlyPaths } from './workgroup-readonly-paths.js';
 import {
@@ -1592,6 +1593,7 @@ export function finalizeSession(
     // Exit handlers are synchronous, so the status write is fire-and-forget.
     void finishSessionBookkeeping(sessionId, active.claimIncarnation);
     stopTypingRefresh(sessionId);
+    endPreviewForContainer(sessionId, active.containerName);
     if (active.channel.kind === 'adopted') {
       active.channel.settled = true;
       // Exit callbacks attached through `channelOnClose` ride this, after the

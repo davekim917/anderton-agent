@@ -30,6 +30,7 @@ vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
   DATA_DIR: TEST_DATA_DIR,
   GROUPS_DIR: TEST_GROUPS_DIR,
+  PREVIEW_ORIGIN_SUFFIX: 'preview.example.test',
 }));
 
 // NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
@@ -241,6 +242,7 @@ import { closeDb } from './db/connection.js';
 import { getSessionClaim } from './db/coordination.js';
 import { stopHostInstanceLease } from './host-instance.js';
 import { log } from './log.js';
+import { openPreview, previewStatus } from './modules/preview/service.js';
 import {
   CLAIM_HARNESS_AGENT_GROUP_ID,
   callerSnapshot,
@@ -433,6 +435,21 @@ describe('supervision channel', () => {
     fakes.listingFails = false;
     fakes.exit('nanoclaw-v2-sess-unreadable', 0);
     await until(() => !isContainerRunning('sess-unreadable'), 'the adopted entry never finalized');
+  });
+
+  it("a container's exit ends the live preview it opened", async () => {
+    await adopt('sess-preview-exit');
+    openPreview({
+      sessionId: 'sess-preview-exit',
+      agentGroupId: CLAIM_HARNESS_AGENT_GROUP_ID,
+      containerName: 'nanoclaw-v2-sess-preview-exit',
+      port: 5173,
+    });
+
+    fakes.exit('nanoclaw-v2-sess-preview-exit', 0);
+    await until(() => !isContainerRunning('sess-preview-exit'), 'the adopted entry never finalized');
+
+    expect(previewStatus('sess-preview-exit')).toBeNull();
   });
 
   it('finalize is a no-op for a channel that is no longer registered', async () => {
