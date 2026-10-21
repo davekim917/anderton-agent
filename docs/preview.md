@@ -26,7 +26,7 @@ Previews live in host memory. A host restart ends them all; the agent opens a ne
 
 - Listen on `127.0.0.1`, not `localhost`: Node can resolve `localhost` to `::1` only, which the bridge does not reach.
 - Accept the preview host. Vite: `server.allowedHosts: ['.<suffix>']`. The proxy passes `Host` through unchanged.
-- Keep `server.fs.allow` to the app and its packages (see Security model).
+- Run from a checkout under `/workspace/worktrees`. `/@fs/` paths anywhere else are refused (see Security model).
 - Leave HMR on the page's own origin (Vite's default when `server.hmr` sets no port), so the browser connects to
   `wss://<id>.<suffix>`.
 
@@ -42,13 +42,15 @@ Previews live in host memory. A host restart ends them all; the agent opens a ne
 - **Ending a preview cuts what is open through it.** Close, replacement and expiry also end WebSockets and
   streaming responses already open on the old URL, not just new requests. Each preview holds at most 32 live
   WebSockets, since every one is its own `docker exec`; the next gets 503.
-- **The app owns which files it serves.** Vite's `server.fs.allow` and its real-path check decide what `/@fs/` may
-  read; the proxy forwards `/@fs/` paths, because in a pnpm workspace Vite serves its own client and dependencies
-  through them. Before forwarding, the proxy refuses with 403 only a path containing `..` or a backslash, checked
-  after URL-decoding it to a fixed point, so no encoding of either gets through. Anyone with the URL can
-  request any path the app will serve, so `server.fs.allow` must hold only the app and the packages it builds from,
-  never a directory with the agent's own instructions, memory or credentials. `ncl preview open`'s help tells the
-  agent so.
+- **`/@fs/` reaches only the agent's checkouts.** `/@fs/<absolute path>` reads any file the app's `server.fs.allow`
+  admits, and Vite's default admits the whole workspace root it detects. An agent container also mounts its group
+  folder at `/workspace/agent` and live credentials under `/home/node`, so the proxy does not leave this to the app.
+  Every `/@fs/` in a path, including after `/@id/`, must be followed by `/workspace/worktrees/`, where the container
+  mounts its repository checkouts; anything else answers 403 `Preview serves files only from the agent's
+checkouts.` pnpm resolves Vite's client and dependencies to the checkout's own `node_modules/.pnpm`, so a
+  monorepo still loads. The proxy also refuses with 403 any path containing `..` or a backslash. Both rules apply
+  after URL-decoding to a fixed point, so no encoding gets past them. Within the checkouts the app's own
+  `server.fs.allow` still decides.
 - **Only the opening session's container.** `open` resolves the calling session's running container. An agent cannot
   point a preview at another container or at the host.
 - **Previews are same-site with each other.** Every preview is a sibling subdomain of one suffix, and with any other

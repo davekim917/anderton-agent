@@ -187,16 +187,41 @@ describe('preview proxy routing', () => {
     expect(opened).toEqual([]);
   });
 
-  it('forwards an /@fs/ path, since a pnpm workspace serves the Vite client through it', async () => {
-    const path = '/@fs/workspace/app/node_modules/.pnpm/vite@7.0.0/node_modules/vite/dist/client/env.mjs';
+  it.each([
+    '/@fs/workspace/worktrees/x/node_modules/.pnpm/vite@6.3.5/node_modules/vite/dist/client/env.mjs',
+    '/@id//@fs/workspace/worktrees/x/packages/ui/src/button.tsx',
+    '/%40fs/workspace/worktrees/x/node_modules/.vite/deps/react.js?v=1',
+  ])('forwards %s, a file under the agent checkouts that a pnpm workspace serves through /@fs/', async (path) => {
     expect((await request(path)).status).toBe(201);
     expect(hits[0].url).toBe(path);
   });
 
   it.each([
+    '/@fs/home/node/.aws/credentials',
+    '/@fs/home/node/.gcp/service-account.json',
+    '/@fs/workspace/agent/CLAUDE.md',
+    '/@fs/workspace/extra/notes.md',
+    '/@fs/workspace/worktrees',
+    '/@fs/workspace/worktreesX/secret',
+    '/@fs//workspace/worktrees/x/a.js',
+    '/@FS/home/node/.aws/credentials',
+    '/%40fs/home/node/.aws/credentials',
+    '/%2540fs/home/node/.aws/credentials',
+    '/@fs/home/node/%2Esnowflake/config',
+    '/@id//@fs/home/node/.aws/credentials',
+    '/@id/__x00__/@fs/workspace/agent/CLAUDE.md',
+    '/@fs/workspace/worktrees/x/@fs/home/node/.aws/credentials',
+  ])('refuses %s with 403, outside the agent checkouts', async (path) => {
+    const res = await request(path);
+    expect(res.status).toBe(403);
+    expect(res.body).toBe("Preview serves files only from the agent's checkouts.");
+    expect(opened).toEqual([]);
+  });
+
+  it.each([
     '/src/../../etc/passwd',
-    '/@fs/workspace/app/../../../etc/passwd',
-    '/%40fs/workspace/%2e%2e/secret',
+    '/@fs/workspace/worktrees/x/../../agent/CLAUDE.md',
+    '/%40fs/workspace/worktrees/%2e%2e/agent/CLAUDE.md',
     '/src/%2e%2e/secret',
     '/src/%252e%252e/secret',
     '/src\\..\\secret',
@@ -309,6 +334,7 @@ describe('preview proxy routing', () => {
       /^HTTP\/1\.1 404 /,
     );
     expect((await upgrade('/src/%2e%2e/secret')).first).toMatch(/^HTTP\/1\.1 403 /);
+    expect((await upgrade('/@id//@fs/home/node/.aws/credentials')).first).toMatch(/^HTTP\/1\.1 403 /);
     expect(opened).toEqual([]);
   });
 });
@@ -320,7 +346,7 @@ describe('pathVerdict / previewIdFromHost', () => {
       '/src/main.tsx?t=123',
       '/@vite/client',
       '/@id/react',
-      '/@fs/workspace/node_modules/vite/dist/client/client.mjs',
+      '/@fs/workspace/worktrees/x/node_modules/vite/dist/client/client.mjs',
       '/node_modules/.vite/deps/react.js?v=1',
     ])
       expect(pathVerdict(p)).toBeNull();

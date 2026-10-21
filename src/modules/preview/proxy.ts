@@ -50,27 +50,40 @@ function endToEndHeaders(raw: string[], drop: ReadonlySet<string> = HOP_BY_HOP):
   return out;
 }
 
+const BAD_REQUEST = { status: 400, body: 'Bad request.' } as const;
+const ESCAPES_ROOT = { status: 403, body: 'This path is not served through a live preview.' } as const;
+const OUTSIDE_CHECKOUTS = { status: 403, body: "Preview serves files only from the agent's checkouts." } as const;
+/** Where an agent container mounts its repository checkouts, and so the only files `/@fs/` may reach. */
+const FS_ALLOWED_ROOT = '/workspace/worktrees/';
+const FS_PREFIX = '/@fs';
+
 /**
- * `..` or a backslash is how a path escapes the app's root, decoded to a fixed point so no encoding of either gets
- * through. `/@fs/` is not refused: in a pnpm workspace Vite serves its own client and deps through it, and which files
- * it may serve is the app's `server.fs.allow`.
+ * Decoded to a fixed point first, so no encoding gets past either rule. `..` or a backslash is how a path escapes the
+ * app's root. `/@fs/<absolute path>` reads any file the dev server's `server.fs.allow` admits, which by default is the
+ * whole workspace root it detects and can reach the credentials mounted under /home/node, so every `/@fs/` in the
+ * path, including after `/@id/`, must name a file under the checkouts. pnpm resolves Vite's client and deps to the
+ * checkout's own node_modules/.pnpm, so a monorepo still loads.
  */
-export function pathVerdict(target: string | undefined): 400 | 403 | null {
-  if (!target?.startsWith('/')) return 400;
+export function pathVerdict(target: string | undefined): { status: 400 | 403; body: string } | null {
+  if (!target?.startsWith('/')) return BAD_REQUEST;
   let path = target.split('?')[0];
   for (let round = 0; ; round += 1) {
-    if (round === MAX_DECODE_ROUNDS) return 400;
+    if (round === MAX_DECODE_ROUNDS) return BAD_REQUEST;
     let next: string;
     try {
       next = decodeURIComponent(path);
     } catch (err) {
-      if (err instanceof URIError) return 400;
+      if (err instanceof URIError) return BAD_REQUEST;
       throw err;
     }
     if (next === path) break;
     path = next;
   }
-  if (path.includes('..') || path.includes('\\')) return 403;
+  if (path.includes('..') || path.includes('\\')) return ESCAPES_ROOT;
+  const lower = path.toLowerCase();
+  for (let at = lower.indexOf(`${FS_PREFIX}/`); at !== -1; at = lower.indexOf(`${FS_PREFIX}/`, at + 1)) {
+    if (!path.startsWith(FS_ALLOWED_ROOT, at + FS_PREFIX.length)) return OUTSIDE_CHECKOUTS;
+  }
   return null;
 }
 
@@ -131,7 +144,6 @@ const STATUS_TEXT: Record<number, string> = {
   503: 'Service Unavailable',
 };
 const NOT_FOUND = 'No live preview at this address.';
-const REFUSED = 'This path is not served through a live preview.';
 
 /**
  * Serves `https://<id>.<PREVIEW_ORIGIN_SUFFIX>`: forwards every request, WebSocket upgrades included, to the port the
@@ -154,7 +166,7 @@ export function createPreviewProxy(deps: PreviewProxyDeps = defaultDeps): http.S
     }
     const verdict = pathVerdict(req.url);
     if (verdict) {
-      plain(res, verdict, verdict === 400 ? 'Bad request.' : REFUSED);
+      plain(res, verdict.status, verdict.body);
       return;
     }
     const upstream = http.request(
@@ -212,7 +224,7 @@ export function createPreviewProxy(deps: PreviewProxyDeps = defaultDeps): http.S
     const target = targetFor(req);
     if (!target) return refuse(404, NOT_FOUND);
     const verdict = pathVerdict(req.url);
-    if (verdict) return refuse(verdict, verdict === 400 ? 'Bad request.' : REFUSED);
+    if (verdict) return refuse(verdict.status, verdict.body);
     const live = liveUpgrades.get(target.revoked) ?? 0;
     if (live >= MAX_UPGRADES_PER_PREVIEW) return refuse(503, 'Too many live connections to this preview.');
     liveUpgrades.set(target.revoked, live + 1);
