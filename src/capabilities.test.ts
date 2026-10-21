@@ -24,6 +24,10 @@ import { writeContainerConfig } from './container-config.js';
 import { SIBLING_BOUND_FIELDS } from './sibling-parity.js';
 import { PRE_TURN_BOUNDS, boundedCapabilities, type ContextNotice } from './modules/memory/pre-turn-context.js';
 import type { AgentGroup } from './types.js';
+import { DEFAULT_FLEET_MCP_SERVERS } from './fleet-mcp-default-servers.js';
+
+// The public export seeds no fleet MCP servers; src/fleet-mcp-default-servers.test.ts keeps the seed non-empty here.
+const itSeeded = it.skipIf(Object.keys(DEFAULT_FLEET_MCP_SERVERS).length === 0);
 
 function group(id: string, folder: string): AgentGroup {
   return { id, name: folder, folder, agent_provider: null, created_at: new Date().toISOString() } as AgentGroup;
@@ -534,7 +538,7 @@ describe('buildSessionServicesSnapshot', () => {
     expect(names).not.toContain('Granola');
   });
 
-  it('describes every MCP server the container gets, including one only the group declares', async () => {
+  itSeeded('describes every MCP server the container gets, including one only the group declares', async () => {
     insertWorkgroup('derived', []);
     const ag = group('ag-derived', 'derived');
     await createGroupInWorkgroup(ag, 'derived');
@@ -568,7 +572,7 @@ describe('buildSessionServicesSnapshot', () => {
     expect(plainly?.useFor).toContain('mcp__plainly__*');
   });
 
-  it('never advertises a retired server, or trips over a malformed one', async () => {
+  itSeeded('never advertises a retired server, or trips over a malformed one', async () => {
     insertWorkgroup('stale', []);
     const ag = group('ag-stale', 'stale');
     await createGroupInWorkgroup(ag, 'stale');
@@ -595,7 +599,7 @@ describe('buildSessionServicesSnapshot', () => {
     expect(names).toContain('Littlebird');
   });
 
-  it('survives the capability budget on a widest-wired group, universals intact', async () => {
+  itSeeded('survives the capability budget on a widest-wired group, universals intact', async () => {
     // The regression this pins: the derived MCP entries are appended to the
     // services array, and BOTH capability budgets evict from the END
     // (`evictCapability`, src/modules/memory/pre-turn-context.ts). Appended,
@@ -1083,7 +1087,7 @@ describe('buildSessionServicesSnapshot', () => {
       );
     });
 
-    it('degrades one malformed stored field instead of losing the whole snapshot', async () => {
+    itSeeded('degrades one malformed stored field instead of losing the whole snapshot', async () => {
       // Round 3, P2, reported for `description` and enumerated as a class:
       // `displayName`, `description`, `url`, `args` and `command` are all typed
       // as strings but none of them is type-checked on the way in from a
@@ -1158,7 +1162,7 @@ describe('buildSessionServicesSnapshot', () => {
       expect(entry?.summary).toBe('https://mcp.example.com/mcp');
     });
 
-    it('derives a hint for a stored MCP server, and names the endpoint when it has no description', async () => {
+    itSeeded('derives a hint for a stored MCP server, and names the endpoint when it has no description', async () => {
       const ag = await widestGroup();
       const snapshot = await buildSessionServicesSnapshot(ag.id, OWNER_SAFE_MG);
       // Fleet entry: derived from the stored `description`.
@@ -1171,7 +1175,7 @@ describe('buildSessionServicesSnapshot', () => {
     });
   });
 
-  it('keeps the migrated universal text verbatim and never doubles an entry', async () => {
+  itSeeded('keeps the migrated universal text verbatim and never doubles an entry', async () => {
     insertWorkgroup('universal', []);
     const ag = group('ag-universal', 'universal');
     await createGroupInWorkgroup(ag, 'universal');

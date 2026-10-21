@@ -22,7 +22,7 @@ The pull request is closed when its change appears in an export, not through Git
 
 - **Tests for what you touched.** Run the files you changed: `pnpm exec vitest run <files>`. The agent runner is a separate Bun package: `cd container/agent-runner && bun test <files>`.
 - **Typechecks.** `pnpm exec tsc --noEmit`, plus `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` when you changed the runner.
-- **Clean git hooks.** `pnpm install` installs hooks that format staged files and scan each commit and push for email addresses, chat-platform IDs and similar identifiers, plus the names your own install's registry holds once setup has created it. The pre-push hook refuses a push to `main`: push a branch, or set `NANOCLAW_ALLOW_MAIN_PUSH=1` for your own fork's `main`.
+- **Formatted code.** `pnpm install` installs a pre-commit hook that formats the TypeScript you stage under `src/`.
 - **Invented names in fixtures and examples.** Never copy a real person, company, account, ID or domain into a test, comment or doc.
 - **No breaking change without a migration path.** A change that needs an action from an existing install gets a `[BREAKING]` entry in [CHANGELOG.md](CHANGELOG.md) naming the skill to run or the doc that covers detect, why, fix, verify and rollback. When it moves a pinned external component, update [versions.json](versions.json) too.
 

@@ -69,11 +69,11 @@ ncl secrets grant --name Littlebird --workgroups <workgroup-id>
 
 ## Fresh installs and the shipped defaults
 
-Until someone runs a `--fleet` command, there is no file: the defaults in
-`DEFAULT_FLEET_MCP_SERVERS` (`src/fleet-mcp-servers.ts`) apply — granola, deepwiki, context7, exa,
-pocket, littlebird — which is exactly the set `buildContainerArgs` used to hardcode. The first
-`--fleet` write materializes the file from those defaults plus the change. Editing that constant is
-not how a tool is added; it is only the seed.
+Until someone runs a `--fleet` command, there is no file: the seed in
+`DEFAULT_FLEET_MCP_SERVERS` (`src/fleet-mcp-default-servers.ts`) applies. The public release ships
+that seed empty, so a fresh install's agents inherit no server until a `--fleet` command adds one.
+The first `--fleet` write materializes the file from the seed plus the change. Editing that constant
+is not how a tool is added; it is only the seed.
 
 A malformed file throws rather than falling back, on the spawn path and in the snapshot alike:
 silently dropping every group's tools is worse than a loud failure the sweep retries.

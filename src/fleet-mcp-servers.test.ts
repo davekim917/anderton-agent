@@ -12,14 +12,17 @@ vi.mock('./config.js', async (importOriginal) => ({
   DATA_DIR: dirs.DATA_DIR,
 }));
 
+import { DEFAULT_FLEET_MCP_SERVERS } from './fleet-mcp-default-servers.js';
 import {
-  DEFAULT_FLEET_MCP_SERVERS,
   RETIRED_MCP_SERVER_NAMES,
   FLEET_MCP_SERVERS_PATH,
   effectiveMcpServers,
   readFleetMcpServers,
   updateFleetMcpServers,
 } from './fleet-mcp-servers.js';
+
+// The public export seeds no fleet MCP servers; src/fleet-mcp-default-servers.test.ts keeps the seed non-empty here.
+const itSeeded = it.skipIf(Object.keys(DEFAULT_FLEET_MCP_SERVERS).length === 0);
 
 beforeEach(() => {
   fs.mkdirSync(dirs.DATA_DIR, { recursive: true });
@@ -46,7 +49,7 @@ describe('the shipped fleet defaults', () => {
     }
   });
 
-  it('carry Littlebird as a fleet-wide remote', () => {
+  itSeeded('carry Littlebird as a fleet-wide remote', () => {
     expect(DEFAULT_FLEET_MCP_SERVERS.littlebird).toMatchObject({
       type: 'http',
       url: 'https://mcp.littlebird.ai/mcp',
@@ -61,7 +64,7 @@ describe('the shipped fleet defaults', () => {
 });
 
 describe('the fleet file', () => {
-  it('replaces the defaults once written, and survives a round trip', () => {
+  itSeeded('replaces the defaults once written, and survives a round trip', () => {
     updateFleetMcpServers((servers) => {
       delete servers.pocket;
       servers.acme = { type: 'http', url: 'https://mcp.acme.test/mcp', description: 'Acme things.' };
@@ -194,7 +197,7 @@ describe('effectiveMcpServers', () => {
     expect(effectiveMcpServers({ mcpServers: { littlebird: own } }).littlebird).toBe(own);
   });
 
-  it('drops a fleet entry the group excludes, and keeps one it declares itself', () => {
+  itSeeded('drops a fleet entry the group excludes, and keeps one it declares itself', () => {
     const excludedOnly = effectiveMcpServers({ mcpServers: {}, excludeMcpServers: ['pocket', 'littlebird'] });
     expect(excludedOnly.pocket).toBeUndefined();
     expect(excludedOnly.littlebird).toBeUndefined();
@@ -209,7 +212,7 @@ describe('effectiveMcpServers', () => {
     expect(declared.pocket).toBeDefined();
   });
 
-  it('layers the workgroup between the group and the fleet, and no exclusion withholds a workgroup entry', () => {
+  itSeeded('layers the workgroup between the group and the fleet, and no exclusion withholds a workgroup entry', () => {
     const own = { type: 'http' as const, url: 'https://own.example.com/mcp' };
     const shared = { type: 'http' as const, url: 'https://shared.example.com/mcp' };
     const servers = effectiveMcpServers(
@@ -223,14 +226,17 @@ describe('effectiveMcpServers', () => {
     expect(servers.exa).toBeDefined();
   });
 
-  it("withholds a fleet entry the workgroup opts out of from a member that does not, but not the member's own", () => {
-    const own = { type: 'http' as const, url: 'https://own.example.com/mcp' };
-    const workgroup = { mcpServers: {}, excludeMcpServers: ['exa', 'pocket'] };
-    const member = effectiveMcpServers({ mcpServers: { pocket: own } }, workgroup);
-    expect(member.exa).toBeUndefined();
-    expect(member.pocket).toBe(own);
-    expect(member.littlebird).toBeDefined();
-  });
+  itSeeded(
+    "withholds a fleet entry the workgroup opts out of from a member that does not, but not the member's own",
+    () => {
+      const own = { type: 'http' as const, url: 'https://own.example.com/mcp' };
+      const workgroup = { mcpServers: {}, excludeMcpServers: ['exa', 'pocket'] };
+      const member = effectiveMcpServers({ mcpServers: { pocket: own } }, workgroup);
+      expect(member.exa).toBeUndefined();
+      expect(member.pocket).toBe(own);
+      expect(member.littlebird).toBeDefined();
+    },
+  );
 
   it('handles a group with no container config at all', () => {
     expect(Object.keys(effectiveMcpServers(undefined)).sort()).toEqual(Object.keys(DEFAULT_FLEET_MCP_SERVERS).sort());

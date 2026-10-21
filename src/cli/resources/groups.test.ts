@@ -43,6 +43,7 @@ import { addDeniedModel } from '../../db/denied-models.js';
 import { dispatch } from '../dispatch.js';
 import { readContainerConfig } from '../../container-config.js';
 import { readFleetMcpServers } from '../../fleet-mcp-servers.js';
+import { DEFAULT_FLEET_MCP_SERVERS } from '../../fleet-mcp-default-servers.js';
 import { CODEX_FAMILY_DEFAULTS } from '../../flag-parser.js';
 import {
   ensureContainerConfig,
@@ -53,6 +54,9 @@ import {
 import { isSiblingBoundField } from '../../sibling-parity.js';
 // Side-effect import: registers the `groups-*` commands (including delete).
 import './groups.js';
+
+// The public export seeds no fleet MCP servers; src/fleet-mcp-default-servers.test.ts keeps the seed non-empty here.
+const itSeeded = it.skipIf(Object.keys(DEFAULT_FLEET_MCP_SERVERS).length === 0);
 
 function now(): string {
   return new Date().toISOString();
@@ -1230,7 +1234,7 @@ describe('groups config — the container.json + container_configs dual write ho
     ]);
   });
 
-  it('config add/remove-mcp-server --fleet edits the fleet defaults, not a group', async () => {
+  itSeeded('config add/remove-mcp-server --fleet edits the fleet defaults, not a group', async () => {
     const added = await dispatch(
       {
         id: 'req-fleet-add',

@@ -8,6 +8,7 @@ import path from 'path';
 
 import { DATA_DIR } from './config.js';
 import { validateMcpServerName, validateMcpServers, type McpServerConfig } from './container-config.js';
+import { DEFAULT_FLEET_MCP_SERVERS } from './fleet-mcp-default-servers.js';
 
 export const FLEET_MCP_SERVERS_PATH = path.join(DATA_DIR, 'fleet-mcp-servers.json');
 
@@ -15,57 +16,6 @@ interface FleetMcpServersFile {
   version: 1;
   mcpServers: Record<string, McpServerConfig>;
 }
-
-/** Seed only: once the file exists it wins. Add tools with `ncl groups config add-mcp-server --fleet`, not here. */
-export const DEFAULT_FLEET_MCP_SERVERS: Record<string, McpServerConfig> = {
-  granola: {
-    type: 'stdio',
-    command: 'bun',
-    args: ['/app/src/granola-mcp-server.ts'],
-    displayName: 'Granola',
-    // Local wrapper, not the hosted endpoint, whose OAuth sessions expired silently every few hours.
-    description:
-      'Meeting transcripts + notes via Granola REST API. Auth injected by OneCLI on public-api.granola.ai; no token visible in-container. Tools: `mcp__granola__list_meetings`, `mcp__granola__get_meeting` (set include_transcript=true for raw transcript).',
-  },
-  deepwiki: {
-    type: 'http',
-    url: 'https://mcp.deepwiki.com/mcp',
-    displayName: 'DeepWiki',
-    description:
-      'AI-powered documentation for any public GitHub repo. Use when the user asks "how does repo X work", for reading wiki structure, fetching wiki contents, or asking free-form questions about a repo. Tools: `mcp__deepwiki__read_wiki_structure`, `mcp__deepwiki__read_wiki_contents`, `mcp__deepwiki__ask_question`.',
-  },
-  context7: {
-    type: 'stdio',
-    command: 'npx',
-    args: ['-y', '@upstash/context7-mcp'],
-    env: {},
-    displayName: 'Context7',
-    description:
-      'Live library / framework / SDK / API docs — React, Next.js, Prisma, Tailwind, Claude SDKs, Stripe, etc. Prefer Context7 over training-memory for: library-specific debugging, API syntax, config options, version migrations, CLI usage. Do NOT use for refactoring, business logic, or general concepts.',
-  },
-  exa: {
-    type: 'http',
-    url: 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa,agent_run',
-    displayName: 'Exa',
-    description:
-      'Web search, research, and code context. Prefer exa over ad-hoc WebSearch/WebFetch for: web search including code/docs lookups (`mcp__exa__web_search_exa`), reading specific URLs (`mcp__exa__web_fetch_exa`), filtered search — categories (company, people), domains, dates (`mcp__exa__web_search_advanced_exa`), multi-step research agent (`mcp__exa__agent_run`).',
-  },
-  pocket: {
-    type: 'http',
-    url: 'https://public.heypocketai.com/mcp',
-    displayName: 'Pocket',
-    description:
-      'Personal knowledge / memory via https://public.heypocketai.com/mcp. Auth pre-injected (Authorization: Bearer). Use Pocket tools to save references, recall prior context, search personal knowledge.',
-  },
-  littlebird: {
-    type: 'http',
-    // OAuth bearer kept fresh by the sweep; a 401 means the grant needs a fresh login, not a retry.
-    url: 'https://mcp.littlebird.ai/mcp',
-    displayName: 'Littlebird',
-    description:
-      'Littlebird workspace: meetings, transcripts, routines, conversations, search. Auth injected by the OneCLI gateway (vault secret Littlebird).',
-  },
-};
 
 /** Must match the agent-runner's `RETIRED_MCP_SERVER_NAMES`, which it drops on every spawn (test-enforced). */
 export const RETIRED_MCP_SERVER_NAMES: ReadonlySet<string> = new Set(['slack-user-token']);

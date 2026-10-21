@@ -170,6 +170,7 @@ import {
 } from './container-runner.js';
 import { CODEX_FAMILY_DEFAULTS } from './flag-parser.js';
 import { effectiveMcpServers } from './fleet-mcp-servers.js';
+import { DEFAULT_FLEET_MCP_SERVERS } from './fleet-mcp-default-servers.js';
 import type { McpServerConfig } from './container-config.js';
 import { ForeignCanonicalCommondirError } from './canonical-git-commondir.js';
 import {
@@ -188,6 +189,9 @@ import { initMigratedTestDb } from './db/index.js';
 import { allowSubprocess } from './test-hermeticity.js';
 import type { MemoryAdmissionResult } from './memory-admission.js';
 import type { Session } from './types.js';
+
+// The public export seeds no fleet MCP servers; src/fleet-mcp-default-servers.test.ts keeps the seed non-empty here.
+const itSeeded = it.skipIf(Object.keys(DEFAULT_FLEET_MCP_SERVERS).length === 0);
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {
@@ -678,7 +682,7 @@ describe('serializeMcpServersEnv', () => {
     });
   });
 
-  it('serializes the fleet defaults exactly as the per-name blocks used to', () => {
+  itSeeded('serializes the fleet defaults exactly as the per-name blocks used to', () => {
     // The five servers that were hardcoded `if (canInject('<name>'))` blocks in
     // buildContainerArgs. What reaches the container must be byte-identical to
     // what those blocks emitted, or a "pure data move" quietly reconfigures
@@ -697,7 +701,7 @@ describe('serializeMcpServersEnv', () => {
     expect(servers.littlebird).toEqual({ type: 'http', url: 'https://mcp.littlebird.ai/mcp' });
   });
 
-  it('leaves out servers with a plugin root, which the runner resolves from container.json', () => {
+  itSeeded('leaves out servers with a plugin root, which the runner resolves from container.json', () => {
     // The runner resolves them (plugin root, placeholders, the ownership marker), then overlays this payload by name:
     // a re-sent raw copy replaced the resolved entry.
     const own = {

@@ -1,6 +1,8 @@
+import fs from 'node:fs';
+
 import { describe, expect, it } from 'vitest';
 
-import { classifyPingResult } from './agent-ping.js';
+import { classifyPingResult, describePingFailure } from './agent-ping.js';
 
 describe('classifyPingResult', () => {
   it('treats a normal text reply as ok', () => {
@@ -35,5 +37,34 @@ describe('classifyPingResult', () => {
 
   it('treats empty output as no reply', () => {
     expect(classifyPingResult(0, '')).toBe('no_reply');
+  });
+
+  it("treats the agent-runner's turn-error reply as a failure, not a pong", () => {
+    const runner = fs.readFileSync(new URL('../../container/agent-runner/src/poll-loop.ts', import.meta.url), 'utf8');
+    const replies = [...runner.matchAll(/`([^`]*Turn ended with an error:[^`]*)`/g)].map(([, text]) =>
+      text.replace(/\$\{[^}]*\}/g, 'codex_system_error: thread entered systemError state'),
+    );
+    // Both turn-error sites; a reworded one drops out of this match and fails the count.
+    expect(replies).toHaveLength(2);
+    for (const reply of replies) {
+      expect(classifyPingResult(0, `> nanoclaw@1.0.0 chat\n> tsx scripts/chat.ts ping\n\n${reply}\n`)).toBe(
+        'agent_error',
+      );
+    }
+  });
+
+  it('still counts a reply that quotes an earlier turn error as a pong', () => {
+    expect(classifyPingResult(0, 'Pong.\n> Turn ended with an error: old failure\nThe current turn succeeded.\n')).toBe(
+      'ok',
+    );
+  });
+});
+
+describe('describePingFailure', () => {
+  it('tells a user with no provider credentials to sign in, not that the reply was late', () => {
+    const { headline, note } = describePingFailure('auth_error');
+    expect(headline).toMatch(/no credentials/i);
+    expect(headline).not.toMatch(/in time/);
+    expect(note).toMatch(/sign in to your provider/i);
   });
 });

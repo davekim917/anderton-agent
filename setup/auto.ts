@@ -35,7 +35,7 @@ import k from 'kleur';
 
 import { BACK_TO_CHANNEL_SELECTION } from './lib/back-nav.js';
 import { runChannelSkill } from './channels/run-channel-skill.js';
-import { pingCliAgent, type PingResult } from './lib/agent-ping.js';
+import { describePingFailure, pingCliAgent, type PingResult } from './lib/agent-ping.js';
 import { getSetupProvider, listSetupProviders } from './providers/registry.js';
 import { applyProviderSkill } from './providers/install.js';
 // Provider payloads self-register their picker entry + auth on import.
@@ -566,17 +566,8 @@ async function main(): Promise<void> {
       } else {
         phEmit('first_chat_failed', { reason: ping });
         renderPingFailureNote(ping);
-        await offerClaudeOnFailure({
-          stepName: 'cli-agent',
-          msg:
-            ping === 'socket_error'
-              ? "NanoClaw service isn't listening on its CLI socket."
-              : 'No reply from the assistant within 30 seconds.',
-          hint:
-            ping === 'socket_error'
-              ? 'Socket at data/cli.sock did not accept a connection.'
-              : 'Agent container may be failing to start or authenticate.',
-        });
+        const { diagnosis, hint } = describePingFailure(ping);
+        await offerClaudeOnFailure({ stepName: 'cli-agent', msg: diagnosis, hint });
       }
     }
   }
@@ -789,29 +780,23 @@ async function confirmAssistantResponds(): Promise<PingResult> {
   if (result === 'ok') {
     s.stop(`${k.bold(fitToWidth('Your assistant is ready.', suffix))}${k.dim(suffix)}`);
   } else {
-    const msg =
-      result === 'socket_error' ? "Couldn't reach the NanoClaw service." : "Your assistant didn't reply in time.";
+    const msg = describePingFailure(result).headline;
     s.error(`${k.bold(fitToWidth(msg, suffix))}${k.dim(suffix)}`);
   }
   return result;
 }
 
-function renderPingFailureNote(result: PingResult): void {
+function renderPingFailureNote(result: Exclude<PingResult, 'ok'>): void {
+  const text = wrapForGutter(describePingFailure(result).note, 6);
   const body =
     result === 'socket_error'
       ? [
-          wrapForGutter(
-            "The NanoClaw service isn't listening on its local socket. Try restarting it, then chat with `pnpm run chat hi`:",
-            6,
-          ),
+          text,
           '',
           `  macOS:  launchctl kickstart -k gui/$(id -u)/${getLaunchdLabel()}`,
           `  Linux:  systemctl --user restart ${getSystemdUnit()}`,
         ].join('\n')
-      : wrapForGutter(
-          'No reply from your assistant within 30 seconds. Check `logs/nanoclaw.log` for clues, then try `pnpm run chat hi`.',
-          6,
-        );
+      : text;
   note(body, 'Skipping the first chat');
 }
 

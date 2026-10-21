@@ -83,6 +83,15 @@ PRODUCT_FILES = glob(
         "scripts/workflow-label-descriptions.test.ts",
         "src/memory-migration-contract.test.ts",
         "src/upstream-ratchet.test.ts",
+        # This repository's boundary gate and push policy (see PUBLIC_HOOKS below), and the tests that run them.
+        ".husky/pre-push",
+        ".husky/commit-msg",
+        "scripts/boundary-hooks.test.ts",
+        "scripts/pre-push.test.ts",
+        "scripts/setup-typecheck-gates.test.ts",
+        # This install's fleet MCP defaults; public-overlay/ ships an empty set in their place.
+        "src/fleet-mcp-default-servers.ts",
+        "src/fleet-mcp-default-servers.test.ts",
         # This host's own systemd units; setup/service.ts writes an install's units.
         "scripts/nanoclaw-v2.service",
         "scripts/nanoclaw-codex-sync.service",
@@ -149,24 +158,41 @@ PUBLIC_DIAGNOSTICS = [
     ),
 ]
 
-# The git hooks' boundary scan refuses a commit unless the install registry and the ignored identifier inventory
-# both load. A fresh public clone has neither, so its hooks tolerate a source whose file does not exist: structural
-# patterns alone before setup, plus that install's own registry once setup has written one. A source that exists
-# but cannot be read still refuses.
-PUBLIC_BOUNDARY_SCAN = [
+# The boundary scan protects this private repository's identifiers and the push refusal guards its main. Neither
+# means anything in a public clone: there the scan harvests the installer's own registry (their name, `local`, `cli`)
+# and refuses their every commit. The public pre-push and commit-msg hooks are excluded above, and the public
+# pre-commit keeps only its formatting gate. The `check:public-boundary` script stays runnable by hand in a fresh
+# clone, which has no registry or identifier inventory: it tolerates a source whose file does not exist, and still
+# refuses one that exists but cannot be read.
+PUBLIC_HOOKS = [
+    core.replace(
+        before = """
+# Run from the main checkout so tsx resolves there, but scan THIS tree.
+#
+# `--root` is not optional. Without it the script defaults to process.cwd(),
+# which the `cd` has just made the main checkout — so a commit from a linked
+# worktree scanned main's index, entirely different content, and printed
+# "passed" about work it never saw. Every commit made from an agent worktree
+# was ungated until 2026-08-26. The registry itself still resolves through the
+# main checkout via findMainCheckoutRoot's fallback.
+#
+# tsx, not `pnpm run`: pnpm exits 0 when a write to its own stdout fails with
+# EPIPE, so `git commit 2>&1 | head` turned a failed scan into a created commit.
+worktree_root=$$(git rev-parse --show-toplevel)
+(cd "$$repo_root" && "$$repo_root/node_modules/.bin/tsx" "$$repo_root/scripts/check-public-boundary.ts" --root "$$worktree_root" --staged)
+""",
+        after = "",
+        multiline = True,
+        paths = glob([".husky/pre-commit"]),
+    ),
     core.replace(
         before = "\"check:public-boundary\": \"tsx scripts/check-public-boundary.ts\"",
         after = "\"check:public-boundary\": \"tsx scripts/check-public-boundary.ts --allow-absent-sources\"",
         paths = glob(["package.json"]),
     ),
-    core.replace(
-        before = "scripts/check-public-boundary.ts\" --root",
-        after = "scripts/check-public-boundary.ts\" --allow-absent-sources --root",
-        paths = glob([".husky/pre-push"]),
-    ),
 ]
 
-PUBLIC_TRANSFORMS = [PUBLIC_OVERLAY, PUBLIC_BUILD] + PUBLIC_DIAGNOSTICS + PUBLIC_BOUNDARY_SCAN
+PUBLIC_TRANSFORMS = [PUBLIC_OVERLAY, PUBLIC_BUILD] + PUBLIC_DIAGNOSTICS + PUBLIC_HOOKS
 
 export_workflow(
     name = "export",

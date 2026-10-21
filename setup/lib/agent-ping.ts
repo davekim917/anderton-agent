@@ -13,7 +13,10 @@
  */
 import { spawn } from 'child_process';
 
-export type PingResult = 'ok' | 'no_reply' | 'socket_error' | 'auth_error';
+export type PingResult = 'ok' | 'no_reply' | 'socket_error' | 'auth_error' | 'agent_error';
+
+// The agent-runner's reply when a turn fails (container/agent-runner/src/poll-loop.ts).
+const TURN_ERROR = /^\u26A0\uFE0F? Turn ended with an error:/mu;
 
 export function classifyPingResult(exitCode: number | null, stdout: string, stderr = ''): PingResult {
   const output = `${stdout}\n${stderr}`;
@@ -28,8 +31,47 @@ export function classifyPingResult(exitCode: number | null, stdout: string, stde
     return 'auth_error';
   }
   if (exitCode === 2) return 'socket_error';
+  if (TURN_ERROR.test(stdout)) return 'agent_error';
   if (exitCode === 0 && stdout.trim().length > 0) return 'ok';
   return 'no_reply';
+}
+
+export function describePingFailure(result: Exclude<PingResult, 'ok'>): {
+  headline: string;
+  note: string;
+  diagnosis: string;
+  hint: string;
+} {
+  switch (result) {
+    case 'socket_error':
+      return {
+        headline: "Couldn't reach the NanoClaw service.",
+        note: "The NanoClaw service isn't listening on its local socket. Try restarting it, then chat with `pnpm run chat hi`:",
+        diagnosis: "NanoClaw service isn't listening on its CLI socket.",
+        hint: 'Socket at data/cli.sock did not accept a connection.',
+      };
+    case 'auth_error':
+      return {
+        headline: 'Your assistant has no credentials yet.',
+        note: 'Your assistant started, but its provider turned it away: sign in to your provider by re-running setup (`bash nanoclaw.sh`), then chat with `pnpm run chat hi`.',
+        diagnosis: "The assistant's provider refused its credentials.",
+        hint: 'Provider sign-in was skipped, or the stored credential was rejected.',
+      };
+    case 'agent_error':
+      return {
+        headline: 'Your assistant replied with an error.',
+        note: "Your assistant's first turn ended with an error instead of a reply. Check `logs/nanoclaw.log` for clues, then try `pnpm run chat hi`.",
+        diagnosis: "The assistant's first turn ended with an error.",
+        hint: 'The agent provider failed the turn; the error is in its reply and in logs/nanoclaw.log.',
+      };
+    case 'no_reply':
+      return {
+        headline: "Your assistant didn't reply in time.",
+        note: 'No reply from your assistant within 30 seconds. Check `logs/nanoclaw.log` for clues, then try `pnpm run chat hi`.',
+        diagnosis: 'No reply from the assistant within 30 seconds.',
+        hint: 'Agent container may be failing to start or authenticate.',
+      };
+  }
 }
 
 export function pingCliAgent(timeoutMs = 30_000): Promise<PingResult> {

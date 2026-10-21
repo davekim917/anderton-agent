@@ -765,20 +765,6 @@ describe('git hooks scan the committing tree, not the main checkout', () => {
       { file: 'leak.md', line: 1, category: 'private-identifier' },
     ]);
   });
-
-  // Asserted against the hook text because this suite does not execute Husky.
-  it('.husky/pre-commit passes --root for the committing worktree', () => {
-    const script = fs.readFileSync(new URL('../.husky/pre-commit', import.meta.url), 'utf8');
-    expect(script).toMatch(/rev-parse --show-toplevel/);
-    expect(script).toMatch(/check:public-boundary\s+--\s+--root\s+"\$worktree_root"/);
-  });
-
-  it('.husky/pre-push passes --root for each pushed snapshot', () => {
-    const script = fs.readFileSync(new URL('../.husky/pre-push', import.meta.url), 'utf8');
-    expect(script).toMatch(/while read -r local_ref local_sha remote_ref remote_sha/);
-    expect(script).toMatch(/worktree add --detach --quiet "\$snapshot_root" "\$1"/);
-    expect(script).toMatch(/check:public-boundary\s+--\s+--root\s+"\$snapshot_root" --index/);
-  });
 });
 
 describe('identifiers derived from the install', () => {
