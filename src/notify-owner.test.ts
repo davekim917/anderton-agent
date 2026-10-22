@@ -40,6 +40,9 @@ import { formatLocalStamp } from './timezone.js';
 const CHANNEL_TYPE = 'slack-notifyownertest';
 const TOKEN_KEY = 'SLACK_BOT_TOKEN_NOTIFYOWNERTEST';
 const FAKE_TOKEN = 'xoxb-test-fake-token-do-not-use';
+const DISCORD_CHANNEL_TYPE = 'discord-notifyownertest';
+const DISCORD_TOKEN_KEY = 'DISCORD_BOT_TOKEN_NOTIFYOWNERTEST';
+const FAKE_DISCORD_TOKEN = 'discord-test-fake-token-do-not-use';
 
 describe('src/notify-owner.ts', () => {
   let rootDir: string;
@@ -55,6 +58,8 @@ describe('src/notify-owner.ts', () => {
     // Defensive: guarantee the ambient environment can never supply this
     // key, so a positive test's fixture .env is the only source of truth.
     vi.stubEnv(TOKEN_KEY, '');
+    vi.stubEnv(DISCORD_TOKEN_KEY, '');
+    vi.stubEnv('OPERATOR_ALERT_CHANNEL', '');
   });
 
   afterEach(() => {
@@ -68,7 +73,7 @@ describe('src/notify-owner.ts', () => {
   function createDb(rows: { channelType: string; platformId: string }[]): void {
     const db = new Database(dbPath);
     db.exec(`
-      CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, platform_id TEXT NOT NULL);
+      CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, channel_type TEXT, platform_id TEXT NOT NULL);
       CREATE TABLE user_roles (user_id TEXT NOT NULL, role TEXT NOT NULL);
       CREATE TABLE user_dms (
         user_id TEXT NOT NULL,
@@ -80,7 +85,11 @@ describe('src/notify-owner.ts', () => {
     db.prepare(`INSERT INTO user_roles (user_id, role) VALUES ('U1', 'owner')`).run();
     rows.forEach((r, i) => {
       const mgId = `mg${i}`;
-      db.prepare(`INSERT INTO messaging_groups (id, platform_id) VALUES (?, ?)`).run(mgId, r.platformId);
+      db.prepare(`INSERT INTO messaging_groups (id, channel_type, platform_id) VALUES (?, ?, ?)`).run(
+        mgId,
+        r.channelType,
+        r.platformId,
+      );
       db.prepare(
         `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES ('U1', ?, ?, ?)`,
       ).run(r.channelType, mgId, new Date(2026, 0, 1, 0, 0, i).toISOString());
@@ -238,5 +247,107 @@ describe('src/notify-owner.ts', () => {
     expect(result.code).toBe(0);
     expect(posts[0]!.text).toContain(nyStamp);
     expect(posts[0]!.text).not.toContain(utcStamp);
+  });
+
+  describe('OPERATOR_ALERT_CHANNEL', () => {
+    const discordRequests: { url: string; init: RequestInit }[] = [];
+    let discordStatus = 200;
+
+    beforeEach(() => {
+      discordRequests.length = 0;
+      discordStatus = 200;
+      vi.stubEnv('DISCORD_API_URL', 'http://discord.invalid/api');
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string, init: RequestInit) => {
+          discordRequests.push({ url, init });
+          return new Response('{}', { status: discordStatus });
+        }),
+      );
+      createDb([{ channelType: CHANNEL_TYPE, platformId: 'slack:DTEST00001' }]);
+      const db = new Database(dbPath);
+      db.prepare(`INSERT INTO messaging_groups (id, channel_type, platform_id) VALUES (?, ?, ?)`).run(
+        'mg-alerts',
+        DISCORD_CHANNEL_TYPE,
+        'discord:G-TEST:C-ALERTS',
+      );
+      db.close();
+    });
+
+    afterEach(() => vi.unstubAllGlobals());
+
+    function writeEnv(alertChannel: string, withSlackToken = true): void {
+      fs.writeFileSync(
+        path.join(rootDir, '.env'),
+        `OPERATOR_ALERT_CHANNEL=${alertChannel}\n${DISCORD_TOKEN_KEY}=${FAKE_DISCORD_TOKEN}\n` +
+          (withSlackToken ? `${TOKEN_KEY}=${FAKE_TOKEN}\n` : ''),
+      );
+    }
+
+    const notify = () => notifyOwner({ title: 'Title', body: 'Body', dbPath, rootDir, timezone: 'UTC' });
+
+    it('posts to the configured Discord channel instead of the owner DM', async () => {
+      writeEnv('mg-alerts');
+      const result = await notify();
+      expect(result).toEqual({ code: 0, message: `delivered to ${DISCORD_CHANNEL_TYPE}:C-ALERTS` });
+      expect(posts).toHaveLength(0);
+      expect(discordRequests).toHaveLength(1);
+      const { url, init } = discordRequests[0]!;
+      expect(url).toBe('http://discord.invalid/api/channels/C-ALERTS/messages');
+      expect((init.headers as Record<string, string>).Authorization).toBe(`Bot ${FAKE_DISCORD_TOKEN}`);
+      const sent = JSON.parse(init.body as string) as { content: string; allowed_mentions: unknown };
+      expect(sent.content.startsWith('**Title** (')).toBe(true);
+      expect(sent.content.endsWith('\n\nBody')).toBe(true);
+      expect(sent.allowed_mentions).toEqual({ parse: [] });
+    });
+
+    it('falls back to the owner DM when the channel post fails, and says why', async () => {
+      writeEnv('mg-alerts');
+      discordStatus = 500;
+      const result = await notify();
+      expect(result.code).toBe(0);
+      expect(result.message).toBe(
+        'OPERATOR_ALERT_CHANNEL=mg-alerts failed (discord channel message failed: HTTP 500); ' +
+          `owner DM: delivered to ${CHANNEL_TYPE}:DTEST00001`,
+      );
+      expect(posts.map((p) => p.channel)).toEqual(['DTEST00001']);
+    });
+
+    it('falls back to the owner DM when the configured messaging group does not exist', async () => {
+      writeEnv('mg-missing');
+      const result = await notify();
+      expect(result.code).toBe(0);
+      expect(result.message).toContain('OPERATOR_ALERT_CHANNEL=mg-missing failed (no such messaging group)');
+      expect(discordRequests).toHaveLength(0);
+      expect(posts).toHaveLength(1);
+    });
+
+    it('reports a tried-and-failed channel as exit 1 even when no owner DM can be tried', async () => {
+      writeEnv('mg-alerts', false);
+      discordStatus = 403;
+      const result = await notify();
+      expect(result.code).toBe(1);
+      expect(result.message).not.toContain(FAKE_DISCORD_TOKEN);
+      expect(posts).toHaveLength(0);
+    });
+
+    it('redacts a token that native fetch quotes back in its header-validation error', async () => {
+      vi.unstubAllGlobals(); // real fetch: it rejects the header before any connection is made
+      const malformed = 'fake-discord-secret\nsecond-line';
+      vi.stubEnv(DISCORD_TOKEN_KEY, malformed);
+      writeEnv('mg-alerts');
+      const result = await notify();
+      expect(result.code).toBe(0);
+      expect(result.message).toContain('OPERATOR_ALERT_CHANNEL=mg-alerts failed');
+      expect(result.message).not.toContain('fake-discord-secret');
+      expect(posts).toHaveLength(1);
+    });
+
+    it('an unreadable .env with the key unset still reaches the owner DM rather than throwing', async () => {
+      fs.mkdirSync(path.join(rootDir, '.env'));
+      vi.stubEnv(TOKEN_KEY, FAKE_TOKEN);
+      const result = await notify();
+      expect(result).toEqual({ code: 0, message: `delivered to ${CHANNEL_TYPE}:DTEST00001` });
+    });
   });
 });
