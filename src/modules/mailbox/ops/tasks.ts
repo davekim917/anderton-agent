@@ -10,6 +10,7 @@ import { cancelTask, clearRecurrence } from '../../../mailbox/sqlite/tasks.js';
 import { migrateMessagesInTable } from '../schema.js';
 import { sqliteUtcToIso } from '../sqlite-utc.js';
 import { nextEvenSeq } from './ingress.js';
+import { terminalAckStatus } from './sweep.js';
 
 /**
  * Insert one pending task occurrence. `seriesId` equals `id` for a new series.
@@ -245,16 +246,34 @@ export interface RecurringMessage {
   channel_type: string | null;
   thread_id: string | null;
   series_id: string;
+  /**
+   * Set on a row paused after it already ran (terminal ack, not yet settled):
+   * the status `armNextTask` settles it to while arming the successor paused.
+   */
+  paused_ack_status?: 'completed' | 'failed';
 }
 
 // Includes 'failed' AND 'expired' so one bad or missed fire doesn't strand the
 // cron series. The next slot is the next cron occurrence after now, so a backlog
 // of missed slots is skipped, not replayed. Upstream's version omits 'expired'
-// and the routing columns, so this one is fork-owned.
-export function getCompletedRecurring(db: Database.Database): RecurringMessage[] {
-  return db
+// and the routing columns, so this one is fork-owned. With `outDb`, it also
+// returns paused rows that `syncProcessingAcks` left unsettled.
+export function getCompletedRecurring(
+  db: Database.Database,
+  outDb: Database.Database | null = null,
+): RecurringMessage[] {
+  const rows = db
     .prepare("SELECT * FROM messages_in WHERE status IN ('completed', 'failed', 'expired') AND recurrence IS NOT NULL")
     .all() as RecurringMessage[];
+  if (outDb === null) return rows;
+  const paused = db
+    .prepare("SELECT * FROM messages_in WHERE status = 'paused' AND recurrence IS NOT NULL")
+    .all() as RecurringMessage[];
+  for (const row of paused) {
+    const settled = terminalAckStatus(outDb, row.id);
+    if (settled !== null) rows.push({ ...row, paused_ack_status: settled });
+  }
+  return rows;
 }
 
 export function insertRecurrence(
@@ -292,7 +311,18 @@ export function armNextTask(
   status: 'pending' | 'paused' = 'pending',
 ): void {
   db.transaction(() => {
-    insertRecurrence(db, msg, newId, nextRun, status);
+    if (msg.paused_ack_status !== undefined) {
+      // Unlike a terminal row, a paused one stays editable after it was read:
+      // a resume or cancel hands it back to the sync path, and an edit means
+      // `msg` is stale, so the next sweep re-reads it.
+      const settled = db
+        .prepare(
+          "UPDATE messages_in SET status = ? WHERE id = ? AND status = 'paused' AND content IS ? AND recurrence IS ?",
+        )
+        .run(msg.paused_ack_status, originalId, msg.content, msg.recurrence).changes;
+      if (settled === 0) return;
+    }
+    insertRecurrence(db, msg, newId, nextRun, msg.paused_ack_status !== undefined ? 'paused' : status);
     clearRecurrence(db, originalId);
   }).immediate();
 }

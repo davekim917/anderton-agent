@@ -116,6 +116,20 @@ export function expireClosedSessionPending(db: Database.Database): number {
     .changes;
 }
 
+const TERMINAL_ACK_SQL = "('completed', 'failed', 'script-skip:error')";
+
+/** `script-skip:error` lands as FAILED, so recurrence derives the failure streak from the rows themselves. */
+function settledStatusForAck(ackStatus: string): 'completed' | 'failed' {
+  return ackStatus === 'script-skip:error' ? 'failed' : 'completed';
+}
+
+export function terminalAckStatus(outDb: Database.Database, messageId: string): 'completed' | 'failed' | null {
+  const row = outDb
+    .prepare(`SELECT status FROM processing_ack WHERE message_id = ? AND status IN ${TERMINAL_ACK_SQL}`)
+    .get(messageId) as { status: string } | undefined;
+  return row ? settledStatusForAck(row.status) : null;
+}
+
 /**
  * Fused (upstream splits it): maps the runner's two notions of "handled", a
  * terminal `processing_ack` and an answer in `messages_out`, onto
@@ -124,23 +138,21 @@ export function expireClosedSessionPending(db: Database.Database): number {
  */
 export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Database): string[] {
   const completed = outDb
-    .prepare(
-      "SELECT message_id, status FROM processing_ack WHERE status IN ('completed', 'failed', 'script-skip:error')",
-    )
+    .prepare(`SELECT message_id, status FROM processing_ack WHERE status IN ${TERMINAL_ACK_SQL}`)
     .all() as Array<{ message_id: string; status: string }>;
 
   if (completed.length > 0) {
-    // `script-skip:error` lands as FAILED, so recurrence derives the failure
-    // streak from the rows themselves.
-    const completeStmt = inDb.prepare(
-      "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status NOT IN ('completed', 'failed')",
-    );
-    const failStmt = inDb.prepare(
-      "UPDATE messages_in SET status = 'failed' WHERE id = ? AND status NOT IN ('completed', 'failed')",
+    // A paused recurring row is skipped: the pause landed after the run, and
+    // settling it here would let recurrence arm a pending successor. Recurrence
+    // settles it instead (`getCompletedRecurring`), arming the successor paused.
+    const settleStmt = inDb.prepare(
+      `UPDATE messages_in SET status = ?
+        WHERE id = ? AND status NOT IN ('completed', 'failed')
+          AND NOT (status = 'paused' AND recurrence IS NOT NULL)`,
     );
     inDb.transaction(() => {
       for (const { message_id, status } of completed) {
-        (status === 'script-skip:error' ? failStmt : completeStmt).run(message_id);
+        settleStmt.run(settledStatusForAck(status), message_id);
       }
     })();
   }

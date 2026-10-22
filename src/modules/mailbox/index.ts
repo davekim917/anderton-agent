@@ -918,7 +918,7 @@ function forkOps(
       ),
     resumeTask: (taskId) => resumeTask(inbound, taskId),
     updateTask: (taskId, update) => updateTask(inbound, taskId, update),
-    getCompletedRecurringRows: () => getCompletedRecurring(inbound),
+    getCompletedRecurringRows: () => getCompletedRecurring(inbound, outboundPresent ? readableOutbound() : null),
     insertRecurrence: (msg, newId, nextRun, status) => insertRecurrence(inbound, msg, newId, nextRun, status),
     armNextRecurrence: (originalId, msg, newId, nextRun, status) =>
       armNextTask(inbound, originalId, msg, newId, nextRun, status),

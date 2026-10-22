@@ -10,7 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { openInboundDb } from '../mailbox/openers.js';
+import { openInboundDb, openOutboundDbWritable } from '../mailbox/openers.js';
 import { ensureSchema } from '../mailbox/schema.js';
 import { composeNanoclawSession } from '../mailbox/index.js';
 import { insertTaskRow } from './db.js';
@@ -422,5 +422,100 @@ describe('handleRecurrence — script-failure backoff (streak derived from faile
       c: number;
     };
     expect(n.c).toBe(1);
+  });
+});
+
+describe('pausing a series whose current occurrence ran before its ack synced', () => {
+  const OUT_PATH = path.join(TEST_DIR, 'outbound.db');
+
+  function sweepFixture() {
+    const db = freshDb();
+    ensureSchema(OUT_PATH, 'outbound');
+    const out = openOutboundDbWritable(OUT_PATH);
+    const mailbox = composeNanoclawSession(db, () => out);
+    const ack = (id: string, status: string) =>
+      out
+        .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+        .run(id, status, new Date().toISOString());
+    return { db, mailbox, ack };
+  }
+
+  const taskRows = (db: ReturnType<typeof freshDb>) =>
+    db
+      .prepare(`SELECT id, status, recurrence, process_after FROM messages_in WHERE kind = 'task' ORDER BY seq`)
+      .all() as Array<{ id: string; status: string; recurrence: string | null; process_after: string }>;
+
+  it.each([
+    ['completed', 'completed'],
+    ['script-skip:error', 'failed'],
+  ])('a %s ack settles the run as %s and the successor arms paused', async (ackStatus, settled) => {
+    const { db, mailbox, ack } = sweepFixture();
+    insertTaskRow(db, {
+      id: 'task-p',
+      seriesId: 'task-p',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily' }),
+    });
+    ack('task-p', ackStatus);
+
+    expect(mailbox.pauseTask('task-p')).toBe(1);
+    mailbox.syncProcessingAcks();
+    await handleRecurrence(mailbox, fakeSession());
+
+    const rows = taskRows(db);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ id: 'task-p', status: settled, recurrence: null });
+    expect(rows[1]).toMatchObject({ status: 'paused', recurrence: '0 9 * * *' });
+    expect(new Date(rows[1].process_after).getTime()).toBeGreaterThan(Date.now());
+
+    mailbox.syncProcessingAcks();
+    await handleRecurrence(mailbox, fakeSession());
+    expect(taskRows(db)).toHaveLength(2);
+
+    expect(mailbox.resumeTask('task-p')).toBe(1);
+    expect(taskRows(db)[1]).toMatchObject({ status: 'pending', recurrence: '0 9 * * *' });
+  });
+
+  it('an edit landing between the read and the arm reaches the paused successor', async () => {
+    const { db, mailbox, ack } = sweepFixture();
+    insertTaskRow(db, {
+      id: 'task-p',
+      seriesId: 'task-p',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'old' }),
+    });
+    ack('task-p', 'completed');
+    mailbox.pauseTask('task-p');
+    mailbox.syncProcessingAcks();
+
+    const [stale] = mailbox.getCompletedRecurringRows();
+    expect(mailbox.updateTask('task-p', { prompt: 'new' })).toBe(1);
+    mailbox.armNextRecurrence(stale.id, stale, 'task-stale', '2030-01-01T00:00:00.000Z');
+    expect(taskRows(db).map((r) => r.id)).toEqual(['task-p']);
+
+    await handleRecurrence(mailbox, fakeSession());
+    const successor = db
+      .prepare(`SELECT status, content FROM messages_in WHERE kind = 'task' AND id != 'task-p'`)
+      .get() as { status: string; content: string };
+    expect(successor.status).toBe('paused');
+    expect(JSON.parse(successor.content).prompt).toBe('new');
+  });
+
+  it('a paused one-shot task with a terminal ack still settles as completed', () => {
+    const { db, mailbox, ack } = sweepFixture();
+    insertTaskRow(db, {
+      id: 'task-once',
+      seriesId: 'task-once',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'once' }),
+    });
+    ack('task-once', 'completed');
+    mailbox.pauseTask('task-once');
+    mailbox.syncProcessingAcks();
+
+    expect(taskRows(db)[0]).toMatchObject({ id: 'task-once', status: 'completed' });
   });
 });
