@@ -30,7 +30,7 @@
     },
     "provider-codex": {
       "description": "Agent turns through the Codex CLI in the container",
-      "tests": []
+      "tests": ["container/agent-runner/src/providers/codex-live-path.test.ts"]
     },
     "provider-opencode": {
       "description": "Agent turns through OpenCode in the container",
