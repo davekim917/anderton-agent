@@ -263,6 +263,7 @@ LAYOUT_MISSING=""
 # and every prefix must be a literal that passes the same validator and equals
 # this gate's own value (normalizing would otherwise hide a duplicate element).
 . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-env-literal.sh"
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-served-commit.sh"
 CONTROLLER_ENV_FILE="$(controller_env_file)"
 prefix_agreement_problems() {  # → " NAME" for each prefix the PR gate's env file does not state identically
   local key var theirs theirs_invalid
@@ -977,8 +978,8 @@ gate_config_missing() {
       [ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
       ;;
     http)
-      [[ "$BACKEND_COMMIT_URL" =~ ^https://[^[:space:]#]+$ ]] || MISSING="$MISSING SMOKE_GATE_BACKEND_COMMIT_URL"
-      [[ "$FRONTEND_COMMIT_URL" =~ ^https://[^[:space:]#]+$ ]] || MISSING="$MISSING SMOKE_GATE_FRONTEND_COMMIT_URL"
+      commit_url_valid "$BACKEND_COMMIT_URL" || MISSING="$MISSING SMOKE_GATE_BACKEND_COMMIT_URL"
+      commit_url_valid "$FRONTEND_COMMIT_URL" || MISSING="$MISSING SMOKE_GATE_FRONTEND_COMMIT_URL"
       ;;
     *) MISSING="$MISSING SMOKE_GATE_COMMIT_SOURCE" ;;
   esac
@@ -1588,14 +1589,6 @@ PID_BRANCH=$!
 timeout 10 gh run list -R "$REPO" --branch "$BRANCH" --limit 100 \
   --json headSha,status,conclusion,workflowName >"$TMP_DIR/checks.json" 2>/dev/null &
 PID_CHECKS=$!
-# A CDN in front of a static site serves version.json from cache (Cloudflare on
-# Render answers HIT for minutes and ignores a request no-cache header), so each
-# read carries a unique query parameter to reach the origin.
-commit_url_fetch() {  # <url>
-  local sep='?'
-  case "$1" in *\?*) sep='&' ;; esac
-  timeout 10 curl -fsS --max-time 10 -H 'Accept: application/json' "$1${sep}smoke_gate_nocache=$(date +%s%N)"
-}
 if [ "$COMMIT_SOURCE" = http ]; then
   commit_url_fetch "$BACKEND_COMMIT_URL" >"$TMP_DIR/backend.json" 2>/dev/null &
   PID_BACKEND=$!
@@ -1633,26 +1626,9 @@ CHECK_FAILED="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha a
 # path-skipped — CHECK_FAILED allowlists "skipped", so total>0/pending=0/
 # failed=0 alone would clear a head with zero CI actually executed.
 CHECK_SUCCESS="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha and .status == "completed" and .conclusion == "success")] | length' "$TMP_DIR/checks.json" 2>/dev/null)"
-# Validated inside jq: `$(...)` strips trailing newlines and bash drops NULs, so
-# a check after extraction would accept "abc1234\n" as abc1234.
-served_commit_sha() {  # <body-file>
-  local short full
-  short="$(jq -rs 'if length == 1 and (.[0] | type) == "object" and (.[0].commit | type) == "string"
-                     and (.[0].commit | ascii_downcase | explode
-                          | length >= 7 and length <= 40 and all(.[]; (. >= 48 and . <= 57) or (. >= 97 and . <= 102)))
-                   then .[0].commit | ascii_downcase else empty end' "$1" 2>/dev/null)"
-  [[ "$short" =~ ^[0-9a-f]{7,40}$ ]] || return 0
-  if [ "${#short}" -eq 40 ]; then printf '%s' "$short"; return 0; fi
-  if [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] && [ "${SOURCE_SHA#"$short"}" != "$SOURCE_SHA" ]; then
-    printf '%s' "$SOURCE_SHA"; return 0
-  fi
-  full="$(timeout 10 gh api "repos/$REPO/commits/$short" --jq '.sha' 2>/dev/null)" || return 0
-  [[ "$full" =~ ^[0-9a-f]{40}$ ]] && [ "${full#"$short"}" != "$full" ] && printf '%s' "$full"
-  return 0
-}
 if [ "$COMMIT_SOURCE" = http ]; then
-  BACKEND_SHA="$(served_commit_sha "$TMP_DIR/backend.json")"
-  FRONTEND_SHA="$(served_commit_sha "$TMP_DIR/frontend.json")"
+  BACKEND_SHA="$(served_commit_sha "$TMP_DIR/backend.json" "$SOURCE_SHA" "$REPO")"
+  FRONTEND_SHA="$(served_commit_sha "$TMP_DIR/frontend.json" "$SOURCE_SHA" "$REPO")"
 else
   BACKEND_SHA="$(jq -r '[.[]? | (.deploy // .) | select(.status == "live")][0].commit.id // empty' "$TMP_DIR/backend.json" 2>/dev/null)"
   FRONTEND_SHA="$(jq -r '[.[]? | (.deploy // .) | select(.status == "live")][0].commit.id // empty' "$TMP_DIR/frontend.json" 2>/dev/null)"

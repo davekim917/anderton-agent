@@ -55,6 +55,29 @@
 #   RENDER_API_KEY                   reads that service and its routes.
 #   SMOKE_BUILD_ID_MAX_CHUNKS        JS files scanned before refusing, default 200.
 #
+# SMOKE_GATE_COMMIT_SOURCE=http (default render; the develop gate's knob):
+# nothing reads Render. Both health probes above become commit-bound in either
+# mode, and the forwarding proof in relative mode is the response itself
+# rather than the static site's route table:
+#   - <backend><health path> and, in relative mode,
+#     <frontend><base><health path> each answer 200 with one JSON object whose
+#     top-level `commit` is the frozen commit (smoke-served-commit.sh: 7-40
+#     hex, an abbreviation kept only when it prefixes it or resolves through
+#     GitHub via SMOKE_GATE_REPO), read with a cache-busting parameter;
+#   - each body satisfies SMOKE_BUILD_ID_BACKEND_MARKER, a jq predicate that
+#     must print exactly one `true` (jq's exit status alone is not the answer:
+#     a predicate that reaches `halt` exits 0 having printed nothing). Another environment can run the same
+#     commit (production deploying the same main), so the commit alone does
+#     not prove the intended backend answered; the marker must name something
+#     only that backend reports.
+#   What http gives up in relative mode: only <base><health path> is shown to
+#   reach the marked backend, not that every path under <base> does (a
+#   narrower route ahead of the rewrite is invisible), and the frontend URL
+#   is not tied to a Render service id.
+#   SMOKE_BUILD_ID_EXPECTED_COMMIT and SMOKE_BUILD_ID_BACKEND_MARKER are
+#   required, both base URLs must be https, and the Render service id and
+#   RENDER_API_KEY are not read.
+#
 # One JSON line on stdout, same convention as the sibling gate scripts.
 # Exit 0 on ok:true, 1 on a failed check (a caller gates a campaign start on
 # this), 2 on a usage error.
@@ -79,6 +102,26 @@ API_BASE="${SMOKE_BUILD_ID_API_BASE:-}"
 EXPECTED_COMMIT="${SMOKE_BUILD_ID_EXPECTED_COMMIT:-}"
 FRONTEND_SERVICE="${SMOKE_BUILD_ID_FRONTEND_SERVICE:-${SMOKE_GATE_FRONTEND_SERVICE:-}}"
 MAX_CHUNKS="${SMOKE_BUILD_ID_MAX_CHUNKS:-200}"
+COMMIT_SOURCE="${SMOKE_GATE_COMMIT_SOURCE:-render}"
+BACKEND_MARKER="${SMOKE_BUILD_ID_BACKEND_MARKER:-}"
+REPO="${SMOKE_GATE_REPO:-}"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/smoke-preview-static.sh"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/smoke-served-commit.sh"
+
+case "$COMMIT_SOURCE" in render|http) ;; *)
+  die "SMOKE_GATE_COMMIT_SOURCE must be render or http" ;; esac
+if [ "$COMMIT_SOURCE" = http ]; then
+  commit_url_valid "$FRONTEND_URL" && commit_url_valid "$BACKEND_URL" &&
+    [[ "$FRONTEND_URL$BACKEND_URL" != *\?* ]] ||
+    die "SMOKE_GATE_COMMIT_SOURCE=http needs https base urls with no whitespace, query or # fragment"
+  printf '%s' "$HEALTH_PATH" | grep -Eq '^(/[A-Za-z0-9._~-]+)+$' ||
+    die "SMOKE_GATE_COMMIT_SOURCE=http needs SMOKE_GATE_HEALTH_PATH to be a plain path such as /health, so the cache buster reaches the server"
+  printf '%s' "$EXPECTED_COMMIT" | grep -Eq '^[0-9a-f]{40}$' ||
+    die "SMOKE_GATE_COMMIT_SOURCE=http needs SMOKE_BUILD_ID_EXPECTED_COMMIT, the frozen backend's 40-hex commit"
+  [ -n "$BACKEND_MARKER" ] && jq -n "def marker: ($BACKEND_MARKER); 0" >/dev/null 2>&1 ||
+    die "SMOKE_GATE_COMMIT_SOURCE=http needs SMOKE_BUILD_ID_BACKEND_MARKER, a jq predicate only the intended backend's health body satisfies"
+  FRONTEND_SERVICE=""
+fi
 
 API_MODE=direct
 if [ -n "$API_BASE" ]; then
@@ -87,14 +130,15 @@ if [ -n "$API_BASE" ]; then
     die "SMOKE_BUILD_ID_API_BASE must be an absolute path such as /api"
   printf '%s' "$EXPECTED_COMMIT" | grep -Eq '^[0-9a-f]{40}$' ||
     die "SMOKE_BUILD_ID_API_BASE needs SMOKE_BUILD_ID_EXPECTED_COMMIT, the frozen backend's 40-hex commit"
-  printf '%s' "$FRONTEND_SERVICE" | grep -Eq '^srv-[a-z0-9]+$' ||
-    die "SMOKE_BUILD_ID_API_BASE needs SMOKE_BUILD_ID_FRONTEND_SERVICE (or SMOKE_GATE_FRONTEND_SERVICE), the static site's Render service id"
-  [ -n "${RENDER_API_KEY:-}" ] ||
-    die "SMOKE_BUILD_ID_API_BASE needs RENDER_API_KEY to read the static site's rewrite routes"
+  if [ "$COMMIT_SOURCE" = render ]; then
+    printf '%s' "$FRONTEND_SERVICE" | grep -Eq '^srv-[a-z0-9]+$' ||
+      die "SMOKE_BUILD_ID_API_BASE needs SMOKE_BUILD_ID_FRONTEND_SERVICE (or SMOKE_GATE_FRONTEND_SERVICE), the static site's Render service id"
+    [ -n "${RENDER_API_KEY:-}" ] ||
+      die "SMOKE_BUILD_ID_API_BASE needs RENDER_API_KEY to read the static site's rewrite routes"
+  fi
   printf '%s' "$MAX_CHUNKS" | grep -Eq '^[1-9][0-9]*$' ||
     die "SMOKE_BUILD_ID_MAX_CHUNKS must be a positive integer"
 fi
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/smoke-preview-static.sh"
 
 FRONTEND_URL="${FRONTEND_URL%/}"
 BACKEND_URL="${BACKEND_URL%/}"
@@ -219,8 +263,9 @@ probe_health() {  # <url> → PROBE_CODE, PROBE_COMMIT, PROBE_PROBLEM
   : >"$body"
   PROBE_COMMIT=""
   PROBE_PROBLEM=""
-  local rc=0
-  PROBE_CODE="$(curl -sS -o "$body" -w '%{http_code}' --max-time "$TIMEOUT" "$1" 2>/dev/null)" || rc=$?
+  local rc=0 url="$1"
+  [ "$COMMIT_SOURCE" = render ] || url="$(commit_url_nocache "$1")"
+  PROBE_CODE="$(curl -sS -o "$body" -w '%{http_code}' --max-time "$TIMEOUT" "$url" 2>/dev/null)" || rc=$?
   if [ "$PROBE_CODE" != 200 ]; then
     PROBE_PROBLEM="returned ${PROBE_CODE:-no response}, not 200"
   elif [ "$rc" -ne 0 ]; then
@@ -229,6 +274,15 @@ probe_health() {  # <url> → PROBE_CODE, PROBE_COMMIT, PROBE_PROBLEM
     PROBE_PROBLEM="returned 200 but not exactly one JSON object (an SPA page served in place of health)"
   elif jq -e 'has("ok") and .ok != true' "$body" >/dev/null 2>&1; then
     PROBE_PROBLEM="reports ok other than true"
+  elif [ "$COMMIT_SOURCE" = http ]; then
+    PROBE_COMMIT="$(served_commit_sha "$body" "$EXPECTED_COMMIT" "$REPO")"
+    if [ -z "$PROBE_COMMIT" ]; then
+      PROBE_PROBLEM="carries no top-level commit that is 7-40 hex and resolves to a full SHA"
+    elif [ "$PROBE_COMMIT" != "$EXPECTED_COMMIT" ]; then
+      PROBE_PROBLEM="serves commit $PROBE_COMMIT, not the frozen $EXPECTED_COMMIT"
+    elif [ "$(jq -r "[($BACKEND_MARKER)] == [true]" "$body" 2>/dev/null)" != true ]; then
+      PROBE_PROBLEM="serves the frozen commit but does not satisfy SMOKE_BUILD_ID_BACKEND_MARKER ($BACKEND_MARKER) — another environment on the same commit answered"
+    fi
   else
     PROBE_COMMIT="$(jq -r "$SERVED_SHA_JQ" "$body" 2>/dev/null)"
     if [ -z "$PROBE_COMMIT" ]; then
@@ -246,7 +300,7 @@ BACKEND_REACHABLE=false
 BACKEND_HTTP_CODE=""
 BACKEND_COMMIT=""
 BACKEND_PROBLEM=""
-if [ "$API_MODE" = direct ]; then
+if [ "$API_MODE" = direct ] && [ "$COMMIT_SOURCE" = render ]; then
   CODE="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time "$TIMEOUT" "${BACKEND_URL}${HEALTH_PATH}" 2>/dev/null)"
   if [ $? -eq 0 ] && [ "$CODE" = "200" ]; then
     BACKEND_REACHABLE=true
@@ -268,8 +322,8 @@ SAME_ORIGIN_URL=""
 SAME_ORIGIN_HTTP_CODE=""
 SAME_ORIGIN_COMMIT=""
 SAME_ORIGIN_PROBLEM=""
-if [ "$API_MODE" = relative ]; then
-  PROBE_PATH="$API_BASE$HEALTH_PATH"
+PROBE_PATH="$API_BASE$HEALTH_PATH"
+if [ "$API_MODE" = relative ] && [ "$COMMIT_SOURCE" = render ]; then
   SVC_API="https://api.render.com/v1/services/$FRONTEND_SERVICE"
   if ! SERVICE_JSON="$(curl -fsS --max-time "$TIMEOUT" -H "Authorization: Bearer $RENDER_API_KEY" "$SVC_API" 2>/dev/null)"; then
     FORWARD_PROBLEM="could not read Render service $FRONTEND_SERVICE"
@@ -311,6 +365,8 @@ if [ "$API_MODE" = relative ]; then
       FORWARD_PROBLEM="route $(jq -r '.shadow | "\(.type) \(.source) -> \(.destination) (priority \(.priority))"' <<<"$ROUTE_EVAL") is evaluated no later than the rewrite of $API_BASE/* and overlaps it — some API requests would not reach $BACKEND_URL"
     fi
   fi
+fi
+if [ "$API_MODE" = relative ]; then
   SAME_ORIGIN_URL="$FRONTEND_URL$PROBE_PATH"
   probe_health "$SAME_ORIGIN_URL"
   SAME_ORIGIN_HTTP_CODE="$PROBE_CODE"
@@ -380,6 +436,8 @@ jq -cn \
   --arg sameOriginUrl "$SAME_ORIGIN_URL" \
   --arg sameOriginHttpCode "$SAME_ORIGIN_HTTP_CODE" \
   --arg sameOriginCommit "$SAME_ORIGIN_COMMIT" \
+  --arg commitSource "$COMMIT_SOURCE" \
+  --arg backendMarker "$BACKEND_MARKER" \
   'def nul: if . == "" then null else . end;
    {ok:$ok, apiMode:$apiMode,
     frontendUrl:$frontendUrl, backendUrl:$backendUrl,
@@ -395,6 +453,10 @@ jq -cn \
         frontendService:$frontendService, forwardRoute:$forwardRoute,
         sameOriginUrl:$sameOriginUrl, sameOriginHttpCode:($sameOriginHttpCode | nul),
         sameOriginCommit:($sameOriginCommit | nul)}
+     else {} end
+   + if $commitSource == "http" then
+       {commitSource:$commitSource, backendMarker:$backendMarker,
+        expectedCommit:$expectedCommit, backendCommit:($backendCommit | nul)}
      else {} end'
 
 [ "$OK" = true ] && exit 0 || exit 1

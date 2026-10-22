@@ -523,6 +523,19 @@ routes to prove the first rule matching `<base><health path>` is the rewrite
 health to return JSON carrying the frozen commit. Backend reachability alone is
 never proxy proof; the script's header lists every refusal.
 
+**Without Render** (`SMOKE_GATE_COMMIT_SOURCE=http`, the develop gate's knob),
+nothing reads the Render API in either mode. The direct backend health and, in
+relative mode, the web origin's `<base><health path>` must each be one JSON
+object whose top-level `commit` is `SMOKE_BUILD_ID_EXPECTED_COMMIT` and which
+satisfies `SMOKE_BUILD_ID_BACKEND_MARKER`, a jq predicate yielding exactly one
+`true`. The marker is required because the commit alone is not proof of which
+backend answered: a production environment that deploys the same branch
+serves the same commit. Pick a field only the intended backend reports, and
+confirm the other environments' health lacks it before relying on it. Under
+http the route table is not read, so only the health path is shown to reach
+the marked backend, not every path under the base; the script's header names
+that trade-off.
+
 **Freeze the deployed PAIR with `scripts/smoke-pair-identity.sh`, not a
 per-run ad hoc script.** `smoke-build-identity.sh` proves the bundle/host
 binding once; it does not re-prove the environment still serves the SAME
@@ -530,7 +543,13 @@ build a minute, or an hour, into a long run. A shared dev environment can be
 replaced under a live run by an unrelated deploy — a different failure from
 `smoke-build-identity.sh`'s bundle-host seam and not caught by it. Configure
 `SMOKE_GATE_FRONTEND_SERVICE` / `SMOKE_GATE_BACKEND_SERVICE` (the same names
-`smoke-develop-gate.sh` reads — one wrapper env file configures both) and:
+`smoke-develop-gate.sh` reads — one wrapper env file configures both). Under
+`SMOKE_GATE_COMMIT_SOURCE=http` the pair is instead
+`SMOKE_GATE_FRONTEND_COMMIT_URL` / `SMOKE_GATE_BACKEND_COMMIT_URL`, each side's
+identity is the `commit` its URL serves (read as the develop gate reads it),
+and the run records `commitSource: "http"`, so its later `check`, `finish` and
+`refreeze` read the same URLs with no Render call even when the knob is unset.
+A run frozen one way is never checked the other way. Then:
 
 ```bash
 bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh start <run-dir>

@@ -42,6 +42,15 @@
 #      SMOKE_PREVIEW_PROVIDER=static: the two ids are the PR previews' URLs (the gate's
 #      frontendPreviewId/backendPreviewId), and each side's identity is the commit it serves
 #      (smoke-preview-static.sh), recorded as deploy `sha-<commit>`; no Render call, no key.
+#      SMOKE_GATE_COMMIT_SOURCE=http: the two ids are SMOKE_GATE_FRONTEND_COMMIT_URL /
+#      SMOKE_GATE_BACKEND_COMMIT_URL (https, the same knobs smoke-develop-gate.sh reads), and each
+#      side's identity is the top-level `commit` its URL serves (smoke-served-commit.sh: one JSON
+#      object, 7-40 hex, an abbreviation kept only when it prefixes the expected or frozen commit
+#      or resolves through GitHub via SMOKE_GATE_REPO), recorded as deploy `sha-<commit>` with
+#      `commitSource: "http"` in identity.json; no Render call, no key. check, finish and refreeze
+#      of a run frozen that way read it the same way with the knob unset; a run frozen through
+#      Render or a static preview is never checked through http, nor the reverse. Setting both
+#      it and SMOKE_PREVIEW_PROVIDER refuses.
 #      SMOKE_PAIR_FIXTURE_DIR (tests only: <dir>/fe.json, <dir>/be.json replace Render).
 #
 # RE-FREEZE, BOUNDED. `start` is no-clobber by design — an unbounded re-freeze would let
@@ -69,21 +78,53 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 jq_here() { (cd "$HERE" && jq -L "$HERE" "$@"); }
-FE="${SMOKE_GATE_FRONTEND_SERVICE:-}"
-BE="${SMOKE_GATE_BACKEND_SERVICE:-}"
-PROVIDER="${SMOKE_PREVIEW_PROVIDER:-render}"
+COMMIT_SOURCE="${SMOKE_GATE_COMMIT_SOURCE:-render}"
+case "$COMMIT_SOURCE" in render|http) ;; *)
+  echo "REFUSED: SMOKE_GATE_COMMIT_SOURCE must be render or http — an unknown source identifies no pair (exit 2)" >&2
+  exit 2 ;; esac
+if [ "$COMMIT_SOURCE" = http ]; then
+  [ -z "${SMOKE_PREVIEW_PROVIDER:-}" ] || {
+    echo "REFUSED: SMOKE_GATE_COMMIT_SOURCE=http and SMOKE_PREVIEW_PROVIDER=$SMOKE_PREVIEW_PROVIDER both say where the pair's identity comes from; set one (exit 2)" >&2
+    exit 2; }
+  FE_VAR=SMOKE_GATE_FRONTEND_COMMIT_URL; BE_VAR=SMOKE_GATE_BACKEND_COMMIT_URL
+  EXPLICIT_PROVIDER=http
+else
+  FE_VAR=SMOKE_GATE_FRONTEND_SERVICE; BE_VAR=SMOKE_GATE_BACKEND_SERVICE
+  EXPLICIT_PROVIDER="${SMOKE_PREVIEW_PROVIDER:-}"
+fi
+FE="${!FE_VAR:-}"
+BE="${!BE_VAR:-}"
+PROVIDER="${EXPLICIT_PROVIDER:-render}"
+REPO="${SMOKE_GATE_REPO:-}"
+TIP_FE=""
+TIP_BE=""
 . "$HERE/smoke-preview-static.sh"
+. "$HERE/smoke-served-commit.sh"
 require_services() {
-  case "$PROVIDER" in render|static) ;; *)
+  case "$PROVIDER" in render|static|http) ;; *)
     echo "REFUSED: SMOKE_PREVIEW_PROVIDER must be render or static — an unknown provider identifies no pair (exit 2)" >&2
     exit 2 ;; esac
+  if [ "$PROVIDER" = http ]; then
+    commit_url_valid "$FE" && commit_url_valid "$BE" && return 0
+    echo "REFUSED: SMOKE_GATE_FRONTEND_COMMIT_URL and SMOKE_GATE_BACKEND_COMMIT_URL must be https URLs with no whitespace or # fragment — no default pair (exit 2)" >&2
+    exit 2
+  fi
   [ -n "$FE" ] && [ -n "$BE" ] && return 0
   echo "REFUSED: SMOKE_GATE_FRONTEND_SERVICE and SMOKE_GATE_BACKEND_SERVICE are required — no default pair (exit 2)" >&2
   exit 2
 }
 fetch() { if [ -n "${SMOKE_PAIR_FIXTURE_DIR:-}" ]; then cat "$SMOKE_PAIR_FIXTURE_DIR/$1.json"; return; fi
-  if [ "$PROVIDER" = static ]; then
-    jq -cn --arg sha "$(served_sha "$2")" '[{deploy:{id:(if $sha == "" then null else "sha-" + $sha end),status:"live",commit:{id:(if $sha == "" then null else $sha end)}}}]'
+  local sha body tip
+  if [ "$PROVIDER" = http ]; then
+    tip="$TIP_BE"; [ "$1" = fe ] && tip="$TIP_FE"
+    body="$(mktemp)" || return 1
+    commit_url_fetch "$2" >"$body" 2>/dev/null || { rm -f "$body"; return 1; }
+    sha="$(served_commit_sha "$body" "$tip" "$REPO")"
+    rm -f "$body"
+  fi
+  if [ "$PROVIDER" = static ]; then sha="$(served_sha "$2")"; fi
+  if [ "$PROVIDER" = static ] || [ "$PROVIDER" = http ]; then
+    jq -cn --arg sha "$sha" '[{deploy:{id:(if $sha == "" then null else "sha-" + $sha end),status:"live",commit:{id:(if $sha == "" then null else $sha end)}}}]'
     return
   fi
   curl -sS --max-time 20 -H "Authorization: Bearer ${RENDER_API_KEY:?RENDER_API_KEY required}" "https://api.render.com/v1/services/$2/deploys?limit=5"; }
@@ -95,6 +136,8 @@ import json, sys, os, re, datetime
 DEP = re.compile(r"^dep-[a-z0-9]{10,}$"); SVC = re.compile(r"^srv-[a-z0-9]{10,}$"); SHA = re.compile(r"^[0-9a-f]{40}$")
 if os.environ["PROVIDER"] == "static":
     DEP = re.compile(r"^sha-[0-9a-f]{40}$"); SVC = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$")
+if os.environ["PROVIDER"] == "http":
+    DEP = re.compile(r"^sha-[0-9a-f]{40}$"); SVC = re.compile(r"^https://[^\s#]+$")
 def pick(raw, svc):
     try:
         arr = json.loads(raw)
@@ -114,6 +157,7 @@ def pick(raw, svc):
 fe = pick(sys.argv[1], os.environ["FE_SVC"]); be = pick(sys.argv[2], os.environ["BE_SVC"])
 ok = all(not o.get("error") for o in (fe, be))
 pair = {"frontend": fe, "backend": be, "readAt": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "ok": ok}
+if os.environ["PROVIDER"] == "http": pair["commitSource"] = "http"
 if not ok: pair["error"] = "; ".join(f"{s}: {o['error']}" for s, o in (("frontend", fe), ("backend", be)) if o.get("error"))
 print(json.dumps(pair, separators=(",", ":"))); sys.exit(0 if ok else 2)
 PY
@@ -173,27 +217,34 @@ frozen_service() { # <identity.json> <frontend|backend> → frozen service id
 # names another service refuses here, before anything reads or records; only
 # refreeze may carry one forward, as RETARGET, for its source-bound check.
 use_frozen_pair() { # <identity.json> <verb>
-  local f="$1" verb="$2" ffe fbe shape
+  local f="$1" verb="$2" ffe fbe shape fsrc knob
   ffe="$(frozen_service "$f" frontend)" && fbe="$(frozen_service "$f" backend)" || {
     echo "REFUSED: $verb: $f names no frozen frontend/backend service id — nothing read or recorded (exit 2)" >&2; exit 2; }
+  fsrc="$(jq -r '.commitSource // empty | strings' "$f" 2>/dev/null)"
   RETARGET=""
   if { [ -n "$FE" ] && [ "$FE" != "$ffe" ]; } || { [ -n "$BE" ] && [ "$BE" != "$fbe" ]; }; then
     if [ "$verb" != refreeze ]; then
-      echo "REFUSED: $verb: env names frontend=${FE:-<unset>} backend=${BE:-<unset>} but this run froze frontend=$ffe backend=$fbe ($f). Unset SMOKE_GATE_FRONTEND_SERVICE/SMOKE_GATE_BACKEND_SERVICE (the frozen ids are used) or pass the frozen ids; nothing read or recorded (exit 2)" >&2
+      echo "REFUSED: $verb: env names frontend=${FE:-<unset>} backend=${BE:-<unset>} but this run froze frontend=$ffe backend=$fbe ($f). Unset $FE_VAR/$BE_VAR (the frozen ids are used) or pass the frozen ids; nothing read or recorded (exit 2)" >&2
       exit 2
     fi
     RETARGET="frontend=$ffe backend=$fbe → frontend=${FE:-$ffe} backend=${BE:-$fbe}"
   fi
   FE="${FE:-$ffe}"; BE="${BE:-$fbe}"
-  if is_url "$FE" && is_url "$BE"; then shape=static
+  if [ "$fsrc" = http ]; then shape=http
+  elif [ -n "$fsrc" ]; then
+    echo "REFUSED: $verb: $f records commitSource=$fsrc, which no provider reads — nothing read or recorded (exit 2)" >&2; exit 2
+  elif is_url "$FE" && is_url "$BE"; then shape=static
   elif is_url "$FE" || is_url "$BE"; then
     echo "REFUSED: $verb: frontend=$FE backend=$BE mixes a preview URL with a service id — no provider reads that pair (exit 2)" >&2; exit 2
   else shape=render; fi
-  if [ -z "${SMOKE_PREVIEW_PROVIDER:-}" ]; then PROVIDER="$shape"
+  if [ -z "$EXPLICIT_PROVIDER" ]; then PROVIDER="$shape"
   elif [ "$PROVIDER" != "$shape" ]; then
-    echo "REFUSED: $verb: SMOKE_PREVIEW_PROVIDER=$PROVIDER but frontend=$FE backend=$BE are $shape ids — nothing read or recorded (exit 2)" >&2
+    knob="SMOKE_PREVIEW_PROVIDER=$PROVIDER"; [ "$COMMIT_SOURCE" = http ] && knob="SMOKE_GATE_COMMIT_SOURCE=http"
+    echo "REFUSED: $verb: $knob but this run froze frontend=$FE backend=$BE as $shape ids — nothing read or recorded (exit 2)" >&2
     exit 2
   fi
+  TIP_FE="$(jq -r '.frontend.commit // empty | strings' "$f" 2>/dev/null)"
+  TIP_BE="$(jq -r '.backend.commit // empty | strings' "$f" 2>/dev/null)"
 }
 
 compare() { # $1 frozen file, $2 now json, $3 label, $4 rc-of-read, $5 log, $6 freeze-generation, $7 expected-source-sha → prints verdict, exit 0/2/3
@@ -233,6 +284,7 @@ case "${1:-}" in
     mkdir -p "$RUN/coordinator" 2>/dev/null || { echo "REFUSED: cannot create $RUN/coordinator (exit 2)" >&2; exit 2; }
     CONTRACT_SOURCE_SHA="$(pr_contract_source_sha "$RUN")" || exit 2
     EXPECTED_SOURCE_SHA="$CONTRACT_SOURCE_SHA"
+    TIP_FE="$EXPECTED_SOURCE_SHA"; TIP_BE="$EXPECTED_SOURCE_SHA"
     P="$(read_pair)"; rc=$?
     [ $rc -eq 0 ] || { echo "REFUSED: identity unreadable/invalid — nothing frozen: $P" >&2; exit 2; }
     if [ -n "$EXPECTED_SOURCE_SHA" ] && ! pair_matches_source_sha "$P" "$EXPECTED_SOURCE_SHA"; then
@@ -354,9 +406,10 @@ PY
     EXPECTED_SOURCE_SHA="$CONTRACT_SOURCE_SHA"
     [ -n "$EXPECTED_SOURCE_SHA" ] || EXPECTED_SOURCE_SHA="$(stored_expected_source_sha "$F")"
     if [ -n "$RETARGET" ] && [ -z "$EXPECTED_SOURCE_SHA" ]; then
-      echo "REFUSED: refreeze onto other services ($RETARGET) needs a PR sourceSha the new pair must serve, and this run has none — nothing re-frozen. Scaffold the PR contract first, or unset SMOKE_GATE_FRONTEND_SERVICE/SMOKE_GATE_BACKEND_SERVICE to re-freeze the frozen services (exit 2)" >&2
+      echo "REFUSED: refreeze onto other services ($RETARGET) needs a PR sourceSha the new pair must serve, and this run has none — nothing re-frozen. Scaffold the PR contract first, or unset $FE_VAR/$BE_VAR to re-freeze the frozen services (exit 2)" >&2
       exit 2
     fi
+    [ -z "$EXPECTED_SOURCE_SHA" ] || { TIP_FE="$EXPECTED_SOURCE_SHA"; TIP_BE="$EXPECTED_SOURCE_SHA"; }
     P="$(read_pair)"; rc=$?
     [ $rc -eq 0 ] || { echo "REFUSED: live identity unreadable/invalid — nothing re-frozen: $P" >&2; exit 2; }
     if [ -n "$EXPECTED_SOURCE_SHA" ] && ! pair_matches_source_sha "$P" "$EXPECTED_SOURCE_SHA"; then
