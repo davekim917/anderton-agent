@@ -2,17 +2,16 @@
  * Spawn-time routing alone never brings back a fallback session whose
  * container stays busy enough to outlive every idle reap.
  */
-import { execFileSync } from 'child_process';
-
 import { readContainerConfig } from '../../container-config.js';
 import {
   containerIdentityFor,
+  isContainerStopping,
   killContainer,
   sameContainerIdentity,
   sessionStillActive,
   type ContainerIdentity,
 } from '../../container-runner.js';
-import { CONTAINER_RUNTIME_BIN } from '../../container-runtime.js';
+import { runRuntime } from '../../container-runtime.js';
 import {
   SWEEP_DUTY_INVENTORY,
   asSessionContext,
@@ -30,7 +29,7 @@ import { PROVIDER_FALLBACK_APPLIED_ENV } from '../../provider-fallback.js';
 import { requestWake } from '../../request-wake.js';
 
 const PROVIDER_RETURN_ID_PREFIX = 'provider-return-';
-/** Synchronous on the host's only event loop: a stalled runtime must cost this attempt, not every session. */
+/** Past this bound the inspect fails and this session's return waits for a later tick. */
 const INSPECT_TIMEOUT_MS = 5_000;
 
 export function isBetweenTurns(
@@ -47,12 +46,11 @@ export function isBetweenTurns(
  * is judged the same way as one this host spawned. The comparison runs inside the runtime's template: the
  * container env also carries credentials, which must never reach this process.
  */
-function readFallbackMarker(containerName: string): boolean {
+async function readFallbackMarker(containerName: string): Promise<boolean> {
   const marker = `${PROVIDER_FALLBACK_APPLIED_ENV}=1`;
-  const output = execFileSync(
-    CONTAINER_RUNTIME_BIN,
+  const output = await runRuntime(
     ['inspect', '--format', `{{range .Config.Env}}{{if eq . "${marker}"}}1{{end}}{{end}}`, containerName],
-    { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8', timeout: INSPECT_TIMEOUT_MS },
+    INSPECT_TIMEOUT_MS,
   );
   return output.trim() === '1';
 }
@@ -67,15 +65,17 @@ function evictEndedContainers(): void {
   }
 }
 
-function containerOnFallback(
+type ReadFallbackMarker = (containerName: string) => boolean | Promise<boolean>;
+
+async function containerOnFallback(
   sessionId: string,
   containerName: string,
-  readMarker: (containerName: string) => boolean,
-): boolean | null {
+  readMarker: ReadFallbackMarker,
+): Promise<boolean | null> {
   const cached = fallbackMarkerBySession.get(sessionId);
   if (cached?.containerName === containerName) return cached.onFallback;
   try {
-    const onFallback = readMarker(containerName);
+    const onFallback = await readMarker(containerName);
     evictEndedContainers();
     fallbackMarkerBySession.set(sessionId, { containerName, onFallback });
     return onFallback;
@@ -95,7 +95,7 @@ export function _fallbackMarkerCacheSizeForTesting(): number {
 
 export async function sweepProviderReturn(
   ctx: SweepSessionContext,
-  deps: { readMarker?: (containerName: string) => boolean } = {},
+  deps: { readMarker?: ReadFallbackMarker } = {},
 ): Promise<boolean> {
   const { session, observed, plan } = ctx;
   if (!observed || !isBetweenTurns(plan, observed)) return false;
@@ -112,7 +112,7 @@ export async function sweepProviderReturn(
   // Asked directly, not inferred from the spawn resolver: it also picks the primary when the fallback is in cooldown.
   const primaryProvider = resolveProviderName(session.agent_provider, containerConfig.provider);
   if (await isProviderUnavailable(session.agent_group_id, primaryProvider)) return false;
-  if (containerOnFallback(session.id, target.containerName, deps.readMarker ?? readFallbackMarker) !== true) {
+  if ((await containerOnFallback(session.id, target.containerName, deps.readMarker ?? readFallbackMarker)) !== true) {
     return false;
   }
 
@@ -120,7 +120,10 @@ export async function sweepProviderReturn(
   // The plan and observation are snapshots from before the awaits above: the container may have been replaced or
   // taken a turn since, and both are rechecked with no yield before the wake row.
   const outcome = await ctx.run((mailbox) => {
-    if (!sameContainerIdentity(containerIdentityFor(session.id), target)) return 'replaced';
+    // A stop that started during the awaits is someone else's decision about this container: leave it to them.
+    if (!sameContainerIdentity(containerIdentityFor(session.id), target) || isContainerStopping(session.id)) {
+      return 'replaced';
+    }
     const current = {
       dueCount: mailbox.countDueMessages(),
       workContinuation: mailbox.readWorkContinuation(),
@@ -145,7 +148,7 @@ export async function sweepProviderReturn(
   if (outcome === 'replaced') return true;
   if (outcome !== 'written') return false;
 
-  if (!sameContainerIdentity(containerIdentityFor(session.id), target)) return true;
+  if (!sameContainerIdentity(containerIdentityFor(session.id), target) || isContainerStopping(session.id)) return true;
   log.warn('provider-return: primary available again — restarting the fallback container', {
     sessionId: session.id,
     containerName: target.containerName,

@@ -357,18 +357,17 @@ async function sweepProviderHeal(
   const target = observedContainer ?? registered;
 
   if (decision === 'park') {
-    // Kill first, then post: outbound.db has one writer and the container must
-    // be stopped first. No onExit: parked means no respawn until real inbound.
+    // outbound.db has one writer, so the notice rides the container's exit: the kill only requests the stop. The
+    // exit work is bookkeeping, not a respawn: the stop intent stays `stop` until real inbound.
     log.warn('self-heal: provider heal budget exhausted — parking', bounds);
     // Fenced again because a replacement can land between the checks.
     if (identityChanged(containerIdentityFor(session.id), target)) {
       log.info('self-heal: park target was replaced before the kill — leaving the live container alone', bounds);
       return true;
     }
-    killContainer(session.id, 'provider-failed-selfheal-parked');
-    try {
-      await run((mailbox) =>
-        // A respawn in the gap after the kill owns outbound.db; the notice is
+    const notice = (): Promise<void> =>
+      run((mailbox) =>
+        // A respawn in the gap after the exit owns outbound.db; the notice is
         // idempotent, so skipping it costs nothing.
         writeOutboundWhenStopped(session, mailbox, () =>
           notifyProviderHealParked(
@@ -378,10 +377,15 @@ async function sweepProviderHeal(
             writeParkedMessage,
           ),
         ),
-      );
-    } catch (err) {
-      log.warn('self-heal: parked notice failed', { sessionId: session.id, err });
-    }
+      ).then(() => undefined);
+    const wasThere = isContainerRunning(session.id) || isContainerSpawning(session.id);
+    killContainer(
+      session.id,
+      'provider-failed-selfheal-parked',
+      wasThere ? () => trackPostKill(notice(), session.id) : undefined,
+    );
+    // Nothing to kill: no exit will fire, and ownership is already false.
+    if (!wasThere) trackPostKill(notice(), session.id);
     return true;
   }
 

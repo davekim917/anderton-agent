@@ -60,6 +60,10 @@ const fakes = vi.hoisted(() => {
     running: new Set<string>(),
     listingFails: false,
     stopThrows: false,
+    /** `docker stop` (and its escalation) outlives its bound. */
+    stopTimesOut: false,
+    /** While set, `docker stop` is in flight and returns only when this settles. */
+    stopGate: null as Promise<void> | null,
     calls: [] as string[],
     waiters: [] as Array<{ name: string; waiter: Waiter }>,
     makeWaiter: null as null | ((name: string) => Waiter),
@@ -85,29 +89,36 @@ const fakes = vi.hoisted(() => {
       this.running.clear();
       this.listingFails = false;
       this.stopThrows = false;
+      this.stopTimesOut = false;
+      this.stopGate = null;
       this.calls = [];
       this.waiters = [];
     },
   };
 });
 
-vi.mock('./container-runtime.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./container-runtime.js')>()),
-  CONTAINER_RUNTIME_BIN: FAKE_RUNTIME_BIN,
-  listInstallContainersWithScope: () => fakes.list(),
-  stopContainer: (name: string) => {
-    fakes.calls.push(`stop:${name}`);
-    if (fakes.stopThrows) throw new Error('docker stop failed');
-  },
-  killContainerHard: (name: string) => {
-    fakes.calls.push(`docker-kill:${name}`);
-  },
-  runtimeShowsRunning: (name: string) => {
-    if (fakes.listingFails) throw new Error('Cannot connect to the Docker daemon');
-    return fakes.running.has(name);
-  },
-  waitForContainerExit: (name: string) => fakes.arm(name),
-}));
+vi.mock('./container-runtime.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./container-runtime.js')>();
+  return {
+    ...real,
+    CONTAINER_RUNTIME_BIN: FAKE_RUNTIME_BIN,
+    listInstallContainersWithScope: () => fakes.list(),
+    stopContainer: (name: string) => {
+      fakes.calls.push(`stop:${name}`);
+      if (fakes.stopThrows) throw new Error('docker stop failed');
+      if (fakes.stopTimesOut) throw new real.RuntimeCallTimeoutError(['stop', '-t', '1', name], 30_000);
+      return fakes.stopGate ?? undefined;
+    },
+    killContainerHard: (name: string) => {
+      fakes.calls.push(`docker-kill:${name}`);
+    },
+    runtimeShowsRunning: (name: string) => {
+      if (fakes.listingFails) throw new Error('Cannot connect to the Docker daemon');
+      return fakes.running.has(name);
+    },
+    waitForContainerExit: (name: string) => fakes.arm(name),
+  };
+});
 
 /** Parks the NEXT `getSessionClaim` read once — the finish's fence read, in the interleaving case. */
 const claimReads = vi.hoisted(() => ({
@@ -233,6 +244,7 @@ import {
   planContainerShutdown,
   isAdoptedContainer,
   isContainerRunning,
+  isContainerStopping,
   killContainer,
   wakeContainer,
   _resetAdoptionStateForTesting,
@@ -351,6 +363,7 @@ describe('supervision channel', () => {
     // `docker stop` failed, so the fallback went to the CONTAINER by name; the
     // waiter was only touched afterwards, and killing it did not finalize —
     // the truth re-read still shows the container running.
+    await until(() => fakes.calls.length === 3, 'the stop fallback never reached the waiter');
     expect(fakes.calls).toEqual([
       'stop:nanoclaw-v2-sess-adopted-kill',
       'docker-kill:nanoclaw-v2-sess-adopted-kill',
@@ -359,6 +372,63 @@ describe('supervision channel', () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(isContainerRunning('sess-adopted-kill')).toBe(true);
     expect(await containerStatusOf('sess-adopted-kill')).toBe('running');
+  });
+
+  it('a second kill while a stop is in flight rides it: one docker stop, every exit callback once, after the exit', async () => {
+    await adopt('sess-slow-stop');
+    let landStop!: () => void;
+    fakes.stopGate = new Promise<void>((resolve) => {
+      landStop = resolve;
+    });
+    const exits: string[] = [];
+
+    killContainer('sess-slow-stop', 'idle', () => {
+      exits.push('first');
+    });
+    killContainer('sess-slow-stop', 'idle again', () => {
+      exits.push('second');
+    });
+
+    expect(fakes.calls).toEqual(['stop:nanoclaw-v2-sess-slow-stop']);
+    expect(isContainerStopping('sess-slow-stop')).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // The stop has not landed and the container has not exited: no exit work yet.
+    expect(exits).toEqual([]);
+    expect(isContainerRunning('sess-slow-stop')).toBe(true);
+
+    landStop();
+    await until(() => !isContainerStopping('sess-slow-stop'), 'the stop never settled');
+    // The stop settling is not the exit: exit work rides the channel's close, not the stop call.
+    expect(exits).toEqual([]);
+    fakes.exit('nanoclaw-v2-sess-slow-stop', 0);
+    await until(() => exits.length === 2, 'the exit work never ran');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(exits).toEqual(['first', 'second']);
+    expect(fakes.calls).toEqual(['stop:nanoclaw-v2-sess-slow-stop']);
+  });
+
+  it("a spawned entry's stop that times out does not SIGKILL the client: the session is not finalized early", async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-stop-timeout');
+    await expect(wakeContainer(callerSnapshot('sess-stop-timeout'))).resolves.toBe(true);
+    fakes.stopTimesOut = true;
+    const exits: string[] = [];
+
+    killContainer('sess-stop-timeout', 'test', () => {
+      exits.push('exit');
+    });
+    await until(() => !isContainerStopping('sess-stop-timeout'), 'the stop never settled');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // The daemon may still be stopping it: the entry stays owned and no exit work has run.
+    expect(isContainerRunning('sess-stop-timeout')).toBe(true);
+    expect(exits).toEqual([]);
+
+    // An outright failure still takes the SIGKILL fallback; the exit work then runs once.
+    fakes.stopTimesOut = false;
+    fakes.stopThrows = true;
+    killContainer('sess-stop-timeout', 'test again');
+    await until(() => !isContainerRunning('sess-stop-timeout'), 'the SIGKILLed client never finalized');
+    await until(() => exits.length === 1, 'the exit work never ran');
   });
 
   it("a spawned entry's fallback is unchanged", async () => {
@@ -406,6 +476,10 @@ describe('supervision channel', () => {
     // The daemon restarted: every waiter exits at once with no container gone.
     fakes.exit('nanoclaw-v2-sess-daemon-restart', 1);
 
+    await until(
+      () => warnings('Adopted container waiter exited but the container is still running — re-arming').length > 0,
+      'the truth re-read never ran',
+    );
     expect(warnings('Adopted container waiter exited but the container is still running — re-arming')).toHaveLength(1);
     expect(isContainerRunning('sess-daemon-restart')).toBe(true);
     expect(await containerStatusOf('sess-daemon-restart')).toBe('running');
@@ -486,7 +560,7 @@ describe('supervision channel', () => {
     });
 
     fakes.exit('nanoclaw-v2-sess-interleave', 0);
-    expect(isContainerRunning('sess-interleave')).toBe(false);
+    await until(() => !isContainerRunning('sess-interleave'), 'the finish never started');
     // The replacement wake: its claim CAS is its own central transaction, so
     // it queues behind the parked finish instead of landing inside its window.
     const replacement = wakeContainer(callerSnapshot('sess-interleave'));

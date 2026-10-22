@@ -477,8 +477,8 @@ export interface BootQuiescenceOptions {
     survivableSessionIds: string[];
     mustStopSessionIds: string[];
   }) => Promise<void> | void;
-  list?: () => InstallContainerScope[];
-  stop?: (name: string) => void;
+  list?: () => InstallContainerScope[] | Promise<InstallContainerScope[]>;
+  stop?: (name: string) => void | Promise<void>;
 }
 
 /**
@@ -524,7 +524,7 @@ export async function quiesceWorkgroupsForBootMountChange(
   const known = new Set(options.knownWorkgroupIds ?? changedWorkgroupIds);
   const knownSessions = new Set(options.knownSessionIds ?? []);
 
-  const containers = list();
+  const containers = await list();
   const unlabeled = containers.filter((entry) => entry.workgroupId === null);
 
   // Partition 1: chooses the stop set and the accountability note's skip set.
@@ -537,18 +537,18 @@ export async function quiesceWorkgroupsForBootMountChange(
 
   const stoppedNames = new Set<string>();
   const mustStopNames = new Set<string>();
-  const stopAll = (entries: InstallContainerScope[]): void => {
+  const stopAll = async (entries: InstallContainerScope[]): Promise<void> => {
     for (const entry of entries) {
       mustStopNames.add(entry.name);
       try {
-        stop(entry.name);
+        await stop(entry.name);
       } catch (err) {
         throw new Error(`Cannot prove install-scoped container absence: failed to stop ${entry.name}`, { cause: err });
       }
       stoppedNames.add(entry.name);
     }
   };
-  stopAll(preStop.mustStop);
+  await stopAll(preStop.mustStop);
 
   // Re-evaluated once nothing in a changed workgroup can write its group dir (the stale snapshot would call a flipped
   // workgroup survivable). Survivors keep running, so a flip after this is reconciled at the next boot, not this one.
@@ -556,7 +556,7 @@ export async function quiesceWorkgroupsForBootMountChange(
 
   // A SECOND inventory, taken after the re-evaluation is awaited, classified by each container's own labels: a
   // newcomer arriving during the await would otherwise go unrecorded and be reconciled under a live container.
-  const afterFirstPass = partitionInstallContainers(list(), finalChanged, known, knownSessions);
+  const afterFirstPass = partitionInstallContainers(await list(), finalChanged, known, knownSessions);
   if (afterFirstPass.mustStop.length > 0) {
     log.info('Boot quiescence second pass', {
       flipped: finalChanged.filter((id) => !changedWorkgroupIds.includes(id)),
@@ -573,9 +573,9 @@ export async function quiesceWorkgroupsForBootMountChange(
       mustStopSessionIds: reclassified,
     });
   }
-  stopAll(afterFirstPass.mustStop);
+  await stopAll(afterFirstPass.mustStop);
   // The door's last word is always a listing: a must-stop container still present cannot be proven absent.
-  const afterSecondPass = partitionInstallContainers(list(), finalChanged, known, knownSessions);
+  const afterSecondPass = partitionInstallContainers(await list(), finalChanged, known, knownSessions);
   if (afterSecondPass.mustStop.length > 0) {
     throw new Error(
       `Install-scoped containers still running after boot quiescence: ${afterSecondPass.mustStop.map((e) => e.name).join(', ')}`,

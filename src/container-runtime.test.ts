@@ -18,16 +18,27 @@ vi.mock('./log.js', () => ({
 }));
 
 // Mock child_process — store the mock fns so tests can configure them. The
-// adoption helpers use the argv forms (`execFileSync`, `spawn`) so a container
-// name never meets a shell; the legacy helpers use the string form.
+// host-path helpers use the async argv form (`execFile`, `spawn`) so a container
+// name never meets a shell; the offline helpers use the string form.
 const mockExecSync = vi.fn();
 const mockExecFileSync = vi.fn();
+const mockExecFile = vi.fn();
 const mockSpawn = vi.fn();
 vi.mock('child_process', () => ({
   execSync: (...args: unknown[]) => mockExecSync(...args),
   execFileSync: (...args: unknown[]) => mockExecFileSync(...args),
+  execFile: (...args: unknown[]) => mockExecFile(...args),
   spawn: (...args: unknown[]) => mockSpawn(...args),
 }));
+
+type ExecFileCallback = (err: Error | null, stdout: string, stderr: string) => void;
+
+/** The next `execFile` call answers `stdout`, or fails with `err`. */
+function execFileAnswers(answer: { stdout?: string; err?: Error }): void {
+  mockExecFile.mockImplementationOnce((_bin: string, _args: string[], _opts: unknown, cb: ExecFileCallback) => {
+    queueMicrotask(() => cb(answer.err ?? null, answer.stdout ?? '', ''));
+  });
+}
 
 import {
   CONTAINER_RUNTIME_BIN,
@@ -39,6 +50,8 @@ import {
   listInstallContainersWithScope,
   killContainerHard,
   runtimeShowsRunning,
+  RUNTIME_QUERY_TIMEOUT_MS,
+  RUNTIME_STOP_TIMEOUT_MS,
   waitForContainerExit,
 } from './container-runtime.js';
 import {
@@ -63,18 +76,29 @@ describe('readonlyMountArgs', () => {
 });
 
 describe('stopContainer', () => {
-  it('calls docker stop for valid container names', () => {
-    stopContainer('nanoclaw-test-123');
-    expect(mockExecSync).toHaveBeenCalledWith(`${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-test-123`, {
-      stdio: 'pipe',
-    });
+  it('calls docker stop for valid container names, bounded', async () => {
+    execFileAnswers({});
+    await stopContainer('nanoclaw-test-123');
+    expect(mockExecFile).toHaveBeenCalledWith(
+      CONTAINER_RUNTIME_BIN,
+      ['stop', '-t', '1', 'nanoclaw-test-123'],
+      expect.objectContaining({ timeout: RUNTIME_STOP_TIMEOUT_MS }),
+      expect.any(Function),
+    );
+    expect(mockExecSync).not.toHaveBeenCalled();
   });
 
-  it('rejects names with shell metacharacters', () => {
-    expect(() => stopContainer('foo; rm -rf /')).toThrow('Invalid container name');
-    expect(() => stopContainer('foo$(whoami)')).toThrow('Invalid container name');
-    expect(() => stopContainer('foo`id`')).toThrow('Invalid container name');
-    expect(mockExecSync).not.toHaveBeenCalled();
+  it('a stop that fails outright rejects without escalating', async () => {
+    execFileAnswers({ err: new Error('No such container') });
+    await expect(stopContainer('nanoclaw-test-123')).rejects.toThrow('No such container');
+    expect(mockExecFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects names with shell metacharacters', async () => {
+    await expect(stopContainer('foo; rm -rf /')).rejects.toThrow('Invalid container name');
+    await expect(stopContainer('foo$(whoami)')).rejects.toThrow('Invalid container name');
+    await expect(stopContainer('foo`id`')).rejects.toThrow('Invalid container name');
+    expect(mockExecFile).not.toHaveBeenCalled();
   });
 });
 
@@ -209,60 +233,60 @@ describe('cleanupOrphansStrict', () => {
 });
 
 describe('listInstallContainersWithScope', () => {
-  it('reads the three scope labels beside the name', () => {
-    mockExecSync.mockReturnValueOnce('nanoclaw-v2-a-1\twg-a\tsess-a\tgrp-a\n');
+  it('reads the three scope labels beside the name', async () => {
+    execFileAnswers({ stdout: 'nanoclaw-v2-a-1\twg-a\tsess-a\tgrp-a\n' });
 
-    expect(listInstallContainersWithScope()).toEqual([
+    expect(await listInstallContainersWithScope()).toEqual([
       { name: 'nanoclaw-v2-a-1', workgroupId: 'wg-a', sessionId: 'sess-a', groupId: 'grp-a' },
     ]);
-    const command = mockExecSync.mock.calls[0][0] as string;
-    expect(command).toContain(`--filter label=${CONTAINER_INSTALL_LABEL}`);
+    const [bin, args] = mockExecFile.mock.calls[0] as [string, string[]];
+    expect(bin).toBe(CONTAINER_RUNTIME_BIN);
+    expect(args.slice(0, 3)).toEqual(['ps', '--filter', `label=${CONTAINER_INSTALL_LABEL}`]);
     for (const key of [CONTAINER_WORKGROUP_LABEL_KEY, CONTAINER_SESSION_LABEL_KEY, CONTAINER_GROUP_LABEL_KEY]) {
-      expect(command).toContain(`{{.Label "${key}"}}`);
+      expect(args.at(-1)).toContain(`{{.Label "${key}"}}`);
     }
-    expect(mockExecSync).toHaveBeenCalledTimes(1);
+    expect(mockExecFile).toHaveBeenCalledTimes(1);
+    expect(mockExecSync).not.toHaveBeenCalled();
   });
 
-  it('reads a missing label as null — unknown scope, never an empty string', () => {
+  it('reads a missing label as null — unknown scope, never an empty string', async () => {
     // Divergence 7: every container spawned before the labels shipped looks
     // like this, and the boot door must treat it as unknown scope.
-    mockExecSync.mockReturnValueOnce('nanoclaw-v2-legacy-1\t\t\t\n');
+    execFileAnswers({ stdout: 'nanoclaw-v2-legacy-1\t\t\t\n' });
 
-    expect(listInstallContainersWithScope()).toEqual([
+    expect(await listInstallContainersWithScope()).toEqual([
       { name: 'nanoclaw-v2-legacy-1', workgroupId: null, sessionId: null, groupId: null },
     ]);
   });
 
-  it('returns an empty inventory for an empty listing', () => {
-    mockExecSync.mockReturnValueOnce('\n');
-    expect(listInstallContainersWithScope()).toEqual([]);
+  it('returns an empty inventory for an empty listing', async () => {
+    execFileAnswers({ stdout: '\n' });
+    expect(await listInstallContainersWithScope()).toEqual([]);
   });
 
-  it('fails closed when the runtime listing fails', () => {
-    mockExecSync.mockImplementationOnce(() => {
-      throw new Error('runtime listing failed');
-    });
+  it('fails closed when the runtime listing fails', async () => {
+    execFileAnswers({ err: new Error('runtime listing failed') });
 
-    expect(() => listInstallContainersWithScope()).toThrow(/prove install-scoped container absence/);
+    await expect(listInstallContainersWithScope()).rejects.toThrow(/prove install-scoped container absence/);
   });
 });
 
 // --- adoption helpers (seam 4 series E) ---
 
 describe('runtimeShowsRunning', () => {
-  it('is true only for an exact-name match', () => {
+  it('is true only for an exact-name match', async () => {
     // The runtime's `name=` filter is a substring match, so a listing for
     // `nanoclaw-v2-a-1` can carry `nanoclaw-v2-a-10` too.
-    mockExecFileSync.mockReturnValueOnce('nanoclaw-v2-a-10\nnanoclaw-v2-a-1\n');
-    expect(runtimeShowsRunning('nanoclaw-v2-a-1')).toBe(true);
+    execFileAnswers({ stdout: 'nanoclaw-v2-a-10\nnanoclaw-v2-a-1\n' });
+    expect(await runtimeShowsRunning('nanoclaw-v2-a-1')).toBe(true);
 
-    mockExecFileSync.mockReturnValueOnce('nanoclaw-v2-a-10\n');
-    expect(runtimeShowsRunning('nanoclaw-v2-a-1')).toBe(false);
+    execFileAnswers({ stdout: 'nanoclaw-v2-a-10\n' });
+    expect(await runtimeShowsRunning('nanoclaw-v2-a-1')).toBe(false);
 
-    mockExecFileSync.mockReturnValueOnce('');
-    expect(runtimeShowsRunning('nanoclaw-v2-a-1')).toBe(false);
+    execFileAnswers({ stdout: '' });
+    expect(await runtimeShowsRunning('nanoclaw-v2-a-1')).toBe(false);
 
-    expect(mockExecFileSync).toHaveBeenCalledWith(
+    expect(mockExecFile).toHaveBeenCalledWith(
       CONTAINER_RUNTIME_BIN,
       [
         'ps',
@@ -273,23 +297,23 @@ describe('runtimeShowsRunning', () => {
         '--format',
         '{{.Names}}',
       ],
-      expect.objectContaining({ encoding: 'utf-8' }),
+      expect.objectContaining({ encoding: 'utf-8', timeout: RUNTIME_QUERY_TIMEOUT_MS }),
+      expect.any(Function),
     );
     expect(mockExecSync).not.toHaveBeenCalled();
-  });
-
-  it('a listing failure throws (not false)', () => {
-    mockExecFileSync.mockImplementationOnce(() => {
-      throw new Error('Cannot connect to the Docker daemon');
-    });
-    // "Cannot prove absence" is never "absent": the caller picks its closed side.
-    expect(() => runtimeShowsRunning('nanoclaw-v2-a-1')).toThrow('Cannot connect to the Docker daemon');
-  });
-
-  it('an invalid name is refused before any subprocess', () => {
-    expect(() => runtimeShowsRunning('foo; rm -rf /')).toThrow('Invalid container name');
-    expect(() => runtimeShowsRunning('')).toThrow('Invalid container name');
     expect(mockExecFileSync).not.toHaveBeenCalled();
+  });
+
+  it('a listing failure rejects (not false)', async () => {
+    execFileAnswers({ err: new Error('Cannot connect to the Docker daemon') });
+    // "Cannot prove absence" is never "absent": the caller picks its closed side.
+    await expect(runtimeShowsRunning('nanoclaw-v2-a-1')).rejects.toThrow('Cannot connect to the Docker daemon');
+  });
+
+  it('an invalid name is refused before any subprocess', async () => {
+    await expect(runtimeShowsRunning('foo; rm -rf /')).rejects.toThrow('Invalid container name');
+    await expect(runtimeShowsRunning('')).rejects.toThrow('Invalid container name');
+    expect(mockExecFile).not.toHaveBeenCalled();
     expect(mockSpawn).not.toHaveBeenCalled();
   });
 });
@@ -317,15 +341,19 @@ describe('waitForContainerExit', () => {
 });
 
 describe('killContainerHard', () => {
-  it('issues `docker kill <name>` with argv', () => {
-    killContainerHard('nanoclaw-v2-a-1');
-    expect(mockExecFileSync).toHaveBeenCalledWith(CONTAINER_RUNTIME_BIN, ['kill', 'nanoclaw-v2-a-1'], {
-      stdio: 'pipe',
-    });
+  it('issues `docker kill <name>` with argv, bounded', async () => {
+    execFileAnswers({});
+    await killContainerHard('nanoclaw-v2-a-1');
+    expect(mockExecFile).toHaveBeenCalledWith(
+      CONTAINER_RUNTIME_BIN,
+      ['kill', 'nanoclaw-v2-a-1'],
+      expect.objectContaining({ timeout: RUNTIME_QUERY_TIMEOUT_MS }),
+      expect.any(Function),
+    );
   });
 
-  it('an invalid name is refused before any subprocess', () => {
-    expect(() => killContainerHard('foo`id`')).toThrow('Invalid container name');
-    expect(mockExecFileSync).not.toHaveBeenCalled();
+  it('an invalid name is refused before any subprocess', async () => {
+    await expect(killContainerHard('foo`id`')).rejects.toThrow('Invalid container name');
+    expect(mockExecFile).not.toHaveBeenCalled();
   });
 });

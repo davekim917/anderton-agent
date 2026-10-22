@@ -1154,16 +1154,29 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     expect(countProviderHealAttemptsSinceRealInbound(mailbox)).toBe(PROVIDER_HEAL_MAX_ATTEMPTS);
 
     mockKillContainer.mockClear();
-    // A real park kill stops the container, and the notice below is written
-    // AFTER it, in a session opened after the kill returned. The write is now
-    // ownership-guarded, so the mock has to model the stop the way production
-    // does — leaving it "running" would model a replacement wake landing in the
-    // kill's gap, which the guard correctly refuses to write through.
-    mockKillContainer.mockImplementation(() => mockIsContainerRunning.mockReturnValue(false));
+    // The park kill only REQUESTS the stop: the container still owns
+    // outbound.db when the kill returns, and the notice must wait for its exit.
+    let exit: (() => void) | undefined;
+    mockKillContainer.mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      exit = onExit;
+    });
     _resetProviderHealTicksForTesting();
     expect(await twoFailedTicks(mailbox, outDb)).toBe(true);
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal-parked');
+    expect(mockKillContainer).toHaveBeenCalledWith(
+      'sess-test',
+      'provider-failed-selfheal-parked',
+      expect.any(Function),
+    );
     expect(healRows(inDb)).toHaveLength(PROVIDER_HEAL_MAX_ATTEMPTS);
+    await _settlePostKillForTesting();
+    expect(
+      outDb.prepare("SELECT COUNT(*) AS c FROM messages_out WHERE id LIKE 'provider-heal-parked-%'").get(),
+    ).toEqual({ c: 0 });
+
+    // The container exits: ownership goes, then the exit work runs.
+    mockIsContainerRunning.mockReturnValue(false);
+    exit?.();
+    await _settlePostKillForTesting();
 
     const notices = outDb
       .prepare("SELECT content FROM messages_out WHERE id LIKE 'provider-heal-parked-%'")
@@ -1171,11 +1184,10 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     expect(notices).toHaveLength(1);
     expect(JSON.parse(notices[0].content)._system.kind).toContain('provider_heal_parked:');
 
-    // The idempotency rerun needs its own precondition. The park kill above
-    // hands `killContainer` no `onExit`, so the mock leaves the container
-    // stopped — and #343's re-check would then claim the pass and return
-    // before the notice logic ran at all, making "still one notice" true for
-    // the wrong reason. State that a container is there to park again, so the
+    // The idempotency rerun needs its own precondition. The container exited
+    // above, and the target-liveness re-check would then claim the pass and return before
+    // the notice logic ran at all, making "still one notice" true for the
+    // wrong reason. State that a container is there to park again, so the
     // rerun reaches `notifyProviderHealParked` and the per-episode marker is
     // what suppresses the second write.
     mockIsContainerRunning.mockReturnValue(true);
@@ -1184,7 +1196,14 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     await twoFailedTicks(mailbox, outDb);
     // It really did take the park branch again — otherwise the assertion below
     // proves nothing about idempotency.
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal-parked');
+    expect(mockKillContainer).toHaveBeenCalledWith(
+      'sess-test',
+      'provider-failed-selfheal-parked',
+      expect.any(Function),
+    );
+    mockIsContainerRunning.mockReturnValue(false);
+    exit?.();
+    await _settlePostKillForTesting();
     expect(
       outDb.prepare("SELECT COUNT(*) AS c FROM messages_out WHERE id LIKE 'provider-heal-parked-%'").get(),
     ).toEqual({ c: 1 });

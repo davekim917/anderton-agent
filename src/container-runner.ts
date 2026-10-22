@@ -69,6 +69,7 @@ import {
   listInstallContainersWithScope,
   readonlyMountArgs,
   runtimeShowsRunning,
+  RuntimeCallTimeoutError,
   stopContainer,
   waitForContainerExit,
   type InstallContainerScope,
@@ -328,7 +329,7 @@ function channelHasExited(channel: SupervisionChannel): boolean {
  * SIGKILL on an adopted entry's WAITER would abandon the container, so the adopted fallback stops the container
  * by name first.
  */
-function channelKillFallback(entry: ActiveContainerEntry, sessionId: string): void {
+async function channelKillFallback(entry: ActiveContainerEntry, sessionId: string): Promise<void> {
   if (entry.channel.kind === 'spawned') {
     try {
       entry.channel.process.kill('SIGKILL');
@@ -338,7 +339,7 @@ function channelKillFallback(entry: ActiveContainerEntry, sessionId: string): vo
     return;
   }
   try {
-    killContainerHard(entry.containerName);
+    await killContainerHard(entry.containerName);
   } catch (err) {
     log.warn('docker kill failed for an adopted container', { sessionId, containerName: entry.containerName, err });
   }
@@ -429,7 +430,7 @@ async function claimSessionRun(
     if (previous?.container_ref) {
       let running: boolean;
       try {
-        running = runtimeShowsRunning(previous.container_ref);
+        running = await runtimeShowsRunning(previous.container_ref);
       } catch (err) {
         log.warn('Refusing session claim — cannot prove the previous container is gone', {
           sessionId,
@@ -1722,25 +1723,71 @@ function settleUnexpectedExit(sessionId: string, containerName: string): boolean
   return true;
 }
 
-/** Stop a RUNNING container, attaching every exit callback before the stop. */
-function stopRunningContainer(sessionId: string, reason: string, onExit: ContainerExitCallback[]): void {
-  const entry = activeContainers.get(sessionId);
-  if (!entry) return;
+/**
+ * Container names with a host stop in flight. The stop runs off the event loop and can take its full bound, so a
+ * second request for the same container (a later sweep tick, a restart) rides the first instead of issuing another.
+ */
+const stopsInFlight = new Set<string>();
+
+export function isContainerStopping(sessionId: string): boolean {
+  const name = activeContainers.get(sessionId)?.containerName ?? pendingHolds.get(sessionId)?.containerName ?? null;
+  return name !== null && stopsInFlight.has(name);
+}
+
+function runStopInFlight(containerName: string, stop: () => Promise<void>): void {
+  stopsInFlight.add(containerName);
+  void stop().finally(() => stopsInFlight.delete(containerName));
+}
+
+function issueTrackedStop(entry: ActiveContainerEntry, sessionId: string): void {
+  runStopInFlight(entry.containerName, async () => {
+    try {
+      await stopContainer(entry.containerName);
+    } catch (err) {
+      // A stop that outlived its bound may still be in progress in the daemon. SIGKILL on the `docker run` client
+      // would finalize the session (and run its exit work) before the container is gone, so leave the client to
+      // report the real exit. A health duty re-issues its kill next tick; a one-shot caller's kill is not retried,
+      // and its exit work waits for that exit.
+      if (err instanceof RuntimeCallTimeoutError && entry.channel.kind === 'spawned') {
+        log.warn('stopContainer timed out — waiting for the container to exit', {
+          sessionId,
+          containerName: entry.containerName,
+        });
+        return;
+      }
+      log.warn('stopContainer failed; falling back to SIGKILL', { sessionId, containerName: entry.containerName, err });
+      await channelKillFallback(entry, sessionId);
+    }
+  });
+}
+
+function attachExitWork(entry: ActiveContainerEntry, sessionId: string, onExit: ContainerExitCallback[]): void {
   for (const callback of onExit) {
     channelOnClose(entry.channel, () => {
       void Promise.resolve()
         .then(callback)
-        .catch((err: unknown) => log.warn('Container exit callback failed', { sessionId, reason, err }));
+        .catch((err: unknown) => log.warn('Container exit callback failed', { sessionId, err }));
     });
+  }
+}
+
+/** Stop a RUNNING container, attaching every exit callback before the stop. */
+function stopRunningContainer(sessionId: string, reason: string, onExit: ContainerExitCallback[]): void {
+  const entry = activeContainers.get(sessionId);
+  if (!entry) return;
+  attachExitWork(entry, sessionId, onExit);
+  if (stopsInFlight.has(entry.containerName)) {
+    log.info('Container stop already in flight — exit work rides it', {
+      sessionId,
+      reason,
+      containerName: entry.containerName,
+    });
+    return;
   }
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName, adopted: entry.adopted });
   hostStoppedContainers.add(entry.containerName);
   clearStatusOnKill(sessionId, reason);
-  try {
-    stopContainer(entry.containerName);
-  } catch {
-    channelKillFallback(entry, sessionId);
-  }
+  issueTrackedStop(entry, sessionId);
 }
 
 /**
@@ -1856,24 +1903,27 @@ function armPendingWaiter(sessionId: string, hold: PendingHold, containerName: s
   waiter.stdout?.on('data', () => {});
   waiter.stderr?.on('data', () => {});
   let handled = false;
-  const onExit = (): void => {
+  // Only the waiter the hold still names may act.
+  const ownsHold = (): boolean => pendingHolds.get(sessionId)?.waiter === waiter;
+  const onExit = async (): Promise<void> => {
     if (handled) return;
     handled = true;
-    // Only the waiter the hold still names may act.
-    if (pendingHolds.get(sessionId)?.waiter !== waiter) return;
-    if (containerProvenGone(containerName)) {
+    if (!ownsHold()) return;
+    const gone = await containerProvenGone(containerName);
+    if (!ownsHold()) return;
+    if (gone) {
       log.info('Pending survivor exited — releasing its hold', { sessionId, containerName });
       hold.waiter = null;
       void releasePendingHold(sessionId);
       return;
     }
     const timer = setTimeout(() => {
-      if (pendingHolds.get(sessionId)?.waiter === waiter) armPendingWaiter(sessionId, hold, containerName);
+      if (ownsHold()) armPendingWaiter(sessionId, hold, containerName);
     }, adoptedWaiterRearmMs);
     timer.unref();
   };
-  waiter.on('close', onExit);
-  waiter.on('error', onExit);
+  waiter.on('close', () => void onExit());
+  waiter.on('error', () => void onExit());
 }
 
 /** Armed only once the pending state is final for this pass; a successful adoption arms the registry's own waiter. */
@@ -1973,8 +2023,11 @@ async function releasePendingHold(sessionId: string): Promise<void> {
       log.warn("Failed to release a pending survivor's storage activity lease", { sessionId, err });
     }
   }
-  const parked = hold.parkedExits.splice(0);
-  for (const callback of parked) {
+  runParkedExits(sessionId, hold.parkedExits.splice(0));
+}
+
+function runParkedExits(sessionId: string, callbacks: ContainerExitCallback[]): void {
+  for (const callback of callbacks) {
     void Promise.resolve()
       .then(callback)
       .catch((err: unknown) => log.warn('Container exit callback failed', { sessionId, err }));
@@ -1986,7 +2039,14 @@ function transferPendingHold(sessionId: string): void {
   pendingAdoptions.delete(sessionId);
   const hold = pendingHolds.get(sessionId);
   pendingHolds.delete(sessionId);
-  if (hold) disarmPendingWaiter(hold);
+  if (!hold) return;
+  disarmPendingWaiter(hold);
+  // Exit work parked by a stop still in flight (or one that failed) now rides the adopted entry's exit. No entry
+  // means the container exited during registration and was finalized, so the work is due now.
+  const parked = hold.parkedExits.splice(0);
+  const entry = activeContainers.get(sessionId);
+  if (entry) attachExitWork(entry, sessionId, parked);
+  else runParkedExits(sessionId, parked);
 }
 
 /**
@@ -2003,11 +2063,26 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
     });
     return;
   }
+  // Parked before the stop is issued: the hold's waiter may prove the exit and release the hold first.
+  hold.parkedExits.push(...onExit);
+  if (stopsInFlight.has(containerName)) {
+    log.info('Container stop already in flight — exit work parked on it', { sessionId, reason, containerName });
+    return;
+  }
   log.info('Killing container', { sessionId, reason, containerName, pending: true });
   hostStoppedContainers.add(containerName);
   clearStatusOnKill(sessionId, reason);
+  runStopInFlight(containerName, () => stopPendingSurvivorRuntime(sessionId, hold, containerName, reason));
+}
+
+async function stopPendingSurvivorRuntime(
+  sessionId: string,
+  hold: PendingHold,
+  containerName: string,
+  reason: string,
+): Promise<void> {
   try {
-    stopContainer(containerName);
+    await stopContainer(containerName);
   } catch (err) {
     log.warn('docker stop failed for a pending survivor — escalating to docker kill', {
       sessionId,
@@ -2015,15 +2090,16 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
       err,
     });
   }
-  if (!containerProvenGone(containerName)) {
+  if (!(await containerProvenGone(containerName))) {
     try {
-      killContainerHard(containerName);
+      await killContainerHard(containerName);
     } catch (err) {
       log.warn('docker kill failed for a pending survivor', { sessionId, containerName, err });
     }
   }
-  hold.parkedExits.push(...onExit);
-  if (!containerProvenGone(containerName)) {
+  // Released by its waiter (which ran the parked exit work) or adopted (which moved it) while the stop ran.
+  if (pendingHolds.get(sessionId) !== hold) return;
+  if (!(await containerProvenGone(containerName))) {
     log.warn('A pending survivor could not be stopped — keeping it pending with its exit work parked', {
       sessionId,
       containerName,
@@ -2032,7 +2108,8 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
     });
     return;
   }
-  void releasePendingHold(sessionId);
+  if (pendingHolds.get(sessionId) !== hold) return;
+  await releasePendingHold(sessionId);
 }
 
 function emptyPendingHold(): PendingHold {
@@ -2050,7 +2127,7 @@ export async function resolvePendingSurvivor(sessionId: string): Promise<'runnin
   if (hold?.containerName) return 'running';
   let listed: InstallContainerScope | undefined;
   try {
-    listed = adoptionListing().find((container) => container.sessionId === sessionId);
+    listed = (await adoptionListing()).find((container) => container.sessionId === sessionId);
   } catch (err) {
     log.warn('Could not re-list an unlisted pending survivor', { sessionId, err });
     return 'unknown';
@@ -2076,16 +2153,16 @@ export function getContainerIdentity(sessionId: string): string | null {
 }
 
 /** Is the container provably gone? A runtime that cannot be asked never proves absence. */
-function containerProvenGone(containerName: string): boolean {
+async function containerProvenGone(containerName: string): Promise<boolean> {
   try {
-    return !runtimeShowsRunning(containerName);
+    return !(await runtimeShowsRunning(containerName));
   } catch {
     return false;
   }
 }
 
 /** Replaceable for tests; `adoptRunningSessions` pins it so the wake-path retry re-lists through the same source. */
-let adoptionListing: () => InstallContainerScope[] = listInstallContainersWithScope;
+let adoptionListing: () => InstallContainerScope[] | Promise<InstallContainerScope[]> = listInstallContainersWithScope;
 
 /** `docker wait` against an unreachable daemon exits at once, so a re-arm without this pause would spin. */
 const ADOPTED_WAITER_REARM_MS = 5_000;
@@ -2128,7 +2205,7 @@ function armAdoptedWaiter(sessionId: string, channel: AdoptedChannel, containerN
   const onExit = (code: number | null): void => {
     if (handled) return;
     handled = true;
-    onWaiterClose(sessionId, channel, containerName, code, stderrTail);
+    void onWaiterClose(sessionId, channel, containerName, code, stderrTail);
   };
   waiter.on('close', onExit);
   waiter.on('error', (err) => {
@@ -2141,21 +2218,22 @@ function armAdoptedWaiter(sessionId: string, channel: AdoptedChannel, containerN
  * A docker-daemon restart exits every waiter at once, so ask the runtime before finalizing. Running or unanswerable
  * → re-arm; gone (including `No such container`) → finalize.
  */
-function onWaiterClose(
+async function onWaiterClose(
   sessionId: string,
   channel: AdoptedChannel,
   containerName: string,
   code: number | null,
   stderrTail: string[],
-): void {
-  if (activeContainers.get(sessionId)?.channel !== channel) {
+): Promise<void> {
+  const owned = (): boolean => activeContainers.get(sessionId)?.channel === channel;
+  if (!owned()) {
     // A waiter the registry no longer owns; the fence inside logs it.
     finalizeSession(sessionId, channel, null, containerName);
     return;
   }
   let running: boolean;
   try {
-    running = runtimeShowsRunning(containerName);
+    running = await runtimeShowsRunning(containerName);
   } catch (err) {
     log.warn(
       'Adopted container waiter exited but the runtime could not be asked — treating it as running and re-arming',
@@ -2168,6 +2246,10 @@ function onWaiterClose(
       },
     );
     scheduleWaiterRearm(sessionId, channel, containerName);
+    return;
+  }
+  if (!owned()) {
+    finalizeSession(sessionId, channel, null, containerName);
     return;
   }
   if (running) {
@@ -2326,8 +2408,8 @@ async function adoptRunningSession(
       sessionId: session.id,
       containerName,
     });
-    const stopped = stopUnadoptable(containerName, 'does not fit the memory admission budget', session.id);
-    if (!stopped || !containerProvenGone(containerName)) {
+    const stopped = await stopUnadoptable(containerName, 'does not fit the memory admission budget', session.id);
+    if (!stopped || !(await containerProvenGone(containerName))) {
       log.warn(
         'Adoption refused for memory but the container is not proven gone — keeping its claim and retrying on wake',
         {
@@ -2372,9 +2454,9 @@ async function adoptRunningSession(
 }
 
 /** Issue `docker stop`; true when the stop call succeeded (not a proof the container is gone). */
-function stopUnadoptable(containerName: string, why: string, sessionId: string | null): boolean {
+async function stopUnadoptable(containerName: string, why: string, sessionId: string | null): Promise<boolean> {
   try {
-    stopContainer(containerName);
+    await stopContainer(containerName);
     log.info('Stopped an unadoptable container at startup', { containerName, sessionId, why });
     return true;
   } catch (err) {
@@ -2387,20 +2469,20 @@ function stopUnadoptable(containerName: string, why: string, sessionId: string |
  * A duplicate this host cannot prove removed fails the boot: when the owned container exits, finalization would
  * release claim, reservation and leases while the duplicate keeps writing the outbound DB.
  */
-function removeDuplicateContainer(
+async function removeDuplicateContainer(
   container: { name: string; sessionId: string | null },
   kind: 'tracked' | 'pending',
   owner: string,
-): void {
-  stopUnadoptable(container.name, `session already has a ${kind} container`, container.sessionId);
-  if (!containerProvenGone(container.name)) {
+): Promise<void> {
+  await stopUnadoptable(container.name, `session already has a ${kind} container`, container.sessionId);
+  if (!(await containerProvenGone(container.name))) {
     try {
-      killContainerHard(container.name);
+      await killContainerHard(container.name);
     } catch (err) {
       log.warn('docker kill failed for a duplicate container', { containerName: container.name, err });
     }
   }
-  if (containerProvenGone(container.name)) return;
+  if (await containerProvenGone(container.name)) return;
   log.error('Boot cannot continue: a duplicate container for an owned session could not be stopped', {
     sessionId: container.sessionId,
     containerName: container.name,
@@ -2433,7 +2515,7 @@ async function holdUnlistedSurvivor(sessionId: string): Promise<void> {
  */
 export async function adoptRunningSessions(
   deps: {
-    list?: () => InstallContainerScope[];
+    list?: () => InstallContainerScope[] | Promise<InstallContainerScope[]>;
     /** The door's survivable partition: when given, THE candidate set; a listed container outside it is stopped. */
     survivableSessionIds?: ReadonlySet<string> | readonly string[];
     /**
@@ -2451,7 +2533,7 @@ export async function adoptRunningSessions(
   const counts: StartupReconciliation = { adopted: 0, stopped: 0, pendingClaim: 0, fencedInbound: 0 };
   let containers: InstallContainerScope[];
   try {
-    containers = adoptionListing();
+    containers = await adoptionListing();
   } catch (err) {
     if (heldOnFailure && heldOnFailure.size > 0) {
       // An unlistable runtime is no evidence these are gone: hold each pending until a re-list succeeds.
@@ -2475,7 +2557,10 @@ export async function adoptRunningSessions(
   }
   /** Stop and PROVE gone; a stop that fails or cannot be proven is held pending (unless there is no session). */
   const stopOrHold = async (container: InstallContainerScope, why: string, session: Session | undefined) => {
-    if (stopUnadoptable(container.name, why, container.sessionId) && containerProvenGone(container.name)) {
+    if (
+      (await stopUnadoptable(container.name, why, container.sessionId)) &&
+      (await containerProvenGone(container.name))
+    ) {
       counts.stopped += 1;
       return;
     }
@@ -2539,14 +2624,14 @@ export async function adoptRunningSessions(
     const tracked = activeContainers.get(container.sessionId);
     if (tracked) {
       // Duplicate of a tracked session: not held pending on failure (a pending mark would misroute its wakes).
-      removeDuplicateContainer(container, 'tracked', tracked.containerName);
+      await removeDuplicateContainer(container, 'tracked', tracked.containerName);
       counts.stopped += 1;
       continue;
     }
     const held = pendingHolds.get(container.sessionId)?.containerName ?? null;
     if (held !== null && held !== container.name) {
       // Duplicate of a pending hold: never re-point the hold, or the first container runs on untracked.
-      removeDuplicateContainer(container, 'pending', held);
+      await removeDuplicateContainer(container, 'pending', held);
       counts.stopped += 1;
       continue;
     }
@@ -2572,7 +2657,7 @@ export async function adoptRunningSessions(
  * refused claim or an unlistable runtime THROWS, so no spawn happens and the sweep retries.
  */
 async function retryPendingAdoption(session: Session): Promise<boolean> {
-  const survivor = adoptionListing().find((container) => container.sessionId === session.id);
+  const survivor = (await adoptionListing()).find((container) => container.sessionId === session.id);
   if (!survivor) {
     await releasePendingHold(session.id);
     log.info('Pending adoption cleared — the container is gone, a fresh spawn is correct', {
@@ -2584,8 +2669,8 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
   if (!fresh) {
     // Ownership is dropped only once the stop is proven; otherwise it stays pending for the next wake.
     if (
-      !stopUnadoptable(survivor.name, 'session cannot take a wake', session.id) ||
-      !containerProvenGone(survivor.name)
+      !(await stopUnadoptable(survivor.name, 'session cannot take a wake', session.id)) ||
+      !(await containerProvenGone(survivor.name))
     ) {
       throw new Error(`session ${session.id} has a running container that could not be stopped — not spawning`);
     }
@@ -2854,12 +2939,7 @@ export async function stopAllContainers(gracePeriodMs: number = 10_000): Promise
       channelOnClose(entry.channel, () => resolve());
     });
     hostStoppedContainers.add(entry.containerName);
-    try {
-      stopContainer(entry.containerName);
-    } catch (err) {
-      log.warn('stopContainer threw; falling back to SIGKILL', { sessionId, err });
-      channelKillFallback(entry, sessionId);
-    }
+    if (!stopsInFlight.has(entry.containerName)) issueTrackedStop(entry, sessionId);
     return exited;
   });
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
@@ -2868,13 +2948,15 @@ export async function stopAllContainers(gracePeriodMs: number = 10_000): Promise
   });
   await Promise.race([Promise.all(exits).then(() => undefined), timeout]);
   if (timeoutHandle) clearTimeout(timeoutHandle);
+  const fallbacks: Promise<void>[] = [];
   for (const [sessionId, entry] of activeContainers.entries()) {
     log.warn('Container did not exit within grace period; SIGKILL', {
       sessionId,
       containerName: entry.containerName,
     });
-    channelKillFallback(entry, sessionId);
+    fallbacks.push(channelKillFallback(entry, sessionId));
   }
+  await Promise.all(fallbacks);
 }
 
 /** `<BASE>_<FOLDER_UPPER>` (dashes→underscores), else `<BASE>`. */

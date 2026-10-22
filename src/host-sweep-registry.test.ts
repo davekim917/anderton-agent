@@ -36,6 +36,7 @@ const h = await vi.hoisted(async () => {
     sessions: [] as Session[],
     agentGroup: { id: 'ag-1', name: 'ag', folder: 'ag-folder' } as unknown,
     running: new Set<string>(),
+    stopping: new Set<string>(),
     spawnedAtMs: 0,
     heartbeatFile: '',
     wakeResult: true,
@@ -166,6 +167,7 @@ vi.mock('./container-runner.js', async (importOriginal) => {
   return {
     ...real,
     isContainerRunning: (id: string) => h.running.has(id),
+    isContainerStopping: (id: string) => h.stopping.has(id),
     getContainerSpawnedAt: () => h.spawnedAtMs,
     getActiveContainerSessionIds: () => [...h.running],
     killContainer: (sessionId: string, reason: string, onExit?: () => void) => {
@@ -523,6 +525,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     h.selfHeal = false;
     h.sessions = [];
     h.running = new Set();
+    h.stopping = new Set();
     h.spawnedAtMs = 0;
     h.heartbeatFile = path.join(h.dataDir, 'no-such-heartbeat');
     h.wakeResult = true;
@@ -611,6 +614,25 @@ describe('sweep duty registry (S2-PR2)', () => {
       'tick:housekeeping',
     ]);
     expect(h.spawns).toEqual([]);
+  });
+
+  it('a session whose container the host is already stopping skips the health phase, not the rest', async () => {
+    _resetSweepRegistryForTesting({ builtins: false });
+    const seen: string[] = [];
+    const session = fakeSession('sess-stopping');
+    h.sessions = [session];
+    h.running.add(session.id);
+    h.stopping.add(session.id);
+
+    registerSweepDuty(probeDuty('wake-10', 'session:wake', 10, seen));
+    registerSweepDuty(probeDuty('health-40', 'session:health', 40, seen));
+    registerSweepDuty(probeDuty('tail-10', 'session:tail', 10, seen));
+
+    await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
+
+    expect(seen).toEqual(['wake-10', 'tail-10']);
+    expect(h.kills).toEqual([]);
   });
 
   // ── R-2 ────────────────────────────────────────────────────────────────────

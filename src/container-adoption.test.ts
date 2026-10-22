@@ -63,6 +63,8 @@ const fakes = vi.hoisted(() => {
     listingFails: false,
     /** `docker stop` throws and the container keeps running. */
     stopFails: false,
+    /** While set, `docker stop` is in flight and lands only when this settles. */
+    stopGate: null as Promise<void> | null,
     /** Waiters for these names close in a microtask as soon as they are armed. */
     closeOnArm: new Set<string>(),
     running: new Set<string>(),
@@ -99,6 +101,7 @@ const fakes = vi.hoisted(() => {
       this.listing = [];
       this.listingFails = false;
       this.stopFails = false;
+      this.stopGate = null;
       this.closeOnArm.clear();
       this.running.clear();
       this.stopped = [];
@@ -116,9 +119,13 @@ vi.mock('./container-runtime.js', async (importOriginal) => ({
   listInstallContainersWithScope: () => fakes.list(),
   stopContainer: (name: string) => {
     if (fakes.stopFails) throw new Error('docker stop failed');
-    fakes.stopped.push(name);
-    fakes.running.delete(name);
-    fakes.listing = fakes.listing.filter((scope) => scope.name !== name);
+    const land = (): void => {
+      fakes.stopped.push(name);
+      fakes.running.delete(name);
+      fakes.listing = fakes.listing.filter((scope) => scope.name !== name);
+    };
+    if (fakes.stopGate) return fakes.stopGate.then(land);
+    land();
   },
   runtimeShowsRunning: (name: string) => {
     if (fakes.listingFails) throw new Error('Cannot connect to the Docker daemon');
@@ -257,6 +264,7 @@ import {
   hasPendingAdoption,
   isAdoptedContainer,
   isContainerRunning,
+  isContainerStopping,
   wakeContainer,
   _markPendingAdoptionForTesting,
   _resetAdoptionStateForTesting,
@@ -869,6 +877,100 @@ describe('adoptRunningSessions', () => {
     expect(memoryStub.reservedMb()).toBe(0);
   });
 
+  it('a survivor adopted while its stop is in flight carries the parked exit work onto its exit', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-stop-in-flight');
+    fakes.listing = [survivor('sess-stop-in-flight')];
+    fakes.running.add('nanoclaw-v2-sess-stop-in-flight');
+    hooks.claimWriteFails = true;
+    await adoptRunningSessions({ list: fakes.list });
+    hooks.claimWriteFails = false;
+
+    let landStop!: () => void;
+    fakes.stopGate = new Promise<void>((resolve) => {
+      landStop = resolve;
+    });
+    const exits: string[] = [];
+    killContainer('sess-stop-in-flight', 'thread close', () => {
+      exits.push('first');
+    });
+    killContainer('sess-stop-in-flight', 'restart', () => {
+      exits.push('second');
+    });
+    expect(isContainerStopping('sess-stop-in-flight')).toBe(true);
+
+    // A wake adopts the survivor before the stop lands: the hold's parked exit work must move with it.
+    await expect(wakeContainer(callerSnapshot('sess-stop-in-flight'))).resolves.toBe(true);
+    expect(isContainerRunning('sess-stop-in-flight')).toBe(true);
+    expect(hasPendingAdoption('sess-stop-in-flight')).toBe(false);
+
+    landStop();
+    await until(() => !isContainerStopping('sess-stop-in-flight'), 'the stop never settled');
+    expect(exits).toEqual([]);
+    fakes.exit('nanoclaw-v2-sess-stop-in-flight', 0);
+    await until(() => exits.length === 2, 'the parked exit work never ran');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(exits).toEqual(['first', 'second']);
+    expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-stop-in-flight']);
+    expect(isContainerRunning('sess-stop-in-flight')).toBe(false);
+  });
+
+  it('a survivor that exits while its adoption registers still runs the exit work parked by an in-flight stop', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-exit-at-adopt');
+    fakes.listing = [survivor('sess-exit-at-adopt')];
+    fakes.running.add('nanoclaw-v2-sess-exit-at-adopt');
+    hooks.claimWriteFails = true;
+    await adoptRunningSessions({ list: fakes.list });
+    hooks.claimWriteFails = false;
+
+    let landStop!: () => void;
+    fakes.stopGate = new Promise<void>((resolve) => {
+      landStop = resolve;
+    });
+    const exits: string[] = [];
+    killContainer('sess-exit-at-adopt', 'restart', () => {
+      exits.push('wake');
+    });
+
+    // Still listed, so the wake adopts it; but it is gone by the time the adopted waiter asks, which finalizes the
+    // entry before the hold is transferred.
+    fakes.running.delete('nanoclaw-v2-sess-exit-at-adopt');
+    fakes.closeOnArm.add('nanoclaw-v2-sess-exit-at-adopt');
+    await wakeContainer(callerSnapshot('sess-exit-at-adopt'));
+    landStop();
+    await until(() => exits.length === 1, 'the parked exit work was dropped');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(exits).toEqual(['wake']);
+    expect(hasPendingAdoption('sess-exit-at-adopt')).toBe(false);
+  });
+
+  it('a pending survivor that exits on its own while its stop is in flight still runs the exit work', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-exit-mid-stop');
+    fakes.listing = [survivor('sess-exit-mid-stop')];
+    fakes.running.add('nanoclaw-v2-sess-exit-mid-stop');
+    hooks.claimWriteFails = true;
+    await adoptRunningSessions({ list: fakes.list });
+
+    let landStop!: () => void;
+    fakes.stopGate = new Promise<void>((resolve) => {
+      landStop = resolve;
+    });
+    const exits: string[] = [];
+    killContainer('sess-exit-mid-stop', 'thread close', () => {
+      exits.push('exit');
+    });
+
+    // The container dies before the stop call returns; its waiter proves it gone and releases the hold first.
+    fakes.running.delete('nanoclaw-v2-sess-exit-mid-stop');
+    fakes.exit('nanoclaw-v2-sess-exit-mid-stop', 0);
+    await until(() => !hasPendingAdoption('sess-exit-mid-stop'), 'the waiter never released the hold');
+    await until(() => exits.length === 1, 'the release did not run the exit work parked before the stop');
+
+    landStop();
+    await until(() => !isContainerStopping('sess-exit-mid-stop'), 'the stop never settled');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(exits).toEqual(['exit']);
+  });
+
   it('killContainer keeps a pending survivor that will not stop, and runs no exit work', async () => {
     await seedSession(TEST_DATA_DIR, 'sess-kill-stuck');
     fakes.listing = [survivor('sess-kill-stuck')];
@@ -1103,8 +1205,8 @@ describe('adoptRunningSessions', () => {
       await getDb().run('DELETE FROM sessions WHERE id = ?', 'sess-unread-gone');
 
       expect(await stopOrphanedSessions()).toBe(1);
+      await until(() => !hasPendingAdoption('sess-unread-gone'), 'the stopped survivor was never released');
       expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-unread-gone']);
-      expect(hasPendingAdoption('sess-unread-gone')).toBe(false);
     });
 
     it('stops a supervised session whose agent group was deleted', async () => {

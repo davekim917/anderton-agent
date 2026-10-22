@@ -29,6 +29,7 @@ const state = vi.hoisted(() => ({
     claimIncarnation: number;
   } | null,
   providerFallback: { provider: 'codex' } as { provider: string } | undefined,
+  stopping: false,
 }));
 const killContainer = vi.hoisted(() => vi.fn());
 const requestWake = vi.hoisted(() => vi.fn(async () => true));
@@ -44,6 +45,7 @@ vi.mock('../../container-config.js', () => ({
 }));
 vi.mock('../../container-runner.js', () => ({
   containerIdentityFor: () => state.registered,
+  isContainerStopping: () => state.stopping,
   // No container owns outbound.db here, so a thread line the duty wrote would land and fail the test.
   containerOwnsOutbound: () => false,
   killContainer,
@@ -120,6 +122,7 @@ beforeEach(() => {
   state.liveClaims = 0;
   state.registered = { containerName: 'nanoclaw-v2-g-1', claimIncarnation: 1 };
   state.providerFallback = { provider: 'codex' };
+  state.stopping = false;
   killContainer.mockReset();
   requestWake.mockClear();
   outboundWrites.length = 0;
@@ -240,6 +243,16 @@ describe('sweepProviderReturn', () => {
       return open(action);
     };
     await expect(sweepProviderReturn(replacingContext, { readMarker: () => true })).resolves.toBe(true);
+    expect(wakeRows).toHaveLength(0);
+    expect(killContainer).not.toHaveBeenCalled();
+  });
+
+  it('leaves a container alone when a stop starts while the marker is read', async () => {
+    const readMarker = vi.fn(async () => {
+      state.stopping = true;
+      return true;
+    });
+    await expect(sweepProviderReturn(context(), { readMarker })).resolves.toBe(true);
     expect(wakeRows).toHaveLength(0);
     expect(killContainer).not.toHaveBeenCalled();
   });

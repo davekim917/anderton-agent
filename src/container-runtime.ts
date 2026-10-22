@@ -1,4 +1,4 @@
-import { execFileSync, execSync, spawn, type ChildProcess } from 'child_process';
+import { execFile, execSync, spawn, type ChildProcess, type ExecFileException } from 'child_process';
 import os from 'os';
 
 import {
@@ -24,14 +24,73 @@ export function readonlyMountArgs(hostPath: string, containerPath: string): stri
   return ['-v', `${hostPath}:${containerPath}:ro`];
 }
 
-/** Plain container names only: the stop path interpolates the name into a shell command. */
+/** Plain container names only: the blocking stop interpolates the name into a shell command. */
 function assertContainerName(name: string): void {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
     throw new Error(`Invalid container name: ${name}`);
   }
 }
 
-export function stopContainer(name: string): void {
+/**
+ * Bounds on the runtime calls the host makes from its event loop. A daemon under disk pressure can take minutes per
+ * call; a call past its bound is killed and fails, so it costs that caller, never the loop.
+ */
+export const RUNTIME_STOP_TIMEOUT_MS = 30_000;
+export const RUNTIME_QUERY_TIMEOUT_MS = 10_000;
+
+let stopTimeoutMs = RUNTIME_STOP_TIMEOUT_MS;
+let queryTimeoutMs = RUNTIME_QUERY_TIMEOUT_MS;
+
+export function _setRuntimeTimeoutsForTesting(timeouts: { stopMs?: number; queryMs?: number } = {}): void {
+  stopTimeoutMs = timeouts.stopMs ?? RUNTIME_STOP_TIMEOUT_MS;
+  queryTimeoutMs = timeouts.queryMs ?? RUNTIME_QUERY_TIMEOUT_MS;
+}
+
+export class RuntimeCallTimeoutError extends Error {
+  constructor(args: string[], timeoutMs: number, options?: ErrorOptions) {
+    super(`${CONTAINER_RUNTIME_BIN} ${args.join(' ')} timed out after ${timeoutMs}ms`, options);
+    this.name = 'RuntimeCallTimeoutError';
+  }
+}
+
+export function runRuntime(args: string[], timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      CONTAINER_RUNTIME_BIN,
+      args,
+      { encoding: 'utf-8', timeout: timeoutMs, killSignal: 'SIGKILL' },
+      (err: ExecFileException | null, stdout: string) => {
+        if (!err) resolve(stdout);
+        else if (err.killed && err.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER')
+          reject(new RuntimeCallTimeoutError(args, timeoutMs, { cause: err }));
+        else reject(err);
+      },
+    );
+  });
+}
+
+/**
+ * `docker stop -t 1`, escalating to `docker kill` when the stop outlives its bound. Rejects when the stop fails
+ * outright (callers keep their own fallback), and with `RuntimeCallTimeoutError` when the escalation fails too: the
+ * stop may still be in progress in the daemon either way.
+ */
+export async function stopContainer(name: string): Promise<void> {
+  assertContainerName(name);
+  try {
+    await runRuntime(['stop', '-t', '1', name], stopTimeoutMs);
+  } catch (err) {
+    if (!(err instanceof RuntimeCallTimeoutError)) throw err;
+    log.warn('docker stop timed out — escalating to docker kill', { containerName: name, timeoutMs: stopTimeoutMs });
+    try {
+      await runRuntime(['kill', name], queryTimeoutMs);
+    } catch (killErr) {
+      throw new RuntimeCallTimeoutError(['stop', '-t', '1', name], stopTimeoutMs, { cause: killErr });
+    }
+  }
+}
+
+/** The pre-async stop, for operator scripts run with the host down; the host process uses `stopContainer`. */
+function stopContainerBlocking(name: string): void {
   assertContainerName(name);
   execSync(`${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`, { stdio: 'pipe' });
 }
@@ -40,23 +99,22 @@ export function stopContainer(name: string): void {
  * SIGKILL by name, the fallback when `stopContainer` failed. For an ADOPTED container there is no `docker run`
  * client to kill, and killing its `docker wait` observer would abandon it rather than stop it.
  */
-export function killContainerHard(name: string): void {
+export async function killContainerHard(name: string): Promise<void> {
   assertContainerName(name);
-  execFileSync(CONTAINER_RUNTIME_BIN, ['kill', name], { stdio: 'pipe' });
+  await runRuntime(['kill', name], queryTimeoutMs);
 }
 
 /**
  * Is a container of THIS install with exactly this name running? A listing, not `docker inspect`: inspect on an
- * auto-removed container throws exactly as a dead daemon does, while an empty listing proves absence. A throw means
- * "could not ask", left to callers (the claim fence refuses, the adopted waiter re-arms). The `name=` filter is a
- * substring match, so the exact-name check is made here.
+ * auto-removed container throws exactly as a dead daemon does, while an empty listing proves absence. A rejection
+ * (including a timeout) means "could not ask", left to callers (the claim fence refuses, the adopted waiter re-arms).
+ * The `name=` filter is a substring match, so the exact-name check is made here.
  */
-export function runtimeShowsRunning(name: string): boolean {
+export async function runtimeShowsRunning(name: string): Promise<boolean> {
   assertContainerName(name);
-  const output = execFileSync(
-    CONTAINER_RUNTIME_BIN,
+  const output = await runRuntime(
     ['ps', '--filter', `label=${CONTAINER_INSTALL_LABEL}`, '--filter', `name=${name}`, '--format', '{{.Names}}'],
-    { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
+    queryTimeoutMs,
   );
   return output.trim().split('\n').filter(Boolean).includes(name);
 }
@@ -107,7 +165,7 @@ export function cleanupOrphans(): void {
     const orphans = output.trim().split('\n').filter(Boolean);
     for (const name of orphans) {
       try {
-        stopContainer(name);
+        stopContainerBlocking(name);
       } catch {
         /* already stopped */
       }
@@ -153,7 +211,7 @@ function labelOrNull(value: string | undefined): string | null {
  * `listInstallContainersStrict`. A container older than the scope labels reads null in every field but `name`, which
  * the caller must treat as unknown scope.
  */
-export function listInstallContainersWithScope(): InstallContainerScope[] {
+export async function listInstallContainersWithScope(): Promise<InstallContainerScope[]> {
   const format = [
     '{{.Names}}',
     `{{.Label "${CONTAINER_WORKGROUP_LABEL_KEY}"}}`,
@@ -162,10 +220,8 @@ export function listInstallContainersWithScope(): InstallContainerScope[] {
   ].join('\\t');
   let output: string;
   try {
-    output = execSync(`${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '${format}'`, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
+    // No bound: an inventory that times out would fail the boot door closed where a slow one completes.
+    output = await runRuntime(['ps', '--filter', `label=${CONTAINER_INSTALL_LABEL}`, '--format', format], 0);
   } catch (err) {
     throw new Error('Cannot prove install-scoped container absence: runtime listing failed', { cause: err });
   }
@@ -190,7 +246,7 @@ export function cleanupOrphansStrict(): string[] {
   const orphans = listInstallContainersStrict();
   for (const name of orphans) {
     try {
-      stopContainer(name);
+      stopContainerBlocking(name);
     } catch (err) {
       throw new Error(`Cannot prove install-scoped container absence: failed to stop ${name}`, { cause: err });
     }

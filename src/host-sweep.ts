@@ -25,6 +25,7 @@ import {
   containerIdentityFor,
   getActiveContainerSessionIds,
   isContainerRunning,
+  isContainerStopping,
   containerOwnsOutbound,
   type ContainerIdentity,
 } from './container-runner.js';
@@ -1068,8 +1069,9 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
           })),
         )) ?? null;
 
-      // W4: session:health, EXCLUSIVE, nothing open.
-      if (observed) {
+      // W4: session:health, EXCLUSIVE, nothing open. Skipped while a host stop is in flight: the container is already
+      // going, and a second kill from a health duty would attach its exit work a second time.
+      if (observed && !isContainerStopping(session.id)) {
         window = 'session:health';
         await runExclusiveSessionPhase(ctx, 'session:health');
       }
