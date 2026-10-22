@@ -49,7 +49,7 @@ Journal (append-only ndjson, fsync'd, under <out-dir>/control.lock):
 synthesis.json (the owner's machine-readable verdict; new contract, s2):
   {schemaVersion:1, runId, sourceSha, verdict: GO|NO_GO|HUMAN_DECISION|BLOCKED,
    laneGenerations:{<laneId>:<gen>},
-   findings:[{id, blocking:bool, confirmed:bool, disposition}],
+   findings:[{id, blocking:bool, confirmed:bool, disposition, existingIssue?}],
    gaps:[{lane, disposition}], dissents:[{id, disposition}],
    holdDisposition:{runId, disposition: resolved|not-in-range|carried, evidence}}
   A closed disposition is `fixed-verified`, `not-blocking:<reason>` or
@@ -58,6 +58,9 @@ synthesis.json (the owner's machine-readable verdict; new contract, s2):
   (markers, contract, challenger/challenge.complete.json) and requires the
   synthesis to disposition each; it never trusts the synthesis' own list as
   complete. Anything short of that maps GO to BLOCKED naming the failed check.
+  Every filed finding (confirmed:true, or a marker's confirmedFindings) needs
+  `existingIssue` (an issue already tracking it) or controller/issues/<id>.json
+  with a title; a synthesis without one is refused back to the owner.
 
 Live hold (holdDisposition): the develop hold is the file the gate's `finish`
 raises on NO_GO/HUMAN_DECISION and DELETES on GO, named by the same
@@ -864,6 +867,9 @@ ALARM_WORDS = {
     "controller_obligation_overdue": "a step is past its deadline",
     "controller_verdict_superseded": "a GO no longer holds, so the run finishes BLOCKED",
     "controller_gh_failed": "a GitHub write failed",
+    "controller_finding_unrouted": ("a confirmed finding names no tracker and has no issue file, so it is held "
+                                    "unfiled and the verdict waits; set `existingIssue` on it in synthesis.json or "
+                                    "write its issue file, and the next fire files it"),
     "controller_gate_refused": "the gate refused a terminal verb",
     "controller_gate_blind": ("the gate cannot read its run root or its lease directory, so it cannot act on "
                               "this run; fix the mount"),
@@ -942,16 +948,21 @@ OWNER_BRIEF = {
         "challenger dissent id -- leave one open rather than change the verdict to fit). Write {run}/run-record.md "
         "(the run record the controller posts as the PR comment: lane detail, design check, recovery history). Write "
         "{run}/controller/verdict-bullets.md: at most three plain-language bullets for the verdict post (what "
-        "blocks or was proven; what was not challenged or not demonstrable; the next owner). For each confirmed "
-        "finding write {run}/controller/issues/<findingId>.json: {{\"title\":...,\"body\":...,\"labels\":[...]}}; "
-        "labels are the repo's own names, severity as `severity:p<n>` (never a bare `P<n>`). "
+        "blocks or was proven; what was not challenged or not demonstrable; the next owner). Every confirmed "
+        "finding an existing issue already tracks (open or closed) carries \"existingIssue\": <issue number> on its "
+        "synthesis.json entry, and gets no issue file: naming the tracker only in prose does not route it, and the "
+        "controller comments on that issue instead of filing a new one. For each other confirmed finding write "
+        "{run}/controller/issues/<findingId>.json: {{\"title\":...,\"body\":...,\"labels\":[...]}}; "
+        "labels are the repo's own names, severity as `severity:p<n>` (never a bare `P<n>`). A confirmed finding "
+        "with neither is refused in the barrier's `invalid[]` and this step is offered again. "
         "The controller files them, posts the verdict, comments on the PR and runs `finish`. To ask for a fresh "
         "adjudicator instead, write {run}/controller/adjudication-request.md (the disputed findings and their "
         "evidence), no synthesis.json, and stop: you are woken again as `adjudicated`."),
     "adjudicated": (
         "Adjudicated: the fresh adjudicator's ruling is in {run}/controller/adjudication.json. Apply it and finish "
         "the synthesis exactly as the `synthesis` step describes (synthesis.md, synthesis.json, run-record.md, "
-        "verdict-bullets.md, issue files)."),
+        "verdict-bullets.md, and for every confirmed finding either \"existingIssue\" on its synthesis.json entry "
+        "or an issue file)."),
 }
 
 
@@ -1326,11 +1337,18 @@ class EffectLayer:
                         dest = {"action": "tracker-comment", "repo": repo, "number": tracker}
                     else:
                         dest["trackerRejected"] = why
+                # Held before the destination is journaled, so a reference the
+                # owner adds later still routes to its tracker.
+                if dest["action"] == "create" and not issue_title(issue_spec(self._run_dir(run_id), fid)):
+                    return self._unfiled(fid, dest.get("trackerRejected"))
                 self.ctl.record(run_id, "gh", slot, "intent", 1, {"destination": dest})
                 if dest["action"] == "tracker-comment":
                     return self._tracker_comment(run_id, fid, c, repo, tracker, finding, marker, key, since)
             rejected = {"trackerRejected": dest["trackerRejected"]} if dest.get("trackerRejected") else {}
-            title, body, labels = self._issue_content(run_id, fid, c)
+            content = self._issue_content(run_id, fid)
+            if content is None:
+                return self._unfiled(fid, dest.get("trackerRejected"))
+            title, body, labels = content
             repo_labels = self._labels_of(repo)
             # SI: dedup against open smoke-finding issues by normalized title,
             # over the COMPLETE open set. No `--label` and no `--search`: either
@@ -1409,21 +1427,12 @@ class EffectLayer:
         named for this finding, from the synthesis finding first, then its
         controller/issues/<fid>.json. Only `existingIssue` (N or "#N") and
         `issue` (this repo's issue URL or "#N") count; a missing, malformed or
-        foreign reference answers None and the finding is filed as before."""
+        foreign reference answers None and the finding is filed from its issue
+        file."""
         run = self._run_dir(run_id)
         syn, _ = read_json_file(os.path.join(run, "synthesis.json"))
-        findings = syn.get("findings") if isinstance(syn, dict) else None
-        finding = next((f for f in findings or [] if isinstance(f, dict) and f.get("id") == fid), {})
-        spec = {}
-        if safe_component(fid):
-            doc, err = read_json_file(os.path.join(run, "controller", "issues", "{}.json".format(fid)))
-            spec = doc if not err and isinstance(doc, dict) else {}
-        for source in (finding, spec):
-            for field in ("existingIssue", "issue"):
-                number = tracker_number(field, source.get(field), self.cfg["repo"])
-                if number:
-                    return number, finding
-        return None, finding
+        finding = next((f for f in parse_synthesis_findings(syn)[0] if f["id"] == fid), {})
+        return finding_tracker(finding, issue_spec(run, fid), self.cfg["repo"]), finding
 
     def _tracker_is_issue(self, repo, number):
         """(True, None) when `number` is an ISSUE of `repo`; (False, why) when
@@ -1507,10 +1516,11 @@ class EffectLayer:
                     "### Owner's run record", "", text])
         lines = head + ["", "### Run record", ""]
         syn, err = read_json_file(os.path.join(run, "synthesis.json"))
-        if not err and isinstance(syn, dict):
-            for f in syn.get("findings") or []:
-                if isinstance(f, dict):
-                    lines.append("- Finding {}: {}".format(f.get("id"), f.get("disposition") or "no disposition"))
+        if not err:
+            findings, problems = parse_synthesis_findings(syn)
+            for f in findings:
+                lines.append("- Finding {}: {}".format(f["id"], f.get("disposition") or "no disposition"))
+            lines += ["- {}".format(p) for p in problems]
         lines += ["", "The owner wrote no prose record; lane evidence is in the run directory."]
         return "\n".join(lines)
 
@@ -1617,24 +1627,26 @@ class EffectLayer:
         except (ValueError, AttributeError):
             return None
 
-    def _issue_content(self, run_id, fid, claim):
-        run = self._run_dir(run_id)
+    def _issue_content(self, run_id, fid):
+        """(title, body, labels) from the owner's issue file, or None when it
+        has no title. A machine-made stand-in is never filed: for a finding an
+        existing issue tracks, it is a duplicate that buries the evidence."""
+        doc = issue_spec(self._run_dir(run_id), fid)
+        title = issue_title(doc)
+        if not title:
+            return None
         labels = ["smoke-finding"]
-        doc, err = read_json_file(os.path.join(run, "controller", "issues", "{}.json".format(fid)))
-        if safe_component(fid) and not err and isinstance(doc, dict) and isinstance(doc.get("title"), str) \
-                and doc["title"].strip():
-            for label in doc.get("labels") or []:
-                if isinstance(label, str) and label.strip() and label not in labels:
-                    labels.append(label.strip())
-            return doc["title"].strip()[:250], str(doc.get("body") or "").strip() or doc["title"], labels
-        # The owner did not write the finding's issue file: file the machine
-        # record rather than hold the run on it.
-        syn, _ = read_json_file(os.path.join(run, "synthesis.json"))
-        finding = next((f for f in (syn or {}).get("findings") or [] if isinstance(f, dict) and f.get("id") == fid), {})
-        title = "Smoke finding {} on PR #{}".format(fid, claim["pr"])
-        body = "Confirmed by smoke run `{}` on build `{}`.\n\n```json\n{}\n```\n\nEvidence: see the run record.".format(
-            run_id, (claim["sha"] or "")[:12], json.dumps(finding, sort_keys=True, indent=1)[:4000])
-        return title, body, labels
+        for label in doc.get("labels") or []:
+            if isinstance(label, str) and label.strip() and label not in labels:
+                labels.append(label.strip())
+        return title[:250], str(doc.get("body") or "").strip() or doc["title"], labels
+
+    @staticmethod
+    def _unfiled(fid, rejected):
+        why = "the tracker it names was rejected ({})".format(rejected) if rejected else \
+            "synthesis.json names no existingIssue/issue for it"
+        return {"outcome": "held",
+                "error": "finding {} not filed: {} and controller/issues/{}.json has no title".format(fid, why, fid)}
 
     # -- gate ---------------------------------------------------------------------
 
@@ -2003,10 +2015,85 @@ def tracker_number(field, value, repo):
     if not isinstance(value, str):
         return None
     m = re.fullmatch(r"#([1-9][0-9]{0,9})", value)
-    if not m and field == "issue":
+    if not m and field == "issue" and repo:
         m = re.fullmatch(r"https://github\.com/{}/issues/([1-9][0-9]{{0,9}})".format(re.escape(repo)), value,
                          re.IGNORECASE)
     return int(m.group(1)) if m else None
+
+
+def issue_spec(run_dir, fid):
+    """The owner's controller/issues/<fid>.json, or None when it is absent,
+    unreadable or not an object."""
+    if not safe_component(fid):
+        return None
+    doc, err = read_json_file(os.path.join(run_dir, "controller", "issues", "{}.json".format(fid)))
+    return doc if not err and isinstance(doc, dict) else None
+
+
+def issue_title(spec):
+    title = spec.get("title") if isinstance(spec, dict) else None
+    return title.strip() if isinstance(title, str) and title.strip() else None
+
+
+def finding_tracker(finding, spec, repo):
+    """The existing issue a finding names as its tracker: `existingIssue` or
+    `issue` on the synthesis finding first, then on its issue file."""
+    for source in (finding, spec):
+        for field in ("existingIssue", "issue"):
+            number = tracker_number(field, (source or {}).get(field), repo)
+            if number:
+                return number
+    return None
+
+
+def parse_synthesis_findings(doc):
+    """(findings, problems): the synthesis' finding objects that have a
+    non-empty string id -- the only shape any reader indexes, files or
+    routes -- and one line for each `findings` value or object entry that is
+    not that shape. A non-object entry is ignored."""
+    raw = doc.get("findings") if isinstance(doc, dict) else None
+    if raw is None:
+        return [], []
+    if not isinstance(raw, list):
+        return [], ["synthesis findings is not a list"]
+    findings, problems = [], []
+    for i, f in enumerate(raw):
+        if not isinstance(f, dict):
+            continue
+        if isinstance(f.get("id"), str) and f["id"]:
+            findings.append(f)
+        else:
+            problems.append("finding entry {} has no string id".format(i))
+    return findings, problems
+
+
+def filed_finding_ids(synthesis_doc, markers):
+    """The findings that get an issue obligation, in filing order: the
+    synthesis' confirmed findings, then every lane marker's confirmedFindings."""
+    out = []
+    for f in parse_synthesis_findings(synthesis_doc)[0]:
+        if f.get("confirmed") and f["id"] not in out:
+            out.append(f["id"])
+    for m in markers.values():
+        for fid in (m["doc"] or {}).get("confirmedFindings") or []:
+            if isinstance(fid, str) and fid not in out:
+                out.append(fid)
+    return out
+
+
+def unrouted_findings(run, synthesis_doc, repo):
+    """One reason per filed finding with nowhere to go: no tracker named and
+    no issue file with a title."""
+    findings = {f["id"]: f for f in parse_synthesis_findings(synthesis_doc)[0]}
+    out = []
+    for fid in filed_finding_ids(synthesis_doc, run.markers()):
+        spec = issue_spec(run.dir, fid)
+        if finding_tracker(findings.get(fid), spec, repo) or issue_title(spec):
+            continue
+        out.append("finding {fid}: confirmed with no tracker and no issue file -- set \"existingIssue\": <N> on it in "
+                   "synthesis.json when an issue of {repo} already tracks it (open or closed), else write "
+                   "controller/issues/{fid}.json with a title".format(fid=fid, repo=repo or "the repo"))
+    return out
 
 
 def publication_label(kind, slot):
@@ -2453,7 +2540,7 @@ def hold_checks(run, doc, hold):
     return [], None
 
 
-def validate_synthesis(run, claim_sha, pr_head, synthesis_barrier, identity, hold=None):
+def validate_synthesis(run, claim_sha, pr_head, synthesis_barrier, identity, hold=None, repo=None):
     """Returns (verdict, failed_checks). GO only when every check passes.
     `hold` is read_live_hold's answer for this run (None: no hold file)."""
     doc, err = run.synthesis()
@@ -2482,6 +2569,7 @@ def validate_synthesis(run, claim_sha, pr_head, synthesis_barrier, identity, hol
         want = run.expected_generation(lane)
         if gens.get(lane) != want:
             failed.append("evidence generation: lane {} synthesis={} contract={}".format(lane, gens.get(lane), want))
+    failed.extend(unrouted_findings(run, doc, repo))
     if failed:
         return "BLOCKED", failed
     if proposed != "GO":
@@ -2500,7 +2588,9 @@ def validate_synthesis(run, claim_sha, pr_head, synthesis_barrier, identity, hol
             not value.startswith("refuted:") or safe_run_relative(run.dir, value[len("refuted:"):]))
 
     gap_disp = {g.get("lane"): g.get("disposition") for g in doc.get("gaps") or [] if isinstance(g, dict)}
-    finding_disp = {f.get("id"): f for f in doc.get("findings") or [] if isinstance(f, dict)}
+    findings, shape_problems = parse_synthesis_findings(doc)
+    failed.extend(shape_problems)
+    finding_disp = {f["id"]: f for f in findings}
     confirmed_ids = set()
     for lane, m in run.markers().items():
         status = (m["doc"] or {}).get("status")
@@ -2932,6 +3022,13 @@ class Controller:
         if result["outcome"] == "shadow_refused":
             self.record(run_id, "gh", slot, "done", 1, {"outcome": result["outcome"], "shadowAssumed": True})
             return "done"
+        if result["outcome"] == "held":
+            # Nothing was written. `failed`, not failed_terminal: every later
+            # attempt re-reads the finding, so a repair files it.
+            self.ensure_alarm(run_id, "controller_finding_unrouted", "finding-unrouted:{}".format(key[:12]),
+                              {"slot": slot, "error": result.get("error")})
+            self.record(run_id, "gh", slot, "failed", 1, {"outcome": "held", "error": result.get("error")})
+            return "held"
         if result["outcome"] == "done":
             self.record(run_id, "gh", slot, "done", 1, {k: result[k] for k in ("outcome", "via", "url", "state",
                                                                                 "duplicateOf", "labelsMapped",
@@ -3959,9 +4056,12 @@ class Controller:
         # over lanes the barrier never passed, and would otherwise stall.
         early, early_err = run.synthesis()
         if not early_err and isinstance(early, dict) and early.get("verdict") in ("BLOCKED", "HUMAN_DECISION"):
+            held = self._hold_unrouted(run_id, pr, run, early, {"ready": False})
+            if held:
+                return held
             verdict, failed = validate_synthesis(run, claim.get("sha"), self.pr_heads.get(str(pr)),
                                                  {"ready": False}, run.last_identity_check(),
-                                                 hold=self.live_hold(run_id))
+                                                 hold=self.live_hold(run_id), repo=self._repo())
             if self.owner_step(run_id, "synthesis", "synthesis", done=True) != "done":
                 return "synthesis"
             return self.pre_finish(run_id, pr, verdict, failed, early)
@@ -4053,14 +4153,61 @@ class Controller:
             self.owner_step(run_id, "synthesis", "synthesis", done=False)
             adj = self._adjudication(run_id, run)
             return adj or "synthesis"
+        held = None if syn_err else self._hold_unrouted(run_id, pr, run, synthesis_doc, syn_barrier)
+        if held:
+            return held
         if self.owner_step(run_id, "synthesis", "synthesis", done=True) != "done":
             return "synthesis"
         self._adjudication(run_id, run)
 
         head = self.pr_heads.get(str(pr))
         verdict, failed = validate_synthesis(run, claim.get("sha"), head, syn_barrier, run.last_identity_check(),
-                                             hold=self.live_hold(run_id))
+                                             hold=self.live_hold(run_id), repo=self._repo())
         return self.pre_finish(run_id, pr, verdict, failed, synthesis_doc if not syn_err else {})
+
+    def _repo(self):
+        return self.effects.cfg.get("repo") or getattr(self.args, "repo", None)
+
+    def _hold_unrouted(self, run_id, pr, run, synthesis_doc, barrier):
+        """None when no confirmed finding is left with no tracker and no issue
+        file, or the synthesis step is closed (the owner cannot be woken for
+        it; validate_synthesis fails it and the issue obligation's hold stops
+        the wrapper). Otherwise the synthesis is refused through the synthesis
+        barrier's invalid[] and the owner re-offered the step, before any
+        issue obligation exists -- until the refusal outlives the owner SLA.
+        The SLA runs from the first refusal, kept on the run's claim because
+        an owner step the phase-dispatch route has not admitted yet has no
+        record to carry it."""
+        reasons = unrouted_findings(run, synthesis_doc, self._repo())
+        ob = self.obligations().get(obligation_key(run_id, "owner", "synthesis"))
+        claim = self.obligations().get(obligation_key(run_id, "run", "claim"))
+        if not reasons or not claim or (ob and ob["state"] not in ("intent", "enqueued")):
+            return None
+        since = parse_iso(claim["detail"].get("unroutedSince"))
+        if since and (self.now - since).total_seconds() > OWNER_STEP_SLA_SECONDS:
+            return self._finish_unrouted_blocked(run_id, pr, synthesis_doc, reasons)
+        self.publish_barrier(run_id, "synthesis", dict(
+            barrier, ready=False, invalid=(barrier.get("invalid") or []) + ["synthesis.json"],
+            invalidReasons=(barrier.get("invalidReasons") or []) + reasons))
+        if self.live:
+            self._reoffer_on_new_refusal(run_id, "synthesis")
+        if not since:
+            self.record(run_id, "run", "claim", claim["state"], detail={"unroutedSince": iso(self.now)})
+        self.owner_step(run_id, "synthesis", "synthesis", done=False)
+        self.decide(run_id, "synthesis", "escalate", "coordination_model", "confirmed finding has no tracker or issue",
+                    invalid=["synthesis.json"], reasons=reasons[:3])
+        return "synthesis"
+
+    def _finish_unrouted_blocked(self, run_id, pr, synthesis_doc, reasons):
+        """The unrouted refusal outlived the owner SLA: finish BLOCKED with no
+        model, as an overdue synthesis after a BLOCKED challenger does, and
+        without waiting on the owner's worker, which may never settle. The
+        verdict is fixed here, so nothing a late write adds can make it GO."""
+        self.decide(run_id, "synthesis", "log", "mechanical",
+                    "confirmed finding still has no tracker or issue past the owner SLA; finishing BLOCKED model-free",
+                    reasons=reasons[:3])
+        return self.pre_finish(run_id, pr, "BLOCKED", ["{} (unrepaired past the owner SLA)".format(r) for r in reasons],
+                               synthesis_doc)
 
     def _adjudication(self, run_id, run):
         """The owner asks for a fresh adjudicator by writing
@@ -4109,7 +4256,7 @@ class Controller:
         if frozen == "GO":
             verdict, failed = validate_synthesis(run, claim.get("sha"), self.pr_heads.get(str(pr)),
                                                  run.barrier("synthesis"), run.last_identity_check(),
-                                                 hold=self.live_hold(run_id))
+                                                 hold=self.live_hold(run_id), repo=self._repo())
         else:
             verdict, failed = frozen, vob["detail"].get("failedChecks") or []
         return self.pre_finish(run_id, pr, verdict, failed, syn_doc if not syn_err else {},
@@ -4247,14 +4394,7 @@ class Controller:
                 verdict, failed = frozen, vob["detail"].get("failedChecks") or []
                 terminal_verb = frozen_terminal_verb(vob["detail"])
         self.decide(run_id, phase, "validate", "mechanical", "verdict validated", verdict=verdict, failedChecks=failed)
-        findings = []
-        for f in (synthesis_doc or {}).get("findings") or []:
-            if isinstance(f, dict) and f.get("confirmed") and isinstance(f.get("id"), str):
-                findings.append(f["id"])
-        for m in run.markers().values():
-            for fid in (m["doc"] or {}).get("confirmedFindings") or []:
-                if isinstance(fid, str) and fid not in findings:
-                    findings.append(fid)
+        findings = filed_finding_ids(synthesis_doc, run.markers())
         # EVERY check that can still change the verdict is settled before any
         # verdict post is prepared or sent, so a fire can never post one
         # verdict and finish another. The issues are driven first; while any
@@ -4263,8 +4403,23 @@ class Controller:
         # starve the post: a fire whose time the issues spent defers it
         # (deferred, never a failure), and the next fire finds them settled.
         states = []
+        refused_at = parse_iso((self.obligations().get(obligation_key(run_id, "run", "claim")) or {"detail": {}})[
+            "detail"].get("unroutedSince"))
         for fid in findings:
-            states.append(("gh", "issue:{}".format(fid), self.github(run_id, phase, "issue:{}".format(fid))))
+            slot = "issue:{}".format(fid)
+            state = self.github(run_id, phase, slot)
+            if state == "held":
+                # Waited on like any open obligation, up to the owner SLA,
+                # counted from the synthesis refusal when one preceded it.
+                ob = self.obligations()[obligation_key(run_id, "gh", slot)]
+                started = min(t for t in (parse_iso(ob["history"][0].get("at")), refused_at, self.now) if t)
+                age = (self.now - started).total_seconds()
+                state = "intent"
+                if age > OWNER_STEP_SLA_SECONDS:
+                    state = "failed_terminal"
+                    self.record(run_id, "gh", slot, state, 1, {"reason": "held unfiled for {}s: {}".format(
+                        int(age), ob["detail"].get("error"))})
+            states.append(("gh", slot, state))
         self._settle_alarm_sends(run_id)
         # failed_terminal and dispatch-ambiguous obligations keep their
         # escalation evidence and permit ONLY finish BLOCKED (spec rev 3) --

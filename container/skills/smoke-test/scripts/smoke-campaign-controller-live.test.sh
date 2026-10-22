@@ -195,7 +195,12 @@ world() { # tick
     printf '# Run record\nAll lanes passed.\n' >"$R/run-record.md"
     printf -- '- The checkout journey passed on the frozen build.\n- Nothing was left unchallenged.\n- Next: the author merges.\n' \
       >"$R/controller/verdict-bullets.md"
-    if [ -n "$FINDING" ]; then
+    if [ -n "$FINDING" ] && [ -n "${PROSE_TRACKER:-}" ]; then
+      # PROSE_TRACKER=<n>: the owner names the tracker only in the disposition
+      # prose -- no existingIssue, no issue file.
+      synthesis "$VERDICT" ".findings=[{id:\"$FINDING\",confirmed:true,blocking:false,
+        disposition:\"not-blocking:cosmetic, already tracked as #$PROSE_TRACKER\"}]"
+    elif [ -n "$FINDING" ]; then
       mkdir -p "$R/controller/issues"
       jq -cn '{title:"Checkout button misaligned at 390px",body:"Seen on B1.",labels:["ui"]}' \
         >"$R/controller/issues/$FINDING.json"
@@ -1391,8 +1396,8 @@ cite() { # <file> <line> <literal substring the cited line must contain>
     || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
 }
 ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
-for c in 'smoke-pr-gate.sh:5673' 'smoke-campaign-controller.py:1757-1759' \
-         'smoke-run-scaffold.sh:270-272' 'smoke-campaign-controller.py:1746-1756'; do
+for c in 'smoke-pr-gate.sh:5673' 'smoke-campaign-controller.py:1769-1771' \
+         'smoke-run-scaffold.sh:270-272' 'smoke-campaign-controller.py:1758-1768'; do
   grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
 done
 cite smoke-pr-gate.sh 5673 'OWNER_TOKEN="$(new_owner_token'
@@ -1401,9 +1406,9 @@ cite smoke-pr-gate.sh 5707 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
 cite smoke-pr-gate.sh 5755 '.activeLeaseOwner=$owner'
 cite smoke-run-scaffold.sh 271 '[ "$owner" = "$DEFAULT_OWNER" ]'
 cite smoke-run-scaffold.sh 710 'adds NO new authority check of its own'
-cite smoke-campaign-controller.py 1702 'def _owner_wake'
-cite smoke-campaign-controller.py 1752 'os.unlink("brief-{}.ack"'
-cite smoke-campaign-controller.py 1757 'if c.get("wake"):'
+cite smoke-campaign-controller.py 1714 'def _owner_wake'
+cite smoke-campaign-controller.py 1764 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1769 'if c.get("wake"):'
 
 
 fi
@@ -2399,6 +2404,91 @@ jr '[.[] | select(.kind=="gh" and .slot=="issue:F1" and .state=="done") | .detai
   | grep -qx true || fail "tracker-comment: done via tracker-comment"
 [ "$(finish_verdict)" = '"GO"' ] || fail "tracker-comment: GO"
 unset TRACKER
+
+fi
+if smoke_case 28-unrouted-finding; then
+# The owner names the tracker only in prose: nothing is filed and nothing
+# finishes. The synthesis is refused in the barrier's invalid[] and re-offered;
+# once the owner sets existingIssue, the tracker gets its one comment.
+new_case unrouted-finding
+jq -cn '{comments:{}, prs:{}, issues:[{number:3191,title:"Checkout drift",body:"tracker",state:"open",labels:[],
+  html_url:"https://github.test/issues/3191"}]}' >"$C/fake/gh.json"
+PROSE_TRACKER=3191 FINDING=F1 campaign 7
+unset PROSE_TRACKER
+[ "$(jq '.issues | length' "$C/fake/gh.json")" = 1 ] || fail "unrouted-finding: filed while unrouted: $(jq -c .issues "$C/fake/gh.json")"
+jq -e '.comments == {}' "$C/fake/gh.json" >/dev/null || fail "unrouted-finding: commented while unrouted: $(jq -c .comments "$C/fake/gh.json")"
+[ "$(finish_verdict)" = null ] || fail "unrouted-finding: finished $(finish_verdict) while unrouted"
+jr '[.[] | select(.kind=="gh" or .kind=="verdict")] | length == 0' | grep -qx true \
+  || fail "unrouted-finding: an obligation fired while unrouted: $(jr '[.[] | select(.kind=="gh" or .kind=="verdict")]')"
+jq -e '(.invalid | index("synthesis.json")) != null and (.invalidReasons | any(startswith("finding F1:")))' \
+  "$R/controller/barrier-synthesis.json" >/dev/null \
+  || fail "unrouted-finding: the barrier report does not refuse F1: $(cat "$R/controller/barrier-synthesis.json" 2>&1)"
+jr '[.[] | select(.kind=="owner" and .slot=="synthesis" and .state=="intent" and .detail.refusalChanged==true)]
+    | length == 1' | grep -qx true || fail "unrouted-finding: the synthesis step was not re-offered once"
+grep -q 'THE BARRIER IS ALREADY REFUSING THIS PHASE' "$R/controller/brief-synthesis.md" \
+  || fail "unrouted-finding: the re-offered brief does not lead with the refusal"
+jq -c '.findings[0].existingIssue = 3191' "$R/synthesis.json" >"$R/.synthesis.tmp"
+mv "$R/.synthesis.tmp" "$R/synthesis.json"
+for n in 8 9 10 11; do world "$n"; inputs_from_fakes; step_ok "$(tick_time "$n")"; done
+[ "$(jq '.issues | length' "$C/fake/gh.json")" = 1 ] || fail "unrouted-finding: a wrapper was filed: $(jq -c .issues "$C/fake/gh.json")"
+jq -e --arg m "<!-- smoke-ctl:$(key "$RUN" gh issue:F1) -->" '.comments["3191"] | length == 1 and (.[0].body | contains($m))' \
+  "$C/fake/gh.json" >/dev/null || fail "unrouted-finding: one marked comment on #3191 after the repair"
+jr '[.[] | select(.kind=="gh" and .slot=="issue:F1" and .state=="done") | .detail | [.via, .duplicateOf]] == [["tracker-comment", 3191]]' \
+  | grep -qx true || fail "unrouted-finding: done via tracker-comment"
+[ "$(finish_verdict)" = '"GO"' ] || fail "unrouted-finding: GO after the repair, got $(finish_verdict)"
+
+fi
+# The run finishes within two fires of its refusal expiring: the held issue's
+# own SLA counts from the refusal, so expiry never starts a second wait.
+finished_soon_after_expiry() { # label
+  local exp fin
+  exp="$(dq '[.[] | select((.reason // "") | startswith("confirmed finding still has no tracker or issue past the owner SLA")) | .at] | first')"
+  fin="$(jr '[.[] | select(.kind=="gate" and .state=="done") | .at] | first')"
+  python3 -c 'import datetime as d, json, sys
+p = lambda s: d.datetime.fromisoformat(json.loads(s).replace("Z", "+00:00"))
+sys.exit(0 if (p(sys.argv[2]) - p(sys.argv[1])).total_seconds() <= 1200 else 1)' "$exp" "$fin" \
+    || fail "$1: finished at $fin, more than two fires after the refusal expired at $exp"
+}
+if smoke_case 28-unrouted-phase-dispatch; then
+# Phase dispatch with the lanes owner never settling: the synthesis step is
+# never admitted, so nothing on it can time the refusal. It still expires, the
+# held issue still files nothing, and the run finishes BLOCKED.
+new_case unrouted-phase-dispatch
+jq -cn '{comments:{}, prs:{}, issues:[{number:3191,title:"Checkout drift",body:"tracker",state:"open",labels:[],
+  html_url:"https://github.test/issues/3191"}]}' >"$C/fake/gh.json"
+OWNER_DISPATCH=1 SETTLE=intake VERDICT=BLOCKED PROSE_TRACKER=3191 FINDING=F1 campaign 22
+unset PROSE_TRACKER
+VERDICT=GO
+jr '[.[] | select(.kind=="owner" and .slot=="synthesis")] | length == 0' | grep -qx true \
+  || fail "unrouted-phase-dispatch: precondition -- the synthesis step was admitted"
+dq '[.[] | select(.reason == "confirmed finding has no tracker or issue")] | length > 0' | grep -qx true \
+  || fail "unrouted-phase-dispatch: precondition -- the synthesis was never refused"
+dq '[.[] | select((.reason // "") | startswith("confirmed finding still has no tracker or issue past the owner SLA"))]
+    | length > 0' | grep -qx true || fail "unrouted-phase-dispatch: the refusal never expired"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "unrouted-phase-dispatch: expected BLOCKED, got $(finish_verdict)"
+[ "$(jq '.issues | length' "$C/fake/gh.json")" = 1 ] \
+  || fail "unrouted-phase-dispatch: a wrapper was filed: $(jq -c .issues "$C/fake/gh.json")"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:finding-unrouted:")))] | length > 0' | grep -qx true \
+  || fail "unrouted-phase-dispatch: the held finding raised no alarm"
+finished_soon_after_expiry unrouted-phase-dispatch
+
+fi
+if smoke_case 28-unrouted-worker-unsettled; then
+# Phase dispatch with the synthesis worker admitted but never settling: the
+# expired refusal finishes BLOCKED without waiting on it, and files nothing.
+new_case unrouted-worker-unsettled
+jq -cn '{comments:{}, prs:{}, issues:[{number:3191,title:"Checkout drift",body:"tracker",state:"open",labels:[],
+  html_url:"https://github.test/issues/3191"}]}' >"$C/fake/gh.json"
+OWNER_DISPATCH=1 SETTLE="intake lanes preliminary" PROSE_TRACKER=3191 FINDING=F1 campaign 22
+unset PROSE_TRACKER
+jr '[.[] | select(.kind=="owner" and .slot=="synthesis")] | (length > 0) and (map(.state) | index("done") == null)' \
+  | grep -qx true || fail "unrouted-worker-unsettled: precondition -- the synthesis worker was not admitted, or settled"
+dq '[.[] | select((.reason // "") | startswith("confirmed finding still has no tracker or issue past the owner SLA"))]
+    | length > 0' | grep -qx true || fail "unrouted-worker-unsettled: the refusal never expired"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "unrouted-worker-unsettled: expected BLOCKED, got $(finish_verdict)"
+[ "$(jq '.issues | length' "$C/fake/gh.json")" = 1 ] \
+  || fail "unrouted-worker-unsettled: a wrapper was filed: $(jq -c .issues "$C/fake/gh.json")"
+finished_soon_after_expiry unrouted-worker-unsettled
 
 fi
 # --- 29. a live HUMAN_DECISION hold, end to end through the gate's finish -------

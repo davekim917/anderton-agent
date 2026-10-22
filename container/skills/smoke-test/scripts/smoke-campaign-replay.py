@@ -25,8 +25,9 @@ since 57b339e0b, 2026-08-29, before this corpus). History has no synthesis.json
 when synthesis.md appeared:
   faithful  proposes the verdict the campaign actually reached, bound to the
             run, with the contract's lane generations and the markers'
-            confirmed findings -- but no dispositions, which history never
-            recorded in machine-readable form.
+            confirmed findings, each with an issue file as the owner's brief
+            asks -- but no dispositions, which history never recorded in
+            machine-readable form.
   go-probe  proposes GO for every campaign (same bindings, no dispositions):
             the validator must refuse every one whose actual verdict was not GO.
 
@@ -547,6 +548,11 @@ def replay_one(ctl, entry, mode, work, effects="shadow"):
                 with open(p, "a") as fh:
                     fh.write(json.dumps({"verdict": payload["verdict"], "readAt": payload["at"]}) + "\n")
             elif kind == "synthesis":
+                for f in payload["findings"]:
+                    if not ctl.safe_component(f["id"]):
+                        continue
+                    _write(os.path.join(run_dir, "controller", "issues", "{}.json".format(f["id"])),
+                           {"title": "Replayed finding {}".format(f["id"]), "labels": []})
                 _write(os.path.join(run_dir, "synthesis.json"), payload)
             ei += 1
         if live:

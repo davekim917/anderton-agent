@@ -483,6 +483,137 @@ class FindingIssue(unittest.TestCase):
                 ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
                 self.assertEqual((ob["detail"]["via"], ob["detail"]["duplicateOf"]), ("tracker-comment", 3191))
 
+    # -- a finding with no tracker and no issue file is held, never wrapped ----
+
+    def no_issue_file(self, fid="CF-1"):
+        (Path(self.c.args.run_root) / RUN / "controller" / "issues" / "{}.json".format(fid)).unlink()
+
+    def test_a_tracker_named_only_in_prose_files_nothing_and_alarms_until_the_field_is_set(self):
+        self.gh(labels=["smoke-finding"], issues=[self.tracker(3191)])
+        self.no_issue_file()
+        self.synth({"id": "CF-1", "confirmed": True, "disposition": "not-blocking:already tracked as #3191"})
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "held")
+        self.assertEqual(self.calls(["issue", "create"]), [])
+        self.assertEqual(self.comments(3191), [])
+        self.assertEqual(len(self.filed()), 1)
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+        self.assertEqual((ob["state"], ob["detail"]["outcome"]), ("failed", "held"))
+        self.assertIn("finding CF-1 not filed", ob["detail"]["error"])
+        self.assertNotIn("destination", ob["detail"])
+        self.assertEqual([t for t, _ in self.c.alarms], ["controller_finding_unrouted"])
+        # Re-read on the next attempt: the field the owner adds routes it.
+        self.synth({"id": "CF-1", "confirmed": True, "disposition": "not-blocking:already tracked as #3191",
+                    "existingIssue": 3191})
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+        self.assertEqual((ob["detail"]["via"], ob["detail"]["duplicateOf"]), ("tracker-comment", 3191))
+        self.assertEqual(len(self.comments(3191)), 1)
+        self.assertEqual(self.calls(["issue", "create"]), [])
+
+    def test_a_rejected_tracker_with_no_issue_file_is_held_not_wrapped(self):
+        pr = dict(self.tracker(3191), pull_request={"url": "https://api.github.test/repos/acme/widget/pulls/3191"})
+        self.gh(labels=["smoke-finding"], issues=[pr])
+        self.no_issue_file()
+        self.synth({"id": "CF-1", "confirmed": True, "existingIssue": 3191})
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "held")
+        self.assertEqual(self.calls(["issue", "create"]), [])
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+        self.assertIn("pull request", ob["detail"]["error"])
+        self.assertNotIn("destination", ob["detail"])
+
+    def test_a_journaled_create_whose_issue_file_is_gone_is_held_not_wrapped(self):
+        self.gh(labels=["smoke-finding", "severity:p3"])
+        (self.state / "faults.json").write_text(json.dumps({"gh:label-list": ["fail-before"]}))
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "intent")
+        self.no_issue_file()
+        self.fx._repo_labels = {}
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "held")
+        self.assertEqual(self.filed(), [])
+        self.assertEqual(len(self.calls(["issue", "create"])), 1, "only the refused create ran")
+
+    def pre_finish_stubbed(self):
+        c = self.c
+        c.driven, finished = set(), []
+        c._settle_alarm_sends = lambda run: None
+        c._run_dir_expected = lambda run: False
+        c._publish_verb = lambda run, view, verb: verb
+        c._terminal_call = lambda run, phase, verb, sha, verdict: finished.append(verdict) or "done"
+        c.post_finish = lambda run, pr, verdict, external: verdict
+        c.send = lambda *a, **kw: "delivered"
+        return finished
+
+    def test_held_issues_hold_the_verdict_then_end_terminal_past_the_owner_sla_and_are_not_reread(self):
+        self.gh(labels=["smoke-finding"])
+        self.no_issue_file()
+        c, finished = self.c, self.pre_finish_stubbed()
+        doc = {"findings": [{"id": fid, "confirmed": True} for fid in ("CF-1", "CF-2", "CF-3")]}
+        self.assertEqual(c.pre_finish(RUN, 7, "NO_GO", [], doc), "verdict")
+        self.assertEqual(finished, [])
+        c.now += dt.timedelta(seconds=ctl.OWNER_STEP_SLA_SECONDS + 60)
+        c.pre_finish(RUN, 7, "NO_GO", [], doc)
+        self.assertEqual(finished, ["BLOCKED"])
+        [fin] = [d for d in c.decisions if d["type"] == "finish"]
+        for fid in ("CF-1", "CF-2", "CF-3"):
+            self.assertIn("obligation gh:issue:{} is failed_terminal".format(fid), fin["failedChecks"])
+            ob = c.obligations()[ctl.obligation_key(RUN, "gh", "issue:" + fid)]
+            self.assertEqual(ob["state"], "failed_terminal")
+            self.assertIn("held unfiled", ob["detail"]["reason"])
+        reads = len(self.calls(["api"]))
+        c.pre_finish(RUN, 7, "NO_GO", [], doc)
+        self.assertEqual(len(self.calls(["api"])), reads, "a terminal hold is never read again")
+        self.assertEqual(self.calls(["issue", "create"]), [])
+
+    def test_a_held_issue_counts_its_hold_from_the_synthesis_refusal(self):
+        self.gh(labels=["smoke-finding"])
+        self.no_issue_file()
+        c, finished = self.c, self.pre_finish_stubbed()
+        since = c.now - dt.timedelta(seconds=ctl.OWNER_STEP_SLA_SECONDS + 60)
+        c.record(RUN, "run", "claim", "claimed", detail={"unroutedSince": ctl.iso(since)})
+        c.pre_finish(RUN, 7, "NO_GO", [], {"findings": [{"id": "CF-1", "confirmed": True}]})
+        self.assertEqual(finished, ["BLOCKED"], "no second SLA after the refusal expired")
+        self.assertEqual(self.calls(["issue", "create"]), [])
+
+    def test_unrouted_findings_names_each_filed_finding_with_neither_a_tracker_nor_a_titled_issue_file(self):
+        run_dir = Path(self.c.args.run_root) / RUN
+        self.no_issue_file()
+        self.spec("CF-3", "Third finding")
+        (run_dir / "controller" / "issues" / "CF-5.json").write_text(json.dumps({"existingIssue": "#3195"}))
+        (run_dir / "controller" / "issues" / "CF-6.json").write_text(json.dumps({"title": "  ", "body": "x"}))
+        doc = {"findings": [{"id": "CF-1", "confirmed": True, "existingIssue": 3191},
+                            {"id": "CF-2", "confirmed": True, "disposition": "not-blocking:tracked as #3192"},
+                            {"id": "CF-3", "confirmed": True},
+                            {"id": "CF-4", "blocking": True},
+                            {"id": "CF-5", "confirmed": True},
+                            {"id": "CF-6", "confirmed": True},
+                            {"id": "CF-7", "confirmed": True, "issue": "https://github.com/acme/widget/issues/3197"}]}
+        view = SimpleNamespace(dir=str(run_dir), markers=lambda: {
+            "B1": {"doc": {"confirmedFindings": ["M-1", "CF-1"]}}, "A1": {"doc": None}})
+        reasons = ctl.unrouted_findings(view, doc, "acme/widget")
+        self.assertEqual([r.split(":")[0] for r in reasons], ["finding CF-2", "finding CF-6", "finding M-1"])
+        self.assertIn('"existingIssue": <N>', reasons[0])
+        # No repo known: an issue URL cannot be checked, so it routes nothing.
+        self.assertIn("finding CF-7", " ".join(ctl.unrouted_findings(view, doc, None)))
+        # A synthesis of the wrong shape has no findings of its own; the
+        # markers' still count.
+        for bad in ("bad", [{}], {"findings": 5}, {"findings": {"id": "CF-2"}}, None):
+            self.assertEqual([r.split(":")[0] for r in ctl.unrouted_findings(view, bad, "acme/widget")],
+                             ["finding M-1", "finding CF-1"], bad)
+
+    def test_a_malformed_synthesis_still_publishes_its_pr_run_record(self):
+        # No prose record, so the comment is rendered from synthesis.json.
+        for findings, line in ((5, "- synthesis findings is not a list"),
+                               ([{"id": ["F1"]}, {"id": "F2", "disposition": "open"}], "- finding entry 0 has no string id")):
+            with self.subTest(findings=findings):
+                self.tearDown()
+                self.setUp()
+                self.gh(labels=["smoke-finding"])
+                run = Path(self.c.args.run_root) / RUN
+                (run / "synthesis.json").write_text(json.dumps({"verdict": "GO", "findings": findings}))
+                hint = {"verdict": "BLOCKED", "failedChecks": ["synthesis findings is not a list"]}
+                self.assertEqual(self.c.github(RUN, "verdict", "pr-comment", hint=hint), "done")
+                [comment] = self.comments(7)
+                self.assertIn(line, comment["body"])
+
     def test_only_spawns_non_start_signal_defers_a_read(self):
         # A read that RAN and failed with the very words spawn() uses for a
         # refused start is unknown; only a call spawn() never started defers.

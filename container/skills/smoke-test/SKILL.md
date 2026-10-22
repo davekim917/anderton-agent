@@ -1945,7 +1945,9 @@ tick a no-op.
   {"schemaVersion": 1, "runId": "<runId>", "sourceSha": "<frozen 40-hex>",
    "verdict": "GO|NO_GO|HUMAN_DECISION|BLOCKED",
    "laneGenerations": {"<laneId>": <contract lane generation>},
-   "findings": [{"id": "F-1", "blocking": true, "confirmed": true, "disposition": "fixed-verified"}],
+   "findings": [{"id": "F-1", "blocking": true, "confirmed": true, "disposition": "fixed-verified"},
+                {"id": "F-2", "blocking": false, "confirmed": true, "disposition": "not-blocking:<reason>",
+                 "existingIssue": <issue number>}],
    "gaps": [{"lane": "<laneId>", "disposition": "not-blocking:<reason>"}],
    "dissents": [{"id": "<challenger dissent id>", "disposition": "refuted:<run-relative evidence path>"}],
    "holdDisposition": {"runId": "<held run>", "disposition": "resolved|not-in-range|carried",
@@ -1960,6 +1962,23 @@ tick a no-op.
   file. If an item has no closed disposition, write the item anyway and
   leave its disposition open (for example, `"open"`). The controller then
   reports that item.
+
+  Every confirmed finding an existing issue already tracks, open or closed,
+  carries `"existingIssue": <issue number>` on its entry here. It gets no
+  `controller/issues/<findingId>.json`. The controller comments on that issue
+  instead of filing a new one, and naming the tracker only in
+  `coordinator/synthesis.md` prose does not route it. Every other confirmed
+  finding, including a lane marker's `confirmedFindings`, needs its issue file
+  with a `title`. The controller refuses a synthesis that leaves a confirmed
+  finding with neither: it lists the finding in the synthesis barrier's
+  `invalid[]` and offers the owner the step again before any issue is filed.
+  The refusal lasts for the owner step's SLA from the first refusal. After
+  that the run finishes `BLOCKED` without a model, whatever the owner is
+  still doing.
+  A finding that still has neither when its issue would be filed is held
+  unfiled with an operator alarm, and the verdict waits on it. Past the owner
+  step's SLA the run finishes `BLOCKED`. It never becomes a stand-in "Smoke
+  finding" issue.
 
   `holdDisposition` is needed only for GO while `SMOKE_GATE_HOLD_FILE`
   holds another run's `HUMAN_DECISION` and the gate has not classified this

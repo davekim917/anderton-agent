@@ -468,13 +468,24 @@ expect_blocked headmoved '.' "moved off the frozen sha" head_moved
 no_head() { printf '{}\n' >"$C/heads.json"; }
 expect_blocked nohead '.' "pr head unverified" no_head
 expect_blocked schema '.schemaVersion = 0' "schemaVersion"
+# Well-formed JSON that is not a synthesis object is BLOCKED, not a step fault.
+expect_blocked nonobject-list '[{}]' "schemaVersion"
+expect_blocked nonobject-string '"bad"' "schemaVersion"
+# A finding GO cannot read is never dropped into a GO.
+expect_blocked malformed-id-go '.findings = [{id:1,confirmed:true,blocking:true,disposition:"open"}]' \
+  "finding entry 0 has no string id"
+expect_blocked findings-not-list '.findings = 5' "findings is not a list"
 expect_blocked verdict '.verdict = "SHIP_IT"' "not a legal verdict"
 # A stale binding blocks whatever the synthesis proposes, NO_GO included.
 expect_blocked nogo-stale ".verdict = \"NO_GO\" | .sourceSha = \"$SHA2\"" "sourceSha binding"
 
 # --- GO needs every gap, finding and dissent closed --------------------------
 
-finding_lane() { marker B1 2 fail '["F1"]'; }
+finding_issue() {
+  mkdir -p "$R/controller/issues"
+  jq -cn '{title:"Checkout button misaligned",body:"Seen on B1.",labels:[]}' >"$R/controller/issues/F1.json"
+}
+finding_lane() { marker B1 2 fail '["F1"]'; finding_issue; }
 expect_blocked openfinding '.' "gap: lane B1 is fail" finding_lane
 expect_blocked findingopen '.gaps = [{lane:"B1",disposition:"not-blocking:flaky preview"}]' "finding F1" finding_lane
 expect_blocked refuted-missing \
@@ -516,6 +527,74 @@ expect_go closed-finding \
 expect_go dissent-closed '.dissents = [{id:"D1",disposition:"refuted:evidence/A1.png"}]' dissent
 expect_go dissent-both-closed \
   '.dissents = [{id:"D1",disposition:"refuted:evidence/A1.png"},{id:"D2",disposition:"not-blocking:copy only"}]' dissent_two
+
+# --- a confirmed finding needs a tracker field or an issue file ---------------
+# Its tracker named only in the disposition prose: the synthesis is refused back
+# to the owner before any issue obligation or verdict exists, whatever it
+# proposes; `existingIssue` lets it through.
+UNROUTED='.gaps = [{lane:"B1",disposition:"refuted:evidence/B1.png"}]
+  | .findings = [{id:"F1",confirmed:true,disposition:"not-blocking:cosmetic, tracked as #41"}]'
+unrouted_refused() { # label
+  [ "$(finish_verdict)" = null ] || fail "$1: finished $(finish_verdict) with F1 unrouted"
+  jr '[.[] | select(.kind=="gh" or .kind=="verdict")] | length == 0' | grep -qx true \
+    || fail "$1: an obligation fired before the repair: $(jr '[.[] | select(.kind=="gh" or .kind=="verdict")]')"
+  dq '[.[] | select(.type=="escalate" and .reason=="confirmed finding has no tracker or issue") | .reasons[]]
+      | any(startswith("finding F1:"))' | grep -qx true \
+    || fail "$1: the refusal does not name F1: $(dq '[.[] | select(.type=="escalate")]')"
+  jr '[.[] | select(.kind=="owner" and .slot=="synthesis" and .state=="done")] | length == 0' | grep -qx true \
+    || fail "$1: the synthesis step was closed over an unrouted finding"
+}
+new_case unrouted
+ready_run CLEAR
+marker B1 2 fail '["F1"]'
+synthesis GO "$UNROUTED"
+step_ok 2026-09-18T10:00:00Z
+step_ok 2026-09-18T10:10:00Z
+unrouted_refused unrouted
+synthesis GO "$UNROUTED | .findings[0].existingIssue = 41"
+step_ok 2026-09-18T10:20:00Z
+[ "$(finish_verdict)" = '"GO"' ] || fail "unrouted: the repaired synthesis finishes GO, got $(finish_verdict)"
+jr '[.[] | select(.kind=="gh" and .slot=="issue:F1")] | length > 0' | grep -qx true \
+  || fail "unrouted: the repaired finding was never filed"
+
+new_case unrouted-early
+claim; contract; marker B1 2 fail '["F1"]'
+synthesis BLOCKED '.findings = [{id:"F1",confirmed:true,disposition:"open"}]'
+step_ok 2026-09-18T10:00:00Z
+unrouted_refused unrouted-early
+
+# A GO validated before the finding lost its route no longer validates.
+new_case unrouted-frozen-go
+ready_run CLEAR
+marker B1 2 fail '["F1"]'
+synthesis GO "$UNROUTED"
+seed run claim enqueued 1 '{"pr":7}'
+seed verdict validated done 1 '{"verdict":"GO","failedChecks":[]}'
+step_ok 2026-09-18T10:00:00Z
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "unrouted-frozen-go: expected BLOCKED, got $(finish_verdict)"
+dq '[.[] | select(.type=="finish") | .failedChecks[]] | any(startswith("finding F1: confirmed with no tracker"))' \
+  | grep -qx true || fail "unrouted-frozen-go: failed checks must name F1: $(dq '[.[] | select(.type=="finish")]')"
+
+# The refusal is bounded: past the owner SLA from the FIRST refusal, the
+# synthesis goes on to validation and finishes BLOCKED naming the finding.
+new_case unrouted-sla
+ready_run CLEAR
+marker B1 2 fail '["F1"]'
+synthesis GO "$UNROUTED"
+step_ok 2026-09-18T10:00:00Z
+step_ok 2026-09-18T10:55:00Z
+unrouted_refused unrouted-sla
+step_ok 2026-09-18T11:01:00Z
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "unrouted-sla: expected BLOCKED past the SLA, got $(finish_verdict)"
+dq '[.[] | select(.type=="finish") | .failedChecks[]] | any(startswith("finding F1: confirmed with no tracker"))' \
+  | grep -qx true || fail "unrouted-sla: failed checks must name F1: $(dq '[.[] | select(.type=="finish")]')"
+
+# A finding id that is not a string is no finding to route, never a step fault.
+new_case malformed-finding-id
+claim; contract
+synthesis BLOCKED '.findings = [{id:["F1"],confirmed:true,disposition:"open"},{id:["F2"],confirmed:false}]'
+step_ok 2026-09-18T10:00:00Z
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "malformed-finding-id: expected BLOCKED, got $(finish_verdict): $STEP_OUT"
 
 # Non-GO verdicts pass through when bound: the owner's call stands.
 new_case nogo
@@ -1051,7 +1130,7 @@ jr '[.[] | select(.kind=="gh" and .slot=="freeze-close" and .state=="done")] | l
 # and re-run with the same fire id.
 new_case samefire-issue
 ready_run CLEAR
-marker B1 2 fail '["F1"]'
+marker B1 2 fail '["F1"]'; finding_issue
 seed run claim enqueued 1 '{"pr":7}'
 synthesis NO_GO
 set +e

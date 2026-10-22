@@ -76,5 +76,26 @@ class RunIds(unittest.TestCase):
         self.assertEqual(smoke_run_id.claimed_at(out).timestamp(), 1789000000, out)
 
 
+class ReplayIssueFiles(unittest.TestCase):
+    def test_the_replay_owner_writes_issue_files_only_inside_the_run(self):
+        import json
+        import tempfile
+        corpus = os.path.join(HERE, "testdata", "controller-replay-corpus.ndjson")
+        entry = next(e for e in map(json.loads, open(corpus)) if e.get("markerConfirmedFindings"))
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = os.path.join(tmp, "outside", "sentinel")
+            os.makedirs(os.path.dirname(outside))
+            open(outside + ".json", "w").write("keep\n")
+            entry["markerConfirmedFindings"] = ["F-safe", "../../../escape", outside]
+            work = os.path.join(tmp, "work")
+            os.makedirs(work)
+            replay.replay_one(replay.load_controller(), entry, "faithful", work)
+            issues = os.path.join(work, "faithful", entry["runId"], "runs", entry["runId"], "controller", "issues")
+            self.assertTrue(os.path.isfile(os.path.join(issues, "F-safe.json")))
+            self.assertEqual(open(outside + ".json").read(), "keep\n")
+            escaped = [os.path.join(dp, f) for dp, _, fs in os.walk(tmp) for f in fs if f == "escape.json"]
+            self.assertEqual(escaped, [])
+
+
 if __name__ == "__main__":
     unittest.main()
