@@ -45,6 +45,11 @@ BRANCH="${SMOKE_GATE_BRANCH:-develop}"
 BACKEND_SERVICE="${SMOKE_GATE_BACKEND_SERVICE:-}"
 FRONTEND_SERVICE="${SMOKE_GATE_FRONTEND_SERVICE:-}"
 DEV_URL="${SMOKE_GATE_DEV_URL:-}"
+# INVARIANT 3: develop-only. smoke-pr-gate.sh finds each PR's preview through
+# Render's service list, which no public URL answers.
+COMMIT_SOURCE="${SMOKE_GATE_COMMIT_SOURCE:-render}"
+BACKEND_COMMIT_URL="${SMOKE_GATE_BACKEND_COMMIT_URL:-}"
+FRONTEND_COMMIT_URL="${SMOKE_GATE_FRONTEND_COMMIT_URL:-}"
 STATE_DIR="${SMOKE_GATE_STATE_DIR:-/workspace/agent/smoke-gate}"
 STATE_FILE="$STATE_DIR/develop-state.json"
 LOCK_FILE="$STATE_DIR/develop-state.lock"
@@ -966,8 +971,17 @@ write_active_file() {
 gate_config_missing() {
   local MISSING=""
   [ -n "$REPO" ] || MISSING="$MISSING SMOKE_GATE_REPO"
-  [ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
-  [ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
+  case "$COMMIT_SOURCE" in
+    render)
+      [ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
+      [ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
+      ;;
+    http)
+      [[ "$BACKEND_COMMIT_URL" =~ ^https://[^[:space:]#]+$ ]] || MISSING="$MISSING SMOKE_GATE_BACKEND_COMMIT_URL"
+      [[ "$FRONTEND_COMMIT_URL" =~ ^https://[^[:space:]#]+$ ]] || MISSING="$MISSING SMOKE_GATE_FRONTEND_COMMIT_URL"
+      ;;
+    *) MISSING="$MISSING SMOKE_GATE_COMMIT_SOURCE" ;;
+  esac
   [ -n "$DEV_URL" ] || MISSING="$MISSING SMOKE_GATE_DEV_URL"
   MISSING="$MISSING$LAYOUT_MISSING"
   # A knob that fell back to its default because the deployed value was not a
@@ -1574,12 +1588,27 @@ PID_BRANCH=$!
 timeout 10 gh run list -R "$REPO" --branch "$BRANCH" --limit 100 \
   --json headSha,status,conclusion,workflowName >"$TMP_DIR/checks.json" 2>/dev/null &
 PID_CHECKS=$!
-timeout 10 curl -fsS "https://api.render.com/v1/services/$BACKEND_SERVICE/deploys?limit=10" \
-  >"$TMP_DIR/backend.json" 2>/dev/null &
-PID_BACKEND=$!
-timeout 10 curl -fsS "https://api.render.com/v1/services/$FRONTEND_SERVICE/deploys?limit=10" \
-  >"$TMP_DIR/frontend.json" 2>/dev/null &
-PID_FRONTEND=$!
+# A CDN in front of a static site serves version.json from cache (Cloudflare on
+# Render answers HIT for minutes and ignores a request no-cache header), so each
+# read carries a unique query parameter to reach the origin.
+commit_url_fetch() {  # <url>
+  local sep='?'
+  case "$1" in *\?*) sep='&' ;; esac
+  timeout 10 curl -fsS --max-time 10 -H 'Accept: application/json' "$1${sep}smoke_gate_nocache=$(date +%s%N)"
+}
+if [ "$COMMIT_SOURCE" = http ]; then
+  commit_url_fetch "$BACKEND_COMMIT_URL" >"$TMP_DIR/backend.json" 2>/dev/null &
+  PID_BACKEND=$!
+  commit_url_fetch "$FRONTEND_COMMIT_URL" >"$TMP_DIR/frontend.json" 2>/dev/null &
+  PID_FRONTEND=$!
+else
+  timeout 10 curl -fsS "https://api.render.com/v1/services/$BACKEND_SERVICE/deploys?limit=10" \
+    >"$TMP_DIR/backend.json" 2>/dev/null &
+  PID_BACKEND=$!
+  timeout 10 curl -fsS "https://api.render.com/v1/services/$FRONTEND_SERVICE/deploys?limit=10" \
+    >"$TMP_DIR/frontend.json" 2>/dev/null &
+  PID_FRONTEND=$!
+fi
 timeout 10 gh api "repos/$REPO/activity?ref=refs/heads/$BRANCH&direction=desc&per_page=1" \
   >"$TMP_DIR/activity.json" 2>/dev/null &
 PID_ACTIVITY=$!
@@ -1604,8 +1633,30 @@ CHECK_FAILED="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha a
 # path-skipped — CHECK_FAILED allowlists "skipped", so total>0/pending=0/
 # failed=0 alone would clear a head with zero CI actually executed.
 CHECK_SUCCESS="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha and .status == "completed" and .conclusion == "success")] | length' "$TMP_DIR/checks.json" 2>/dev/null)"
-BACKEND_SHA="$(jq -r '[.[]? | (.deploy // .) | select(.status == "live")][0].commit.id // empty' "$TMP_DIR/backend.json" 2>/dev/null)"
-FRONTEND_SHA="$(jq -r '[.[]? | (.deploy // .) | select(.status == "live")][0].commit.id // empty' "$TMP_DIR/frontend.json" 2>/dev/null)"
+# Validated inside jq: `$(...)` strips trailing newlines and bash drops NULs, so
+# a check after extraction would accept "abc1234\n" as abc1234.
+served_commit_sha() {  # <body-file>
+  local short full
+  short="$(jq -rs 'if length == 1 and (.[0] | type) == "object" and (.[0].commit | type) == "string"
+                     and (.[0].commit | ascii_downcase | explode
+                          | length >= 7 and length <= 40 and all(.[]; (. >= 48 and . <= 57) or (. >= 97 and . <= 102)))
+                   then .[0].commit | ascii_downcase else empty end' "$1" 2>/dev/null)"
+  [[ "$short" =~ ^[0-9a-f]{7,40}$ ]] || return 0
+  if [ "${#short}" -eq 40 ]; then printf '%s' "$short"; return 0; fi
+  if [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] && [ "${SOURCE_SHA#"$short"}" != "$SOURCE_SHA" ]; then
+    printf '%s' "$SOURCE_SHA"; return 0
+  fi
+  full="$(timeout 10 gh api "repos/$REPO/commits/$short" --jq '.sha' 2>/dev/null)" || return 0
+  [[ "$full" =~ ^[0-9a-f]{40}$ ]] && [ "${full#"$short"}" != "$full" ] && printf '%s' "$full"
+  return 0
+}
+if [ "$COMMIT_SOURCE" = http ]; then
+  BACKEND_SHA="$(served_commit_sha "$TMP_DIR/backend.json")"
+  FRONTEND_SHA="$(served_commit_sha "$TMP_DIR/frontend.json")"
+else
+  BACKEND_SHA="$(jq -r '[.[]? | (.deploy // .) | select(.status == "live")][0].commit.id // empty' "$TMP_DIR/backend.json" 2>/dev/null)"
+  FRONTEND_SHA="$(jq -r '[.[]? | (.deploy // .) | select(.status == "live")][0].commit.id // empty' "$TMP_DIR/frontend.json" 2>/dev/null)"
+fi
 
 if ! printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$' ||
    ! printf '%s' "$BACKEND_SHA" | grep -Eq '^[0-9a-f]{40}$' ||
@@ -1808,11 +1859,13 @@ if [ "$READONLY" = true ]; then
     --argjson succeeded "$CHECK_SUCCESS" \
     --argjson backendLag "$BACKEND_LAG_ACCEPTED" \
     --argjson frontendLag "$FRONTEND_LAG_ACCEPTED" \
+    --arg commitSource "$COMMIT_SOURCE" \
     '{ok:true,
       settled:($ciReady and $deployReady),
       sourceSha:$sha,
       backendDeploySha:$backend,
       frontendDeploySha:$frontend,
+      commitSource:$commitSource,
       ciReady:$ciReady,
       deployReady:$deployReady,
       checkCount:$checks,

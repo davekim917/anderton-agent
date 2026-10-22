@@ -1995,8 +1995,7 @@ no-wakes. Deploy it as a thin wrapper script in the agent folder that exports
 the group's values and execs the skill copy at
 `/app/skills/smoke-test/scripts/smoke-develop-gate.sh`, so gate fixes
 propagate without touching the deployment. The gate requires GitHub checks to
-settle and the live frontend and backend deploy commits (read from the Render
-API; adapt the wrapper's env or the fetch block for other deploy hosts) to
+settle and the live frontend and backend deploy commits to
 equal the exact branch SHA, and that SHA to have been the branch tip for
 `SMOKE_GATE_DEBOUNCE_SECONDS` (default 600), before it wakes. The quiet period
 runs from when the tip landed, read from GitHub's repository activity (the
@@ -2010,6 +2009,32 @@ duplicates, and reclaims an abandoned active run on exactly one signal: the
 liveness window (no `progress` stamp for 30 minutes,
 `SMOKE_GATE_PROGRESS_STALE_SECONDS`). A container killed mid-run simply stops
 stamping, so the gate recovers the SHA on the next poll past the window.
+
+**Where the deploy commits come from** is `SMOKE_GATE_COMMIT_SOURCE`:
+
+- `render` (default): the newest `live` deploy in the Render deploys API for
+  `SMOKE_GATE_BACKEND_SERVICE` / `SMOKE_GATE_FRONTEND_SERVICE`.
+- `http`: the top-level `commit` in the JSON served at
+  `SMOKE_GATE_BACKEND_COMMIT_URL` / `SMOKE_GATE_FRONTEND_COMMIT_URL` (HTTPS, no `#` fragment,
+  e.g. the API's `/health` and the web's `/version.json`); the service ids are
+  not required and no verb calls Render. Each read adds a cache-busting query
+  parameter, because a CDN in front of a static site otherwise serves a cached
+  `version.json`. A 7-39 character commit counts as the tip when it prefixes
+  it, and is otherwise resolved to a full SHA through GitHub. An unreachable
+  URL, an HTTP error, a body that is not one JSON object, or a `commit` that is
+  not 7-40 hex is unknown (`gate_fetch_failed`), never a match.
+
+Both sources wait the same way on a deploy that has not gone live: the
+previous commit is still the one live or served, so the head stays unsettled
+and the `develop_unsettled` alarm fires after `SMOKE_GATE_UNSETTLED_ALERT_SECONDS`.
+Neither tells a failed deploy from one still in progress. The opt-in
+`SMOKE_GATE_BACKEND_PATHS` / `SMOKE_GATE_FRONTEND_PATHS` lag rule applies to
+both alike: with it set, an older served commit is accepted when nothing under
+that service's paths changed since it. Leave both unset for strict equality.
+What `http` gives up:
+it trusts the app to report its own build (the commit the running process says
+it is, not Render's deploy record), and while a replacement instance is
+switching in, the served commit can disagree with Render's for a short window.
 
 **A run that is still stamping keeps its slot, however long it has run.** The
 hard age ceiling (4 hours, `SMOKE_GATE_ACTIVE_STALE_SECONDS`) used to override
@@ -2116,8 +2141,8 @@ bash /workspace/agent/smoke-develop-gate.sh check
 ```
 
 Freeze only on `settled: true`, and record the returned `sourceSha`,
-`backendDeploySha`, `frontendDeploySha` and `deployLagAccepted` in the run
-record as the proof. Anything else — `ciReady:false`, a pending or failed
+`backendDeploySha`, `frontendDeploySha`, `deployLagAccepted` and
+`commitSource` in the run record as the proof. Anything else — `ciReady:false`, a pending or failed
 check, an unaccepted deploy lag, `gate_fetch_failed` — means the head is not
 testable yet. Say so and wait; do not freeze on a build you cannot prove.
 `settled: true` is a statement about this instant, so freeze immediately
