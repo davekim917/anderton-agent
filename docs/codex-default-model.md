@@ -50,12 +50,13 @@ For a fallback, set `providerFallback.model` in that group's `container.json`. `
 
 **Deploy.** Run `scripts/deploy.sh` on a build whose image pins codex-cli ≥ 0.159.0; it rebuilds the image because `container/` changed. Before the host restart, rebuild any group that spawns from its own image (`grep -lE '"imageTag"' groups/*/container.json`): a base rebuild does not touch it, and it would send the new default to its old baked CLI. A package image built by `install_packages` is rebuilt with `ncl groups restart --id <group-id> --rebuild`, which also recycles that group's containers, so run it at a quiet moment; any other tag is an operator-supplied image and is rebuilt with its own process. Running containers survive a host restart: the new host adopts them, and they keep the runner source and CLI they were spawned with. So after the restart, recycle each Codex group, and each Claude group with a Codex fallback, that has a live container: `ncl groups restart --id <group-id>`. Until then, those sessions keep running the old default on the old CLI, which is consistent. Move the host CLI with `codex update` (the standalone install keeps earlier releases under `~/.codex/packages/standalone/releases/`) so it equals the image pin.
 
-**Verify.** A turn on a container spawned after the deploy (recycled as above) for an unpinned Codex group writes `turn_usage` rows with `model = 'gpt-6.1-sol'`. Also confirm both CLIs:
+**Verify.** A turn on a container spawned after the deploy (recycled as above) for an unpinned Codex group writes `turn_usage` rows with `model = 'gpt-6.1-sol'`. Compare both CLI versions with the pin printed from `versions.json`:
 
 ```bash
 pnpm exec tsx scripts/q.ts data/v2.db "select agent_group_id, model, effort, count(*) from turn_usage where provider = 'codex' and ts > '<deploy time>' group by 1,2,3"
-docker exec <codex container> codex --version   # expect 0.160.1 (the image pin)
-codex --version                                  # host, expect the same as the image pin
+node --input-type=module -e 'import fs from "node:fs"; console.log(`codex-cli ${JSON.parse(fs.readFileSync("versions.json", "utf8"))["codex-cli"]}`)'
+docker exec <codex container> codex --version
+codex --version
 ```
 
 **Rollback.**
