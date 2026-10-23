@@ -31,6 +31,10 @@
     { "id": "railway", "name": "Railway CLI", "arg": "RAILWAY_VERSION", "source": { "kind": "github", "repo": "railwayapp/cli" } },
     { "id": "supabase", "name": "Supabase CLI", "arg": "SUPABASE_VERSION", "source": { "kind": "github", "repo": "supabase/cli" } },
     { "id": "yq", "name": "yq", "arg": "YQ_VERSION", "source": { "kind": "github", "repo": "mikefarah/yq" } },
+    { "id": "jq", "name": "jq", "arg": "JQ_VERSION", "source": { "kind": "github", "repo": "jqlang/jq" }, "checksums": [
+      { "arg": "JQ_SHA256_amd64", "url": "https://github.com/jqlang/jq/releases/download/jq-{version}/sha256sum.txt", "filename": "jq-linux-amd64" },
+      { "arg": "JQ_SHA256_arm64", "url": "https://github.com/jqlang/jq/releases/download/jq-{version}/sha256sum.txt", "filename": "jq-linux-arm64" }
+    ] },
     { "id": "hex-cli", "name": "Hex CLI", "arg": "HEX_CLI_VERSION", "source": { "kind": "github", "repo": "hex-inc/hex-cli" }, "checksums": [
       { "arg": "HEX_CLI_SHA256_arm64", "url": "https://github.com/hex-inc/hex-cli/releases/download/v{version}/hex-aarch64-unknown-linux-gnu.tar.xz.sha256" },
       { "arg": "HEX_CLI_SHA256_amd64", "url": "https://github.com/hex-inc/hex-cli/releases/download/v{version}/hex-x86_64-unknown-linux-gnu.tar.xz.sha256" }

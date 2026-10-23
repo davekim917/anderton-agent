@@ -114,7 +114,7 @@ if [ "$COMMIT_SOURCE" = http ]; then
   commit_url_valid "$FRONTEND_URL" && commit_url_valid "$BACKEND_URL" &&
     [[ "$FRONTEND_URL$BACKEND_URL" != *\?* ]] ||
     die "SMOKE_GATE_COMMIT_SOURCE=http needs https base urls with no whitespace, query or # fragment"
-  printf '%s' "$HEALTH_PATH" | grep -Eq '^(/[A-Za-z0-9._~-]+)+$' ||
+  printf '%s' "$HEALTH_PATH" | LC_ALL=C grep -Eq '^(/[A-Za-z0-9._~-]+)+$' ||
     die "SMOKE_GATE_COMMIT_SOURCE=http needs SMOKE_GATE_HEALTH_PATH to be a plain path such as /health, so the cache buster reaches the server"
   printf '%s' "$EXPECTED_COMMIT" | grep -Eq '^[0-9a-f]{40}$' ||
     die "SMOKE_GATE_COMMIT_SOURCE=http needs SMOKE_BUILD_ID_EXPECTED_COMMIT, the frozen backend's 40-hex commit"
@@ -126,7 +126,7 @@ fi
 API_MODE=direct
 if [ -n "$API_BASE" ]; then
   API_MODE=relative
-  printf '%s' "$API_BASE" | grep -Eq '^(/[A-Za-z0-9._~-]+)+$' ||
+  printf '%s' "$API_BASE" | LC_ALL=C grep -Eq '^(/[A-Za-z0-9._~-]+)+$' ||
     die "SMOKE_BUILD_ID_API_BASE must be an absolute path such as /api"
   printf '%s' "$EXPECTED_COMMIT" | grep -Eq '^[0-9a-f]{40}$' ||
     die "SMOKE_BUILD_ID_API_BASE needs SMOKE_BUILD_ID_EXPECTED_COMMIT, the frozen backend's 40-hex commit"

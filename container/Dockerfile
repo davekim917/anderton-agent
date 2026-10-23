@@ -82,7 +82,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         curl \
         ffmpeg \
         git \
-        jq \
         less \
         tini \
         unzip \
@@ -96,6 +95,28 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi
+
+# jq from the upstream release, not Debian's package: bookworm ships jq 1.6,
+# which cannot compile the jq 1.7 syntax the container skill scripts use.
+# The host runs Ubuntu's patched jq 1.7.1 and runs the same scripts, so they
+# stay within what 1.7 and this release share.
+# Pins come from the release's sha256sum.txt:
+#   curl -sL https://github.com/jqlang/jq/releases/download/jq-$V/sha256sum.txt
+ARG JQ_VERSION=1.8.2
+ARG JQ_SHA256_amd64=b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+ARG JQ_SHA256_arm64=8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         amd64) SHA="$JQ_SHA256_amd64" ;; \
+         arm64) SHA="$JQ_SHA256_arm64" ;; \
+         *) echo "Unsupported arch for jq: $ARCH" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-linux-${ARCH}" \
+       -o /tmp/jq \
+    && echo "$SHA  /tmp/jq" | sha256sum -c - \
+    && install -m 0755 /tmp/jq /usr/local/bin/jq \
+    && rm -f /tmp/jq \
+    && [ "$(/usr/local/bin/jq --version)" = "jq-${JQ_VERSION}" ]
 
 # GitHub CLI (official apt repo). Kept in a separate layer so the dep cache
 # above still hits when only gh bumps.

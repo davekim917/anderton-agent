@@ -371,4 +371,13 @@ OUT="$(bash "$SCRIPT" "$FRONTEND" "$BACKEND" 2>&1)" && RC=0 || RC=$?
 [ "$RC" -eq 2 ] || { echo "R16: expected exit 2, got $RC: $OUT" >&2; exit 1; }
 jq -e '.ok == false and (.error | test("EXPECTED_COMMIT"))' <<<"$OUT" >/dev/null
 
+# R31. A non-ASCII API base is a usage error in every locale: en_US.UTF-8's
+#      [A-Za-z] range also matches ä. Where that locale is not installed, bash
+#      warns on stderr and runs in C, so only stdout is read.
+relative_stubs
+export SMOKE_BUILD_ID_API_BASE=/äpi
+OUT="$(LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$FRONTEND" "$BACKEND" 2>/dev/null)" && RC=0 || RC=$?
+[ "$RC" -eq 2 ] || { echo "R31: expected exit 2, got $RC: $OUT" >&2; exit 1; }
+jq -e '.ok == false and (.error | test("SMOKE_BUILD_ID_API_BASE must be an absolute path"))' <<<"$OUT" >/dev/null
+
 echo "smoke build identity tests passed"

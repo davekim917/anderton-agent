@@ -335,6 +335,69 @@ describe('deterministic update application', () => {
     expect(await readFile(dockerfilePath, 'utf8')).toContain(`ARG TOOL_SHA256_amd64=${'b'.repeat(64)}`);
   });
 
+  it('reads each arch checksum from the line of a shared sum file that names exactly its asset', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'container-updates-'));
+    await mkdir(path.join(root, 'container'), { recursive: true });
+    const dockerfilePath = path.join(root, 'container', 'Dockerfile');
+    await writeFile(
+      dockerfilePath,
+      `ARG TOOL_VERSION=1.0.0\nARG TOOL_SHA256_amd64=${'a'.repeat(64)}\nARG TOOL_SHA256_arm64=${'a'.repeat(64)}\n`,
+    );
+    await writeFile(
+      path.join(root, 'container', 'update-sources.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        dockerfile: [
+          {
+            id: 'tool',
+            name: 'tool',
+            arg: 'TOOL_VERSION',
+            source: { kind: 'github', repo: 'o/r' },
+            checksums: [
+              {
+                arg: 'TOOL_SHA256_amd64',
+                url: 'https://example/tool-{version}/sums.txt',
+                filename: 'tool-linux-amd64',
+              },
+              {
+                arg: 'TOOL_SHA256_arm64',
+                url: 'https://example/tool-{version}/sums.txt',
+                filename: 'tool-linux-arm64',
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const item: AuditItem = {
+      id: 'docker:tool',
+      name: 'tool',
+      kind: 'dockerfile-pin',
+      surface: 'container',
+      current: '1.0.0',
+      latest: '2.0.0',
+      status: 'outdated',
+      source: 'github',
+    };
+    await applySelectedUpdates({
+      repoRoot: root,
+      items: [item],
+      selectedIds: [item.id],
+      fetchText: async (url) => {
+        expect(url).toBe('https://example/tool-2.0.0/sums.txt');
+        return [
+          `${'c'.repeat(64)}  tool-linux-amd64.tar.gz`,
+          `${'d'.repeat(64)}  tool-linux-amd64`,
+          `${'e'.repeat(64)} *tool-linux-arm64`,
+        ].join('\n');
+      },
+    });
+    const dockerfile = await readFile(dockerfilePath, 'utf8');
+    expect(dockerfile).toContain('ARG TOOL_VERSION=2.0.0');
+    expect(dockerfile).toContain(`ARG TOOL_SHA256_amd64=${'d'.repeat(64)}`);
+    expect(dockerfile).toContain(`ARG TOOL_SHA256_arm64=${'e'.repeat(64)}`);
+  });
+
   it('does not change a Dockerfile when coupled checksum resolution fails', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'container-updates-'));
     await mkdir(path.join(root, 'container'), { recursive: true });

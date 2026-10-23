@@ -292,7 +292,7 @@ function normalizeVersion(value: string): string {
   return match?.[1] ?? value.trim().replace(/^v/, '');
 }
 
-function compareVersions(left: string, right: string): number {
+export function compareVersions(left: string, right: string): number {
   const parse = (value: string) =>
     normalizeVersion(value)
       .replace(/\.post/g, '.')
@@ -815,7 +815,9 @@ function substitute(template: string, version: string): string {
 
 function checksumFromText(text: string, filename?: string): string {
   const lines = text.trim().split(/\r?\n/);
-  const line = filename ? lines.find((candidate) => candidate.includes(filename)) : lines[0];
+  const line = filename
+    ? lines.find((candidate) => candidate.trim().split(/\s+/).at(-1)?.replace(/^\*/, '') === filename)
+    : lines[0];
   const digest = line?.match(/\b([0-9a-f]{64})\b/i)?.[1]?.toLowerCase();
   if (!digest) throw new Error(`could not resolve SHA256${filename ? ` for ${filename}` : ''}`);
   return digest;
