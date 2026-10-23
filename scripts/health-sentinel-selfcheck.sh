@@ -226,6 +226,33 @@ case "$OUT" in
   *) bad "a 1h-old pause breached" "$OUT" ;;
 esac
 
+# A known pause is a standing state, not a new fault: it re-alerts daily, not on
+# the 6h cooldown. The fail-closed `paused-series` key is a fault and keeps 6h.
+seed_last_alert() { python3 -c "
+import json,sys
+json.dump({'last_alert': {sys.argv[2]: int(sys.argv[3])}}, open(sys.argv[1], 'w'))" \
+  "$ROOT/data/health-sentinel-state.json" "$1" "$2"; }
+stub_ncl "echo '{\"data\":[{\"series_id\":\"ghost-x\",\"status\":\"paused\",\"last_run\":\"$OLD_RUN\"}]}'"
+seed_last_alert paused-ghost-x $(( $(date +%s) - 7 * 3600 ))
+run_sentinel
+case "$OUT" in
+  *"within alert cooldown"*) ok "a paused series alerted 7h ago is not re-alerted" ;;
+  *) bad "a paused series re-alerted after 7h" "$OUT" ;;
+esac
+seed_last_alert paused-ghost-x $(( $(date +%s) - 25 * 3600 ))
+run_sentinel
+case "$OUT" in
+  *"within alert cooldown"*) bad "a paused series alerted 25h ago was not re-alerted" "$OUT" ;;
+  *) ok "a paused series re-alerts after a day" ;;
+esac
+stub_ncl "exit 1"
+seed_last_alert paused-series $(( $(date +%s) - 7 * 3600 ))
+run_sentinel
+case "$OUT" in
+  *"within alert cooldown"*) bad "an unreadable task listing took the daily cooldown" "$OUT" ;;
+  *) ok "an unreadable task listing still re-alerts after 6h" ;;
+esac
+
 # FAIL CLOSED. "Cannot look" must never read as "nothing wrong" — that is the
 # exact shape this vital exists to close.
 rm -f "$ROOT/data/health-sentinel-state.json"

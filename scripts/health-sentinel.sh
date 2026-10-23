@@ -58,6 +58,8 @@ SWEEP_MS_MAX=${SWEEP_MS_MAX:-120000}
 DISK_MAX_PCT=${DISK_MAX_PCT:-90}
 RESTARTS_MAX=${RESTARTS_MAX:-3}
 ALERT_COOLDOWN_S=${ALERT_COOLDOWN_S:-21600}
+# A paused series is a standing state the operator already knows about, so it repeats daily, not every 6h.
+PAUSED_SERIES_COOLDOWN_S=${PAUSED_SERIES_COOLDOWN_S:-86400}
 
 NOW=$(date +%s)
 
@@ -513,18 +515,19 @@ export STATE_FILE LOG_SIZE ERR_SIZE RESTARTS
 ALERT_FILE=$(mktemp)
 trap 'rm -f "$ALERT_FILE"' EXIT
 export ALERT_FILE
-ALERT_KEYS=$(python3 - "$NOW" "$ALERT_COOLDOWN_S" "${BREACHES[@]+"${BREACHES[@]}"}" <<'EOF'
+ALERT_KEYS=$(python3 - "$NOW" "$ALERT_COOLDOWN_S" "$PAUSED_SERIES_COOLDOWN_S" "${BREACHES[@]+"${BREACHES[@]}"}" <<'EOF'
 import json, os, sys
 state_file = os.environ["STATE_FILE"]
-now, cooldown = int(sys.argv[1]), int(sys.argv[2])
-breaches = [b.split("|", 1) for b in sys.argv[3:]]
+now, cooldown, paused_cooldown = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+breaches = [b.split("|", 1) for b in sys.argv[4:]]
 try:
     with open(state_file) as f: state = json.load(f)
 except Exception: state = {}
 last = state.get("last_alert", {})
 lines, keys = [], []
 for key, msg in breaches:
-    if now - int(last.get(key, 0)) >= cooldown and key not in keys:
+    wait = paused_cooldown if key.startswith("paused-") and key != "paused-series" else cooldown
+    if now - int(last.get(key, 0)) >= wait and key not in keys:
         lines.append(f"- {msg}")
         keys.append(key)
 state["log_off"] = int(os.environ["LOG_SIZE"])
