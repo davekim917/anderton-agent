@@ -463,7 +463,8 @@ never against the live body.
 standing instructions carry `Acceptance contract (<any label>): active`; every
 step marked *(contract)* applies then and never otherwise, and without that
 line this skill runs exactly as before. *(contract)* Also freeze every request
-the PR body's `acceptance-v1` block (`references/acceptance.example.json`)
+the PR body's `acceptance-v1` block (`references/acceptance.example.json`;
+a data-only re-check: `references/acceptance.data.example.json`)
 names in `sources` — `issue#<n>` via `gh issue view` as `intent/issue-<n>.md`,
 `slack:<channel>/<thread_id>` via `read_thread` as
 `intent/slack-<channel>-<thread>.md` — hashed into `intent_sources`. An
@@ -1487,7 +1488,24 @@ write `evidence/<lane>/acceptance-results.json`, one row per item:
  "evidence":["evidence/A1/ac1.png"],"blockedBy":null}
 ```
 
-`met`/`not_met` need an existing evidence file and a nonempty excerpt;
+An item is `platform` `web`, `api`, `native` or `data`, with the matching
+`then.surface`. A `data` item (a dbt/warehouse re-check with no screen or
+endpoint) has `then.surface` `data:<schema>.<table>` or
+`data:<database>.<schema>.<table>`; its row adds the immutable object it
+queried and the query, and observes by `"kind":"query"`:
+
+```json
+{"itemId":"AD1","verdict":"met",
+ "object":{"relation":"<database>.<schema>.<table>","build":"<CI run or build id>"},
+ "query":"evidence/A1/ad1.sql","observed":{"kind":"query","excerpt":"COUNT(*) = 0"},
+ "evidence":["evidence/A1/ad1.result.json"],"blockedBy":null}
+```
+
+`object` and `query` are required on a data item's `met`/`not_met` (a table
+name alone is rebuilt in place, so the build id pins which one was read) and
+refused on any other item's row. The relation may sit in a CI database or
+schema but must be the table the surface names; `query` must be a non-empty
+file inside the run. `met`/`not_met` need an existing evidence file and a nonempty excerpt;
 `not_demonstrable` keeps the blocker-plus-artifact rule above; `blocked` means
 never attempted because the lane or environment stopped — `blockedBy`
 required, never coverage. A derived contract with no user-observable item says
@@ -1498,7 +1516,11 @@ file in the lane marker's `evidence[]`. **Provenance is mechanical**: each
 source resolves to. The PR body is searched with its one block removed, and
 is unavailable if `acceptance-v1` appears anywhere else in it — a quote that
 lives only inside a block is `unsupported`. The coordinator runs `check`
-before synthesis; the barrier never reads it.
+before synthesis; the barrier never reads it. A contract `check` refuses
+outright (an item failing the item rule, a missing or unreadable file) is a
+stop, not a clean zero: the JSON carries `stopped: "<why>"`, and the report
+sentence reads `Acceptance: present(n) — stopped: <why>, nothing checked`
+instead of zero counters (an absent contract keeps `Acceptance: absent`).
 
 **This lane runs in addition to the diff-derived lanes above, never instead
 of them.** A defect never promised as behavior is the seam lanes' to catch;

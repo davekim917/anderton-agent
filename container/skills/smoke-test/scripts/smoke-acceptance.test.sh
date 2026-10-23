@@ -399,4 +399,117 @@ new_run; extract >/dev/null; check >/dev/null; report >/dev/null
 [ -z "$(find "$RUN" -name '.tmp-*' -o -name '__pycache__')" ] || fail "5-leftovers: $(find "$RUN" -name '.tmp-*' -o -name '__pycache__')"
 [ ! -e "$SCRIPT_DIR/__pycache__" ] || fail "5-bytecode beside the scripts"
 
+# --- 6. data items and the stop/zero distinction -----------------------------------
+# A data re-check has no screen or endpoint: the item reads a relation, and its
+# row names the build-pinned object it queried and the query file. Every other
+# fail-closed check (source identity, quote provenance, evidence paths) still
+# applies to it.
+DATA="$SCRIPT_DIR/../references/acceptance.data.example.json"
+QD="$(jq -r '.items[0].quote' "$DATA")"
+new_data_run() { # [block-json]
+  new_run "${1:-$(cat "$DATA")}"
+  printf 'Issue 413\n\nAfter the rebuild,\n  %s, and the desk total must agree.\n' "$QD" > "$RUN/intent/issue-413.md"
+  printf 'select count(*) from LANTERN_CI.PR_88_FINES.FCT_LOAN_FINES where fine_cents < 0;\n' > "$RUN/evidence/A1/ad1.sql"
+  printf '[{"COUNT(*)":0}]\n' > "$RUN/evidence/A1/ad1.result.json"
+}
+OBJ='{"relation":"LANTERN_CI.PR_88_FINES.FCT_LOAN_FINES","build":"ci-run-5521"}'
+QOBS='{"kind":"query","excerpt":"COUNT(*) = 0"}'
+data_row() { # <verdict> [jq-edit]
+  row AD1 "$1" '["evidence/A1/ad1.result.json"]' '' "$QOBS" \
+    | jq -c --argjson o "$OBJ" ".object = \$o | .query = \"evidence/A1/ad1.sql\" | ${2:-.}"
+}
+new_data_run
+expect 6-data-extract '.ok == true and .origin == "pr-body" and .itemCount == 1 and .problems == []' "$(extract)"
+rows "[$(data_row met)]"
+expect 6-data-ok '.ok == true and .stopped == null and .provenance == {"AD1":"supported"} and .rowProblems == [] and .verdicts.met == 1' "$(check)"
+python3 "$TOOL" check "$RUN" >/dev/null || fail "6-data-exit-code"
+[ "$(report)" = "Acceptance: present(1) — 0 unsupported, 0 missing rows" ] || fail "6-data-sentence: $(report)"
+rows "[$(data_row not_met)]"
+expect 6-data-not-met-ok '.ok == true and .verdicts.not_met == 1' "$(check)"
+# A never-attempted data item has no object to name; blocked keeps its own rule.
+rows "[$(data_row blocked 'del(.object, .query) | .observed = null | .evidence = [] | .blockedBy = "CI run never built the fines model"')]"
+expect 6-data-blocked-ok '.ok == true and .verdicts.blocked == 1' "$(check)"
+data_row_problem() { # <label> <row-json> <problem-regex>
+  rows "[$2]"
+  local out; out="$(check)"
+  jq -e --arg re "$3" '.ok == false and .stopped == null and any(.rowProblems[]; .itemId == "AD1" and any(.problems[]; test($re)))' <<<"$out" >/dev/null || fail "$1: $out"
+}
+data_row_problem 6-data-no-object "$(data_row met 'del(.object)')" 'met on a data item needs object'
+data_row_problem 6-data-not-met-no-object "$(data_row not_met 'del(.object)')" 'not_met on a data item needs object'
+data_row_problem 6-data-no-build "$(data_row met 'del(.object.build)')" 'object.build must name the CI run'
+data_row_problem 6-data-blank-build "$(data_row met '.object.build = " "')" 'object.build must name the CI run'
+data_row_problem 6-data-unqualified-object "$(data_row met '.object.relation = "FCT_LOAN_FINES"')" 'object.relation must be a fully qualified'
+data_row_problem 6-data-other-table "$(data_row met '.object.relation = "LANTERN_CI.PR_88_FINES.FCT_LOANS"')" 'object.relation LANTERN_CI.PR_88_FINES.FCT_LOANS is not the table the item names'
+data_row_problem 6-data-quoted-case "$(data_row met '.object.relation = "LANTERN_CI.PR_88_FINES.\"fct_loan_fines\""')" 'is not the table the item names'
+rows "[$(data_row met '.object.relation = "lantern_ci.pr_88_fines.fct_loan_fines"')]"
+expect 6-data-unquoted-case-folds '.ok == true' "$(check)"
+rows "[$(data_row met '.object.relation = "PR_88_FINES.\"FCT_LOAN_FINES\""')]"
+expect 6-data-two-part-quoted '.ok == true' "$(check)"
+data_row_problem 6-data-object-extra-key "$(data_row met '.object.note = "x"')" 'object must be .relation, build. and nothing else'
+data_row_problem 6-data-no-query "$(data_row met 'del(.query)')" 'met on a data item needs query'
+data_row_problem 6-data-query-missing-file "$(data_row met '.query = "evidence/A1/never.sql"')" 'query is not an existing, non-empty file inside the run: evidence/A1/never.sql'
+data_row_problem 6-data-query-escape "$(data_row met '.query = "../run/evidence/A1/ad1.sql"')" 'query is not an existing'
+data_row_problem 6-data-query-nul "$(data_row met '.query = "evidence/A1/ad1.sql\u0000x"')" 'query is not an existing'
+data_row_problem 6-data-evidence-nul "$(data_row met '.evidence = ["evidence/A1/ad1.result.json\u0000x"]')" 'not an existing, non-empty file inside the run'
+data_row_problem 6-data-evidence-missing "$(data_row met '.evidence = ["evidence/A1/never.json"]')" 'not an existing, non-empty file inside the run: evidence/A1/never.json'
+data_row_problem 6-data-no-evidence "$(data_row met '.evidence = []')" 'met needs at least one existing evidence file'
+data_row_problem 6-data-no-excerpt "$(data_row met '.observed.excerpt = ""')" 'met needs a non-empty observed.excerpt'
+data_row_problem 6-data-dom-kind "$(data_row met '.observed.kind = "dom"')" 'a data item observes only by query'
+data_row_problem 6-data-nd-no-blocker "$(data_row not_demonstrable)" 'not_demonstrable needs blockedBy'
+# The object and query keys, and the query kind, belong to data rows only.
+new_run; extract >/dev/null; shot ac1.png; shot ac3.png; printf 'select 1;\n' > "$RUN/evidence/A1/ad1.sql"
+row_problem 6-web-row-object "$(row AC1 met '["evidence/A1/ac1.png"]' | jq -c --argjson o "$OBJ" '.object = $o')" 'object belongs only to a data item'
+row_problem 6-web-row-query "$(row AC1 met '["evidence/A1/ac1.png"]' | jq -c '.query = "evidence/A1/ad1.sql"')" 'query belongs only to a data item'
+row_problem 6-web-row-query-kind "$(row AC1 met '["evidence/A1/ac1.png"]' '' "$QOBS")" 'observed.kind query belongs to a data item'
+# The contract item names a fully qualified relation, and platform data pairs
+# with a data: surface both ways. Each is the ONLY problem, so the platform
+# itself is accepted.
+only_problem() { # <label> <jq-edit on the data block> <problem-regex>
+  new_data_run "$(jq "$2" "$DATA")"
+  local out; out="$(extract)"
+  jq -e --arg re "$3" '.origin == "absent" and (.problems | length) == 1 and (.problems[0] | test($re))' <<<"$out" >/dev/null || fail "$1: $out"
+}
+only_problem 6-data-surface-unqualified '.items[0].then.surface = "data:FCT_LOAN_FINES"' 'then.surface must be .* data:<schema>.<table>'
+only_problem 6-data-surface-four-part '.items[0].then.surface = "data:A.B.C.D"' 'then.surface must be'
+only_problem 6-data-platform-web-surface '.items[0].then.surface = "web:/desk"' 'platform data and a data:<schema>.<table> surface go together'
+only_problem 6-data-surface-web-platform '.items[0].platform = "web"' 'platform data and a data:<schema>.<table> surface go together'
+only_problem 6-data-source-unknown '.items[0].source = "R9"' 'source must name a key of sources'
+new_data_run "$(jq '.items[0].then.surface = "data:LANTERN_CI.\"Pr 88\".FCT_LOAN_FINES"' "$DATA")"
+expect 6-data-surface-quoted '.origin == "pr-body" and .problems == []' "$(extract)"
+# A doubled quote inside a quoted identifier is one literal quote: valid in the
+# surface and the row, and the table binding decodes it before comparing.
+ESC='LANTERN_CI.PR_88_FINES."FCT_""LOAN""_FINES"'
+new_data_run "$(jq '.items[0].then.surface = "data:FINES.\"FCT_\"\"LOAN\"\"_FINES\""' "$DATA")"
+expect 6-data-surface-escaped-quote '.origin == "pr-body" and .problems == []' "$(extract)"
+rows "[$(data_row met ".object.relation = $(jq -Rn --arg r "$ESC" '$r')")]"
+expect 6-data-escaped-quote-binds '.ok == true and .stopped == null' "$(check)"
+rows "[$(data_row met '.object.relation = "LANTERN_CI.PR_88_FINES.\"FCT_\"\"LOAN_FINES\""')]"
+expect 6-data-escaped-quote-other-table '.ok == false and any(.rowProblems[].problems[]; test("is not the table the item names"))' "$(check)"
+rows "[$(data_row met '.object.relation = "LANTERN_CI.PR_88_FINES.\"FCT_\"LOAN_FINES\""')]"
+expect 6-data-lone-inner-quote '.ok == false and any(.rowProblems[].problems[]; test("object.relation must be a fully qualified"))' "$(check)"
+# Provenance is unchanged for a data item: a quote the issue never said, or a
+# source that was never frozen, is unsupported.
+new_data_run "$(jq '.items[0].quote = "fines are never negative"' "$DATA")"; extract >/dev/null
+rows "[$(data_row met)]"
+expect 6-data-bad-quote '.ok == false and .stopped == null and .provenance.AD1 == "unsupported" and (.unsupported[0].reason | test("quote not found in intent/issue-413.md"))' "$(check)"
+new_data_run "$(jq '.sources.R1 = "issue#414"' "$DATA")"; extract >/dev/null
+rows "[$(data_row met)]"
+expect 6-data-unfrozen-source '.ok == false and .provenance.AD1 == "unsupported" and (.unsupported[0].reason | test("unfrozen: intent/issue-414.md is missing"))' "$(check)"
+new_data_run; extract >/dev/null
+alias_frozen '.sources.R1.frozen = "issue-412.md"'
+rows "[$(data_row met)]"
+expect 6-data-source-alias '.provenance.AD1 == "unsupported" and (.unsupported[0].reason | test("stores frozen .issue-412.md. but its request resolves to intent/issue-413.md"))' "$(check)"
+# A refused contract is a STOP, never a clean zero: the JSON names it and the
+# sentence cannot be mistaken for "nothing missing".
+new_run; derived '.items[1].platform = "ios"'
+OUT="$(check)"
+expect 6-stopped '.ok == false and .stopped == "1 contract problem" and .itemCount == 2 and .provenance == {}' "$OUT"
+[ "$(report)" = "Acceptance: derived(2) — stopped: 1 contract problem, nothing checked" ] || fail "6-stopped-sentence: $(report)"
+derived '.items[0].platform = "ios" | .items[1].platform = "ios"'
+[ "$(report)" = "Acceptance: derived(2) — stopped: 2 contract problems, nothing checked" ] || fail "6-stopped-sentence-plural: $(report)"
+derived '.items = [] | .none = [{"reason":"dependency bump"}]'
+expect 6-clean-zero-not-stopped '.ok == true and has("stopped") and .stopped == null' "$(check)"
+rm "$RUN/intent/acceptance.json"
+expect 6-missing-is-stopped '.stopped == "contract missing"' "$(check)"
+
 echo "smoke-acceptance.test.sh: all sections passed"

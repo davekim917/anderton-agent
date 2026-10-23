@@ -46,10 +46,14 @@ FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*(.*?)[ \t\r]*$")
 # `pr2/R1` would collide with carried PR 2's `R1` (#928 review 2, finding 1).
 AUTHORED_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 DOC_ID_RE = re.compile(r"^(pr[0-9]+/)?[A-Za-z0-9_-]+$")
-SURFACE_RE = re.compile(r"^(web:\S.*|api:[A-Z]+ \S.*|native:\S.*)$")
-PLATFORMS = ("web", "native", "api")
+IDENT = r'(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")'
+RELATION = IDENT + r"(?:\." + IDENT + r"){1,2}"
+RELATION_RE = re.compile(r"^" + RELATION + r"$")
+SURFACE_RE = re.compile(r"^(web:\S.*|api:[A-Z]+ \S.*|native:\S.*|data:" + RELATION + r")$")
+BUILD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/#-]*$")
+PLATFORMS = ("web", "native", "api", "data")
 VERDICTS = ("met", "not_met", "not_demonstrable", "blocked")
-OBSERVED_KINDS = ("text", "dom", "api", "screenshot-only")
+OBSERVED_KINDS = ("text", "dom", "api", "screenshot-only", "query")
 EXCERPT_MAX = 500
 ITEM_REQUIRED = ("id", "source", "quote", "when", "then", "platform")
 ITEM_KEYS = set(ITEM_REQUIRED) | {"actor", "given", "negative"}
@@ -60,7 +64,8 @@ THEN_KEYS = {"surface", "expect"}
 NEGATIVE_KEYS = {"given", "expect"}
 BLOCK_KEYS = {"v", "sources", "items", "reason"}
 DOC_KEYS = {"schemaVersion", "origin", "blocks", "sources", "items", "none", "problems"}
-ROW_KEYS = {"itemId", "verdict", "observed", "evidence", "blockedBy"}
+ROW_KEYS = {"itemId", "verdict", "observed", "evidence", "blockedBy", "object", "query"}
+OBJECT_KEYS = {"relation", "build"}
 
 
 def emit(obj, code=0):
@@ -178,11 +183,13 @@ def validate_item(it, where, sources, allowed):
         for k in _unknown_keys(then, THEN_KEYS):
             errors.append("{}: then has unknown key {}".format(where, k))
         if not _is_text(then.get("surface")) or not SURFACE_RE.match(then["surface"]):
-            errors.append("{}: then.surface must be web:<route> | api:<METHOD> <path> | native:<screen>".format(where))
+            errors.append("{}: then.surface must be web:<route> | api:<METHOD> <path> | native:<screen> | data:<schema>.<table>".format(where))
         if not _is_text(then.get("expect")):
             errors.append("{}: then.expect must be a non-empty string".format(where))
     if it.get("platform") not in PLATFORMS:
         errors.append("{}: platform must be one of {}".format(where, "|".join(PLATFORMS)))
+    elif (it["platform"] == "data") != (isinstance(then, dict) and str(then.get("surface", "")).startswith("data:")):
+        errors.append("{}: platform data and a data:<schema>.<table> surface go together".format(where))
     neg = it.get("negative")
     if neg is not None:
         if not isinstance(neg, dict) or not _is_text(neg.get("expect")):
@@ -418,7 +425,7 @@ def _run_file_ok(run_dir, rel):
     smoke-evidence-barrier.sh:191-192), present (its :197-198 existence check,
     which it applies to `pass` markers only -- so every acceptance verdict
     gets it here), and non-empty (smoke-journeys.py _run_file_ok, :919-930)."""
-    if not _is_text(rel) or "\n" in rel or "\r" in rel:
+    if not _is_text(rel) or "\n" in rel or "\r" in rel or "\0" in rel:
         return False
     if os.path.isabs(rel) or rel in (".", "..") or ".." in rel.split("/"):
         return False
@@ -530,7 +537,43 @@ def load_rows(run_dir, lane):
     return rows, rels, problems
 
 
-def row_problems(run_dir, row):
+def table_name(relation):
+    """The last part of a relation, compared the way the warehouse resolves
+    it: an unquoted identifier case-folded, a quoted one exactly, with `""`
+    read as one quote."""
+    last = re.findall(IDENT, relation)[-1]
+    return last[1:-1].replace('""', '"') if last.startswith('"') else last.upper()
+
+
+def data_row_problems(run_dir, row, verdict, surface):
+    """A data item's row names the immutable object it read -- the relation
+    and the CI run or build that produced it, since a table name alone is
+    rebuilt in place -- and the query it ran, as a file inside the run. Both
+    are required wherever the verdict claims an observation. The relation may
+    sit in a CI database or schema, but it is the table the item names."""
+    out = []
+    obj, query = row.get("object"), row.get("query")
+    if obj is None:
+        if verdict in ("met", "not_met"):
+            out.append("{} on a data item needs object {{relation, build}}".format(verdict))
+    elif not isinstance(obj, dict) or _unknown_keys(obj, OBJECT_KEYS):
+        out.append("object must be {relation, build} and nothing else")
+    else:
+        if not _is_text(obj.get("relation")) or not RELATION_RE.match(obj["relation"]):
+            out.append("object.relation must be a fully qualified <schema>.<table> or <database>.<schema>.<table>")
+        elif table_name(obj["relation"]) != table_name(surface[len("data:"):]):
+            out.append("object.relation {} is not the table the item names ({})".format(obj["relation"], surface))
+        if not _is_text(obj.get("build")) or not BUILD_RE.match(obj["build"]):
+            out.append("object.build must name the CI run or build the relation came from")
+    if query is None:
+        if verdict in ("met", "not_met"):
+            out.append("{} on a data item needs query, the run-relative file holding the query it ran".format(verdict))
+    elif not _run_file_ok(run_dir, query):
+        out.append("query is not an existing, non-empty file inside the run: {}".format(query))
+    return out
+
+
+def row_problems(run_dir, row, item):
     if not isinstance(row, dict):
         return ["row is not an object"]
     out = []
@@ -539,13 +582,22 @@ def row_problems(run_dir, row):
     verdict = row.get("verdict")
     if verdict not in VERDICTS:
         out.append("verdict must be one of {}".format("|".join(VERDICTS)))
+    is_data = item.get("platform") == "data"
     observed = row.get("observed")
     excerpt = observed.get("excerpt") if isinstance(observed, dict) else None
     if observed is not None:
         if not isinstance(observed, dict) or observed.get("kind") not in OBSERVED_KINDS:
             out.append("observed.kind must be one of {}".format("|".join(OBSERVED_KINDS)))
+        elif (observed["kind"] == "query") != is_data:
+            out.append("observed.kind query belongs to a data item, and a data item observes only by query")
         elif excerpt is not None and (not isinstance(excerpt, str) or len(excerpt) > EXCERPT_MAX):
             out.append("observed.excerpt must be a string of at most {} characters".format(EXCERPT_MAX))
+    if is_data:
+        out.extend(data_row_problems(run_dir, row, verdict, item["then"]["surface"]))
+    else:
+        for k in ("object", "query"):
+            if k in row:
+                out.append("{} belongs only to a data item's row".format(k))
     evidence = row.get("evidence")
     if evidence is None:
         evidence = []
@@ -580,25 +632,30 @@ def row_problems(run_dir, row):
 
 def run_check(run_dir, lane):
     doc_path = os.path.join(run_dir, "intent", "acceptance.json")
-    result = {"ok": False, "origin": "absent", "itemCount": 0, "provenance": {}, "unsupported": [],
+    result = {"ok": False, "origin": "absent", "itemCount": 0, "stopped": None, "provenance": {}, "unsupported": [],
               "missingRows": [], "unknownRows": [], "rowProblems": [], "resultFiles": [],
               "verdicts": {v: 0 for v in VERDICTS}, "problems": []}
-    if not os.path.exists(doc_path):
-        result["problems"].append("intent/acceptance.json is missing: run `extract` at freeze, then derive if it reports absent")
+
+    def stop(why):
+        result["stopped"] = why
         result["sentence"] = sentence(result)
         return result
+
+    if not os.path.exists(doc_path):
+        result["problems"].append("intent/acceptance.json is missing: run `extract` at freeze, then derive if it reports absent")
+        return stop("contract missing")
     doc = _read_json(doc_path)
     if doc is None:
         result["problems"].append("intent/acceptance.json is unreadable or not JSON")
-        result["sentence"] = sentence(result)
-        return result
+        return stop("contract unreadable")
     problems = doc_problems(doc)
     result["problems"].extend(problems)
     if isinstance(doc, dict) and doc.get("origin") in ("pr-body", "derived", "absent"):
         result["origin"] = doc["origin"]
     if problems:
-        result["sentence"] = sentence(result)
-        return result
+        if isinstance(doc, dict) and isinstance(doc.get("items"), list):
+            result["itemCount"] = len(doc["items"])
+        return stop("{} contract problem{}".format(len(problems), "" if len(problems) == 1 else "s"))
     items = doc["items"]
     result["itemCount"] = len(items)
     prov = provenance(run_dir, doc)
@@ -608,7 +665,7 @@ def run_check(run_dir, lane):
     rows, files, file_problems = load_rows(run_dir, lane)
     result["resultFiles"] = files
     result["problems"].extend(file_problems)
-    known = {it["id"] for it in items}
+    known = {it["id"]: it for it in items}
     seen = {}
     for rel, row in rows:
         iid = row.get("itemId") if isinstance(row, dict) else None
@@ -621,7 +678,7 @@ def run_check(run_dir, lane):
             result["rowProblems"].append({"itemId": iid, "file": rel, "problems": ["duplicate row (first in {})".format(seen[iid])]})
             continue
         seen[iid] = rel
-        probs = row_problems(run_dir, row)
+        probs = row_problems(run_dir, row, known[iid])
         if probs:
             result["rowProblems"].append({"itemId": iid, "file": rel, "problems": probs})
         if row.get("verdict") in VERDICTS:
@@ -634,12 +691,15 @@ def run_check(run_dir, lane):
 
 def sentence(result):
     """`Acceptance: present(n)|derived(n)|absent -- m unsupported, k missing
-    rows` -- the report's one Untested-line sentence (SKILL.md §8)."""
+    rows`, or `... -- stopped: <why>, nothing checked` when the contract was
+    refused -- the report's one Untested-line sentence (SKILL.md §8)."""
     origin = result["origin"]
     if origin == "absent":
         head = "absent"
     else:
         head = "{}({})".format("present" if origin == "pr-body" else "derived", result["itemCount"])
+        if result.get("stopped"):
+            return "Acceptance: {} — stopped: {}, nothing checked".format(head, result["stopped"])
     return "Acceptance: {} — {} unsupported, {} missing rows".format(
         head, len(result["unsupported"]), len(result["missingRows"]))
 

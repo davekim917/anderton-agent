@@ -1,0 +1,17 @@
+{
+  "_comment": "FICTIONAL data-only example for the made-up 'Lantern Library' app: a request asking for a warehouse re-check, with no screen or endpoint to drive. Same block shape as acceptance.example.json; the item's platform is data and then.surface names the relation it reads, data:<schema>.<table> or data:<database>.<schema>.<table>. The lane's result row for a data item adds object {relation, build} -- the fully qualified relation it actually queried and the CI run or build id that produced it -- and query, the run-relative file holding the SQL it ran; observed.kind is query. smoke-acceptance.test.sh freezes a fictional issue holding the quote.",
+  "v": 1,
+  "sources": {
+    "R1": "issue#413"
+  },
+  "items": [
+    {
+      "id": "AD1",
+      "source": "R1",
+      "quote": "no loan should carry a negative fine after the nightly fines rebuild",
+      "when": "rebuild the fines model in CI and select every fine below zero",
+      "then": { "surface": "data:FINES.FCT_LOAN_FINES", "expect": "zero rows with fine_cents below zero" },
+      "platform": "data"
+    }
+  ]
+}
