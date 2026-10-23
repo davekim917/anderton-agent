@@ -154,6 +154,10 @@ export function createTakeoverProxy(deps: TakeoverProxyDeps = defaultDeps): http
           'Content-Type': upRes.headers['content-type'] ?? 'application/json',
           'Cache-Control': 'no-store',
         });
+        // An upstream lost mid-body ends the response with no error to report, and pipe() never ends res for it.
+        upRes.on('close', () => {
+          if (!upRes.complete) res.destroy();
+        });
         upRes.pipe(res);
       },
     );

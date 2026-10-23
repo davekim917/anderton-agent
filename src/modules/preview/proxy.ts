@@ -181,6 +181,10 @@ export function createPreviewProxy(deps: PreviewProxyDeps = defaultDeps): http.S
       },
       (upRes) => {
         res.writeHead(upRes.statusCode ?? 502, upRes.statusMessage, endToEndHeaders(upRes.rawHeaders));
+        // An upstream lost mid-body ends the response with no error to report, and pipe() never ends res for it.
+        upRes.on('close', () => {
+          if (!upRes.complete) res.destroy();
+        });
         upRes.pipe(res);
       },
     );

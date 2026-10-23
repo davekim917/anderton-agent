@@ -1,16 +1,24 @@
+import { spawn } from 'child_process';
+import { EventEmitter } from 'events';
 import http from 'http';
 import net from 'net';
 import type { AddressInfo } from 'net';
-import { Duplex } from 'stream';
+import { Duplex, PassThrough } from 'stream';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { log } from '../../log.js';
+import { openContainerLoopback } from '../browser-takeover/bridge.js';
 import { createPreviewProxy, MAX_UPGRADES_PER_PREVIEW, pathVerdict, previewIdFromHost } from './proxy.js';
 
 vi.mock('../../config.js', async (orig) => ({
   ...(await orig<typeof import('../../config.js')>()),
   PREVIEW_ORIGIN_SUFFIX: 'preview.example.test',
 }));
+vi.mock('child_process', async (orig) => {
+  const actual = await orig<typeof import('child_process')>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
 
 const ID = '0123456789abcdef0123456789abcdef';
 const HOST = `${ID}.preview.example.test`;
@@ -27,6 +35,7 @@ let raw: net.Socket[];
 let streams: Duplex[];
 let revocation: AbortController;
 let earlyBody: string;
+let held: (() => void)[];
 
 function listen(server: http.Server): Promise<number> {
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve((server.address() as AddressInfo).port)));
@@ -39,10 +48,15 @@ beforeEach(async () => {
   streams = [];
   revocation = new AbortController();
   earlyBody = '';
+  held = [];
   upstream = http.createServer((req, res) => {
     if (req.url === '/early') {
       req.on('data', (d) => (earlyBody += d.toString()));
       res.end('early');
+      return;
+    }
+    if (req.url === '/held') {
+      held.push(() => res.end('from-app'));
       return;
     }
     if (req.url === '/stream') {
@@ -336,6 +350,118 @@ describe('preview proxy routing', () => {
     expect((await upgrade('/src/%2e%2e/secret')).first).toMatch(/^HTTP\/1\.1 403 /);
     expect((await upgrade('/@id//@fs/home/node/.aws/credentials')).first).toMatch(/^HTTP\/1\.1 403 /);
     expect(opened).toEqual([]);
+  });
+});
+
+describe('preview proxy over the docker-exec bridge', () => {
+  type FakeExec = EventEmitter & { stdin: PassThrough; stdout: PassThrough; kill: ReturnType<typeof vi.fn> };
+  let children: FakeExec[];
+  let uncaught: unknown[];
+  const onUncaught = (err: unknown) => uncaught.push(err);
+
+  /** A `docker exec` whose pipes carry a real connection to the app, so the real openContainerLoopback wraps it. */
+  function fakeExec(behavior: 'relay' | 'exits' | 'unspawnable'): FakeExec {
+    const child = Object.assign(new EventEmitter(), {
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      kill: vi.fn(() => true),
+    });
+    children.push(child);
+    if (behavior === 'relay') {
+      const socket = net.connect(upstreamPort, '127.0.0.1');
+      raw.push(socket);
+      child.stdin.pipe(socket).pipe(child.stdout);
+      child.kill.mockImplementation(() => {
+        socket.destroy();
+        setImmediate(() => child.emit('exit', null, 'SIGTERM'));
+        return true;
+      });
+    } else if (behavior === 'exits') {
+      setImmediate(() => child.emit('exit', 1, null));
+    } else {
+      process.nextTick(() => child.emit('error', Object.assign(new Error('spawn docker EAGAIN'), { code: 'EAGAIN' })));
+    }
+    return child;
+  }
+
+  async function bridgedProxy(behavior: Parameters<typeof fakeExec>[0]) {
+    vi.mocked(spawn).mockImplementation((() => fakeExec(behavior)) as unknown as typeof spawn);
+    const server = createPreviewProxy({
+      openUpstream: openContainerLoopback,
+      resolve: () => ({ containerName: CONTAINER, port: APP_PORT, revoked: revocation.signal }),
+    });
+    const port = await listen(server);
+    const get = (path = '/') =>
+      new Promise<{ status: number; body: string }>((resolve, reject) =>
+        http
+          .get({ host: '127.0.0.1', port, path, agent: false, headers: { host: HOST } }, (res) => {
+            let body = '';
+            res.on('data', (d) => (body += d.toString()));
+            res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+          })
+          .on('error', reject),
+      );
+    const close = () => new Promise((r) => server.close(r));
+    return { port, get, close };
+  }
+
+  beforeEach(() => {
+    children = [];
+    uncaught = [];
+    process.on('uncaughtException', onUncaught);
+    // The host's own handler exits on an uncaught exception, which would end the run before the assertion reads it.
+    vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+  });
+
+  afterEach(() => {
+    process.off('uncaughtException', onUncaught);
+    vi.mocked(spawn).mockRestore();
+    vi.restoreAllMocks();
+  });
+
+  it('survives a page load of more parallel requests than the agent pools, and kills every exec it drops', async () => {
+    const warn = vi.spyOn(log, 'warn');
+    const { get, close } = await bridgedProxy('relay');
+    const pending = Promise.all(Array.from({ length: 120 }, () => get('/held')));
+    await until(() => held.length === 16);
+    const release = setInterval(() => held.splice(0).forEach((answer) => answer()), 5);
+    const results = await pending;
+    clearInterval(release);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(uncaught).toEqual([]);
+    // The agent itself drops what its free pool cannot hold, before the server closes.
+    await until(() => children.some((c) => c.kill.mock.calls.length > 0));
+    await close();
+    await until(() => children.every((c) => c.kill.mock.calls.length > 0));
+    expect(uncaught).toEqual([]);
+    expect(results.filter((r) => r.status !== 200 || r.body !== 'from-app')).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('cuts a response whose exec dies in the middle of the body', async () => {
+    const { port, close } = await bridgedProxy('relay');
+    const outcome = await new Promise<string>((resolve) =>
+      http
+        .get({ host: '127.0.0.1', port, path: '/stream', agent: false, headers: { host: HOST } }, (res) => {
+          res.once('data', () => children[0].emit('exit', null, 'SIGKILL'));
+          res.on('close', () => resolve(res.complete ? 'complete' : 'cut'));
+        })
+        .on('error', () => resolve('cut')),
+    );
+    await close();
+    expect(outcome).toBe('cut');
+    expect(uncaught).toEqual([]);
+  });
+
+  it.each([
+    ['exits before answering', 'exits'],
+    ['cannot be spawned', 'unspawnable'],
+  ] as const)('answers 502 when the exec %s', async (_label, behavior) => {
+    const { get, close } = await bridgedProxy(behavior);
+    expect((await get()).status).toBe(502);
+    await close();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(uncaught).toEqual([]);
   });
 });
 
