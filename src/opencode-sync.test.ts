@@ -106,10 +106,30 @@ describe('syncOpenCodePluginSkills with workgroup-scoped plugins (src/plugin-sco
     expect(fs.readFileSync(path.join(GLOBAL_SKILLS, 'dup-skill', 'SKILL.md'), 'utf-8')).toContain('FROM_B_SHARED');
   });
 
+  it('mirrors into a per-group dir that holds no auth.json', () => {
+    const sibling = path.join(HOME, '.local', 'share', 'opencode-example-retail-opencode');
+    fs.mkdirSync(sibling, { recursive: true });
+    pluginAgent('shared-plugin', 'shared-agent');
+
+    expect(syncOpenCodePluginSkills().targets).toContain(path.join(sibling, 'skill'));
+    expect(syncOpenCodeSubagents().targets).toContain(path.join(sibling, 'agent'));
+    expect(fs.existsSync(path.join(sibling, 'skill', 'shared-skill'))).toBe(true);
+  });
+
+  it('never mirrors into a dir holding an auth.json, which is a credential store', () => {
+    const credentialDir = path.join(HOME, '.local', 'share', 'opencode-example-retail-opencode');
+    fs.mkdirSync(credentialDir, { recursive: true });
+    fs.writeFileSync(path.join(credentialDir, 'auth.json'), '{}');
+    pluginAgent('shared-plugin', 'shared-agent');
+
+    expect(syncOpenCodePluginSkills().targets).not.toContain(path.join(credentialDir, 'skill'));
+    expect(syncOpenCodeSubagents().targets).not.toContain(path.join(credentialDir, 'agent'));
+    expect(fs.readdirSync(credentialDir)).toEqual(['auth.json']);
+  });
+
   it('keeps a scoped plugin skill out of per-sibling targets too', () => {
     const sibling = path.join(HOME, '.local', 'share', 'opencode-client-wg-opencode');
     fs.mkdirSync(sibling, { recursive: true });
-    fs.writeFileSync(path.join(sibling, 'auth.json'), '{}');
     scopePlugins({ 'client-plugin': ['client-wg'] });
 
     const result = syncOpenCodePluginSkills();

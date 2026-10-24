@@ -2,15 +2,11 @@ import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import * as fs from 'fs';
 
 import {
-  _resetOpenCodeAuthCacheForTesting,
-  _setOpenCodeAuthProvidersForTesting,
   buildOpenCodeConfig,
   buildOpencodeServerEnv,
   commentRulePlugins,
   OPENCODE_PERMISSIONS,
-  parseOpenCodeAuthProviders,
   runtimeConfigKey,
-  shouldBypassOpenCodeProxy,
 } from './opencode.js';
 import { MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import { splitExcludedPlugins } from '../plugin-exclusions.js';
@@ -36,8 +32,11 @@ function stubGuardPresent(present: boolean): void {
   spies.push(s);
 }
 
+const savedNoProxy = { NO_PROXY: process.env.NO_PROXY, no_proxy: process.env.no_proxy };
+
 beforeEach(() => {
-  _resetOpenCodeAuthCacheForTesting();
+  delete process.env.NO_PROXY;
+  delete process.env.no_proxy;
   delete process.env.OPENCODE_ALLOW_UNGUARDED;
   process.env.OPENCODE_MODEL = 'nvidia/test-model';
   delete process.env.OPENCODE_SMALL_MODEL;
@@ -46,9 +45,12 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  _resetOpenCodeAuthCacheForTesting();
   for (const s of spies.splice(0)) s.mockRestore();
   delete process.env.OPENCODE_ALLOW_UNGUARDED;
+  for (const [key, value] of Object.entries(savedNoProxy)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 });
 
 describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
@@ -151,28 +153,23 @@ describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
     expect(optout.plugin).toEqual([MANAGED_GIT_GUARD_PLUGIN, GUARD_PLUGIN]);
   });
 
-  it('keeps default Anthropic effort on the registered model without synthesizing an API key', () => {
+  it('gives an anthropic/* model the gateway placeholder key, with effort on the registered model', () => {
     stubGuardPresent(true);
-    _setOpenCodeAuthProvidersForTesting(
-      parseOpenCodeAuthProviders('{"anthropic":{"type":"oauth","access":"access","refresh":"refresh","expires":0}}'),
-    );
     process.env.OPENCODE_MODEL = 'anthropic/claude-sonnet-4-8';
     process.env.OPENCODE_EFFORT = 'high';
 
     const cfg = buildOpenCodeConfig({}, {}) as {
+      enabled_providers?: string[];
       provider?: Record<string, { options?: Record<string, unknown>; models?: Record<string, { options?: unknown }> }>;
     };
 
     expect(cfg.provider?.anthropic?.models?.['claude-sonnet-4-8']?.options).toEqual({ reasoningEffort: 'high' });
-    expect(cfg.provider?.anthropic?.options).toBeUndefined();
-    expect(JSON.stringify(cfg.provider?.anthropic)).not.toContain('apiKey');
+    expect(cfg.provider?.anthropic?.options).toEqual({ apiKey: 'placeholder' });
+    expect(cfg.enabled_providers).toEqual(['anthropic']);
   });
 
-  it('moves a per-turn Anthropic effort override onto the per-turn model without an API key', () => {
+  it('moves a per-turn Anthropic effort override onto the per-turn model, keeping the placeholder', () => {
     stubGuardPresent(true);
-    _setOpenCodeAuthProvidersForTesting(
-      parseOpenCodeAuthProviders('{"anthropic":{"type":"oauth","access":"access","refresh":"refresh","expires":0}}'),
-    );
     process.env.OPENCODE_MODEL = 'anthropic/claude-sonnet-4-8';
     process.env.OPENCODE_EFFORT = 'low';
 
@@ -182,106 +179,52 @@ describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
 
     expect(cfg.provider?.anthropic?.models?.['claude-opus-4-8']?.options).toEqual({ reasoningEffort: 'max' });
     expect(cfg.provider?.anthropic?.models?.['claude-sonnet-4-8']).toBeUndefined();
-    expect(cfg.provider?.anthropic?.options).toBeUndefined();
-    expect(JSON.stringify(cfg.provider?.anthropic)).not.toContain('apiKey');
+    expect(cfg.provider?.anthropic?.options).toEqual({ apiKey: 'placeholder' });
   });
 
-  it('fails closed when scoped Go-only auth wins over a shared Anthropic fallback', () => {
-    stubGuardPresent(true);
-    _setOpenCodeAuthProvidersForTesting(
-      parseOpenCodeAuthProviders('{"opencode-go":{"type":"oauth","access":"access","refresh":"refresh","expires":0}}'),
-    );
+  it.each(['NO_PROXY', 'no_proxy'])(
+    'refuses an anthropic/* model when %s takes api.anthropic.com off the gateway path',
+    (variable) => {
+      stubGuardPresent(true);
+      process.env[variable] = 'localhost,api.anthropic.com';
+      expect(() => buildOpenCodeConfig({}, { model: 'anthropic/claude-opus-4-8' })).toThrow(
+        /api\.anthropic\.com is in NO_PROXY/,
+      );
+      expect(() => buildOpenCodeConfig({}, { model: 'opencode-go/glm-5.3-flash' })).not.toThrow();
+    },
+  );
 
-    expect(() => buildOpenCodeConfig({}, { model: 'anthropic/claude-opus-4-8' })).toThrow(
-      /requires a valid top-level anthropic record/i,
-    );
-  });
-
-  it('accepts complete OpenCode auth records but rejects empty credentials', () => {
-    expect(
-      parseOpenCodeAuthProviders(
-        JSON.stringify({
-          'opencode-go': { type: 'oauth', access: 'access', refresh: 'refresh', expires: 0 },
-          nvidia: { type: 'api', key: 'nvapi-key', metadata: { region: 'us' } },
-          'wellknown-provider': { type: 'wellknown', key: 'key', token: 'token' },
-          'whitespace-api': { type: 'api', key: ' ' },
-          empty: {},
-          'bad-oauth': { type: 'oauth', access: 1, refresh: 'refresh', expires: 0 },
-          'empty-oauth-access': { type: 'oauth', access: '', refresh: 'refresh', expires: 0 },
-          'empty-oauth-refresh': { type: 'oauth', access: 'access', refresh: '', expires: 0 },
-          'bad-api': { type: 'api', key: 1 },
-          'empty-api': { type: 'api', key: '' },
-          'bad-metadata': { type: 'api', key: 'key', metadata: { region: 1 } },
-          'empty-wellknown-key': { type: 'wellknown', key: '', token: 'token' },
-          'empty-wellknown-token': { type: 'wellknown', key: 'key', token: '' },
-          nullish: null,
-          array: [],
-          text: 'token',
-        }),
-      ),
-    ).toEqual(['opencode-go', 'nvidia', 'wellknown-provider', 'whitespace-api']);
-    expect(parseOpenCodeAuthProviders('{not-json')).toEqual([]);
-  });
-
-  it('rejects incomplete records before native routing or Anthropic startup', () => {
-    stubGuardPresent(true);
-    const providers = parseOpenCodeAuthProviders('{"opencode-go":{},"anthropic":{}}');
-    expect(providers).toEqual([]);
-    expect(shouldBypassOpenCodeProxy('opencode-go/glm-5.3-flash', providers)).toBe(false);
-
-    _setOpenCodeAuthProvidersForTesting(providers);
-    expect(() => buildOpenCodeConfig({}, { model: 'anthropic/claude-opus-4-8' })).toThrow(
-      /requires a valid top-level anthropic record/i,
-    );
-  });
-
-  it('does not let an unrelated valid record satisfy Anthropic startup', () => {
-    stubGuardPresent(true);
-    _setOpenCodeAuthProvidersForTesting(parseOpenCodeAuthProviders('{"nvidia":{"type":"api","key":"nvapi-key"}}'));
-
-    expect(() => buildOpenCodeConfig({}, { model: 'anthropic/claude-opus-4-8' })).toThrow(
-      /requires a valid top-level anthropic record/i,
-    );
-  });
+  it.each(['opencode-go/glm-5.3-flash', 'opencode/big-pickle', 'nvidia/nemotron'])(
+    'routes %s through the gateway: placeholder key, the one enabled provider',
+    (model) => {
+      stubGuardPresent(true);
+      const provider = model.split('/')[0];
+      const cfg = buildOpenCodeConfig({}, { model }) as {
+        enabled_providers?: string[];
+        provider?: Record<string, { options?: Record<string, unknown> }>;
+      };
+      expect(cfg.provider?.[provider]?.options).toEqual({ apiKey: 'placeholder' });
+      expect(cfg.enabled_providers).toEqual([provider]);
+    },
+  );
 });
 
-describe('effective-model OpenCode proxy routing', () => {
-  it.each([
-    ['opencode-go/glm-5.3-flash', ['opencode-go'], true],
-    ['opencode/big-pickle', ['opencode'], true],
-    ['opencode/big-pickle', ['opencode-go'], false],
-    ['opencode-go/glm-5.3-flash', ['opencode'], false],
-    ['nvidia/nemotron', ['nvidia', 'opencode-go'], false],
-    ['malformed', ['opencode-go'], false],
-  ] as const)('routes %s with auth %j: nativeDirect=%s', (model, providers, expected) => {
-    expect(shouldBypassOpenCodeProxy(model, providers)).toBe(expected);
+describe('OpenCode gateway routing', () => {
+  it('never takes opencode.ai off the proxy path', () => {
+    for (const model of ['opencode-go/glm-5.3-flash', 'opencode/big-pickle']) {
+      const env = buildOpencodeServerEnv({ NO_PROXY: 'localhost', no_proxy: '127.0.0.1' }, { model });
+      expect(env.NO_PROXY).toBe('localhost');
+      expect(env.no_proxy).toBe('127.0.0.1');
+    }
   });
 
-  it('adds opencode.ai only to a matching native child route', () => {
-    _setOpenCodeAuthProvidersForTesting(['opencode-go']);
-    const direct = buildOpencodeServerEnv(
-      { NO_PROXY: 'localhost', no_proxy: '127.0.0.1' },
-      { model: 'opencode-go/glm-5.3-flash' },
-    );
-    expect(direct.NO_PROXY?.split(',')).toContain('opencode.ai');
-    expect(direct.no_proxy?.split(',')).toContain('opencode.ai');
+  it('respawns when a per-turn model crosses providers, and not within one', () => {
+    const goA = runtimeConfigKey({}, undefined, { model: 'opencode-go/glm-5.3-flash' });
+    const goB = runtimeConfigKey({}, undefined, { model: 'opencode-go/kimi-k2.7-code' });
+    const nvidia = runtimeConfigKey({}, undefined, { model: 'nvidia/nemotron' });
 
-    const proxied = buildOpencodeServerEnv(
-      { NO_PROXY: 'localhost', no_proxy: '127.0.0.1' },
-      { model: 'opencode/big-pickle' },
-    );
-    expect(proxied.NO_PROXY?.split(',')).not.toContain('opencode.ai');
-    expect(proxied.no_proxy?.split(',')).not.toContain('opencode.ai');
-  });
-
-  it('respawns only when a model switch crosses the native-direct route boundary', () => {
-    _setOpenCodeAuthProvidersForTesting(['opencode-go']);
-    const proxied = runtimeConfigKey({}, undefined, { model: 'nvidia/nemotron' });
-    const directA = runtimeConfigKey({}, undefined, { model: 'opencode-go/glm-5.3-flash' });
-    const directB = runtimeConfigKey({}, undefined, { model: 'opencode-go/kimi-k2.5' });
-
-    expect(directA).not.toBe(proxied);
-    expect(directB).toBe(directA);
+    expect(goB).toBe(goA);
+    expect(nvidia).not.toBe(goA);
   });
 });
 
@@ -411,9 +354,6 @@ describe('buildOpenCodeConfig + buildOpencodeServerEnv — combined spawn (F3)',
       },
     };
     process.env.OPENCODE_MODEL = 'anthropic/claude-opus-4-8';
-    _setOpenCodeAuthProvidersForTesting(
-      parseOpenCodeAuthProviders('{"anthropic":{"type":"oauth","access":"access","refresh":"refresh","expires":0}}'),
-    );
 
     // 1) Absent guard → refuse to build.
     stubGuardPresent(false);

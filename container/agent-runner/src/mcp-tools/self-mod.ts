@@ -140,7 +140,7 @@ export const listModels: McpToolDefinition = {
   tool: {
     name: 'list_models',
     description:
-      "OpenCode-only model inventory for the session-scoped `change_model` tool. It returns OpenCode slugs reachable from this container's auth.json + env, grouped by upstream provider prefix (opencode-go/*, opencode/*, nvidia/*, etc.), minus any operator-denied slugs. Do NOT use it to validate or reject a channel-default request (`set_channel_model`): that host-side tool is provider-aware and must be called directly for an authorized request. Read-only, no approval needed.",
+      "OpenCode-only model inventory for the session-scoped `change_model` tool. It returns OpenCode slugs reachable from this container's OpenCode config + env, grouped by upstream provider prefix (opencode-go/*, opencode/*, nvidia/*, etc.), minus any operator-denied slugs. Do NOT use it to validate or reject a channel-default request (`set_channel_model`): that host-side tool is provider-aware and must be called directly for an authorized request. Read-only, no approval needed.",
     inputSchema: { type: 'object' as const, properties: {} },
   },
   async handler() {

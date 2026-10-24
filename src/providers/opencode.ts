@@ -1,10 +1,9 @@
 /**
  * Host-side container config for the `opencode` provider. XDG_DATA_HOME is pinned to a per-session host dir so
- * opencode.db stays per-session; auth, agent definitions and skills are copied in at spawn from
- * `~/.local/share/opencode-<folder>/`. Definitions fall back to `~/.config/opencode`; auth NEVER falls back: the
- * operator's own `~/.local/share/opencode/auth.json` also holds personal sign-ins (OpenAI/ChatGPT OAuth), so a group
- * with no scoped auth.json gets none and runs on OneCLI alone. NO_PROXY is merged so OpenCode still reaches 127.0.0.1
- * behind OneCLI's HTTPS_PROXY.
+ * opencode.db stays per-session; agent definitions and skills are copied in at spawn from
+ * `~/.local/share/opencode-<folder>/`, falling back to `~/.config/opencode`. No credential is staged: every request
+ * leaves through the OneCLI gateway, which injects the vault key, so OpenCode only ever holds a placeholder.
+ * NO_PROXY is merged so OpenCode still reaches 127.0.0.1 behind OneCLI's HTTPS_PROXY.
  */
 import fs from 'fs';
 import os from 'os';
@@ -246,12 +245,10 @@ function mergeNoProxy(current: string | undefined, additions: string): string {
 }
 
 interface OpenCodeSourcePaths {
-  authFile: string;
   agentsDir: string;
   skillsDir: string;
 }
 
-/** Each surface resolves independently: a missing scoped auth.json must not suppress the scoped definitions. */
 function resolveOpenCodeSourcePaths(
   agentGroupFolder: string | undefined,
   agentGroupId: string,
@@ -262,12 +259,10 @@ function resolveOpenCodeSourcePaths(
   assertValidGroupFolder(scopedFolder);
   const scoped = path.join(hostHome, '.local', 'share', `opencode-${scopedFolder}`);
   const config = path.join(hostHome, '.config', 'opencode');
-  const scopedAuth = path.join(scoped, 'auth.json');
   const scopedAgents = path.join(scoped, 'agent');
   const scopedSkills = path.join(scoped, 'skill');
 
   return {
-    authFile: scopedAuth,
     agentsDir: fs.existsSync(scopedAgents) ? scopedAgents : path.join(config, 'agent'),
     skillsDir: fs.existsSync(scopedSkills) ? scopedSkills : path.join(config, 'skill'),
   };
@@ -277,7 +272,7 @@ function resolveOpenCodeSourcePaths(
 export const OPENCODE_XDG_CONTAINER_PATH = '/opencode-xdg';
 
 /**
- * Points OpenCode at the staged tree: creds under `$XDG_DATA_HOME/opencode/`, agents under
+ * Points OpenCode at the staged tree: state under `$XDG_DATA_HOME/opencode/`, agents under
  * `$XDG_CONFIG_HOME/opencode/agent/`. Non-OpenCode containers get these too; nothing else in the image reads them.
  * `XDG_CONFIG_HOME` is DEAD for the runner and its children, since the entrypoint re-exports it after Docker applies
  * this env; both are still declared for `docker exec` shells, which skip the entrypoint. `OPENCODE_CONFIG` names the
@@ -290,36 +285,46 @@ export const OPENCODE_XDG_ENV: Readonly<Record<string, string>> = Object.freeze(
   OPENCODE_CONFIG: `${OPENCODE_XDG_CONTAINER_PATH}/opencode/opencode.json`,
 });
 
-export interface StagedOpenCodeAuth {
+export interface StagedOpenCodeXdg {
   mounts: VolumeMount[];
   env: Readonly<Record<string, string>>;
   /** `<sessionDir>/opencode-xdg/opencode` — where the provider adds the rest. */
   opencodeSubdir: string;
 }
 
+/** What OpenCode sends as the provider key; the gateway overwrites it with the vault secret for that host. */
+const OPENCODE_GATEWAY_API_KEY = 'placeholder';
+
 /**
- * The global config in every staged tree, holding only the fleet default model. Without it a headless `opencode run`
- * picks "the first model by internal priority" across every credential it finds (in a Codex container, an OpenAI
- * model with a stale OAuth entry). Safe for the OpenCode provider's own container, whose inline
- * `OPENCODE_CONFIG_CONTENT` merges over this file.
+ * The global config in every staged tree: the fleet default model, and the gateway placeholder as its provider's key.
+ * Without the model a headless `opencode run` picks "the first model by internal priority" across every credential
+ * it finds; without a key OpenCode treats the provider as unconfigured and never sends the request the gateway would
+ * authenticate. Safe for the OpenCode provider's own container, whose inline `OPENCODE_CONFIG_CONTENT` merges over
+ * this file.
  */
 export const OPENCODE_STAGED_CONFIG_FILE = 'opencode.json';
 function stagedOpenCodeConfig(): string {
-  return JSON.stringify({ $schema: 'https://opencode.ai/config.json', model: DEFAULT_OPENCODE_MODEL }, null, 2) + '\n';
+  return (
+    JSON.stringify(
+      {
+        $schema: 'https://opencode.ai/config.json',
+        model: DEFAULT_OPENCODE_MODEL,
+        provider: { [DEFAULT_OPENCODE_PROVIDER]: { options: { apiKey: OPENCODE_GATEWAY_API_KEY } } },
+      },
+      null,
+      2,
+    ) + '\n'
+  );
 }
 
 /**
- * Stages the group's scoped OpenCode credential and default-model config into a session-private XDG tree, and nothing
- * more: every container gets this so any agent can drive `opencode` headless, while agents, skills and opencode.db
- * belong to the OpenCode provider's contribution, which reuses this for its auth step. The dirs were writable by the
- * prior container, so every managed entry is recreated without following a path it may have replaced with a symlink.
+ * Stages the session-private OpenCode XDG tree with the default-model config and nothing more: every container gets
+ * this so any agent can drive `opencode` headless, while agents, skills and opencode.db belong to the OpenCode
+ * provider's contribution. An `auth.json` left by an earlier spawn or written by the prior container is removed, so
+ * OpenCode never reads a credential from disk. The dirs were writable by the prior container, so every managed entry
+ * is recreated without following a path it may have replaced with a symlink.
  */
-export function stageOpenCodeAuth(
-  sessionDir: string,
-  agentGroupFolder: string | undefined,
-  agentGroupId: string,
-  hostHome: string | undefined,
-): StagedOpenCodeAuth {
+export function stageOpenCodeXdg(sessionDir: string): StagedOpenCodeXdg {
   const opencodeDir = path.join(sessionDir, 'opencode-xdg');
   const opencodeSubdir = path.join(opencodeDir, 'opencode');
   if (fs.lstatSync(opencodeDir, { throwIfNoEntry: false }) === undefined)
@@ -328,19 +333,7 @@ export function stageOpenCodeAuth(
   if (fs.lstatSync(opencodeSubdir, { throwIfNoEntry: false }) === undefined) fs.mkdirSync(opencodeSubdir);
   assertRealDirectory(opencodeSubdir);
 
-  let authContents: Buffer | null = null;
-  if (hostHome) {
-    const source = resolveOpenCodeSourcePaths(agentGroupFolder, agentGroupId, hostHome);
-    if (fs.existsSync(source.authFile)) authContents = fs.readFileSync(source.authFile);
-    else
-      log.warn('OpenCode credential not staged: the group has no scoped auth.json', {
-        agentGroupId,
-        agentGroupFolder,
-        scopedAuthFile: source.authFile,
-      });
-  }
-  if (authContents) replaceUntrustedFile(opencodeSubdir, 'auth.json', authContents);
-  else removeUntrustedPathEntry(opencodeSubdir, 'auth.json');
+  removeUntrustedPathEntry(opencodeSubdir, 'auth.json');
   replaceUntrustedFile(opencodeSubdir, OPENCODE_STAGED_CONFIG_FILE, stagedOpenCodeConfig());
 
   return {
@@ -352,7 +345,7 @@ export function stageOpenCodeAuth(
 
 registerProviderContainerConfig('opencode', async (ctx) => {
   const hostHome = ctx.hostEnv.HOME || os.homedir();
-  const staged = stageOpenCodeAuth(ctx.sessionDir, ctx.agentGroupFolder, ctx.agentGroupId, hostHome);
+  const staged = stageOpenCodeXdg(ctx.sessionDir);
   const opencodeSubdir = staged.opencodeSubdir;
 
   let hostAgentsDir: string | null = null;
@@ -410,8 +403,6 @@ registerProviderContainerConfig('opencode', async (ctx) => {
 
   const env: Record<string, string> = {
     ...staged.env,
-    // The child runtime adds opencode.ai only when the effective turn model has a native auth record; the host cannot
-    // decide that from the boot model, since `-m` and channel defaults can change it.
     NO_PROXY: mergeNoProxy(ctx.hostEnv.NO_PROXY, '127.0.0.1,localhost'),
     no_proxy: mergeNoProxy(ctx.hostEnv.no_proxy, '127.0.0.1,localhost'),
   };
@@ -427,7 +418,6 @@ registerProviderContainerConfig('opencode', async (ctx) => {
     const value = resolveScopedOpenCodeEnv(ctx.hostEnv, varName, ctx.agentGroupFolder);
     if (value !== undefined && value.trim() !== '') env[varName] = value;
   }
-  // No OPENCODE_BASE_URL: routing follows the auth.json key and the model prefix.
 
   return { mounts: staged.mounts, env };
 });

@@ -411,6 +411,75 @@ export function mergeWorkgroupAndGroupSecrets(
   return ordered;
 }
 
+/** The one host OpenCode's own providers (`opencode` Zen, `opencode-go` Go) are served from. */
+const OPENCODE_SECRET_HOST = 'opencode.ai';
+
+export interface SpawnSecrets {
+  /** What the spawn grants: the union, holding at most one secret that injects on OPENCODE_SECRET_HOST. */
+  secrets: string[];
+  /** OpenCode secrets the union declared that lost to the one granted. */
+  withheld: string[];
+}
+
+function findSecretRow(rows: readonly OnecliSecret[], declaration: string): OnecliSecret | undefined {
+  return rows.find(
+    (row) =>
+      typeof row === 'object' &&
+      row !== null &&
+      (isUuid(declaration) ? row.id === declaration : row.name === declaration),
+  );
+}
+
+function injectsOnOpenCode(row: OnecliSecret | undefined): boolean {
+  return typeof row?.hostPattern === 'string' && row.hostPattern.trim().toLowerCase() === OPENCODE_SECRET_HOST;
+}
+
+/**
+ * The workgroup ∪ group union, except that exactly one OpenCode secret survives: the group's own, else the
+ * workgroup's, else `fleetOpenCodeSecret`. The gateway applies every granted secret whose host and path match, last
+ * header write winning, over vault rows it reads in no defined order, so two would resolve arbitrarily. Within one
+ * level the first declared wins, and a level that lists the fleet secret itself has not declared its own. A
+ * declaration absent from the vault is left for `resolveSecretUuids` to refuse.
+ */
+export async function resolveSpawnSecrets(
+  workgroupSecrets: string[] | undefined,
+  groupSecrets: string[] | undefined,
+  fleetOpenCodeSecret: string | undefined,
+): Promise<SpawnSecrets> {
+  const merged = mergeWorkgroupAndGroupSecrets(workgroupSecrets, groupSecrets);
+  const configuredFleet = fleetOpenCodeSecret?.trim() || undefined;
+  const declared = configuredFleet && !merged.includes(configuredFleet) ? [...merged, configuredFleet] : merged;
+  // One group-level declaration cannot compete with another; a fleet default is always checked against the vault.
+  if (configuredFleet === undefined && declared.length <= 1) return { secrets: declared, withheld: [] };
+
+  const first = await loadSecrets(false);
+  let rows = first.secrets;
+  if (first.fromCache && declared.some((declaration) => findSecretRow(rows, declaration) === undefined)) {
+    rows = (await loadSecrets(true)).secrets;
+  }
+  const isOpenCode = (declaration: string): boolean => injectsOnOpenCode(findSecretRow(rows, declaration));
+  let fleet = configuredFleet;
+  if (fleet !== undefined && !isOpenCode(fleet)) {
+    log.error('NANOCLAW_OPENCODE_FLEET_SECRET is not a vault secret on opencode.ai; no fleet default granted', {
+      fleetOpenCodeSecret: fleet,
+    });
+    fleet = undefined;
+  }
+  const fleetId = fleet === undefined ? undefined : (findSecretRow(rows, fleet)?.id ?? fleet);
+  const isOwnOpenCode = (declaration: string): boolean =>
+    isOpenCode(declaration) && declaration !== fleet && findSecretRow(rows, declaration)?.id !== fleetId;
+
+  const openCodeSecret =
+    (groupSecrets ?? []).find(isOwnOpenCode) ?? (workgroupSecrets ?? []).find(isOwnOpenCode) ?? fleet ?? null;
+  const winnerId = openCodeSecret === null ? undefined : findSecretRow(rows, openCodeSecret)?.id;
+  const loses = (declaration: string): boolean =>
+    isOpenCode(declaration) && declaration !== openCodeSecret && findSecretRow(rows, declaration)?.id !== winnerId;
+
+  const secrets = merged.filter((declaration) => !loses(declaration));
+  if (openCodeSecret !== null && !secrets.includes(openCodeSecret)) secrets.push(openCodeSecret);
+  return { secrets, withheld: merged.filter(loses) };
+}
+
 /**
  * The OneCLI secrets granting Slack USER-token access (the owner's DMs), withheld from sessions that are not
  * owner-safe (`isOwnerSafeSlackSession`). `explicitNames` is authoritative when given (case-insensitive

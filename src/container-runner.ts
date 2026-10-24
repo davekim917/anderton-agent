@@ -35,6 +35,7 @@ import {
   MAX_CONCURRENT_CONTAINERS,
   ONECLI_API_KEY,
   ONECLI_URL,
+  OPENCODE_FLEET_SECRET,
   TASK_LIST_ENABLED,
   TASK_SCRIPT_TIMEOUT_MS,
 } from './config.js';
@@ -130,7 +131,7 @@ import { applyOnecliContainerConfig, describeDiagnosis } from './onecli-apply.js
 import {
   applyOnecliSecrets,
   ensureOnecliAgent,
-  mergeWorkgroupAndGroupSecrets,
+  resolveSpawnSecrets,
   slackUserTokenSecrets,
   typesafeKeyPlaceholderEnv,
 } from './onecli-secrets.js';
@@ -186,7 +187,7 @@ import {
   type VolumeMount,
 } from './providers/provider-container-registry.js';
 import { buildContainerCodexConfig, CODEX_CHANNEL_DEFAULT_ENV } from './providers/codex.js';
-import { OPENCODE_XDG_CONTAINER_PATH, OPENCODE_XDG_ENV, stageOpenCodeAuth } from './providers/opencode.js';
+import { OPENCODE_XDG_CONTAINER_PATH, OPENCODE_XDG_ENV, stageOpenCodeXdg } from './providers/opencode.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { assertHostOwnedInboundDb, hostInboundMounts, migrateInboundDbToHostDir } from './modules/mailbox/index.js';
@@ -4047,21 +4048,15 @@ export async function buildMounts(
     }
   }
 
-  // Host OpenCode credential for every non-OpenCode container, AUTH ONLY. Withheld on a host-state failure like
-  // the peer Codex stage: an agent that symlinked `/workspace/opencode-xdg` must not break its later spawns.
+  // Staged OpenCode tree (default-model config, no credential) for every non-OpenCode container. Withheld on a
+  // host-state failure like the peer Codex stage: an agent that symlinked `/workspace/opencode-xdg` must not break its
+  // later spawns.
   if (provider !== 'opencode') {
     try {
-      mounts.push(
-        ...stageOpenCodeAuth(
-          sessionDir(agentGroup.id, session.id),
-          agentGroup.folder,
-          agentGroup.id,
-          process.env.HOME || os.homedir(),
-        ).mounts,
-      );
+      mounts.push(...stageOpenCodeXdg(sessionDir(agentGroup.id, session.id)).mounts);
     } catch (err) {
       if (!isHostStateFailure(err)) throw err;
-      log.warn('OpenCode credential withheld from container (staging failed)', {
+      log.warn('OpenCode tree withheld from container (staging failed)', {
         agentGroupId: agentGroup.id,
         containerPath: OPENCODE_XDG_CONTAINER_PATH,
         error: err.message,
@@ -5282,9 +5277,20 @@ async function buildContainerArgs(
     // Defaults to the per-group identity; reassigned to `<group>-noslack` below for non-owner-safe sessions.
     let effectiveIdentifier = agentIdentifier;
     if (agentIdentifier) {
-      // Workgroup secrets are the baseline and per-group onecliSecrets extend them (never subtract). Fail-closed;
-      // a no-op when the merged list is empty.
-      const mergedSecrets = mergeWorkgroupAndGroupSecrets(access.onecliSecrets, containerConfig.onecliSecrets);
+      // Workgroup secrets are the baseline and per-group onecliSecrets extend them, except that one OpenCode secret
+      // replaces the others. Fail-closed; a no-op when the list is empty.
+      const spawnSecrets = await resolveSpawnSecrets(
+        access.onecliSecrets,
+        containerConfig.onecliSecrets,
+        OPENCODE_FLEET_SECRET,
+      );
+      if (spawnSecrets.withheld.length > 0) {
+        log.info('OpenCode secrets withheld: a nearer level declares its own', {
+          folder: agentGroup.folder,
+          withheld: spawnSecrets.withheld,
+        });
+      }
+      const mergedSecrets = spawnSecrets.secrets;
 
       // The Slack user token is the whole Slack boundary (Slack access is `curl slack.com/api/*` through the
       // proxy). Identities are per-GROUP, so non-owner-safe sessions spawn under a second identity `<group>-noslack`

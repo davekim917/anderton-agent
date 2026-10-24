@@ -103,23 +103,23 @@ next spawn, and the enabler run is just a verification pass.
    > **Run it regardless and keep the result even though `cp` reports failure** — the
    > next sync deletes the original, and this is the last copy of the instructions.
    > Scoped mirrors (`~/.local/share/opencode-<group>/`) exist only for groups with
-   > their own `auth.json`; the rest share the global dir. Watch the case where a
-   > group HAD scoped auth and `auth.json` was later removed: the sync stops targeting
-   > the dir (`discoverOpenCodeXdgTargets` skips a sibling with no `auth.json`,
-   > `src/opencode-sync.ts:194-195`) while the container still prefers it, because
-   > `resolveOpenCodeSourcePaths` picks the scoped `skill/` dir purely on existence
-   > (`src/providers/opencode.ts:148`). That group then serves a frozen mirror
-   > forever — neither updated nor sharing the global one. Check for it before
+   > their own dir; the rest share the global dir. Watch the case where a scoped dir
+   > still holds an `auth.json` left from the retired scoped-credential route: the
+   > sync treats it as a credential store and stops targeting the dir
+   > (`discoverOpenCodeXdgTargets`, `src/opencode-sync.ts`) while the container still
+   > prefers it, because `resolveOpenCodeSourcePaths` picks the scoped `skill/` dir
+   > purely on existence (`src/providers/opencode.ts`). That group then serves a frozen
+   > mirror — neither updated nor sharing the global one. Check for it before
    > trusting a sync result:
    >
    > ```bash
    > for d in ~/.local/share/opencode-*/; do
-   >   [ -d "$d/skill" ] && [ ! -f "$d/auth.json" ] && echo "STALE: $d"
+   >   [ -d "$d/skill" ] && [ -e "$d/auth.json" ] && echo "STALE: $d"
    > done
    > ```
    >
-   > Prefer restoring the group's `auth.json` — the dir becomes a sync target again and
-   > nothing is lost. Do **not** just delete the `skill/` dir: it can also hold skills
+   > Delete that `auth.json` (no container reads it any more; OpenCode keys live in the
+   > OneCLI vault) — the dir becomes a sync target again and nothing is lost. Do **not** just delete the `skill/` dir: it can also hold skills
    > installed by hand or natively, which `syncSkillSymlinks` deliberately keeps
    > (`fs.rmSync` runs only behind an `isManagedMirror(entryPath)` gate,
    > `src/plugin-skill-discovery.ts:432-433`). That protection covers **directories only**:
@@ -286,9 +286,9 @@ next spawn, and the enabler run is just a verification pass.
    entry not in it. So enabling **any** remaining plugin runs the same reconciliation
    and drops the orphan. Only a plugins root with nothing left to enable has no route.
 
-   One target it cannot reach: a scoped mirror whose `auth.json` is gone.
-   `discoverOpenCodeXdgTargets` skips those siblings (`src/opencode-sync.ts:194-195`),
-   so reconciliation visits the global dir and the still-authenticated scoped ones only.
+   One target it cannot reach: a scoped dir that still holds an `auth.json`.
+   `discoverOpenCodeXdgTargets` skips those as credential stores (`src/opencode-sync.ts`),
+   so reconciliation visits the global dir and the scoped dirs without one only.
    An orphan sitting in a stale scoped dir survives every reconcile — repair it with the
    stale-mirror steps in step 1's preflight, not by enabling another plugin.
 

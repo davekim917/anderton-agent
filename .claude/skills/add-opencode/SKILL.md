@@ -158,7 +158,7 @@ or mutate retired per-group source overlays.
 
 ### Model / provider config (DB, not `.env`)
 
-Model, provider, and effort live in the **`container_configs`** DB row, set via `ncl` — the same one-pattern template claude and codex use (a code-level default, overridden per-group in the DB). The host **no longer reads** `OPENCODE_PROVIDER` / `OPENCODE_MODEL` / `OPENCODE_SMALL_MODEL` / `OPENCODE_EFFORT` from `.env` for model selection (those scoped vars are dead — see `src/providers/opencode.ts`). The provider is **derived from the model slug's prefix** (`deepseek/…` → deepseek, `opencode-go/…` → Go, `opencode/…` → Zen, `nvidia/…` → NVIDIA); there is no base-URL var to set — opencode's provider registry routes by prefix + the auth.json/OneCLI cred.
+Model, provider, and effort live in the **`container_configs`** DB row, set via `ncl` — the same one-pattern template claude and codex use (a code-level default, overridden per-group in the DB). The host **no longer reads** `OPENCODE_PROVIDER` / `OPENCODE_MODEL` / `OPENCODE_SMALL_MODEL` / `OPENCODE_EFFORT` from `.env` for model selection (those scoped vars are dead — see `src/providers/opencode.ts`). The provider is **derived from the model slug's prefix** (`deepseek/…` → deepseek, `opencode-go/…` → Go, `opencode/…` → Zen, `nvidia/…` → NVIDIA); there is no base-URL var to set — opencode's provider registry routes by prefix, and the OneCLI gateway injects the credential.
 
 Set the model on the group after selecting `provider=opencode` below (the group
 row must exist):
@@ -169,18 +169,28 @@ ncl groups config update --id <agentGroupFolder> --model deepseek/deepseek-chat 
 
 If you set nothing, the group inherits the code default `opencode-go/deepseek-v4.1-flash` (effort `high`) — correct for an OpenCode Go group, wrong for any other provider, so a non-Go group **must** set `--model` explicitly. Effort accepts `low|medium|high` (opencode's portable set). The `provider/model-id` shapes in the examples below are still the right FORMAT for `--model` — just pass them to `ncl`, not `.env`.
 
-Credentials: register provider API keys in OneCLI with the matching `--host-pattern` (e.g. `api.deepseek.com`, `openrouter.ai`). OneCLI injects them via `HTTPS_PROXY` in the container — the key never lives in `.env` or the container environment.
+Credentials: every OpenCode credential lives in the OneCLI vault, registered with the provider's `--host-pattern` (e.g. `api.deepseek.com`, `openrouter.ai`). No `auth.json` is ever staged into a container: OpenCode sends the key `placeholder`, and the gateway replaces it on the way out through `HTTPS_PROXY`. The key never lives in `.env`, on disk, or in the container environment.
 
-After adding a secret, **grant the agent access** — agents in `selective` mode only receive secrets they've been explicitly assigned:
-
-Use the safe merge pattern — `set-secrets` replaces the entire list, so always read first:
+Grant a secret through the workgroup or the group, never `onecli agents set-secrets`: each spawn reconciles the agent's grants to exactly what the workgroup and the group's `container.json` declare, so a direct grant is undone at the next spawn.
 
 ```bash
-AGENT_ID=$(onecli agents list | jq -r '.data[] | select(.identifier=="<agentGroupId>") | .id')
-CURRENT=$(onecli agents secrets --id "$AGENT_ID" | jq -r '[.data[]] | join(",")')
-MERGED=$(printf '%s' "$CURRENT,<new-secret-id>" | tr ',' '\n' | sort -u | paste -sd ',' -)
-onecli agents set-secrets --id "$AGENT_ID" --secret-ids "$MERGED"
-onecli agents secrets --id "$AGENT_ID"
+ncl secrets grant --name <vault name> --workgroups <workgroup-id>   # every member of the workgroup
+ncl secrets grant --name <vault name> --groups <group-id>           # one group (its container.json onecliSecrets)
+```
+
+**One OpenCode key per agent.** Secrets whose host pattern is exactly `opencode.ai` (OpenCode Go and Zen) are the exception to the union: the spawn grants exactly one, chosen in this order (`resolveSpawnSecrets`, `src/onecli-secrets.ts`):
+
+1. the group's own, from its `container.json` `onecliSecrets`;
+2. else its workgroup's;
+3. else the fleet default, `NANOCLAW_OPENCODE_FLEET_SECRET` in `.env` (unset: none).
+
+The losers are withheld and the host logs them. The gateway applies every matching secret and the last header write wins, over vault rows it reads in no defined order, so granting two would pick one at random. Within one level the first declared wins, and a level that lists the fleet secret itself has not declared its own. A new group therefore needs nothing: it inherits its workgroup's key or the fleet default. Give an agent or a workgroup its own account only when it needs separate billing or limits:
+
+```bash
+onecli secrets create --name "OpenCode-Go-<label>" --type generic \
+  --value YOUR_GO_KEY --host-pattern opencode.ai --path-pattern "/zen/go/*" \
+  --header-name "Authorization" --value-format "Bearer {value}"
+ncl secrets grant --name "OpenCode-Go-<label>" --groups <group-id>      # or --workgroups <workgroup-id>
 ```
 
 Each example below gives the `provider/model-id` to pass to `ncl … --model` plus
@@ -208,30 +218,25 @@ onecli secrets create --name "OpenRouter" --type generic \
 
 #### Example: Anthropic
 
-Model id for `--model`: `anthropic/claude-sonnet-4-20250514`. An
-`anthropic/*` model requires OpenCode's own authenticated provider record in a
-verified native `auth.json`; generic `ANTHROPIC_*` environment variables and
-OneCLI proxy injection do not configure OpenCode authentication.
+Model id for `--model`: `anthropic/claude-sonnet-4-20250514`. OpenCode's
+Anthropic SDK sends the key as `x-api-key`, so an `anthropic/*` model needs an
+Anthropic **API key** in the vault, registered with `--type anthropic`: the
+gateway sets `x-api-key` for an `sk-ant-api…` value. A Claude subscription
+OAuth token (`sk-ant-oat…`) does not work here: the gateway only replaces an
+`Authorization` header, which this SDK never sends, so the request leaves with
+the placeholder and fails with 401.
 
-Before selecting this model, authenticate with OpenCode's native Anthropic
-provider flow into the group's scoped file (see "Per-group auth file" below)
-and verify, without printing credentials, that it contains a valid top-level
-`anthropic` record. The host reads only the scoped file:
+On a host that runs Claude on a subscription token (`CLAUDE_CODE_OAUTH_TOKEN`),
+every container takes `api.anthropic.com` off the proxy so Claude's own
+token rotation works, and the gateway then never sees OpenCode's Anthropic
+calls. The runner refuses an `anthropic/*` model there with an error naming
+the bypass; use one only on a host without that token.
 
 ```bash
-AUTH_FILE="$HOME/.local/share/opencode-<group-folder>/auth.json"
-# Uses the runtime's own parser: incomplete records must not pass the operator gate.
-bun -e '
-  import fs from "node:fs";
-  import { parseOpenCodeAuthProviders } from "./container/agent-runner/src/providers/opencode.ts";
-  const auth = fs.readFileSync(process.argv[1], "utf8");
-  if (!parseOpenCodeAuthProviders(auth).includes("anthropic")) process.exit(1);
-' "$AUTH_FILE"
+onecli secrets create --name "Anthropic-API-<label>" --type anthropic \
+  --value YOUR_SK_ANT_API_KEY --host-pattern api.anthropic.com
+ncl secrets grant --name "Anthropic-API-<label>" --groups <group-id>
 ```
-
-The host copies only the scoped
-`~/.local/share/opencode-<group-folder>/auth.json`. Do not switch the group to
-an `anthropic/*` slug until that check passes.
 
 #### OpenCode Zen (`x-api-key`, not Bearer)
 
@@ -244,6 +249,10 @@ from the slug prefix (see [Zen docs](https://opencode.ai/docs/zen/)).
 
 Model id for `--model`: an `opencode/<id>` slug, e.g. `opencode/big-pickle` (use a real Zen model id from the docs).
 
+A Zen secret is also an `opencode.ai` secret, so it competes with the Go key
+under the one-key rule above: grant it to the group that runs Zen, where it
+replaces the workgroup's Go key.
+
 **OneCLI:** register the Zen key with **`x-api-key`**, not Bearer:
 
 ```bash
@@ -252,33 +261,34 @@ onecli secrets create --name "OpenCode Zen" --type generic \
   --header-name "x-api-key" --value-format "{value}"
 ```
 
-### Per-group auth file
+### OpenCode Go (the default provider)
 
-Every group needs its own key-only `~/.local/share/opencode-<group-folder>/auth.json`.
-The host stages only that file into the container. It never falls back to the
-operator's `~/.local/share/opencode/auth.json`, which also holds personal
-sign-ins, and logs a WARN naming the missing path on each spawn of a group
-without one. Never copy the operator's file. With the pinned host CLI
-installed (`/clone-as-opencode` step 6a derives the version from the image
-pin), log in under a throwaway XDG:
+The code default model is an `opencode-go/*` slug. OpenCode Go takes the key as
+`Authorization: Bearer`, and OpenCode sends the `x-opencode-session` header on
+its own for every `opencode*` provider. The path pattern must cover the path
+the pinned CLI calls; the pinned build calls `/zen/go/v1/…`:
 
 ```bash
-TMPXDG=$(mktemp -d)
-# Adding a provider to an existing scoped file: seed the throwaway XDG with it
-# first, so the login adds a record instead of replacing the file.
-[ -f ~/.local/share/opencode-<group-folder>/auth.json ] && mkdir -p "$TMPXDG/opencode" \
-  && cp ~/.local/share/opencode-<group-folder>/auth.json "$TMPXDG/opencode/auth.json"
-# One login per provider the group uses, e.g. --provider anthropic for an anthropic/* model.
-XDG_DATA_HOME="$TMPXDG" opencode providers login --provider opencode
-mkdir -p ~/.local/share/opencode-<group-folder>
-mv "$TMPXDG/opencode/auth.json" ~/.local/share/opencode-<group-folder>/auth.json
-rm -rf "$TMPXDG"
+onecli secrets create --name "OpenCode-Go" --type generic \
+  --value YOUR_GO_KEY --host-pattern opencode.ai --path-pattern "/zen/go/*" \
+  --header-name "Authorization" --value-format "Bearer {value}"
+ncl secrets grant --name OpenCode-Go --workgroups <workgroup-id>   # or set NANOCLAW_OPENCODE_FLEET_SECRET=OpenCode-Go
 ```
+
+models.dev already lists Go under `/inference/go/…`; a CLI bump that follows
+it sends Go calls past this pattern with the placeholder, so re-check the path
+in the gateway log (`docker logs onecli | grep opencode.ai`) on every
+`OPENCODE_VERSION` bump.
+
+Every container gets it, not only OpenCode groups: Claude and Codex
+containers carry a headless `opencode` whose staged config names the same
+default model and placeholder key.
 
 ### Per group
 
-Create the per-group auth file above, then select OpenCode through the
-container-config source of truth, then restart the
+Make sure the group's workgroup (or the fleet default) grants an OpenCode key
+as above, then select OpenCode through the container-config source of truth,
+then restart the
 group so the host materializes the new `provider` into `container.json` and
 spawns with the matching host contribution:
 

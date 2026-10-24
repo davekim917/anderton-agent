@@ -269,43 +269,32 @@ export function validateProviderMemoryPayload(
         issues,
         skillFile,
         skill,
-        /anthropic\/\*[\s\S]{0,320}verified native `auth\.json`/i,
-        'native auth.json requirement for Anthropic OpenCode models',
+        /anthropic\/\*[\s\S]{0,400}--type anthropic/i,
+        'vault API-key requirement for Anthropic OpenCode models',
       );
       requireMatch(
         issues,
         skillFile,
         skill,
-        /~\/\.local\/share\/opencode-<group-folder>\/auth\.json/,
-        'scoped native OpenCode auth path',
+        /No `auth\.json` is ever staged/,
+        'vault-only OpenCode credential statement',
       );
       requireMatch(
         issues,
         skillFile,
         skill,
-        /AUTH_FILE="\$HOME\/\.local\/share\/opencode-<group-folder>\/auth\.json"/,
-        'scoped-only OpenCode auth selection',
+        /--host-pattern opencode\.ai --path-pattern "\/zen\/go\/\*"[\s\S]{0,120}--header-name "Authorization" --value-format "Bearer \{value\}"/,
+        'OpenCode Go vault secret registration',
       );
-      rejectMatch(
-        issues,
-        skillFile,
-        skill,
-        /AUTH_FILE=[^\n]*(?:SHARED_AUTH|share\/opencode\/auth\.json)/,
-        'shared OpenCode auth fallback selection',
-      );
-      requireMatch(
-        issues,
-        skillFile,
-        skill,
-        /import \{ parseOpenCodeAuthProviders \} from ["']\.\/container\/agent-runner\/src\/providers\/opencode\.ts["'][\s\S]*parseOpenCodeAuthProviders\(auth\)\.includes\(["']anthropic["']\)/,
-        'runtime-equivalent Anthropic auth record validation',
-      );
+      rejectMatch(issues, skillFile, skill, /AUTH_FILE=/, 'native OpenCode auth.json selection');
+      rejectMatch(issues, skillFile, skill, /opencode providers login/, 'native OpenCode login');
+      rejectMatch(issues, skillFile, skill, /parseOpenCodeAuthProviders/, 'native OpenCode auth.json validation');
       rejectMatch(issues, skillFile, skill, /test -s [^\n]*auth\.json/, 'size-only native OpenCode auth validation');
       rejectMatch(
         issues,
         skillFile,
         skill,
-        /anthropic\/\*[\s\S]{0,320}(?:normal Anthropic env|proxy\s*\+\s*placeholder-key|ANTHROPIC_(?:API_KEY|AUTH_TOKEN|BASE_URL))/i,
+        /anthropic\/\*[\s\S]{0,320}(?:normal Anthropic env|ANTHROPIC_(?:API_KEY|AUTH_TOKEN|BASE_URL))/i,
         'false Anthropic environment-auth guidance for OpenCode',
       );
     }

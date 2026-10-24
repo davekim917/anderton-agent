@@ -1,6 +1,6 @@
 ---
 name: clone-as-opencode
-description: Create an OpenCode-backed sibling agent for an existing Claude or Codex group. The sibling joins the source workgroup and shares its CLAUDE.md, repos, sources, and conversations. Cross-agent collaboration happens via standard platform `@`-mentions — requires installing a second bot app for the sibling so each agent has its own real bot user. Works on Slack and Discord. Targets OpenCode Go / Zen via OAuth-issued API key.
+description: Create an OpenCode-backed sibling agent for an existing Claude or Codex group. The sibling joins the source workgroup and shares its CLAUDE.md, repos, sources, and conversations. Cross-agent collaboration happens via standard platform `@`-mentions — requires installing a second bot app for the sibling so each agent has its own real bot user. Works on Slack and Discord. Targets OpenCode Go / Zen through a OneCLI vault key.
 ---
 
 # Clone Group As OpenCode Sibling
@@ -273,42 +273,31 @@ diff <(jq -S "$DEL" groups/${SOURCE_FOLDER}/container.json) \
      <(jq -S "$DEL" groups/${SIBLING_FOLDER}/container.json) && echo "  ✅ parity clean" || true
 ```
 
-**Why `credentialFolder`**: container-runner's per-group credential lookups (LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Snowflake, etc.) key on `<BASE>_<FOLDER_UPPER>`. Without this field a sibling folder like `example-retail-opencode` would look for `LOOKER_BASE_URL_EXAMPLE_RETAIL_OPENCODE`, which doesn't exist. `credentialFolder` redirects credential lookups to the source folder; identity-bound paths (container name, group dir mount, OpenCode auth dir) stay on the sibling's own folder.
+**Why `credentialFolder`**: container-runner's per-group credential lookups (LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Snowflake, etc.) key on `<BASE>_<FOLDER_UPPER>`. Without this field a sibling folder like `example-retail-opencode` would look for `LOOKER_BASE_URL_EXAMPLE_RETAIL_OPENCODE`, which doesn't exist. `credentialFolder` redirects credential lookups to the source folder; identity-bound paths (container name, group dir mount) stay on the sibling's own folder.
 
-**Note: no per-provider auth gate** — every container carries the Codex home, and its own scoped OpenCode `auth.json` when one exists, regardless of its provider (`src/container-runner.ts`, `stageOpenCodeAuth` in `src/providers/opencode.ts`). `codexHostAuth` is retired and ignored wherever it still appears on disk.
+**Note: no per-provider auth gate** — every container carries the Codex home and the staged OpenCode tree (default model, placeholder key, no credential) regardless of its provider (`src/container-runner.ts`, `stageOpenCodeXdg` in `src/providers/opencode.ts`). `codexHostAuth` is retired and ignored wherever it still appears on disk.
 
-### 6a. Per-sibling OpenCode account
+### 6a. OpenCode credential (usually nothing to do)
 
-Required. The host stages only the sibling's own `~/.local/share/opencode-<sibling-folder>/auth.json` (`resolveOpenCodeSourcePaths` in `src/providers/opencode.ts`). There is no fallback to the operator's `~/.local/share/opencode/auth.json`, which also holds personal sign-ins: without a scoped file the sibling gets no OpenCode credential and the host logs a WARN on every spawn. Never copy the operator's file into the scoped dir. Create a key-only file by logging in under a throwaway XDG:
+No `auth.json` is staged into any container. The OpenCode key lives in the OneCLI vault and the gateway injects it, so the sibling needs a vault secret on `opencode.ai`, granted at one of three levels; the spawn grants exactly one (`resolveSpawnSecrets` in `src/onecli-secrets.ts`): the group's own `container.json` `onecliSecrets`, else its workgroup's, else `NANOCLAW_OPENCODE_FLEET_SECRET`. A sibling joining a workgroup that already grants `OpenCode-Go` (or on a host with the fleet default set) needs nothing here.
+
+Check what it will get:
 
 ```bash
-# Derive the host CLI version from the image pin; it must stay aligned with the
-# container CLI and SDK.
-OPENCODE_VERSION="$(pnpm exec tsx -e 'import fs from "node:fs"; import { effectiveDockerArgBeforeFinalRun } from "./setup/lib/dockerfile-version.ts"; const dockerfile = fs.readFileSync("container/Dockerfile", "utf8"); const pin = effectiveDockerArgBeforeFinalRun(dockerfile, "OPENCODE_VERSION", "\"opencode-ai@${OPENCODE_VERSION}\""); if (!pin || !/^\d+\.\d+\.\d+$/.test(pin)) process.exit(1); process.stdout.write(pin);')" || exit 1
-pnpm install -g "opencode-ai@${OPENCODE_VERSION}"
-# Verify: opencode --version
-
-# Run login under a throwaway XDG_DATA_HOME so any existing global
-# ~/.local/share/opencode/auth.json is not touched. The browser flow at
-# opencode.ai/auth handles plan selection (Go, Zen, free) and emits an API
-# key that gets pasted into the terminal and written to auth.json.
-TMPXDG=$(mktemp -d)
-# Adding a provider to an existing scoped file: seed the throwaway XDG with it
-# first, so the login adds a record instead of replacing the file.
-[ -f ~/.local/share/opencode-${SIBLING_FOLDER}/auth.json ] && mkdir -p "$TMPXDG/opencode" \
-  && cp ~/.local/share/opencode-${SIBLING_FOLDER}/auth.json "$TMPXDG/opencode/auth.json"
-XDG_DATA_HOME="$TMPXDG" opencode providers login --provider opencode
-
-# Stage the resulting auth.json in the scoped dir our host provider reads.
-mkdir -p ~/.local/share/opencode-${SIBLING_FOLDER}
-mv "$TMPXDG/opencode/auth.json" ~/.local/share/opencode-${SIBLING_FOLDER}/auth.json
-rm -rf "$TMPXDG"
-
-# Verify.
-ls -la ~/.local/share/opencode-${SIBLING_FOLDER}/auth.json
+ncl groups config get --workgroup "${SOURCE_WORKGROUP}" | grep -i opencode
+grep -E '^NANOCLAW_OPENCODE_FLEET_SECRET=' .env
 ```
 
-To put several siblings on one OpenCode account, run the login once per sibling with the same key; each still gets its own scoped file.
+Give the sibling its own OpenCode account only for separate billing or limits. Its secret, granted to the group, replaces the workgroup's for this sibling alone:
+
+```bash
+onecli secrets create --name "OpenCode-Go-${SIBLING_FOLDER}" --type generic \
+  --value YOUR_GO_KEY --host-pattern opencode.ai --path-pattern "/zen/go/*" \
+  --header-name "Authorization" --value-format "Bearer {value}"
+ncl secrets grant --name "OpenCode-Go-${SIBLING_FOLDER}" --groups "${SIBLING_FOLDER}"
+```
+
+Do not create `~/.local/share/opencode-${SIBLING_FOLDER}/auth.json`: the host never reads it, and a directory holding one is skipped by the host's agent and skill mirror.
 
 ### 6b. OpenCode model selection
 
@@ -327,9 +316,9 @@ A new Go-billing sibling needs **no model config at all** — it inherits
 ncl groups config update --id "${SIBLING_FOLDER}" --model opencode-go/glm-5.1 --effort high
 ```
 
-**Go vs Zen billing routing — by the model-slug PREFIX, not a base URL.** Both
-share the same `auth.json`, but the provider prefix selects the billing
-endpoint, and the host derives `OPENCODE_PROVIDER` from it automatically:
+**Go vs Zen billing routing — by the model-slug PREFIX, not a base URL.** The
+provider prefix selects the billing endpoint, and the host derives
+`OPENCODE_PROVIDER` from it automatically:
 
 | Model slug prefix | Endpoint | Billing |
 |---|---|---|
@@ -337,11 +326,14 @@ endpoint, and the host derives `OPENCODE_PROVIDER` from it automatically:
 | `opencode/*` (e.g. `opencode/gpt-5.5`) | `/zen/v1` | **Zen credit** (opt-in; use only for a Zen-only model) |
 | `nvidia/*` | NVIDIA | per NVIDIA cred |
 
-The container enables EVERY credentialed provider in-session, so the agent can
-switch to any go/zen/nvidia model mid-thread with the `-m <slug>` flag (no
-restart) — `ncl groups config update --model` / `change_model` is the
-persistent group-level equivalent. Default to `opencode-go/*`; reach for
-`opencode/*` only when you deliberately want a Zen-only model.
+Each prefix needs its own vault secret on that endpoint's host and path. A Zen
+secret is also on `opencode.ai`, so under the one-key rule it replaces the Go
+key for the group it is granted to. The agent can switch model mid-thread with
+the `-m <slug>` flag — a switch within one provider keeps the running server, a
+switch across providers respawns it — and `ncl groups config update --model` /
+`change_model` is the persistent group-level equivalent. Default to
+`opencode-go/*`; reach for `opencode/*` only when you deliberately want a
+Zen-only model.
 
 **Reasoning effort** — `-e` / the `--effort` DB field accept `low | medium | high`
 (the portable intersection). `xhigh`/`max`/`minimal` are NOT accepted for
@@ -350,17 +342,14 @@ opencode (they 400 on most Go/Zen upstreams); the container sends only
 unset to let each model use its upstream default (most Go thinking models —
 Kimi/GLM/DeepSeek/Qwen — already run high by default).
 
-**Picking a model** — run `opencode models` (from the host after `providers login`,
-or ask the running agent to call its `list_models` tool) for the live catalog;
+**Picking a model** — ask the running agent to call its `list_models` tool for
+the live catalog;
 it updates dynamically. Examples: `opencode-go/kimi-k2.7-code`,
 `opencode-go/glm-5.1`, `opencode-go/deepseek-v4-pro`, `opencode-go/qwen3.7-plus`.
 
-**OpenCode Go credit overflow:** Go subscriptions drain from Zen credit balance when Go limits are hit, so a single login with both plans active gives you a smooth fallback.
+**OpenCode Go credit overflow:** Go subscriptions drain from Zen credit balance when Go limits are hit, so one account with both plans active gives you a smooth fallback.
 
-**Auth note — what works:**
-- ✅ OpenCode Go / Zen / free (via `opencode providers login --provider opencode`)
-- ✅ OpenAI ChatGPT Plus/Pro subscription (via `--provider openai --method <chatgpt>`)
-- ✅ Provider API keys via OneCLI vault + `ANTHROPIC_BASE_URL` (OneCLI bypass mode — see `add-opencode/SKILL.md`)
+**Auth note — what works:** every provider authenticates through a OneCLI vault secret on its host (`add-opencode/SKILL.md` has the registration for Go, Zen, DeepSeek, OpenRouter and Anthropic). Subscription sign-ins (ChatGPT, Claude Pro/Max) need a native `auth.json`, which is never staged, so they do not work here.
 
 ### 7. Insert the agent_groups row
 
@@ -491,12 +480,12 @@ Slack siblings don't need this mirror — Slack's channelType is already workspa
 
 > **Functional checks first — the parity audit (step 11) is structural and will
 > NOT catch the two runtime failures that have bitten opencode siblings:**
-> 1. **Wrong provider/model vs auth.json** → the agent replies `Model not found`
->    / `Invalid API key`. The bug lives in the agent-runner's config generation,
->    so `opencode models` / `opencode run` alone do **not** reproduce it — only a
->    real agent turn does. Root cause is always: `OPENCODE_MODEL`'s provider
->    prefix is not a key in the `auth.json` this sibling uses (e.g. `opencode/*`
->    when only `opencode-go` is authed, or vice-versa).
+> 1. **Wrong provider/model vs vault secret** → the agent replies `Model not
+>    found` / `Invalid API key`. Only a real agent turn reproduces it. Root cause
+>    is always: no secret granted to this sibling injects on the host and path
+>    `OPENCODE_MODEL`'s provider prefix calls (e.g. `opencode/*` when only the
+>    Go key is granted, or vice-versa), so the request leaves with the
+>    placeholder key.
 > 2. **Double-prefixed `platform_id`** → delivery fails with `Invalid
 >    Discord/Slack thread ID`. The register step prepends the channel_type even
 >    when the adapter already base-prefixed the id.
@@ -513,26 +502,26 @@ JOIN messaging_group_agents mga ON mga.messaging_group_id=mg.id
 WHERE mga.agent_group_id='${SIBLING_FOLDER}'"
 ```
 
-**Check B — pre-flight: the model's provider is authed (deterministic, no spawn):**
+**Check B — pre-flight: the model's provider has a granted secret (no spawn):**
 
 ```bash
 # Effective model = DB value (container_configs) or the code default; provider =
-# its slug prefix (the host derives OPENCODE_PROVIDER from this — there is no
-# .env var to read anymore).
+# its slug prefix.
 MODEL=$(pnpm exec tsx scripts/q.ts data/v2.db \
   "SELECT model FROM container_configs WHERE agent_group_id='${SIBLING_FOLDER}'" 2>/dev/null | tr -d '\n')
 [ -n "$MODEL" ] || MODEL="opencode-go/deepseek-v4.1-flash"   # DEFAULT_OPENCODE_MODEL
-PROV="${MODEL%%/*}"   # e.g. opencode-go (Go), opencode (Zen), nvidia
-# The only auth.json this sibling receives; there is no global fallback.
-AUTH="$HOME/.local/share/opencode-${SIBLING_FOLDER}/auth.json"
-if [ ! -f "$AUTH" ]; then
-  echo "❌ no $AUTH — the sibling has no OpenCode credential. Run step 6a."
-else
-  node -e "const a=require('$AUTH'); process.exit(('$PROV' in a)?0:1)" \
-    && echo "✅ provider '$PROV' (from model '$MODEL') is present in $AUTH" \
-    || echo "❌ provider '$PROV' is NOT in $AUTH — '$MODEL' will fail at runtime. Pick a model whose provider is authed, or add it to the scoped file (step 6a with --provider '$PROV'; never a plain login, which writes the operator's own file)."
-fi
+echo "model $MODEL"
+# Secrets declared at each level; the spawn grants one opencode.ai secret from them.
+jq -r '.onecliSecrets // [] | .[]' "groups/${SIBLING_FOLDER}/container.json"
+ncl groups config get --workgroup "${SOURCE_WORKGROUP}" | grep -i -A20 secrets
+grep -E '^NANOCLAW_OPENCODE_FLEET_SECRET=' .env
+# Host and path of each OpenCode secret, names only.
+onecli secrets list | jq -r '.data[] | select(.hostPattern=="opencode.ai") | "\(.name)\t\(.pathPattern)"'
 ```
+
+`opencode-go/*` needs a granted secret whose path covers `/zen/go/`; `opencode/*`
+needs a Zen secret (`x-api-key`). After the first turn, `docker logs onecli |
+grep opencode.ai | tail` shows each call's path and status.
 
 **Check C — live round-trip (the only check that exercises model + auth + delivery):**
 
@@ -542,7 +531,7 @@ Send a test @-mention in the sibling's channel: `@<sibling-bot-name> reply with 
 SDIR=$(ls -dt data/v2-sessions/${SIBLING_FOLDER}/sess-* 2>/dev/null | head -1)
 pnpm exec tsx scripts/q.ts "$SDIR/outbound.db" "SELECT content FROM messages_out ORDER BY rowid DESC LIMIT 1" \
   | grep -qiE "Model not found|Invalid API key|Error:" \
-  && echo "❌ sibling returned an error — see Check B; fix .env then 'ncl groups restart --id ${SIBLING_ID}'" \
+  && echo "❌ sibling returned an error — see Check B; fix the grant then 'ncl groups restart --id ${SIBLING_ID}'" \
   || echo "✅ sibling produced a clean response — round-trip verified"
 ```
 
@@ -655,8 +644,11 @@ pnpm exec tsx scripts/q.ts data/v2.db "delete from agent_groups where id='${SIBL
 # Drop the symlink tree.
 rm -rf groups/${SIBLING_FOLDER}
 
-# Drop the scoped OpenCode auth dir (if you created one in step 6a).
+# Drop the sibling's OpenCode mirror dir, if it has one.
 rm -rf ~/.local/share/opencode-${SIBLING_FOLDER}
+# Its own OpenCode secret (step 6a), if you made one.
+OC_SECRET_ID=$(onecli secrets list | jq -r --arg n "OpenCode-Go-${SIBLING_FOLDER}" '.data[] | select(.name==$n) | .id')
+[ -n "$OC_SECRET_ID" ] && onecli secrets delete --id "$OC_SECRET_ID"
 
 # Drop env entries.
 FOLDER_UPPER=$(echo "${SIBLING_FOLDER}" | tr 'a-z-' 'A-Z_')
@@ -695,7 +687,7 @@ Optionally, uninstall the sibling's bot app from the platform.
 
 - `composeGroupClaudeMd` (host-side, every container spawn) regenerates `groups/${SIBLING_FOLDER}/AGENTS.md` from the same CLAUDE.md the source group uses. No manual AGENTS.md authoring.
 - The opencode container reads MCP server config from `mcpServers` in container.json (and any merged in via `NANOCLAW_MCP_SERVERS`), which the runtime translates to OpenCode's `mcp` config field via `mcpServersToOpenCodeConfig`.
-- The host opencode provider copies `auth.json` from the per-sibling scoped dir on every spawn. Session state (opencode.db) stays per-session in `<sessionDir>/opencode-xdg/opencode/`; the scoped auth.json is the only host OpenCode credential copied in.
+- No OpenCode credential is copied into any container: the gateway injects the vault key. Session state (opencode.db) stays per-session in `<sessionDir>/opencode-xdg/opencode/`, and each spawn removes any `auth.json` found there.
 - Worktrees are thread-scoped when `NANOCLAW_THREAD_WORKTREES=1`. Concurrent git ops across siblings share standard `.git/index.lock` semantics; turn-taking via `@`-mentions mitigates by design.
 - **OpenCode's exact Docker pin is the source of truth** for the CLI and
   `@opencode-ai/sdk`. Derive both from it, never use `bun update`, and re-run
@@ -703,9 +695,8 @@ Optionally, uninstall the sibling's bot app from the platform.
 
 ### Notes on cross-sibling auth and OpenCode plan choice
 
-- A single OpenCode login covers Go + Zen + free models. Go drains from Zen credits when Go-tier limits are hit — one auth, two billing buckets.
-- Anthropic Claude Pro/Max subscription is **not** supported by OpenCode 1.3.0+ (Anthropic restriction). Use Claude as the SOURCE side (primary agent) and OpenCode for the sibling; mixing Claude-subscription auth into OpenCode is dead.
-- OpenAI ChatGPT Plus/Pro subscription IS supported (`--provider openai --method <chatgpt>`) if you want a sibling running on your existing ChatGPT subscription instead of OpenCode billing.
+- One OpenCode account covers Go + Zen + free models, but the gateway keys each on its own path: Go on `/zen/go/*` (Bearer), Zen with `x-api-key`. Go drains from Zen credits when Go-tier limits are hit.
+- Subscription sign-ins (Claude Pro/Max, ChatGPT Plus/Pro) are not available to an OpenCode sibling: they live only in a native `auth.json`, which is never staged. Use Claude or Codex as the source side for those accounts.
 
 ## Guard parity contract
 

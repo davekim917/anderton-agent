@@ -54,10 +54,9 @@ describe('provider version contracts', () => {
     expect(addSkill.indexOf(`ARG OPENCODE_VERSION=${pin}`)).toBeLessThan(
       addSkill.indexOf('OPENCODE_VERSION="$(pnpm exec tsx -e'),
     );
+    // The vault holds the sibling's key, so the clone skill installs no host CLI and carries no pin to drift.
     expect(cloneSkill).not.toMatch(/(?:mapfile|sed -nE)/);
-    expect(cloneSkill).toContain('OPENCODE_VERSION="$(pnpm exec tsx -e');
-    expect(cloneSkill).toContain('effectiveDockerArgBeforeFinalRun');
-    expect(cloneSkill).toContain('./setup/lib/dockerfile-version.ts');
+    expect(cloneSkill).not.toMatch(/opencode-ai@|OPENCODE_VERSION/);
   });
 
   it.each([

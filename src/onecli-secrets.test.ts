@@ -7,6 +7,7 @@ import {
   ensureOnecliAgent,
   mergeWorkgroupAndGroupSecrets,
   resolveSecretUuids,
+  resolveSpawnSecrets,
   slackUserTokenSecrets,
   typesafeKeyPlaceholderEnv,
   __resetCachesForTest,
@@ -545,6 +546,159 @@ describe('mergeWorkgroupAndGroupSecrets — C3', async () => {
   test('handles both undefined', async () => {
     const result = mergeWorkgroupAndGroupSecrets(undefined, undefined);
     expect(result).toEqual([]);
+  });
+});
+
+const OPENCODE_ROWS = [
+  {
+    id: 'e1e1e1e1-e1e1-e1e1-e1e1-e1e1e1e1e1e1',
+    name: 'Fleet OpenCode',
+    hostPattern: 'opencode.ai',
+    pathPattern: '/zen/go/*',
+  },
+  {
+    id: 'e2e2e2e2-e2e2-e2e2-e2e2-e2e2e2e2e2e2',
+    name: 'Retail OpenCode',
+    hostPattern: 'opencode.ai',
+    pathPattern: '/zen/go/*',
+  },
+  {
+    id: 'e3e3e3e3-e3e3-e3e3-e3e3-e3e3e3e3e3e3',
+    name: 'Group OpenCode',
+    hostPattern: 'OpenCode.ai ',
+    pathPattern: null,
+  },
+  { id: 'e4e4e4e4-e4e4-e4e4-e4e4-e4e4e4e4e4e4', name: 'Exa', hostPattern: 'api.exa.ai', pathPattern: null },
+  { id: 'e5e5e5e5-e5e5-e5e5-e5e5-e5e5e5e5e5e5', name: 'Hex', hostPattern: 'app.hex.tech', pathPattern: null },
+];
+
+describe('resolveSpawnSecrets — exactly one OpenCode secret per agent', async () => {
+  beforeEach(() => {
+    __setSecretsCacheForTest(OPENCODE_ROWS);
+  });
+
+  test("the group's own OpenCode secret withholds the workgroup's, and nothing else", async () => {
+    expect(await resolveSpawnSecrets(['Exa', 'Fleet OpenCode'], ['Group OpenCode', 'Hex'], undefined)).toEqual({
+      secrets: ['Exa', 'Group OpenCode', 'Hex'],
+      withheld: ['Fleet OpenCode'],
+    });
+  });
+
+  test("the workgroup's OpenCode secret beats the fleet default", async () => {
+    expect(await resolveSpawnSecrets(['Retail OpenCode', 'Exa'], [], 'Fleet OpenCode')).toEqual({
+      secrets: ['Retail OpenCode', 'Exa'],
+      withheld: [],
+    });
+  });
+
+  test('the fleet default is granted when neither the group nor its workgroup declares one', async () => {
+    expect(await resolveSpawnSecrets(['Exa'], ['Hex'], 'Fleet OpenCode')).toEqual({
+      secrets: ['Exa', 'Hex', 'Fleet OpenCode'],
+      withheld: [],
+    });
+    expect(await resolveSpawnSecrets([], [], 'Fleet OpenCode')).toEqual({ secrets: ['Fleet OpenCode'], withheld: [] });
+  });
+
+  test("a group's own secret beats both the workgroup's and the fleet default", async () => {
+    expect(await resolveSpawnSecrets(['Retail OpenCode'], ['Group OpenCode'], 'Fleet OpenCode')).toEqual({
+      secrets: ['Group OpenCode'],
+      withheld: ['Retail OpenCode'],
+    });
+  });
+
+  test('a workgroup still listing the fleet secret yields to its own key once the fleet default is set', async () => {
+    expect(await resolveSpawnSecrets(['Fleet OpenCode', 'Retail OpenCode'], [], 'Fleet OpenCode')).toEqual({
+      secrets: ['Retail OpenCode'],
+      withheld: ['Fleet OpenCode'],
+    });
+    expect(await resolveSpawnSecrets(['Fleet OpenCode', 'Exa'], [], 'Fleet OpenCode')).toEqual({
+      secrets: ['Fleet OpenCode', 'Exa'],
+      withheld: [],
+    });
+  });
+
+  test('a group OpenCode secret newer than the cached listing is found by a refresh, and still wins', async () => {
+    __setSecretsCacheForTest(OPENCODE_ROWS.filter((row) => row.name !== 'Group OpenCode'));
+    respond(() => JSON.stringify({ data: OPENCODE_ROWS }));
+    expect(await resolveSpawnSecrets(['Fleet OpenCode'], ['Group OpenCode'], undefined)).toEqual({
+      secrets: ['Group OpenCode'],
+      withheld: ['Fleet OpenCode'],
+    });
+  });
+
+  test.each([
+    ['not on opencode.ai', 'Exa'],
+    ['absent from the vault', 'Missing Fleet'],
+  ])('a fleet default %s is never granted', async (_label, fleet) => {
+    respond(() => JSON.stringify({ data: OPENCODE_ROWS }));
+    expect(await resolveSpawnSecrets(['Hex'], [], fleet)).toEqual({ secrets: ['Hex'], withheld: [] });
+    expect(await resolveSpawnSecrets([], [], fleet)).toEqual({ secrets: [], withheld: [] });
+  });
+
+  test('a fleet default named by id is the same secret a workgroup lists by name', async () => {
+    const fleetId = 'e1e1e1e1-e1e1-e1e1-e1e1-e1e1e1e1e1e1';
+    expect(await resolveSpawnSecrets(['Fleet OpenCode', 'Retail OpenCode'], [], fleetId)).toEqual({
+      secrets: ['Retail OpenCode'],
+      withheld: ['Fleet OpenCode'],
+    });
+  });
+
+  test('two OpenCode secrets at one level keep the first declared', async () => {
+    expect(await resolveSpawnSecrets(['Retail OpenCode', 'Exa', 'Fleet OpenCode'], [], undefined)).toEqual({
+      secrets: ['Retail OpenCode', 'Exa'],
+      withheld: ['Fleet OpenCode'],
+    });
+  });
+
+  test("the winner's name and id together are one secret, not a competitor", async () => {
+    const groupId = 'e3e3e3e3-e3e3-e3e3-e3e3-e3e3e3e3e3e3';
+    expect(await resolveSpawnSecrets(['Fleet OpenCode'], ['Group OpenCode', groupId], undefined)).toEqual({
+      secrets: ['Group OpenCode', groupId],
+      withheld: ['Fleet OpenCode'],
+    });
+  });
+
+  test('a declaration the vault lacks stays in the list for resolveSecretUuids to refuse', async () => {
+    respond(() => JSON.stringify({ data: OPENCODE_ROWS }));
+    expect(await resolveSpawnSecrets(['Fleet OpenCode', 'Missing'], [], undefined)).toEqual({
+      secrets: ['Fleet OpenCode', 'Missing'],
+      withheld: [],
+    });
+  });
+
+  test('the spawn grants the agent only the winning OpenCode secret', async () => {
+    const mutations: Array<{ method: string; url: string }> = [];
+    respond((bin: unknown, rawArgs: unknown) => {
+      const argv = (rawArgs ?? []) as string[];
+      if (bin !== 'curl') return '';
+      const mutation = grantMutation([bin, argv]);
+      if (mutation) {
+        mutations.push(mutation);
+        return '';
+      }
+      const url = argv.join(' ');
+      if (url.includes('/grants')) {
+        const agentId = url.match(/\/api\/agents\/([^/]+)\/grants/)?.[1];
+        return JSON.stringify({ agentId, mode: 'grants', connections: [], secrets: [] });
+      }
+      if (url.includes('/api/agents')) return JSON.stringify(AGENT_FIXTURE);
+      if (url.includes('/api/secrets')) return JSON.stringify({ data: OPENCODE_ROWS });
+      return '';
+    });
+
+    const { secrets } = await resolveSpawnSecrets(['Fleet OpenCode', 'Exa'], ['Group OpenCode'], undefined);
+    await applyOnecliSecrets('example-retail', secrets);
+
+    const granted = mutations.filter((m) => m.method === 'PUT').map((m) => m.url.split('/').pop());
+    expect(granted.sort()).toEqual(['e3e3e3e3-e3e3-e3e3-e3e3-e3e3e3e3e3e3', 'e4e4e4e4-e4e4-e4e4-e4e4-e4e4e4e4e4e4']);
+  });
+
+  test('the spawn path resolves its grants through resolveSpawnSecrets with the fleet default', () => {
+    const source = readFileSync(new URL('./container-runner.ts', import.meta.url), 'utf-8');
+    expect(source).toMatch(
+      /await resolveSpawnSecrets\(\s*access\.onecliSecrets,\s*containerConfig\.onecliSecrets,\s*OPENCODE_FLEET_SECRET,?\s*\)/,
+    );
+    expect(source).not.toMatch(/mergeWorkgroupAndGroupSecrets\(/);
   });
 });
 

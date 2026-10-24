@@ -9,13 +9,12 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { closeDb } from '../db/connection.js';
-import { log } from '../log.js';
 import { getProviderContainerConfig, type ProviderContainerContext } from './provider-container-registry.js';
 // Importing the module registers the host config callback.
-import { stageOpenCodeAuth } from './opencode.js';
+import { stageOpenCodeXdg } from './opencode.js';
 import { initMigratedTestDb } from '../db/index.js';
 
 function makeCtx(root: string, overrides: Partial<ProviderContainerContext> = {}): ProviderContainerContext {
@@ -41,7 +40,7 @@ function scopedAuthPath(home: string): string {
   return path.join(home, '.local', 'share', 'opencode-example-opencode', 'auth.json');
 }
 
-/** The operator's personal login is present beside the scoped file, so a fallback to it would show in the staged auth. */
+/** Both a scoped file and the operator's personal login are on disk, so staging either would show in the runtime tree. */
 function writeGlobalSources(home: string): void {
   const shared = path.join(home, '.local', 'share', 'opencode');
   const config = path.join(home, '.config', 'opencode');
@@ -75,7 +74,7 @@ describe('opencode provider container-config reconciliation', () => {
     try {
       await fn(ctx);
       fs.writeFileSync(path.join(runtime, 'opencode.db'), 'session-state');
-      expect(fs.existsSync(path.join(runtime, 'auth.json'))).toBe(true);
+      expect(fs.existsSync(path.join(runtime, 'auth.json'))).toBe(false);
       expect(fs.existsSync(path.join(runtime, 'agent', 'global.md'))).toBe(true);
       expect(fs.existsSync(path.join(runtime, 'skill', 'global-skill', 'SKILL.md'))).toBe(true);
 
@@ -122,23 +121,39 @@ describe('opencode provider container-config reconciliation', () => {
     }
   });
 
-  it('keeps scoped auth authoritative when shared auth has a different provider', async () => {
+  it('never stages a scoped auth.json, and removes one an earlier spawn staged', async () => {
     const fn = getProviderContainerConfig('opencode')!;
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-scoped-auth-'));
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-no-auth-staging-'));
     const ctx = makeCtx(root);
     const home = ctx.hostEnv.HOME!;
-    const scoped = path.join(home, '.local', 'share', 'opencode-example-opencode');
-    const shared = path.join(home, '.local', 'share', 'opencode');
+    const runtime = runtimeDir(ctx.sessionDir);
     writeGlobalSources(home);
-    fs.writeFileSync(path.join(shared, 'auth.json'), '{"anthropic":{"type":"oauth"}}');
-    fs.mkdirSync(scoped, { recursive: true });
-    fs.writeFileSync(path.join(scoped, 'auth.json'), '{"opencode-go":{"type":"oauth"}}');
+    fs.mkdirSync(runtime, { recursive: true });
+    fs.writeFileSync(path.join(runtime, 'auth.json'), '{"opencode-go":{"type":"api","key":"invented-stale-key"}}');
 
     try {
       await fn(ctx);
-      expect(fs.readFileSync(path.join(runtimeDir(ctx.sessionDir), 'auth.json'), 'utf8')).toBe(
-        '{"opencode-go":{"type":"oauth"}}',
-      );
+      expect(fs.existsSync(scopedAuthPath(home))).toBe(true);
+      expect(fs.existsSync(path.join(runtime, 'auth.json'))).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('stages the gateway placeholder as the default provider key in the config every container reads', async () => {
+    const fn = getProviderContainerConfig('opencode')!;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-placeholder-'));
+    const ctx = makeCtx(root);
+    writeGlobalSources(ctx.hostEnv.HOME!);
+
+    try {
+      await fn(ctx);
+      const config = JSON.parse(fs.readFileSync(path.join(runtimeDir(ctx.sessionDir), 'opencode.json'), 'utf8')) as {
+        model?: string;
+        provider?: Record<string, { options?: { apiKey?: string } }>;
+      };
+      expect(config.model).toBe('opencode-go/deepseek-v4.1-flash');
+      expect(config.provider?.['opencode-go']?.options?.apiKey).toBe('placeholder');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -168,10 +183,9 @@ describe('opencode provider container-config reconciliation', () => {
       expect(fs.readFileSync(path.join(outside, 'auth-sentinel'), 'utf8')).toBe('keep');
       expect(fs.readFileSync(path.join(outside, 'agent', 'sentinel'), 'utf8')).toBe('keep');
       expect(fs.readFileSync(path.join(outside, 'skill', 'sentinel'), 'utf8')).toBe('keep');
-      expect(fs.lstatSync(path.join(runtime, 'auth.json')).isFile()).toBe(true);
+      expect(fs.lstatSync(path.join(runtime, 'auth.json'), { throwIfNoEntry: false })).toBeUndefined();
       expect(fs.lstatSync(path.join(runtime, 'agent')).isDirectory()).toBe(true);
       expect(fs.lstatSync(path.join(runtime, 'skill')).isDirectory()).toBe(true);
-      expect(fs.readFileSync(path.join(runtime, 'auth.json'), 'utf8')).toBe('{"opencode-go":{"type":"oauth"}}');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -328,43 +342,25 @@ describe('opencode provider container-config reconciliation', () => {
     const home = ctx.hostEnv.HOME!;
     writeGlobalSources(home);
     fs.rmSync(scopedAuthPath(home));
-    const warn = vi.spyOn(log, 'warn');
 
     try {
       await fn(ctx);
       expect(fs.existsSync(path.join(runtimeDir(ctx.sessionDir), 'auth.json'))).toBe(false);
-      expect(warn).toHaveBeenCalledTimes(1);
-      expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining('no scoped auth.json'),
-        expect.objectContaining({
-          agentGroupId: 'group-1',
-          agentGroupFolder: 'example-opencode',
-          scopedAuthFile: scopedAuthPath(home),
-        }),
-      );
     } finally {
-      warn.mockRestore();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it('withholds the personal shared auth.json from a peer container with no scoped file', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-peer-no-fallback-'));
+  it('stages no auth.json for a peer container, whatever credential files the host holds', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-peer-no-auth-'));
     const home = path.join(root, 'home');
     const sessionDir = path.join(root, 'session');
     writeGlobalSources(home);
-    fs.rmSync(scopedAuthPath(home));
-    const warn = vi.spyOn(log, 'warn');
 
     try {
-      const staged = stageOpenCodeAuth(sessionDir, 'example-opencode', 'group-1', home);
-      expect(fs.existsSync(path.join(staged.opencodeSubdir, 'auth.json'))).toBe(false);
-      expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining('no scoped auth.json'),
-        expect.objectContaining({ agentGroupId: 'group-1', scopedAuthFile: scopedAuthPath(home) }),
-      );
+      const staged = stageOpenCodeXdg(sessionDir);
+      expect(fs.readdirSync(staged.opencodeSubdir)).toEqual(['opencode.json']);
     } finally {
-      warn.mockRestore();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

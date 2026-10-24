@@ -383,6 +383,13 @@ mcpServers  = container.json.mcpServers, then workgroup.mcp_servers, then fleet 
 excluded plugins = workgroup.exclude_plugins ∪ container.json.excludePlugins
 ```
 
+One exception narrows the secrets union: an agent gets exactly one secret whose host pattern is `opencode.ai`. The
+member's own wins over the workgroup's, and the workgroup's over `NANOCLAW_OPENCODE_FLEET_SECRET`; the rest are withheld
+at spawn (`resolveSpawnSecrets`, `src/onecli-secrets.ts`), because the gateway resolves two matching secrets in no defined
+order. A workgroup that still lists the fleet secret has not declared its own. The capability snapshot keeps the plain
+union: it never names a provider key (`PROVIDER_SECRET`, `src/capabilities.ts`), so the two cannot disagree in what an
+agent is told.
+
 A member's own declaration can ADD to the workgroup (one sibling alone needs `Datafold-Example-Retail`), or replace a
 workgroup MCP server by declaring the same name, and can opt out of more. It cannot SUBTRACT: `excludeMcpServers`
 withholds fleet defaults only, so no sibling silently weakens what the workgroup granted, and no sibling can take back

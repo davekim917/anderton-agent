@@ -11,6 +11,7 @@ const envConfig = readEnvFile([
   'ASSISTANT_HAS_OWN_NUMBER',
   'ONECLI_URL',
   'ONECLI_API_KEY',
+  'NANOCLAW_OPENCODE_FLEET_SECRET',
   'TZ',
   'NANOCLAW_WORKGROUP_SHARED_FS',
   'NANOCLAW_SELF_HEAL',
@@ -161,6 +162,10 @@ export const CONTAINER_PIDS_LIMIT = Math.max(
 );
 export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
 export const ONECLI_API_KEY = process.env.ONECLI_API_KEY || envConfig.ONECLI_API_KEY;
+// The OneCLI secret (name or id) that injects on opencode.ai for a group whose own container.json and workgroup
+// declare none. Unset grants no fleet default.
+export const OPENCODE_FLEET_SECRET =
+  process.env.NANOCLAW_OPENCODE_FLEET_SECRET || envConfig.NANOCLAW_OPENCODE_FLEET_SECRET || undefined;
 // The gateway hands every pending approval to every host polling it and keeps the first decision submitted, so a second
 // host on the same gateway (an isolated verification boot) sets `0` to stay off the queue.
 export const ONECLI_APPROVALS_ENABLED =

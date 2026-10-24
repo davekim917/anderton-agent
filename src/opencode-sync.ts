@@ -1,8 +1,8 @@
 /**
  * OpenCode sibling of `codex-sync.ts`: converts the Claude `.md` subagents into OpenCode agent files in the global
- * `~/.config/opencode/agent/` and in `~/.local/share/opencode-<folder>/agent/` for each sibling with an
- * `auth.json` (the provider copies those into the session XDG at spawn). Only files carrying the managed marker
- * are overwritten or pruned; hand-written agents survive.
+ * `~/.config/opencode/agent/` and in each per-group `~/.local/share/opencode-<folder>/agent/` (the provider copies
+ * those into the session XDG at spawn). Only files carrying the managed marker are overwritten or pruned;
+ * hand-written agents survive.
  */
 import fs from 'fs';
 import os from 'os';
@@ -10,6 +10,7 @@ import path from 'path';
 
 import { parseClaudeAgentMd } from './claude-agent-md.js';
 import { discoverClaudeSubagents, type DiscoveredSubagent } from './claude-subagent-discovery.js';
+import { isValidGroupFolder } from './group-folder.js';
 import { formatOpenCodeAgentMd, isManagedOpenCodeAgent } from './opencode-agent-md.js';
 import { log } from './log.js';
 import {
@@ -136,13 +137,16 @@ function syncOneOpenCodeAgentsDir(target: string, sources: DiscoveredSubagent[])
 
 /**
  * OpenCode reads agents from `$XDG_CONFIG_HOME/opencode/agent/` (singular canonicalized); XDG_DATA is not an agent
- * discovery path, so per-sibling files live beside auth.json and are copied in at spawn.
+ * discovery path, so per-group files live in the group's data dir and are copied in at spawn.
  */
 function discoverOpenCodeAgentTargets(): string[] {
   return discoverOpenCodeXdgTargets('agent');
 }
 
-/** `~/.config/opencode/<subdir>` plus `~/.local/share/opencode-<folder>/<subdir>` per sibling with auth.json. */
+/**
+ * `~/.config/opencode/<subdir>` plus `~/.local/share/opencode-<folder>/<subdir>` per group dir. A dir holding an
+ * `auth.json` is a credential store, never a mirror target.
+ */
 function discoverOpenCodeXdgTargets(subdir: string): string[] {
   const home = os.homedir();
   const targets: string[] = [path.join(home, '.config', 'opencode', subdir)];
@@ -158,8 +162,10 @@ function discoverOpenCodeXdgTargets(subdir: string): string[] {
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     if (!entry.name.startsWith('opencode-')) continue;
-    const auth = path.join(siblingsRoot, entry.name, 'auth.json');
-    if (!fs.existsSync(auth)) continue;
+    if (!isValidGroupFolder(entry.name.slice('opencode-'.length))) continue;
+    if (fs.lstatSync(path.join(siblingsRoot, entry.name, 'auth.json'), { throwIfNoEntry: false }) !== undefined) {
+      continue;
+    }
     targets.push(path.join(siblingsRoot, entry.name, subdir));
   }
 

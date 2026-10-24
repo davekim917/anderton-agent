@@ -1,13 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import * as fs from 'fs';
 
-import {
-  _resetOpenCodeAuthCacheForTesting,
-  buildOpenCodeConfig,
-  parseLimitEnv,
-  resolveModelLimit,
-  resolveModelModalities,
-} from './opencode.js';
+import { buildOpenCodeConfig, parseLimitEnv, resolveModelLimit, resolveModelModalities } from './opencode.js';
 
 const GUARD_PLUGIN = '/workspace/plugins/bootstrap/plugins/workflow/hooks/guards/opencode-guard.ts';
 
@@ -24,7 +18,6 @@ const CAPABILITY_VARS = [
 ];
 
 beforeEach(() => {
-  _resetOpenCodeAuthCacheForTesting();
   process.env.OPENCODE_MODEL = 'nvidia/test-model';
   delete process.env.OPENCODE_SMALL_MODEL;
   delete process.env.OPENCODE_PROVIDER;
@@ -34,7 +27,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  _resetOpenCodeAuthCacheForTesting();
   for (const s of spies.splice(0)) s.mockRestore();
   for (const v of CAPABILITY_VARS) delete process.env[v];
 });

@@ -134,10 +134,10 @@ async function providerContribution(
   );
 }
 
-// Hermeticity: `buildMounts` resolves ~/plugins, the Codex home and the
-// OpenCode home from `os.homedir()`/`$HOME`, so with the operator's real HOME a
-// case that says nothing about credentials still stats — and now COPIES — the
-// host's real `~/.local/share/opencode-<folder>/auth.json` into TEST_ROOT. Every case
+// Hermeticity: `buildMounts` resolves ~/plugins and the Codex home from
+// `os.homedir()`/`$HOME`, so with the operator's real HOME a case that says
+// nothing about credentials still stats — and COPIES — the host's real
+// `~/.codex/auth.json` into TEST_ROOT. Every case
 // gets an empty test home by default; the cases that exercise credential
 // resolution set their own `fakeHome` and restore to this one.
 let savedHome: string | undefined;
@@ -1294,11 +1294,11 @@ describe('buildMounts agent surfaces', async () => {
     expect(mounts.some((m) => m.containerPath === '/workspace/plugins/codex')).toBe(false);
   });
 
-  // Part of the same credential matrix as the Codex block above: every
-  // container carries the host OpenCode credential, so any agent can drive
-  // `opencode` headless. AUTH ONLY for a non-OpenCode group — agent
-  // definitions, skills and opencode.db are OpenCode provider session state.
-  it('stages only the OpenCode credential into a Claude container', async () => {
+  // Every container carries the staged OpenCode tree so any agent can drive
+  // `opencode` headless, and none carries an OpenCode credential: the OneCLI
+  // gateway injects the vault key, so even a host scoped auth.json stays home.
+  // Agent definitions, skills and opencode.db are OpenCode provider state.
+  it('stages the OpenCode tree into a Claude container with no credential in it', async () => {
     const ag = group('ag-opencode-auth', 'opencode-auth');
     await createAgentGroup(ag);
     withWorkgroup(ag);
@@ -1306,7 +1306,7 @@ describe('buildMounts agent surfaces', async () => {
     initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider: 'claude' });
 
     const fakeHome = path.join(TEST_ROOT, 'opencode-auth-home');
-    // Scoped host dir with every surface populated. Only auth.json may cross.
+    // Scoped host dir with every surface populated. Nothing in it may cross.
     const scoped = path.join(fakeHome, '.local', 'share', `opencode-${ag.folder}`);
     fs.mkdirSync(path.join(scoped, 'agent'), { recursive: true });
     fs.mkdirSync(path.join(scoped, 'skill', 'demo'), { recursive: true });
@@ -1326,16 +1326,15 @@ describe('buildMounts agent surfaces', async () => {
 
     const xdgHost = path.join(sessionDir(ag.id, 's-opencode-auth'), 'opencode-xdg');
     expect(mounts).toContainEqual({ hostPath: xdgHost, containerPath: '/opencode-xdg', readonly: false });
-    // The credential crossed, plus the one-line default-model config, and
-    // nothing else did (agent/ and skill/ stayed on the host).
     const staged = path.join(xdgHost, 'opencode');
-    expect(fs.readFileSync(path.join(staged, 'auth.json'), 'utf8')).toBe('{"opencode":{"type":"api"}}');
-    expect(fs.readdirSync(staged).sort()).toEqual(['auth.json', OPENCODE_STAGED_CONFIG_FILE].sort());
+    expect(fs.readdirSync(staged)).toEqual([OPENCODE_STAGED_CONFIG_FILE]);
     // A bare `opencode run` in this container runs the fleet default model
-    // rather than OpenCode's own first-credentialed-provider guess (#884).
+    // rather than OpenCode's own first-credentialed-provider guess, with
+    // the placeholder key the gateway replaces.
     expect(JSON.parse(fs.readFileSync(path.join(staged, OPENCODE_STAGED_CONFIG_FILE), 'utf8'))).toEqual({
       $schema: 'https://opencode.ai/config.json',
       model: 'opencode-go/deepseek-v4.1-flash',
+      provider: { 'opencode-go': { options: { apiKey: 'placeholder' } } },
     });
   });
 
@@ -1371,7 +1370,7 @@ describe('buildMounts agent surfaces', async () => {
   // reach — the session dir is mounted RW at /workspace, so it can replace
   // `/workspace/opencode-xdg` with a symlink and `assertRealDirectory` refuses
   // it on every later spawn (src/fs-safety.ts:41).
-  it('withholds the OpenCode credential from a container that wedged its own staging dir', async () => {
+  it('withholds the OpenCode tree from a container that wedged its own staging dir', async () => {
     const ag = group('ag-opencode-wedged', 'opencode-wedged');
     await createAgentGroup(ag);
     withWorkgroup(ag);
@@ -1388,7 +1387,7 @@ describe('buildMounts agent surfaces', async () => {
     expect(mounts.some((m) => m.containerPath === '/opencode-xdg')).toBe(false);
     expect(mounts.some((m) => m.containerPath === '/workspace')).toBe(true);
     expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining('OpenCode credential withheld'),
+      expect.stringContaining('OpenCode tree withheld'),
       expect.objectContaining({ containerPath: '/opencode-xdg' }),
     );
   });

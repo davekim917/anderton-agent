@@ -76,12 +76,11 @@ function conformantFixture(provider: MemoryConformantProvider): Map<string, stri
         'cd container/agent-runner && bun add @opencode-ai/sdk@"${OPENCODE_VERSION}" && cd -',
         'ncl groups config update --id <group-id> --provider opencode',
         'The installer fails closed before the first write for a possible local customization.',
-        'An `anthropic/*` model requires a verified native `auth.json`.',
-        '~/.local/share/opencode-<group-folder>/auth.json',
-        'AUTH_FILE="$HOME/.local/share/opencode-<group-folder>/auth.json"',
-        'import { parseOpenCodeAuthProviders } from "./container/agent-runner/src/providers/opencode.ts";',
-        'const auth = fs.readFileSync(process.argv[1], "utf8");',
-        'if (!parseOpenCodeAuthProviders(auth).includes("anthropic")) process.exit(1);',
+        'No `auth.json` is ever staged into a container: the gateway injects the vault key.',
+        'An `anthropic/*` model needs an Anthropic API key in the vault, registered with `--type anthropic`.',
+        'onecli secrets create --name "OpenCode-Go" --type generic \\',
+        '  --value YOUR_GO_KEY --host-pattern opencode.ai --path-pattern "/zen/go/*" \\',
+        '  --header-name "Authorization" --value-format "Bearer {value}"',
       ].join('\n'),
     );
   }
@@ -210,13 +209,13 @@ describe('provider registry memory conformance', () => {
     );
   });
 
-  it('rejects OpenCode Anthropic guidance that substitutes environment auth for native auth.json', () => {
+  it('rejects OpenCode Anthropic guidance that substitutes environment auth for the vault', () => {
     const fixture = conformantFixture('opencode');
     fixture.set(
       '.claude/skills/add-opencode/SKILL.md',
       [
         fixture.get('.claude/skills/add-opencode/SKILL.md')!,
-        'For `anthropic/*`, OpenCode uses the normal Anthropic env inside the container — the proxy + placeholder-key pattern is unchanged.',
+        'For `anthropic/*`, OpenCode uses the normal Anthropic env inside the container.',
       ].join('\n'),
     );
 
@@ -225,50 +224,51 @@ describe('provider registry memory conformance', () => {
     );
   });
 
-  it('rejects OpenCode auth selection that falls back to the shared personal login', () => {
-    const fixture = conformantFixture('opencode');
-    fixture.set(
-      '.claude/skills/add-opencode/SKILL.md',
-      fixture
-        .get('.claude/skills/add-opencode/SKILL.md')!
-        .replace(
-          'AUTH_FILE="$HOME/.local/share/opencode-<group-folder>/auth.json"',
-          [
-            'SCOPED_AUTH="$HOME/.local/share/opencode-<group-folder>/auth.json"',
-            'SHARED_AUTH="$HOME/.local/share/opencode/auth.json"',
-            'if [[ -e "$SCOPED_AUTH" ]]; then',
-            '  AUTH_FILE="$SCOPED_AUTH"',
-            'else',
-            '  AUTH_FILE="$SHARED_AUTH"',
-            'fi',
-          ].join('\n'),
-        ),
-    );
-
-    const issues = validateProviderMemoryPayload('opencode', (file) => fixture.get(file));
-    expect(issues).toContain(
-      '.claude/skills/add-opencode/SKILL.md: contains forbidden shared OpenCode auth fallback selection',
-    );
-    expect(issues.some((issue) => issue.includes('scoped-only OpenCode auth selection'))).toBe(true);
-  });
-
   it.each([
-    ['braced variable', 'AUTH_FILE="${SHARED_AUTH}"'],
-    ['unquoted tilde path', 'AUTH_FILE=~/.local/share/opencode/auth.json'],
-    ['single-quoted home path', "AUTH_FILE='/home/example/.local/share/opencode/auth.json'"],
-  ])('rejects a shared-login AUTH_FILE written as a %s', (_label, selection) => {
+    [
+      'a scoped auth.json selection',
+      'AUTH_FILE="$HOME/.local/share/opencode-<group-folder>/auth.json"',
+      'native OpenCode auth.json selection',
+    ],
+    ['a shared-login selection', 'AUTH_FILE="${SHARED_AUTH}"', 'native OpenCode auth.json selection'],
+    ['a native login', 'XDG_DATA_HOME="$TMPXDG" opencode providers login --provider opencode', 'native OpenCode login'],
+    [
+      'a native auth.json parser check',
+      'import { parseOpenCodeAuthProviders } from "./container/agent-runner/src/providers/opencode.ts";',
+      'native OpenCode auth.json validation',
+    ],
+  ])('rejects OpenCode guidance that stages a native credential: %s', (_label, line, rule) => {
     const fixture = conformantFixture('opencode');
     fixture.set(
       '.claude/skills/add-opencode/SKILL.md',
-      [fixture.get('.claude/skills/add-opencode/SKILL.md')!, selection].join('\n'),
+      [fixture.get('.claude/skills/add-opencode/SKILL.md')!, line].join('\n'),
     );
 
     expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toContain(
-      '.claude/skills/add-opencode/SKILL.md: contains forbidden shared OpenCode auth fallback selection',
+      `.claude/skills/add-opencode/SKILL.md: contains forbidden ${rule}`,
     );
   });
 
-  it('rejects size-only OpenCode auth checks that do not validate the selected Anthropic record', () => {
+  it.each([
+    [
+      'vault-only OpenCode credential statement',
+      'No `auth.json` is ever staged into a container: the gateway injects the vault key.',
+    ],
+    ['vault API-key requirement for Anthropic OpenCode models', 'registered with `--type anthropic`.'],
+    ['OpenCode Go vault secret registration', '--path-pattern "/zen/go/*"'],
+  ])('requires the %s', (rule, removed) => {
+    const fixture = conformantFixture('opencode');
+    fixture.set(
+      '.claude/skills/add-opencode/SKILL.md',
+      fixture.get('.claude/skills/add-opencode/SKILL.md')!.replace(removed, ''),
+    );
+
+    expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toContain(
+      `.claude/skills/add-opencode/SKILL.md: missing ${rule}`,
+    );
+  });
+
+  it('rejects size-only OpenCode auth checks', () => {
     const fixture = conformantFixture('opencode');
     fixture.set(
       '.claude/skills/add-opencode/SKILL.md',
@@ -280,23 +280,6 @@ describe('provider registry memory conformance', () => {
 
     expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toContain(
       '.claude/skills/add-opencode/SKILL.md: contains forbidden size-only native OpenCode auth validation',
-    );
-  });
-
-  it('rejects OpenCode Anthropic guidance that does not reuse the runtime auth parser', () => {
-    const fixture = conformantFixture('opencode');
-    fixture.set(
-      '.claude/skills/add-opencode/SKILL.md',
-      fixture
-        .get('.claude/skills/add-opencode/SKILL.md')!
-        .replace(
-          'parseOpenCodeAuthProviders(auth).includes("anthropic")',
-          'Object.hasOwn(JSON.parse(auth), "anthropic")',
-        ),
-    );
-
-    expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toContain(
-      '.claude/skills/add-opencode/SKILL.md: missing runtime-equivalent Anthropic auth record validation',
     );
   });
 
@@ -562,10 +545,10 @@ describe('provider registry memory conformance', () => {
     expect(skill).toContain('ncl groups restart --id <group-id>');
     expect(skill).toMatch(/fails\s+closed before the first write/i);
     expect(skill).toMatch(/possible local\s+customization/i);
-    expect(skill).toMatch(/anthropic\/\*[\s\S]{0,320}verified native `auth\.json`/i);
-    expect(skill).toContain('~/.local/share/opencode-<group-folder>/auth.json');
-    expect(skill).toContain('AUTH_FILE="$HOME/.local/share/opencode-<group-folder>/auth.json"');
-    expect(skill).not.toContain('AUTH_FILE="$SHARED_AUTH"');
+    expect(skill).toMatch(/anthropic\/\*[\s\S]{0,400}--type anthropic/i);
+    expect(skill).toContain('No `auth.json` is ever staged');
+    expect(skill).not.toContain('AUTH_FILE=');
+    expect(skill).not.toContain('opencode providers login');
     expect(skill).not.toMatch(/anthropic\/\*[\s\S]{0,320}normal Anthropic env/i);
   });
 
