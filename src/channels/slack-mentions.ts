@@ -32,6 +32,7 @@ export interface SlackBotIdentity {
 }
 
 const knownSlackBots = new Map<string, SlackBotIdentity>();
+const SLACK_TS_RE = /^\d+\.\d+$/;
 
 /**
  * Workspace humans keyed by teamId, from `users.list` at init and hourly, so agent-emitted `@Alice` resolves without
@@ -69,9 +70,29 @@ export function slackPermalink(channelType: string, platformId: string, threadId
   const parts = threadId.split(':');
   const ts = parts[parts.length - 1];
   const channel = parts.length >= 2 ? parts[parts.length - 2] : platformId.split(':').pop();
-  if (!channel || !/^\d+\.\d+$/.test(ts)) return null;
+  if (!channel || !SLACK_TS_RE.test(ts)) return null;
 
   return `${base.replace(/\/+$/, '')}/archives/${channel}/p${ts.replace('.', '')}?thread_ts=${ts}&cid=${channel}`;
+}
+
+/**
+ * Link to one message, which `slackPermalink` cannot address: a reply opens in its thread (`thread_ts` names the
+ * thread's root, as for a thread link), a top-level message opens in the channel. Null when it cannot be built exactly.
+ */
+export function slackMessagePermalink(
+  channelType: string,
+  platformId: string,
+  threadId: string | null,
+  messageTs: string,
+): string | null {
+  const base = knownSlackBots.get(channelType)?.workspaceUrl;
+  const channel = platformId.split(':').pop();
+  if (!base || !channel || !SLACK_TS_RE.test(messageTs)) return null;
+  const message = `${base.replace(/\/+$/, '')}/archives/${channel}/p${messageTs.replace('.', '')}`;
+  if (!threadId) return message;
+  const threadTs = threadId.split(':').pop() ?? '';
+  if (!SLACK_TS_RE.test(threadTs)) return null;
+  return `${message}?thread_ts=${threadTs}&cid=${channel}`;
 }
 
 /**

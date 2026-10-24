@@ -286,7 +286,14 @@ function namespacedUserId(payload: ResponsePayload): string | null {
 async function clickRefusal(approval: PendingApproval, payload: ResponsePayload): Promise<string | null> {
   const userId = namespacedUserId(payload);
   if (!userId) return 'Your click could not be matched to a user, so it did not count.';
+  return answerRefusal(approval, userId);
+}
 
+export async function canAnswerApproval(approval: PendingApproval, userId: string): Promise<boolean> {
+  return (await answerRefusal(approval, userId)) === null;
+}
+
+async function answerRefusal(approval: PendingApproval, userId: string): Promise<string | null> {
   // An approval may name a specific approver; only that exact user may resolve it.
   if (approval.approver_user_id) {
     return userId === approval.approver_user_id ? null : await onlyNamed([approval.approver_user_id]);

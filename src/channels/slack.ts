@@ -29,6 +29,7 @@ import {
   slackMentionOutsideCode,
   slackPermalink,
   slackChannelPermalink,
+  slackMessagePermalink,
   normalizeSlackOrderedListContinuations,
   resolveInboundSlackIds,
   resolveSlackMentions,
@@ -654,6 +655,8 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
       bridge.resolveConversation = (platformId) => resolveSlackConversation(client, platformId);
       bridge.permalink = (platformId, threadId) => slackPermalink(ws.channelType, platformId, threadId);
       bridge.channelPermalink = (platformId) => slackChannelPermalink(ws.channelType, platformId);
+      bridge.messagePermalink = (platformId, threadId, messageId) =>
+        slackMessagePermalink(ws.channelType, platformId, threadId, messageId);
       bridge.postParent = (platformId, text) => slackPostParent(client, platformId, text);
       bridge.createThread = (platformId, parentMessageId, title, firstMessage) =>
         slackCreateThread(client, platformId, parentMessageId, title, firstMessage);

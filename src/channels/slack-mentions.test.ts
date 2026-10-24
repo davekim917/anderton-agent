@@ -11,6 +11,7 @@ import {
   slackMentionOutsideCode,
   slackPermalink,
   slackChannelPermalink,
+  slackMessagePermalink,
   upgradeSlackBotProfile,
   type SlackBotIdentity,
 } from './slack-mentions.js';
@@ -1127,5 +1128,48 @@ describe('slackChannelPermalink', () => {
 
   it('declines rather than guessing when the workspace is unknown', () => {
     expect(slackChannelPermalink('slack-never-registered', 'slack:C0AAA')).toBeNull();
+  });
+});
+
+describe('slackMessagePermalink', () => {
+  const CHANNEL_TYPE = 'slack-message-permalink-test';
+
+  function register(workspaceUrl: string | undefined): void {
+    registerSlackBot(CHANNEL_TYPE, {
+      userId: 'U1',
+      username: 'bot',
+      teamId: 'T1',
+      ...(workspaceUrl === undefined ? {} : { workspaceUrl }),
+    });
+  }
+
+  it('links a reply inside its thread, the shape chat.getPermalink returns', () => {
+    register('https://acme.slack.com/');
+
+    const url = new URL(
+      slackMessagePermalink(CHANNEL_TYPE, 'slack:C0AAA', 'slack:C0AAA:1786621514.008659', '1786621599.000100')!,
+    );
+    expect(url.origin).toBe('https://acme.slack.com');
+    expect(url.pathname).toBe('/archives/C0AAA/p1786621599000100');
+    expect(url.searchParams.get('thread_ts')).toBe('1786621514.008659');
+    expect(url.searchParams.get('cid')).toBe('C0AAA');
+  });
+
+  it('links a top-level message with no thread query', () => {
+    register('https://acme.slack.com');
+
+    expect(slackMessagePermalink(CHANNEL_TYPE, 'slack:C0AAA', null, '1786621599.000100')).toBe(
+      'https://acme.slack.com/archives/C0AAA/p1786621599000100',
+    );
+  });
+
+  it('declines rather than guessing', () => {
+    register(undefined);
+    expect(slackMessagePermalink(CHANNEL_TYPE, 'slack:C0AAA', null, '1786621599.000100')).toBeNull();
+
+    register('https://acme.slack.com/');
+    expect(slackMessagePermalink('slack-unregistered', 'slack:C0AAA', null, '1786621599.000100')).toBeNull();
+    expect(slackMessagePermalink(CHANNEL_TYPE, 'slack:C0AAA', null, 'not-a-ts')).toBeNull();
+    expect(slackMessagePermalink(CHANNEL_TYPE, 'slack:C0AAA', 'slack:C0AAA:not-a-ts', '1786621599.000100')).toBeNull();
   });
 });

@@ -459,6 +459,12 @@ export async function requestApprovalOutcome(opts: RequestApprovalOptions): Prom
   });
 
   log.info('Approval requested', { action, approvalId, agentName, target: destination.label, deliveryTarget });
+  if (deliveryTarget === 'thread') {
+    // Not awaited: a slow or failing DM must not hold the caller, which may still have to mark its request pending.
+    void import('./card-pointer.js')
+      .then(({ sendCardPointer }) => sendCardPointer(approvalId, session))
+      .catch((err: unknown) => log.warn('Card pointer DM failed', { approvalId, err }));
+  }
   return 'posted';
 }
 

@@ -27,6 +27,7 @@ import {
   discoverDiscordRecoveryTargets,
   extractDiscordChannelId,
   discordChannelPermalink,
+  discordMessagePermalink,
   discordPermalink,
   type DiscordBotIdentity,
   type DiscordRestClient,
@@ -710,6 +711,31 @@ describe('discordPermalink', () => {
       'https://discord.com/channels/123456789000000001/123456789000000002',
     );
     expect(discordChannelPermalink('slack:C0AAA')).toBeNull();
+  });
+});
+
+describe('discordMessagePermalink', () => {
+  const GUILD = '123456789000000001';
+  const CHANNEL = '123456789000000002';
+  const THREAD = '123456789000000003';
+  const MESSAGE = '123456789000000004';
+
+  it('links a message inside its thread, which is its own channel', () => {
+    expect(
+      discordMessagePermalink(`discord:${GUILD}:${CHANNEL}`, `discord:${GUILD}:${CHANNEL}:${THREAD}`, MESSAGE),
+    ).toBe(`https://discord.com/channels/${GUILD}/${THREAD}/${MESSAGE}`);
+  });
+
+  it('links a top-level message in its channel', () => {
+    expect(discordMessagePermalink(`discord:${GUILD}:${CHANNEL}`, null, MESSAGE)).toBe(
+      `https://discord.com/channels/${GUILD}/${CHANNEL}/${MESSAGE}`,
+    );
+  });
+
+  it('declines anything it cannot link exactly', () => {
+    expect(discordMessagePermalink(`discord:${GUILD}:${CHANNEL}`, null, 'not-a-snowflake')).toBeNull();
+    expect(discordMessagePermalink(`discord:@me:${CHANNEL}`, null, MESSAGE)).toBeNull();
+    expect(discordMessagePermalink('slack:C0AAA', null, MESSAGE)).toBeNull();
   });
 });
 

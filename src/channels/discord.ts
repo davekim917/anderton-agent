@@ -558,6 +558,14 @@ export function discordPermalink(threadId: string | null): string | null {
   return `https://discord.com/channels/${guildId}/${thread}`;
 }
 
+/** A message lives in its thread when it has one: a Discord thread is itself a channel. */
+export function discordMessagePermalink(platformId: string, threadId: string | null, messageId: string): string | null {
+  const [scheme, guildId, channelId] = platformId.split(':');
+  const where = threadId ? threadId.split(':')[3] : channelId;
+  if (scheme !== 'discord' || ![guildId, where, messageId].every((id) => SNOWFLAKE.test(id ?? ''))) return null;
+  return `https://discord.com/channels/${guildId}/${where}/${messageId}`;
+}
+
 export function discordChannelPermalink(platformId: string): string | null {
   const [scheme, guildId, channelId] = platformId.split(':');
   if (scheme !== 'discord' || !SNOWFLAKE.test(guildId ?? '') || !SNOWFLAKE.test(channelId ?? '')) return null;
@@ -876,6 +884,8 @@ for (const ws of workspaces) {
       });
       bridge.permalink = (_platformId, threadId) => discordPermalink(threadId);
       bridge.channelPermalink = (platformId) => discordChannelPermalink(platformId);
+      bridge.messagePermalink = (platformId, threadId, messageId) =>
+        discordMessagePermalink(platformId, threadId, messageId);
       bridge.postParent = (platformId, text) => discordPostParent(rest, platformId, text);
       bridge.createThread = async (platformId, parentMessageId, title, firstMessage) => {
         const created = await discordCreateThread(rest, platformId, parentMessageId, title, firstMessage);

@@ -64,6 +64,9 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: TEST_DIR };
 });
 
+// Its own mailbox read would take a failure `failedMailboxWrites` injects for the gate; card-pointer.test.ts covers it.
+vi.mock('../approvals/card-pointer.js', () => ({ sendCardPointer: vi.fn().mockResolvedValue('skipped-no-requester') }));
+
 vi.mock('../../container-runner.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../container-runner.js')>()),
   wakeContainer: mocks.wakeContainer,

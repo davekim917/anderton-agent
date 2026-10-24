@@ -332,6 +332,9 @@ export interface ChannelAdapter {
   /** Link to the CHANNEL itself, or null. `permalink` addresses a thread and may decline every thread-less call. */
   channelPermalink?(platformId: string): string | null;
 
+  /** Link to one posted message (`messageId` as `deliver` returned it), or null when it cannot be built exactly. */
+  messagePermalink?(platformId: string, threadId: string | null, messageId: string): string | null;
+
   /**
    * Subscribe the bot to a thread so follow-up messages route via the
    * platform's "subscribed message" path (onSubscribedMessage in Chat SDK).
