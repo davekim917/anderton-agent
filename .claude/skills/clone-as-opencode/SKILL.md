@@ -275,11 +275,11 @@ diff <(jq -S "$DEL" groups/${SOURCE_FOLDER}/container.json) \
 
 **Why `credentialFolder`**: container-runner's per-group credential lookups (LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Snowflake, etc.) key on `<BASE>_<FOLDER_UPPER>`. Without this field a sibling folder like `example-retail-opencode` would look for `LOOKER_BASE_URL_EXAMPLE_RETAIL_OPENCODE`, which doesn't exist. `credentialFolder` redirects credential lookups to the source folder; identity-bound paths (container name, group dir mount, OpenCode auth dir) stay on the sibling's own folder.
 
-**Note: no per-provider auth gate** — every container carries the Codex home and the OpenCode `auth.json` regardless of its provider (`src/container-runner.ts`, `stageOpenCodeAuth` in `src/providers/opencode.ts`). `codexHostAuth` is retired and ignored wherever it still appears on disk.
+**Note: no per-provider auth gate** — every container carries the Codex home, and its own scoped OpenCode `auth.json` when one exists, regardless of its provider (`src/container-runner.ts`, `stageOpenCodeAuth` in `src/providers/opencode.ts`). `codexHostAuth` is retired and ignored wherever it still appears on disk.
 
 ### 6a. Per-sibling OpenCode account
 
-OpenCode auth.json lives at `~/.local/share/opencode/auth.json` by default. The host-side provider (`resolveOpenCodeSourceDir`) prefers a scoped `~/.local/share/opencode-<sibling-folder>/auth.json` when present, falling back to the global one. To put this sibling on its own OpenCode subscription (separate billing, separate model limits), create the scoped dir and login into it:
+Required. The host stages only the sibling's own `~/.local/share/opencode-<sibling-folder>/auth.json` (`resolveOpenCodeSourcePaths` in `src/providers/opencode.ts`). There is no fallback to the operator's `~/.local/share/opencode/auth.json`, which also holds personal sign-ins: without a scoped file the sibling gets no OpenCode credential and the host logs a WARN on every spawn. Never copy the operator's file into the scoped dir. Create a key-only file by logging in under a throwaway XDG:
 
 ```bash
 # Derive the host CLI version from the image pin; it must stay aligned with the
@@ -293,6 +293,10 @@ pnpm install -g "opencode-ai@${OPENCODE_VERSION}"
 # opencode.ai/auth handles plan selection (Go, Zen, free) and emits an API
 # key that gets pasted into the terminal and written to auth.json.
 TMPXDG=$(mktemp -d)
+# Adding a provider to an existing scoped file: seed the throwaway XDG with it
+# first, so the login adds a record instead of replacing the file.
+[ -f ~/.local/share/opencode-${SIBLING_FOLDER}/auth.json ] && mkdir -p "$TMPXDG/opencode" \
+  && cp ~/.local/share/opencode-${SIBLING_FOLDER}/auth.json "$TMPXDG/opencode/auth.json"
 XDG_DATA_HOME="$TMPXDG" opencode providers login --provider opencode
 
 # Stage the resulting auth.json in the scoped dir our host provider reads.
@@ -304,7 +308,7 @@ rm -rf "$TMPXDG"
 ls -la ~/.local/share/opencode-${SIBLING_FOLDER}/auth.json
 ```
 
-To share one OpenCode account across all opencode siblings instead, skip this step entirely — the host falls back to the global `~/.local/share/opencode/auth.json`.
+To put several siblings on one OpenCode account, run the login once per sibling with the same key; each still gets its own scoped file.
 
 ### 6b. OpenCode model selection
 
@@ -519,12 +523,15 @@ MODEL=$(pnpm exec tsx scripts/q.ts data/v2.db \
   "SELECT model FROM container_configs WHERE agent_group_id='${SIBLING_FOLDER}'" 2>/dev/null | tr -d '\n')
 [ -n "$MODEL" ] || MODEL="opencode-go/deepseek-v4.1-flash"   # DEFAULT_OPENCODE_MODEL
 PROV="${MODEL%%/*}"   # e.g. opencode-go (Go), opencode (Zen), nvidia
-# Resolve the auth.json this sibling uses: scoped dir if present, else global.
+# The only auth.json this sibling receives; there is no global fallback.
 AUTH="$HOME/.local/share/opencode-${SIBLING_FOLDER}/auth.json"
-[ -f "$AUTH" ] || AUTH="$HOME/.local/share/opencode/auth.json"
-node -e "const a=require('$AUTH'); process.exit(('$PROV' in a)?0:1)" \
-  && echo "✅ provider '$PROV' (from model '$MODEL') is present in $AUTH" \
-  || echo "❌ provider '$PROV' is NOT in $AUTH — '$MODEL' will fail at runtime. Pick a model whose provider is authed, or 'opencode providers login' for it."
+if [ ! -f "$AUTH" ]; then
+  echo "❌ no $AUTH — the sibling has no OpenCode credential. Run step 6a."
+else
+  node -e "const a=require('$AUTH'); process.exit(('$PROV' in a)?0:1)" \
+    && echo "✅ provider '$PROV' (from model '$MODEL') is present in $AUTH" \
+    || echo "❌ provider '$PROV' is NOT in $AUTH — '$MODEL' will fail at runtime. Pick a model whose provider is authed, or add it to the scoped file (step 6a with --provider '$PROV'; never a plain login, which writes the operator's own file)."
+fi
 ```
 
 **Check C — live round-trip (the only check that exercises model + auth + delivery):**
@@ -688,7 +695,7 @@ Optionally, uninstall the sibling's bot app from the platform.
 
 - `composeGroupClaudeMd` (host-side, every container spawn) regenerates `groups/${SIBLING_FOLDER}/AGENTS.md` from the same CLAUDE.md the source group uses. No manual AGENTS.md authoring.
 - The opencode container reads MCP server config from `mcpServers` in container.json (and any merged in via `NANOCLAW_MCP_SERVERS`), which the runtime translates to OpenCode's `mcp` config field via `mcpServersToOpenCodeConfig`.
-- The host opencode provider copies `auth.json` from the per-sibling scoped dir on every spawn. Session state (opencode.db) stays per-session in `<sessionDir>/opencode-xdg/opencode/`; only the auth token is shared.
+- The host opencode provider copies `auth.json` from the per-sibling scoped dir on every spawn. Session state (opencode.db) stays per-session in `<sessionDir>/opencode-xdg/opencode/`; the scoped auth.json is the only host OpenCode credential copied in.
 - Worktrees are thread-scoped when `NANOCLAW_THREAD_WORKTREES=1`. Concurrent git ops across siblings share standard `.git/index.lock` semantics; turn-taking via `@`-mentions mitigates by design.
 - **OpenCode's exact Docker pin is the source of truth** for the CLI and
   `@opencode-ai/sdk`. Derive both from it, never use `bun update`, and re-run

@@ -214,18 +214,12 @@ verified native `auth.json`; generic `ANTHROPIC_*` environment variables and
 OneCLI proxy injection do not configure OpenCode authentication.
 
 Before selecting this model, authenticate with OpenCode's native Anthropic
-provider flow and verify, without printing credentials, that the effective
-auth file contains a valid top-level `anthropic` record. Selection is
-scoped-first, exactly like the host:
+provider flow into the group's scoped file (see "Per-group auth file" below)
+and verify, without printing credentials, that it contains a valid top-level
+`anthropic` record. The host reads only the scoped file:
 
 ```bash
-SCOPED_AUTH="$HOME/.local/share/opencode-<group-folder>/auth.json"
-SHARED_AUTH="$HOME/.local/share/opencode/auth.json"
-if [[ -e "$SCOPED_AUTH" ]]; then
-  AUTH_FILE="$SCOPED_AUTH"
-else
-  AUTH_FILE="$SHARED_AUTH"
-fi
+AUTH_FILE="$HOME/.local/share/opencode-<group-folder>/auth.json"
 # Uses the runtime's own parser: incomplete records must not pass the operator gate.
 bun -e '
   import fs from "node:fs";
@@ -235,10 +229,9 @@ bun -e '
 ' "$AUTH_FILE"
 ```
 
-The host copies the scoped
-`~/.local/share/opencode-<group-folder>/auth.json` when present; otherwise it
-uses `~/.local/share/opencode/auth.json`. Do not switch the group to an
-`anthropic/*` slug until that check passes.
+The host copies only the scoped
+`~/.local/share/opencode-<group-folder>/auth.json`. Do not switch the group to
+an `anthropic/*` slug until that check passes.
 
 #### OpenCode Zen (`x-api-key`, not Bearer)
 
@@ -259,9 +252,33 @@ onecli secrets create --name "OpenCode Zen" --type generic \
   --header-name "x-api-key" --value-format "{value}"
 ```
 
+### Per-group auth file
+
+Every group needs its own key-only `~/.local/share/opencode-<group-folder>/auth.json`.
+The host stages only that file into the container. It never falls back to the
+operator's `~/.local/share/opencode/auth.json`, which also holds personal
+sign-ins, and logs a WARN naming the missing path on each spawn of a group
+without one. Never copy the operator's file. With the pinned host CLI
+installed (`/clone-as-opencode` step 6a derives the version from the image
+pin), log in under a throwaway XDG:
+
+```bash
+TMPXDG=$(mktemp -d)
+# Adding a provider to an existing scoped file: seed the throwaway XDG with it
+# first, so the login adds a record instead of replacing the file.
+[ -f ~/.local/share/opencode-<group-folder>/auth.json ] && mkdir -p "$TMPXDG/opencode" \
+  && cp ~/.local/share/opencode-<group-folder>/auth.json "$TMPXDG/opencode/auth.json"
+# One login per provider the group uses, e.g. --provider anthropic for an anthropic/* model.
+XDG_DATA_HOME="$TMPXDG" opencode providers login --provider opencode
+mkdir -p ~/.local/share/opencode-<group-folder>
+mv "$TMPXDG/opencode/auth.json" ~/.local/share/opencode-<group-folder>/auth.json
+rm -rf "$TMPXDG"
+```
+
 ### Per group
 
-Select OpenCode through the container-config source of truth, then restart the
+Create the per-group auth file above, then select OpenCode through the
+container-config source of truth, then restart the
 group so the host materializes the new `provider` into `container.json` and
 spawns with the matching host contribution:
 

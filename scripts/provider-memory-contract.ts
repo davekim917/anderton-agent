@@ -283,15 +283,15 @@ export function validateProviderMemoryPayload(
         issues,
         skillFile,
         skill,
-        /~\/\.local\/share\/opencode\/auth\.json/,
-        'shared native OpenCode auth fallback path',
+        /AUTH_FILE="\$HOME\/\.local\/share\/opencode-<group-folder>\/auth\.json"/,
+        'scoped-only OpenCode auth selection',
       );
-      requireMatch(
+      rejectMatch(
         issues,
         skillFile,
         skill,
-        /SCOPED_AUTH=[^\n]*opencode-<group-folder>\/auth\.json[\s\S]*if \[\[ -e "\$SCOPED_AUTH" \]\]; then[\s\S]*AUTH_FILE="\$SCOPED_AUTH"[\s\S]*else[\s\S]*AUTH_FILE="\$SHARED_AUTH"/,
-        'scoped-first effective OpenCode auth selection',
+        /AUTH_FILE=[^\n]*(?:SHARED_AUTH|share\/opencode\/auth\.json)/,
+        'shared OpenCode auth fallback selection',
       );
       requireMatch(
         issues,

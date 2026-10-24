@@ -23,8 +23,10 @@ is still in the container, which is why this is no boundary either. The credenti
 - the **Claude** ring, as env;
 - the **Codex** `auth.json` from `~/.codex-<folder>` where a group has its own
   home, otherwise `~/.codex`, plus any `codexAuthFallbacks` homes;
-- the **OpenCode** `auth.json` from `~/.local/share/opencode-<folder>`,
-  otherwise the shared `~/.local/share/opencode`.
+- the **OpenCode** `auth.json` from `~/.local/share/opencode-<folder>` only.
+  There is no fallback to the operator's own `~/.local/share/opencode/auth.json`,
+  which also holds personal sign-ins: a group without a scoped file gets no
+  OpenCode credential, and the host logs a WARN naming the missing path.
 
 What crosses is the CREDENTIAL, not the host home. Every Codex home is staged
 per session: the container's `/home/node/.codex` (and each
@@ -55,9 +57,10 @@ gone, because presence was the wrong thing to gate.
 Scope is *available*, not enforced by default. A per-group home exists only
 where an operator created one, and on this install almost none do: as of
 2026-09-17 no group has a `~/.codex-<folder>`, so all 27 share the one fleet
-Codex account, and only two have their own `~/.local/share/opencode-<folder>`.
-Read "bounded by scope" as a lever to pull per group, not a control that
-already holds.
+Codex account. OpenCode is the exception: as of 2026-10-24 every group has
+its own key-only `~/.local/share/opencode-<folder>/auth.json`, and a group
+without one gets no OpenCode credential at all. For Codex, read "bounded by
+scope" as a lever to pull per group, not a control that already holds.
 
 ## The Three Levels
 

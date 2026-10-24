@@ -1,8 +1,10 @@
 /**
  * Host-side container config for the `opencode` provider. XDG_DATA_HOME is pinned to a per-session host dir so
- * opencode.db stays per-session; auth, agent definitions and skills are copied in at spawn. Each surface prefers
- * `~/.local/share/opencode-<folder>/` independently: auth falls back to `~/.local/share/opencode`, definitions to
- * `~/.config/opencode`. NO_PROXY is merged so OpenCode still reaches 127.0.0.1 behind OneCLI's HTTPS_PROXY.
+ * opencode.db stays per-session; auth, agent definitions and skills are copied in at spawn from
+ * `~/.local/share/opencode-<folder>/`. Definitions fall back to `~/.config/opencode`; auth NEVER falls back: the
+ * operator's own `~/.local/share/opencode/auth.json` also holds personal sign-ins (OpenAI/ChatGPT OAuth), so a group
+ * with no scoped auth.json gets none and runs on OneCLI alone. NO_PROXY is merged so OpenCode still reaches 127.0.0.1
+ * behind OneCLI's HTTPS_PROXY.
  */
 import fs from 'fs';
 import os from 'os';
@@ -249,7 +251,7 @@ interface OpenCodeSourcePaths {
   skillsDir: string;
 }
 
-/** Each surface resolves independently: a scoped auth.json must not suppress the definition fallbacks, or vice versa. */
+/** Each surface resolves independently: a missing scoped auth.json must not suppress the scoped definitions. */
 function resolveOpenCodeSourcePaths(
   agentGroupFolder: string | undefined,
   agentGroupId: string,
@@ -259,14 +261,13 @@ function resolveOpenCodeSourcePaths(
   // folder/id reaches path.join, so traversal is rejected before the scoped path is formed.
   assertValidGroupFolder(scopedFolder);
   const scoped = path.join(hostHome, '.local', 'share', `opencode-${scopedFolder}`);
-  const shared = path.join(hostHome, '.local', 'share', 'opencode');
   const config = path.join(hostHome, '.config', 'opencode');
   const scopedAuth = path.join(scoped, 'auth.json');
   const scopedAgents = path.join(scoped, 'agent');
   const scopedSkills = path.join(scoped, 'skill');
 
   return {
-    authFile: fs.existsSync(scopedAuth) ? scopedAuth : path.join(shared, 'auth.json'),
+    authFile: scopedAuth,
     agentsDir: fs.existsSync(scopedAgents) ? scopedAgents : path.join(config, 'agent'),
     skillsDir: fs.existsSync(scopedSkills) ? scopedSkills : path.join(config, 'skill'),
   };
@@ -308,10 +309,10 @@ function stagedOpenCodeConfig(): string {
 }
 
 /**
- * Stages the host OpenCode credential and default-model config into a session-private XDG tree, and nothing more:
- * every container gets this so any agent can drive `opencode` headless, while agents, skills and opencode.db belong to
- * the OpenCode provider's contribution, which reuses this for its auth step. The dirs were writable by the prior
- * container, so every managed entry is recreated without following a path it may have replaced with a symlink.
+ * Stages the group's scoped OpenCode credential and default-model config into a session-private XDG tree, and nothing
+ * more: every container gets this so any agent can drive `opencode` headless, while agents, skills and opencode.db
+ * belong to the OpenCode provider's contribution, which reuses this for its auth step. The dirs were writable by the
+ * prior container, so every managed entry is recreated without following a path it may have replaced with a symlink.
  */
 export function stageOpenCodeAuth(
   sessionDir: string,
@@ -331,6 +332,12 @@ export function stageOpenCodeAuth(
   if (hostHome) {
     const source = resolveOpenCodeSourcePaths(agentGroupFolder, agentGroupId, hostHome);
     if (fs.existsSync(source.authFile)) authContents = fs.readFileSync(source.authFile);
+    else
+      log.warn('OpenCode credential not staged: the group has no scoped auth.json', {
+        agentGroupId,
+        agentGroupFolder,
+        scopedAuthFile: source.authFile,
+      });
   }
   if (authContents) replaceUntrustedFile(opencodeSubdir, 'auth.json', authContents);
   else removeUntrustedPathEntry(opencodeSubdir, 'auth.json');

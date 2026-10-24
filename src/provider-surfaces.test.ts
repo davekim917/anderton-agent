@@ -137,7 +137,7 @@ async function providerContribution(
 // Hermeticity: `buildMounts` resolves ~/plugins, the Codex home and the
 // OpenCode home from `os.homedir()`/`$HOME`, so with the operator's real HOME a
 // case that says nothing about credentials still stats — and now COPIES — the
-// host's real `~/.local/share/opencode/auth.json` into TEST_ROOT. Every case
+// host's real `~/.local/share/opencode-<folder>/auth.json` into TEST_ROOT. Every case
 // gets an empty test home by default; the cases that exercise credential
 // resolution set their own `fakeHome` and restore to this one.
 let savedHome: string | undefined;
