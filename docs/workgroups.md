@@ -115,29 +115,6 @@ Every sibling can read the whole checkout, `.git/config` included, so keep
 credentials out of it: no token in the remote URL and no `http.extraheader`.
 Authenticate the refresh through the host's git credential helper.
 
-## Workgroup verify skills
-
-The bootstrap `create-verification-skill` skill writes a generated
-`verify-<project>` skill into the workgroup's shared tree, at
-`data/workgroups/<workgroup-id>/.claude/skills/verify-<project>/`
-(`/workspace/workgroup/.claude/skills/` in a container). No provider runtime
-scans that directory for skills, so while the shared tree is mounted, the
-composed `CLAUDE.md` / `AGENTS.md` lists each one by its `SKILL.md` path and
-tells the agent to read and run it before claiming a change to that project
-works. See `src/workgroup-verify-skills.ts`.
-
-A skill promoted into its project's repo leaves only `evidence/` and a
-one-line `PROMOTED` note in that directory. Such an entry is listed as
-promoted, pointing the agent at `.claude/skills/verify-<project>/SKILL.md` in
-its own worktree of the project, since a container never loads a repo's
-skills; the closing line then says the skill's binding check still applies.
-
-Siblings can write that tree, so the list carries only directory names
-matching `^verify-[a-z0-9-]+$` that hold a regular `SKILL.md` or, failing
-that, a regular `PROMOTED` (symlinks are skipped), never a skill's
-description or body or a `PROMOTED` note's text. It shows at most 20, then a
-"+N more" line. No verify skill, or no shared-tree mount, means no section.
-
 ## Workgroup-scoped plugins
 
 `~/plugins` is fleet-wide: every agent group mounts every plugin unless its

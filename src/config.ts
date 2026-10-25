@@ -31,7 +31,6 @@ const envConfig = readEnvFile([
   'NANOCLAW_REPOSITORY_QUIESCE_TIMEOUT_MS',
   'NANOCLAW_POST_DEPLOY_INBOUND_WINDOW_MS',
   'ONECLI_GATEWAY_CONTAINER',
-  'NANOCLAW_ONECLI_APPROVALS',
   'BROWSER_TAKEOVER_ORIGIN',
   'BROWSER_TAKEOVER_PORT',
   'PREVIEW_ORIGIN_SUFFIX',
@@ -166,10 +165,6 @@ export const ONECLI_API_KEY = process.env.ONECLI_API_KEY || envConfig.ONECLI_API
 // declare none. Unset grants no fleet default.
 export const OPENCODE_FLEET_SECRET =
   process.env.NANOCLAW_OPENCODE_FLEET_SECRET || envConfig.NANOCLAW_OPENCODE_FLEET_SECRET || undefined;
-// The gateway hands every pending approval to every host polling it and keeps the first decision submitted, so a second
-// host on the same gateway (an isolated verification boot) sets `0` to stay off the queue.
-export const ONECLI_APPROVALS_ENABLED =
-  (process.env.NANOCLAW_ONECLI_APPROVALS ?? envConfig.NANOCLAW_ONECLI_APPROVALS) !== '0';
 export const MAX_MESSAGES_PER_PROMPT = Math.max(1, parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10);
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
 // 0 disables the host-level admission cap.

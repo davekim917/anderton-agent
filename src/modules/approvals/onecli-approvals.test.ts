@@ -62,18 +62,9 @@ vi.mock('../../container-runner.js', async (importOriginal) => ({
 let TEST_DIR: string;
 let DB_PATH: string;
 
-const approvalsSwitch = vi.hoisted(() => ({ enabled: true }));
-
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
-  return {
-    ...actual,
-    ONECLI_URL: 'https://onecli.test',
-    ONECLI_API_KEY: 'test-key',
-    get ONECLI_APPROVALS_ENABLED() {
-      return approvalsSwitch.enabled;
-    },
-  };
+  return { ...actual, ONECLI_URL: 'https://onecli.test', ONECLI_API_KEY: 'test-key' };
 });
 
 const ADMIN = 'slack:U-ADMIN';
@@ -546,19 +537,5 @@ describe('approver-set authorization', () => {
     // approver set that still resolves, with a warning — fork behavior kept.
     expect(await first.approvals.resolveOneCLIApproval(approvalId, 'approve', '')).toBe(true);
     await expect(held).resolves.toBe('approve');
-  });
-});
-
-describe('OneCLI approvals switch', () => {
-  afterEach(() => {
-    approvalsSwitch.enabled = true;
-  });
-
-  it('never registers with the gateway when NANOCLAW_ONECLI_APPROVALS=0', async () => {
-    approvalsSwitch.enabled = false;
-    const { approvals } = await boot(true);
-    approvals.startOneCLIApprovalHandler(makeAdapter());
-    await settle();
-    expect(sdk.callbacks).toHaveLength(0);
   });
 });

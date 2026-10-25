@@ -21,7 +21,7 @@
 import { OneCLI, type ApprovalRequest, type ManualApprovalHandle } from '@onecli-sh/sdk';
 
 import { approvalResolutionLine, pickApprovalDelivery, pickApprover } from './primitive.js';
-import { ONECLI_API_KEY, ONECLI_APPROVALS_ENABLED, ONECLI_URL } from '../../config.js';
+import { ONECLI_API_KEY, ONECLI_URL } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import {
   createPendingApproval,
@@ -196,10 +196,6 @@ async function settleUnconsumedDecision(row: PendingApproval): Promise<void> {
 
 export function startOneCLIApprovalHandler(deliveryAdapter: ChannelDeliveryAdapter): void {
   if (handle) return;
-  if (!ONECLI_APPROVALS_ENABLED) {
-    log.info('OneCLI approval handler disabled by NANOCLAW_ONECLI_APPROVALS=0');
-    return;
-  }
   adapterRef = deliveryAdapter;
 
   reattachSurvivingApprovals().catch((err) => log.error('OneCLI approval re-attach failed', { err }));

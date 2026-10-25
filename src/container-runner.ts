@@ -154,7 +154,6 @@ import {
   resolveWorkgroupReadAccess,
   workgroupReadAccessInstructions,
 } from './workgroup-read-access.js';
-import { workgroupVerifySkillsInstructions } from './workgroup-verify-skills.js';
 import { resolveWorkgroupWiki, workgroupWikiInstructions } from './workgroup-wiki.js';
 import {
   assertCredentialFolderInWorkgroup,
@@ -3589,7 +3588,6 @@ export async function buildMounts(
         validatedWorkgroupReadAccess,
       ),
       workgroupWikiInstructions: workgroupWikiInstructions(workgroupWiki),
-      workgroupVerifySkillsInstructions: workgroupVerifySkillsInstructions(wgKey),
       workgroupMcpServers: access.mcpServers,
       workgroupExcludePlugins: access.excludePlugins,
     });
