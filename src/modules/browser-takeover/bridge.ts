@@ -24,12 +24,18 @@ export function openContainerLoopback(containerName: string, port: number): Dupl
   const child = spawn(CONTAINER_RUNTIME_BIN, ['exec', '-i', containerName, 'bash', '-c', loopbackRelayScript(port)], {
     stdio: ['pipe', 'pipe', 'ignore'],
   });
-  child.stdin.on('error', () => {});
-  const stream = Duplex.from({ readable: child.stdout, writable: child.stdin });
-  // Duplex.from reports a bare destroy() as an AbortError, where a net.Socket reports nothing. http.Agent relies on
-  // that: it destroys a socket its full free pool cannot take after the request has stopped listening for errors.
-  const destroyPipes = stream._destroy.bind(stream);
-  stream._destroy = (err, callback) => destroyPipes(err, (pipeErr) => callback(err ? (pipeErr ?? err) : null));
+  let stream: Duplex;
+  if (child.stdin && child.stdout) {
+    child.stdin.on('error', () => {});
+    stream = Duplex.from({ readable: child.stdout, writable: child.stdin });
+    // Duplex.from reports a bare destroy() as an AbortError, where a net.Socket reports nothing. http.Agent relies on
+    // that: it destroys a socket its full free pool cannot take after the request has stopped listening for errors.
+    const destroyPipes = stream._destroy.bind(stream);
+    stream._destroy = (err, callback) => destroyPipes(err, (pipeErr) => callback(err ? (pipeErr ?? err) : null));
+  } else {
+    // On EMFILE/ENFILE spawn returns with no pipes and reports the failure as 'error' on the next tick.
+    stream = new Duplex({ read() {}, write: (_chunk, _encoding, callback) => callback() });
+  }
   // An error with no other listener has no request to fail, so it is logged instead of taking the host down.
   stream.on('error', (err) => {
     if (stream.listenerCount('error') === 1) log.warn('Container loopback failed', { containerName, port, err });

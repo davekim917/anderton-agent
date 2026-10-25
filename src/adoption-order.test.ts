@@ -161,6 +161,12 @@ describe('adoption order (P3)', () => {
     expect(order.indexOf('warnActiveContainersOfShutdown')).toBeLessThan(order.indexOf('beginContainerShutdown'));
   });
 
+  it('live previews are restored after adoption and before the sweep can reap their containers as idle', () => {
+    const restore = indexOfCall(calls, 'await restorePreviews');
+    expect(restore).toBeGreaterThan(indexOfCall(calls, ADOPT));
+    expect(restore).toBeLessThan(indexOfCall(calls, 'startHostSweep'));
+  });
+
   it('nothing in main() calls wakeContainer before adoption resolves', () => {
     const adopt = indexOfCall(calls, ADOPT);
     const wakes = calls

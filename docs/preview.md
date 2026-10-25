@@ -20,7 +20,15 @@ running app in their own browser, hot reload included, while the agent keeps edi
    as soon as nobody needs the app, or its container stays up for the rest of those 8 hours. A scheduled-task
    session is not held.
 
-Previews live in host memory. A host restart ends them all; the agent opens a new one.
+A host restart keeps a preview whose container is still the session's, adopted or with its adoption pending: the link
+keeps working and still ends at its original expiry. A preview whose container did not survive ends at boot, and so
+does one whose surviving container the restarting host could not name (its container list or session row unreadable
+at boot); the agent opens a new one.
+
+When a preview ends without the agent closing it, the host tries to say so. On expiry its agent gets a note with the
+command to reopen it. When its container exits, the session's thread gets a note that the link stopped working, since
+there is no agent left to say so, unless a new container already owns the session by then, as an adoption still
+pending at boot does: the host never writes under a container, so that note is skipped.
 
 ## What the app must do
 
@@ -41,7 +49,10 @@ Previews live in host memory. A host restart ends them all; the agent opens a ne
   connections are kept alive between requests, since each one is a `docker exec`.
 - **Ending a preview cuts what is open through it.** Close, replacement and expiry also end WebSockets and
   streaming responses already open on the old URL, not just new requests. Each preview holds at most 32 live
-  WebSockets, since every one is its own `docker exec`; the next gets 503.
+  WebSockets, since every one is its own `docker exec`; the next gets 503. Across every preview on the host, at most
+  48 HTTP connections to containers are open at once (more requests wait their turn) and at most 64 WebSockets (the
+  next gets 503). That bounds the `docker exec` processes previews start at about 2.5 GB; requests waiting their turn
+  are not bounded.
 - **`/@fs/` reaches only the agent's checkouts.** `/@fs/<absolute path>` reads any file the app's `server.fs.allow`
   admits, and Vite's default admits the whole workspace root it detects. An agent container also mounts its group
   folder at `/workspace/agent` and live credentials under `/home/node`, so the proxy does not leave this to the app.

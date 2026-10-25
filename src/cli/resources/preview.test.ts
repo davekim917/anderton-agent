@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({ container: 'nanoclaw-v2-example-1' as string | null }));
 
@@ -13,7 +13,8 @@ vi.mock('../../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
-import { resolvePreview } from '../../modules/preview/service.js';
+import { closeDb, getDb, initMigratedTestDb } from '../../db/index.js';
+import { previewStatus, resolvePreview } from '../../modules/preview/service.js';
 import type { CallerContext } from '../frame.js';
 import { GROUP_SCOPE_RESOURCES, lookup } from '../registry.js';
 import './preview.js';
@@ -31,9 +32,14 @@ async function run(verb: string, args: Record<string, unknown> = {}, ctx: Caller
   return { data, human: cmd.formatHuman?.(data) ?? '' };
 }
 
+beforeEach(async () => {
+  await initMigratedTestDb();
+});
+
 afterEach(async () => {
   h.container = 'nanoclaw-v2-example-1';
   await run('close');
+  await closeDb();
 });
 
 describe('ncl preview', () => {
@@ -64,6 +70,23 @@ describe('ncl preview', () => {
     expect((await run('status')).human).toContain((data as { url: string }).url);
     expect((await run('close')).human).toBe('Live preview closed.');
     expect((await run('status')).human).toBe('No live preview is open for this session.');
+  });
+
+  it.each([
+    ['exits', null],
+    ['is replaced', 'nanoclaw-v2-example-2'],
+  ])('fails, leaving nothing open, when the container %s while the link is being stored', async (_label, next) => {
+    const driver = getDb();
+    const run_ = driver.run.bind(driver);
+    // The container's exit hook ran while the INSERT waited for the database, before the preview existed to end.
+    vi.spyOn(driver, 'run').mockImplementation(async (sql: string, ...params: unknown[]) => {
+      if (/^\s*INSERT INTO previews/.test(sql)) h.container = next;
+      return run_(sql, ...(params as never[]));
+    });
+    await expect(run('open', { port: 5173 })).rejects.toThrow(/container stopped while the link was being opened/);
+    vi.mocked(driver.run).mockRestore();
+    expect(previewStatus('sess-example')).toBeNull();
+    expect(await getDb().all('SELECT id FROM previews')).toEqual([]);
   });
 
   it('refuses a session with no running container, a host caller, and a missing port', async () => {

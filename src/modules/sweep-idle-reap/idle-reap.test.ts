@@ -342,6 +342,8 @@ import {
   type SweepSessionContext,
 } from '../../host-sweep.js';
 import { _mailboxSessionDepthForTesting } from '../../host-sweep-depth-probe.js';
+import { closeDb, getDb, initTestDb } from '../../db/index.js';
+import { migration089 } from '../../db/migrations/089-previews.js';
 import { closePreview, openPreview, PREVIEW_TTL_MS } from '../preview/service.js';
 
 probe.depth = _mailboxSessionDepthForTesting;
@@ -600,19 +602,30 @@ describe('the idle reaps win over ceiling enforcement in the exclusive chain', (
       const duty = getHealthDuty(SWEEP_DUTY_INVENTORY.S13);
       const longQuiet = Date.now() - CHAT_IDLE_REAP_MS - 1;
       const quietCtx = fakeHealthCtx({ lastOutboundAtMs: longQuiet, lastInboundAtMs: longQuiet });
-      const preview = { sessionId: 'sess-direct', agentGroupId: 'ag-1', containerName: 'nanoclaw-v2-ag-1', port: 5173 };
+      const preview = {
+        sessionId: 'sess-direct',
+        agentGroupId: 'ag-1',
+        containerFor: () => 'nanoclaw-v2-ag-1',
+        port: 5173,
+      };
 
+      // getRawDb is stubbed in this file, so the previews table is created through the driver.
+      await initTestDb();
+      const ddl: string[] = [];
+      migration089.up({ exec: (sql: string) => ddl.push(sql) } as unknown as Parameters<typeof migration089.up>[0]);
+      await getDb().exec(ddl.join('\n'));
       const opened = Date.now();
-      openPreview(preview);
+      await openPreview(preview);
       expect(await duty.claims!(quietCtx)).toBe(false);
-      closePreview('sess-direct');
+      await closePreview('sess-direct');
       expect(await duty.claims!(quietCtx)).toBe(true);
 
-      openPreview(preview);
+      await openPreview(preview);
       vi.spyOn(Date, 'now').mockReturnValue(opened + PREVIEW_TTL_MS + 60_000);
       expect(await duty.claims!(quietCtx)).toBe(true);
       vi.restoreAllMocks();
-      closePreview('sess-direct');
+      await closePreview('sess-direct');
+      await closeDb();
     });
 
     describe('a parked continuation does not hold a container open', () => {

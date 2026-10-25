@@ -33,6 +33,7 @@ vi.mock('./config.js', async (importOriginal) => ({
   // Small enough for the concurrency-cap case, large enough that no other
   // case here ever holds three containers at once.
   MAX_CONCURRENT_CONTAINERS: 3,
+  PREVIEW_ORIGIN_SUFFIX: 'preview.example.test',
 }));
 
 // NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
@@ -275,6 +276,7 @@ import { closeDb, getDb } from './db/connection.js';
 import { getSessionClaim } from './db/coordination.js';
 import { getHostInstanceId, stopHostInstanceLease } from './host-instance.js';
 import { log } from './log.js';
+import { openPreview, previewStatus } from './modules/preview/service.js';
 import { withExistingMailboxSession } from './session-manager.js';
 import {
   CLAIM_HARNESS_AGENT_GROUP_ID,
@@ -841,6 +843,26 @@ describe('adoptRunningSessions', () => {
     expect(containerOwnsOutbound('sess-observed')).toBe(false);
     expect(memoryStub.reservedMb()).toBe(0);
     expect(infos('Pending survivor exited — releasing its hold')).toHaveLength(1);
+  });
+
+  it("a pending survivor's live preview ends when the survivor is proven gone", async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-preview-pending');
+    fakes.listing = [survivor('sess-preview-pending')];
+    hooks.claimWriteFails = true;
+    await adoptRunningSessions({ list: fakes.list });
+    expect(hasPendingAdoption('sess-preview-pending')).toBe(true);
+    await openPreview({
+      sessionId: 'sess-preview-pending',
+      agentGroupId: CLAIM_HARNESS_AGENT_GROUP_ID,
+      containerFor: getContainerIdentity,
+      port: 5173,
+    });
+
+    fakes.listing = [];
+    fakes.exit('nanoclaw-v2-sess-preview-pending', 0);
+    await until(() => !hasPendingAdoption('sess-preview-pending'), 'the pending hold was never released');
+
+    expect(previewStatus('sess-preview-pending')).toBeNull();
   });
 
   it('a pending survivor whose waiter closes while it still runs is re-observed, not released', async () => {

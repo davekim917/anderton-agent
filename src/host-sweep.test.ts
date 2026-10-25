@@ -458,11 +458,16 @@ describe('sweepSession on a session with no mailbox', () => {
 
     const f = slaFixture('sess-sla-preview', ABSOLUTE_CEILING_MS + 60_000, ABSOLUTE_CEILING_MS + 120_000);
     await createSession(f.session);
-    openPreview({ sessionId: f.session.id, agentGroupId: 'ag-sla', containerName: 'nanoclaw-v2-sla-1', port: 5173 });
+    await openPreview({
+      sessionId: f.session.id,
+      agentGroupId: 'ag-sla',
+      containerFor: () => 'nanoclaw-v2-sla-1',
+      port: 5173,
+    });
     await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
     expect(mockKillContainer).not.toHaveBeenCalled();
 
-    closePreview(f.session.id);
+    await closePreview(f.session.id);
     await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
     expect(mockKillContainer).toHaveBeenCalled();
     await closeDb();

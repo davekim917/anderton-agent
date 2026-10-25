@@ -47,6 +47,7 @@ import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js'
 import {
   adoptRunningSessions,
   beginContainerShutdown,
+  getContainerIdentity,
   honorPendingStopIntents,
   planContainerShutdown,
 } from './container-runner.js';
@@ -84,7 +85,9 @@ import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { startDashboard } from './dashboard/index.js';
 import { startBrowserTakeoverProxy } from './modules/browser-takeover/proxy.js';
+import { reportPreviewLost } from './modules/preview/notify.js';
 import { startPreviewProxy } from './modules/preview/proxy.js';
+import { restorePreviews } from './modules/preview/service.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 import { reconcilePendingUpgradeContexts } from './session-manager.js';
 import { releaseOrphanedRepoIngressFencesAtStartup } from './repo-fence-recovery.js';
@@ -594,6 +597,12 @@ export async function main(): Promise<void> {
     survivableSessionIds: scope.survivableSessionIds,
     heldOnInventoryFailure: adoptionSeedFor(scope),
   });
+  // Before the sweep's first idle reap, which reads an open preview as a reason to keep its container.
+  try {
+    await restorePreviews(getContainerIdentity, reportPreviewLost);
+  } catch (err) {
+    log.error('Live preview restore failed at startup', { err });
+  }
   for (const report of memoryReports) {
     if (report.state.status === 'migration-required') {
       log.warn('Workgroup memory requires operator migration; automatic startup left it untouched', {

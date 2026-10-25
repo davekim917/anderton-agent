@@ -2015,6 +2015,7 @@ async function releasePendingHold(sessionId: string): Promise<void> {
   pendingHolds.delete(sessionId);
   if (!hold) return;
   disarmPendingWaiter(hold);
+  if (hold.containerName) endPreviewForContainer(sessionId, hold.containerName);
   if (hold.reservedMb !== null) releaseMemoryReservation(sessionId);
   if (hold.lease) {
     try {

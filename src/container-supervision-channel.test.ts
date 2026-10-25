@@ -238,6 +238,7 @@ import fs from 'node:fs';
 import {
   adoptRunningSessions,
   getAdoptedSessionIds,
+  getContainerIdentity,
   hasPendingAdoption,
   beginContainerShutdown,
   finalizeSession,
@@ -513,10 +514,10 @@ describe('supervision channel', () => {
 
   it("a container's exit ends the live preview it opened", async () => {
     await adopt('sess-preview-exit');
-    openPreview({
+    await openPreview({
       sessionId: 'sess-preview-exit',
       agentGroupId: CLAIM_HARNESS_AGENT_GROUP_ID,
-      containerName: 'nanoclaw-v2-sess-preview-exit',
+      containerFor: getContainerIdentity,
       port: 5173,
     });
 

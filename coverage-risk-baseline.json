@@ -195,6 +195,7 @@
     "src/db/migrations/086-thread-route-checks.ts": 100,
     "src/db/migrations/087-workgroup-access.ts": 100,
     "src/db/migrations/088-wiring-engage-senders.ts": 100,
+    "src/db/migrations/089-previews.ts": 100,
     "src/db/migrations/index.ts": 100,
     "src/db/migrations/module-agent-to-agent-destinations.ts": 38.89,
     "src/db/migrations/module-approvals-pending-approvals.ts": 100,

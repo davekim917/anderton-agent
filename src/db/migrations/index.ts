@@ -86,6 +86,7 @@ import { migration085 } from './085-container-config-speed.js';
 import { migration086 } from './086-thread-route-checks.js';
 import { migration087 } from './087-workgroup-access.js';
 import { migration088 } from './088-wiring-engage-senders.js';
+import { migration089 } from './089-previews.js';
 import { migration014 as containerConfigs } from './014-container-configs.js';
 import { migration015 as cliScope } from './015-cli-scope.js';
 // Upstream's 016: an idempotent messaging_groups recreate that backfills instance = channel_type.
@@ -212,6 +213,7 @@ export const migrations: Migration[] = [
   migration086,
   migration087,
   migration088,
+  migration089,
   // Last on purpose: normalizes naive timestamps left by everything above (016's recreate copies created_at as-is).
   migration053,
 ];

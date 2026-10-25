@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({ gate: null as number | null | Error }));
 
@@ -16,19 +16,28 @@ vi.mock('../bash-gate/index.js', () => ({
   },
 }));
 
+import { closeDb, initMigratedTestDb } from '../../db/index.js';
 import { closePreview, openPreview, PREVIEW_TTL_MS } from '../preview/service.js';
 import { heldAwakeUntilMs } from './held-awake.js';
 
 const SESSION = 'sess-held';
-const openOne = () =>
-  Date.parse(
-    openPreview({ sessionId: SESSION, agentGroupId: 'ag-held', containerName: 'nanoclaw-v2-held-1', port: 5173 })
-      .expiresAt,
-  );
+const openOne = async () => {
+  const { expiresAt } = await openPreview({
+    sessionId: SESSION,
+    agentGroupId: 'ag-held',
+    containerFor: () => 'nanoclaw-v2-held-1',
+    port: 5173,
+  });
+  return Date.parse(expiresAt);
+};
+beforeEach(async () => {
+  await initMigratedTestDb();
+});
 
-afterEach(() => {
-  closePreview(SESSION);
+afterEach(async () => {
+  await closePreview(SESSION);
   h.gate = null;
+  await closeDb();
 });
 
 describe('heldAwakeUntilMs', () => {
@@ -38,13 +47,13 @@ describe('heldAwakeUntilMs', () => {
 
   it("holds until an open preview's expiry, 8 hours from open", async () => {
     const before = Date.now();
-    const expiry = openOne();
+    const expiry = await openOne();
     expect(expiry - before).toBeGreaterThanOrEqual(PREVIEW_TTL_MS);
     expect(await heldAwakeUntilMs(SESSION)).toBe(expiry);
   });
 
   it('takes the later of a gate deadline and a preview expiry', async () => {
-    const expiry = openOne();
+    const expiry = await openOne();
     h.gate = expiry + 1;
     expect(await heldAwakeUntilMs(SESSION)).toBe(expiry + 1);
     h.gate = expiry - 1;
@@ -52,7 +61,7 @@ describe('heldAwakeUntilMs', () => {
   });
 
   it('a failed gate lookup still leaves the preview holding the session', async () => {
-    const expiry = openOne();
+    const expiry = await openOne();
     h.gate = new Error('db unavailable');
     expect(await heldAwakeUntilMs(SESSION)).toBe(expiry);
   });

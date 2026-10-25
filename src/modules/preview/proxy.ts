@@ -13,6 +13,10 @@ const UPSTREAM_IDLE_MS = 2_000;
 const MAX_DECODE_ROUNDS = 4;
 /** Each WebSocket holds its own `docker exec` and relay for its whole life, outside the HTTP pool's socket cap. */
 export const MAX_UPGRADES_PER_PREVIEW = 32;
+// Across every preview on the host: each upstream connection is a host `docker exec` process of roughly 25 MB, so
+// these two bound those processes at about 2.5 GB. Requests waiting for a connection are not bounded.
+export const MAX_UPSTREAM_CONNECTIONS = 48;
+export const MAX_UPGRADES_TOTAL = 64;
 const HOP_BY_HOP = new Set([
   'connection',
   'keep-alive',
@@ -105,7 +109,7 @@ class ContainerAgent extends http.Agent {
   private readonly idle = new WeakMap<Duplex, NodeJS.Timeout>();
 
   constructor(private readonly openUpstream: PreviewProxyDeps['openUpstream']) {
-    super({ keepAlive: true, maxSockets: 16, maxFreeSockets: 8 });
+    super({ keepAlive: true, maxSockets: 16, maxFreeSockets: 8, maxTotalSockets: MAX_UPSTREAM_CONNECTIONS });
   }
 
   override createConnection(options: http.ClientRequestArgs): Duplex {
@@ -153,6 +157,7 @@ export function createPreviewProxy(deps: PreviewProxyDeps = defaultDeps): http.S
   const { openUpstream, resolve } = deps;
   const agent = new ContainerAgent(openUpstream);
   const liveUpgrades = new WeakMap<AbortSignal, number>();
+  let totalUpgrades = 0;
   const targetFor = (req: http.IncomingMessage) => {
     const id = previewIdFromHost(req.headers.host);
     return id ? resolve(id) : null;
@@ -231,7 +236,9 @@ export function createPreviewProxy(deps: PreviewProxyDeps = defaultDeps): http.S
     if (verdict) return refuse(verdict.status, verdict.body);
     const live = liveUpgrades.get(target.revoked) ?? 0;
     if (live >= MAX_UPGRADES_PER_PREVIEW) return refuse(503, 'Too many live connections to this preview.');
+    if (totalUpgrades >= MAX_UPGRADES_TOTAL) return refuse(503, 'Too many live preview connections on this host.');
     liveUpgrades.set(target.revoked, live + 1);
+    totalUpgrades += 1;
 
     const upstream = openUpstream(target.containerName, target.port);
     const lines = [`${req.method} ${req.url} HTTP/1.1`];
@@ -246,6 +253,7 @@ export function createPreviewProxy(deps: PreviewProxyDeps = defaultDeps): http.S
       if (closed) return;
       closed = true;
       liveUpgrades.set(target.revoked, (liveUpgrades.get(target.revoked) ?? 1) - 1);
+      totalUpgrades -= 1;
       target.revoked.removeEventListener('abort', close);
       upstream.destroy();
       socket.destroy();
