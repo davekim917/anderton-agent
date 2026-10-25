@@ -263,6 +263,7 @@
     "src/modules/permissions/db/users.ts": 71.43,
     "src/modules/permissions/grant.ts": 79.65,
     "src/modules/permissions/guard.ts": 93.75,
+    "src/modules/permissions/inbound-sender.ts": 87.5,
     "src/modules/permissions/index.ts": 79.22,
     "src/modules/permissions/sender-approval.ts": 77.78,
     "src/modules/permissions/slack-user-token-gate.ts": 100,

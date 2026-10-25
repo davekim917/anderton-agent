@@ -32,6 +32,7 @@ import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { grantRole } from '../permissions/db/user-roles.js';
+import type { PendingApproval } from '../../types.js';
 import { REJECT_WITH_REASON_VALUE } from './primitive.js';
 
 vi.mock('../../container-runner.js', async (importOriginal) => ({
@@ -57,17 +58,22 @@ function now(): string {
   return new Date().toISOString();
 }
 
-let delivered: Array<{ channelType: string; platformId: string; content: string }>;
+let delivered: Array<{ channelType: string; platformId: string; threadId: string | null; content: string }>;
 
 const fakeAdapter: ChannelDeliveryAdapter = {
-  async deliver(channelType, platformId, _threadId, _kind, content) {
-    delivered.push({ channelType, platformId, content });
+  async deliver(channelType, platformId, threadId, _kind, content) {
+    delivered.push({ channelType, platformId, threadId, content });
     return 'pm-1';
   },
 };
 
-async function seedApproval(approvalId: string, action = 'create_agent'): Promise<void> {
+async function seedApproval(
+  approvalId: string,
+  action = 'create_agent',
+  card: Partial<PendingApproval> = {},
+): Promise<void> {
   await createPendingApproval({
+    ...card,
     approval_id: approvalId,
     session_id: 'sess-1',
     request_id: approvalId,
@@ -91,15 +97,20 @@ function dmReply(text?: string): InboundEvent {
 }
 
 /** Click the "Reject with reason…" button as the seeded admin. */
-async function clickRejectWithReason(approvalId: string): Promise<void> {
+async function clickRejectWithReason(
+  approvalId: string,
+  at: { platformId: string; threadId: string | null; messageId?: string } = { platformId: '', threadId: null },
+): Promise<void> {
   const { handleApprovalsResponse } = await import('./response-handler.js');
   await handleApprovalsResponse({
     questionId: approvalId,
     value: REJECT_WITH_REASON_VALUE,
     userId: 'admin-1',
     channelType: DM_CHANNEL,
-    platformId: '', // not surfaced by the click payload — resolved via ensureUserDm
-    threadId: null,
+    // A card with a stored location takes a click only on that card message.
+    platformId: at.platformId,
+    threadId: at.threadId,
+    ...(at.messageId ? { messageId: at.messageId } : {}),
   });
 }
 
@@ -485,5 +496,146 @@ describe('a rejected command gate', () => {
 
     expect(await getPendingApproval('appr-gate')).toBeUndefined();
     expect(gateAck()).toEqual({ status: 'failed', error: 'Rejected by an approver.' });
+  });
+});
+
+describe("reject with reason, asked in the card's thread", () => {
+  const ROOM = 'slack:C-room';
+  const THREAD = 'slack:C-room:111.1';
+  const inThread = { channel_type: 'slack', platform_id: ROOM, thread_id: THREAD, platform_message_id: '222.2' };
+
+  // The reason prompt among everything delivered; the card edit goes to the same place and must not stand in for it.
+  function prompts() {
+    return delivered.filter((d) => {
+      const c = JSON.parse(d.content) as { text?: string; operation?: string };
+      return !c.operation && /reason/i.test(c.text ?? '');
+    });
+  }
+
+  function reply(threadId: string | null, sender: string, text: string, platformId = ROOM): InboundEvent {
+    return {
+      channelType: 'slack',
+      platformId,
+      threadId,
+      message: {
+        id: 'm-t',
+        kind: 'chat-sdk',
+        content: JSON.stringify({ text, author: { userId: sender } }),
+        timestamp: now(),
+      },
+    };
+  }
+
+  it("prompts in the card's thread and relays the clicker's reply there", async () => {
+    const { captureReasonReply } = await import('./reason-capture.js');
+    await seedApproval('appr-t1', 'install_packages', inThread);
+    await clickRejectWithReason('appr-t1', { platformId: ROOM, threadId: THREAD, messageId: '222.2' });
+
+    expect(prompts().map((d) => [d.platformId, d.threadId])).toEqual([[ROOM, THREAD]]);
+    expect(delivered.some((d) => d.platformId === DM_PLATFORM)).toBe(false);
+
+    expect(await captureReasonReply(reply(THREAD, 'admin-1', 'wrong schema'))).toBe(true);
+    expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin: "wrong schema"');
+    expect(await getPendingApproval('appr-t1')).toBeUndefined();
+  });
+
+  it("leaves someone else's message in the thread alone and keeps waiting for the clicker", async () => {
+    const { captureReasonReply } = await import('./reason-capture.js');
+    await seedApproval('appr-t2', 'install_packages', inThread);
+    await clickRejectWithReason('appr-t2', { platformId: ROOM, threadId: THREAD, messageId: '222.2' });
+
+    expect(await captureReasonReply(reply(THREAD, 'teammate-2', 'what happened?'))).toBe(false);
+    expect((await getPendingApproval('appr-t2'))?.status).toBe('awaiting_reason');
+
+    expect(await captureReasonReply(reply(THREAD, 'admin-1', 'not now'))).toBe(true);
+    expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin: "not now"');
+  });
+
+  it('does not take a DM as the reason when the card has a thread', async () => {
+    const { captureReasonReply } = await import('./reason-capture.js');
+    await seedApproval('appr-t3', 'install_packages', inThread);
+    await clickRejectWithReason('appr-t3', { platformId: ROOM, threadId: THREAD, messageId: '222.2' });
+
+    expect(await captureReasonReply(dmReply('in the dm'))).toBe(false);
+    expect((await getPendingApproval('appr-t3'))?.status).toBe('awaiting_reason');
+  });
+
+  it('asks beside a card with no thread, and takes the reply there or under the card', async () => {
+    const { captureReasonReply } = await import('./reason-capture.js');
+    await seedApproval('appr-t4', 'install_packages', { ...inThread, thread_id: null });
+    await clickRejectWithReason('appr-t4', { platformId: ROOM, threadId: null, messageId: '222.2' });
+
+    // A DM can't hold a thread, so the prompt goes beside the card, never into an invented thread.
+    expect(prompts().map((d) => [d.platformId, d.threadId])).toEqual([[ROOM, null]]);
+    expect(await captureReasonReply(reply(`${ROOM}:222.2`, 'admin-1', 'duplicate'))).toBe(true);
+
+    await seedApproval('appr-t5', 'install_packages', { ...inThread, thread_id: null, platform_message_id: '555.5' });
+    await clickRejectWithReason('appr-t5', { platformId: ROOM, threadId: null, messageId: '555.5' });
+    expect(await captureReasonReply(reply(null, 'admin-1', 'beside it'))).toBe(true);
+    expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin: "beside it"');
+  });
+
+  it('takes a top-level DM reply, which the Slack bridge labels with its own id as thread', async () => {
+    const { captureReasonReply } = await import('./reason-capture.js');
+    await seedApproval('appr-t8', 'install_packages', { ...inThread, thread_id: null, platform_message_id: '666.6' });
+    await clickRejectWithReason('appr-t8', { platformId: ROOM, threadId: null, messageId: '666.6' });
+
+    const event = reply(`${ROOM}:999.9`, 'admin-1', 'top level');
+    event.message.nativeId = '999.9';
+    expect(await captureReasonReply(event)).toBe(true);
+    expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin: "top level"');
+  });
+
+  it('takes a Discord DM reply, which the bridge labels with the channel itself as thread', async () => {
+    const { captureReasonReply } = await import('./reason-capture.js');
+    await seedApproval('appr-t9', 'install_packages', { ...inThread, thread_id: null, platform_message_id: '777.7' });
+    await clickRejectWithReason('appr-t9', { platformId: ROOM, threadId: null, messageId: '777.7' });
+
+    expect(await captureReasonReply(reply(ROOM, 'admin-1', 'channel root'))).toBe(true);
+    expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin: "channel root"');
+  });
+
+  it("takes the copy reaching the card's own bot, not a sibling bot's copy of the same message", async () => {
+    const { captureReasonReply } = await import('./reason-capture.js');
+    await seedApproval('appr-t10', 'install_packages', {
+      ...inThread,
+      platform_message_id: '888.8',
+      instance: 'slack-card-bot',
+    });
+    await clickRejectWithReason('appr-t10', { platformId: ROOM, threadId: THREAD, messageId: '888.8' });
+
+    const sibling = { ...reply(THREAD, 'admin-1', 'why'), instance: 'slack-sibling-bot' };
+    expect(await captureReasonReply(sibling)).toBe(false);
+    expect(await captureReasonReply({ ...reply(THREAD, 'admin-1', 'why'), instance: 'slack-card-bot' })).toBe(true);
+  });
+
+  it('keeps two approvers asked in one thread apart', async () => {
+    const { captureReasonReply } = await import('./reason-capture.js');
+    const { handleApprovalsResponse } = await import('./response-handler.js');
+    await upsertUser({ id: 'slack:admin-2', kind: 'slack', display_name: 'Admin 2', created_at: now() });
+    await grantRole({
+      user_id: 'slack:admin-2',
+      role: 'owner',
+      agent_group_id: null,
+      granted_by: null,
+      granted_at: now(),
+    });
+    await seedApproval('appr-t6', 'install_packages', { ...inThread, platform_message_id: '333.3' });
+    await seedApproval('appr-t7', 'add_mcp_server', { ...inThread, platform_message_id: '444.4' });
+    await clickRejectWithReason('appr-t6', { platformId: ROOM, threadId: THREAD, messageId: '333.3' });
+    await handleApprovalsResponse({
+      questionId: 'appr-t7',
+      value: REJECT_WITH_REASON_VALUE,
+      userId: 'admin-2',
+      channelType: DM_CHANNEL,
+      platformId: ROOM,
+      threadId: THREAD,
+      messageId: '444.4',
+    });
+
+    expect(await captureReasonReply(reply(THREAD, 'admin-1', 'first'))).toBe(true);
+    expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin: "first"');
+    expect(await captureReasonReply(reply(THREAD, 'admin-2', 'second'))).toBe(true);
+    expect(lastRelayedText()).toBe('Your add_mcp_server request was rejected by admin: "second"');
   });
 });

@@ -6,8 +6,8 @@
  *      some free-form `action` string and registered a handler via
  *      `registerApprovalHandler(action, handler)`. On approve, we look up the
  *      handler and call it; on plain reject we relay a decline to the agent; on
- *      "Reject with reason…" we hold the row and capture the admin's next DM as
- *      a one-line reason (see reason-capture.ts). Reject finalization is shared
+ *      "Reject with reason…" we hold the row and capture the clicker's next message
+ *      where the card is as a one-line reason (see reason-capture.ts). Reject finalization is shared
  *      via finalizeReject.
  *   2. OneCLI credential approvals (`action = 'onecli_credential'`). Resolved
  *      row-keyed, so the card stays clickable across a host restart — see
@@ -220,7 +220,7 @@ async function applyResponse(
   selectedOption: string,
   userId: string,
 ): Promise<string | undefined> {
-  // "Reject with reason…" — hold the row and capture the admin's next DM
+  // "Reject with reason…" — hold the row and capture the clicker's reply
   // instead of finalizing now. The agent is notified exactly once: after the
   // reason arrives, or after the sweep's timeout if the admin ghosts.
   if (selectedOption === REJECT_WITH_REASON_VALUE) {

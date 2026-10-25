@@ -3,11 +3,12 @@
  *
  * When an admin clicks the third approval button, the reject is held instead of
  * finalized: the row is parked at status='awaiting_reason' and the admin is
- * prompted in their DM for a one-line reason. Their next DM (≤ 280 chars) is
- * captured by a router message-interceptor and relayed to the requesting agent
- * as one combined message — `Your <action> request was rejected by admin:
- * "<reason>"`. A plain Reject never arms this, so an unrelated DM is never
- * swallowed.
+ * prompted in the card's own thread for a one-line reason. Their next message in
+ * that thread (≤ 280 chars) is captured by a router message-interceptor and
+ * relayed to the requesting agent as one combined message — `Your <action>
+ * request was rejected by admin: "<reason>"`. A card with no thread to answer in
+ * falls back to the admin's DM. Only the clicker's own reply is taken, and a
+ * plain Reject never arms this, so no other message is swallowed.
  *
  * Restart-safety: arming lives in an in-memory map (lost on restart, like the
  * agent-naming capture it mirrors), but the hold is a durable DB row. If the
@@ -33,6 +34,7 @@ import {
 import { log } from '../../log.js';
 import { registerMessageInterceptor } from '../../router.js';
 import type { PendingApproval, Session } from '../../types.js';
+import { inboundSender } from '../permissions/inbound-sender.js';
 import { ensureUserDm } from '../permissions/user-dm.js';
 import { finalizeReject, resolveClaimed } from './finalize.js';
 import { editApprovalCardResolution, REJECT_WITH_REASON_VALUE } from './primitive.js';
@@ -43,26 +45,25 @@ const REASON_CAPTURE_WINDOW_MS = 5 * 60 * 1000;
 const MAX_REASON_LEN = 280;
 
 const PROMPT_TEXT =
-  "Reply with a one-line reason for the rejection — I'll relay it to the agent. " +
+  "Reply here with a one-line reason for the rejection — I'll relay it to the agent. " +
   'No reply within ~5 min declines it without a reason.';
 
 interface ReasonArming {
   approvalId: string;
-  /** Namespaced id of the admin who clicked, for resolution attribution. */
+  /** Namespaced id of the admin who clicked: only their reply is taken, and the resolution is attributed to them. */
   userId: string;
 }
 
 /**
- * Approvers waiting to type a rejection reason, keyed by their DM channel
- * (`<channelType>:<dmPlatformId>`). A DM's platform id is unique per user, so
- * the inbound reply matches by channel alone — no sender re-parsing needed, and
- * a group message can never collide with an armed DM. Cleared on receipt,
- * staleness, or restart.
+ * Approvers waiting to type a rejection reason, keyed by where they reply and who they are
+ * (`<instance>|<platformId>|<threadId>|<userId>`), so two approvers asked in one thread each keep their own capture. Cleared
+ * on receipt, staleness, or restart.
  */
 const awaitingReason = new Map<string, ReasonArming>();
 
-function dmKey(channelType: string, platformId: string): string {
-  return `${channelType}:${platformId}`;
+// Sibling bots in one channel each receive their own copy of a message; only the copy reaching the card's bot counts.
+function replyKey(instance: string, platformId: string, threadId: string | null, userId: string): string {
+  return `${instance}|${platformId}|${threadId ?? ''}|${userId}`;
 }
 
 function clampReason(raw: string): string {
@@ -87,19 +88,19 @@ export async function claimReasonHold(approval: PendingApproval): Promise<boolea
 
 /**
  * Begin the reject-with-reason hold for an approval the admin chose not to
- * finalize outright, after `claimReasonHold` parked the row. Prompts the
- * admin's DM, then arms capture. If we can't reach the admin (no DM, no
- * adapter, delivery throws) we finalize a plain reject immediately rather than
- * strand the requesting agent.
+ * finalize outright, after `claimReasonHold` parked the row. Prompts where the
+ * card is (see reasonTarget), then arms capture. If we can't reach the admin
+ * (nowhere to ask, no adapter, delivery throws) we finalize a plain reject
+ * immediately rather than strand the requesting agent.
  */
 export async function armReasonCapture(approval: PendingApproval, session: Session, userId: string): Promise<void> {
-  const dm = userId ? await ensureUserDm(userId) : null;
   const adapter = getDeliveryAdapter();
-  if (!dm || !adapter) {
+  const target = await reasonTarget(approval, userId);
+  if (!target || !adapter) {
     log.warn('reject-with-reason: cannot reach approver, finalizing plain reject', {
       approvalId: approval.approval_id,
       userId,
-      hasDm: Boolean(dm),
+      hasTarget: Boolean(target),
       hasAdapter: Boolean(adapter),
     });
     if (await claimHeldReject(approval)) await finalizeReject(approval, session, userId);
@@ -107,7 +108,15 @@ export async function armReasonCapture(approval: PendingApproval, session: Sessi
   }
 
   try {
-    await adapter.deliver(dm.channel_type, dm.platform_id, null, 'chat-sdk', JSON.stringify({ text: PROMPT_TEXT }));
+    await adapter.deliver(
+      target.channelType,
+      target.platformId,
+      target.threadId,
+      'chat-sdk',
+      JSON.stringify({ text: PROMPT_TEXT }),
+      undefined,
+      target.instance,
+    );
   } catch (err) {
     log.error('reject-with-reason: reason prompt delivery failed, finalizing plain reject', {
       approvalId: approval.approval_id,
@@ -122,26 +131,86 @@ export async function armReasonCapture(approval: PendingApproval, session: Sessi
   const expiresAt = new Date(Date.now() + REASON_CAPTURE_WINDOW_MS).toISOString();
   if (!(await restartApprovalReasonWindow(approval.approval_id, expiresAt))) return;
   // Armed before the card edit is awaited, so a reply typed during it is still captured.
-  awaitingReason.set(dmKey(dm.channel_type, dm.platform_id), { approvalId: approval.approval_id, userId });
+  for (const threadId of target.replyThreads) {
+    awaitingReason.set(replyKey(target.instance ?? target.channelType, target.platformId, threadId, userId), {
+      approvalId: approval.approval_id,
+      userId,
+    });
+  }
   // The bridge edits no card on click; without this the held card shows live
   // buttons while the approver types. finalizeReject edits it again.
   await editApprovalCardResolution(approval, REJECT_WITH_REASON_VALUE, userId);
-  log.info('reject-with-reason: awaiting reason reply', { approvalId: approval.approval_id, userId });
+  log.info('reject-with-reason: awaiting reason reply', {
+    approvalId: approval.approval_id,
+    userId,
+    inThread: target.inThread,
+  });
+}
+
+interface ReasonTarget {
+  channelType: string;
+  platformId: string;
+  /** Where the prompt is posted. */
+  threadId: string | null;
+  /** Where a reply counts. */
+  replyThreads: Array<string | null>;
+  instance: string | undefined;
+  inThread: boolean;
+}
+
+/** Where the reason is asked for and read: the card's thread, else beside the card, else the approver's DM. */
+async function reasonTarget(approval: PendingApproval, userId: string): Promise<ReasonTarget | null> {
+  if (approval.channel_type && approval.platform_id && (approval.thread_id || approval.platform_message_id)) {
+    const located = {
+      channelType: approval.channel_type,
+      platformId: approval.platform_id,
+      instance: approval.instance ?? approval.channel_type,
+      inThread: true,
+    };
+    if (approval.thread_id) return { ...located, threadId: approval.thread_id, replyThreads: [approval.thread_id] };
+    // A card with no thread (a channel's top level, or a DM, which can't hold threads) is asked beside it; the reply
+    // counts there or in a thread under the card.
+    return {
+      ...located,
+      threadId: null,
+      replyThreads: [null, `${approval.platform_id}:${approval.platform_message_id}`],
+    };
+  }
+  const dm = userId ? await ensureUserDm(userId) : null;
+  if (!dm) return null;
+  return {
+    channelType: dm.channel_type,
+    platformId: dm.platform_id,
+    threadId: null,
+    replyThreads: [null],
+    instance: undefined,
+    inThread: false,
+  };
 }
 
 /**
- * Router message-interceptor: capture the next DM from an admin who armed a
- * reason. Returns true (consume the message) when this DM is an armed reason
- * channel and still holds a live row; false otherwise so normal routing runs.
+ * Router message-interceptor: capture the clicker's next message where the
+ * reason was asked for. Returns true (consume the message) when it answers an
+ * armed reason and the row is still live; false otherwise so normal routing runs.
  *
  * Exported for tests; registered as the interceptor below.
  */
 export async function captureReasonReply(event: InboundEvent): Promise<boolean> {
-  const arming = awaitingReason.get(dmKey(event.channelType, event.platformId));
+  // Keyed by the sender too: someone else talking in the thread is not the reason, and their message routes as usual.
+  const sender = inboundSender(event)?.userId;
+  if (!sender) return false;
+  // Bridges label a message outside any thread differently: Slack DMs use the message's own id, Discord DMs the
+  // channel itself. Either counts as a reply beside the card.
+  const outsideThread =
+    event.threadId === event.platformId ||
+    event.threadId === `${event.platformId}:${event.message.nativeId ?? event.message.id}`;
+  const threads = outsideThread ? [event.threadId, null] : [event.threadId];
+  const instance = event.instance ?? event.channelType;
+  const arming = threads.map((t) => awaitingReason.get(replyKey(instance, event.platformId, t, sender))).find(Boolean);
   if (!arming) return false;
 
-  // This DM is an armed reason channel — disarm regardless of outcome.
-  awaitingReason.delete(dmKey(event.channelType, event.platformId));
+  // The clicker answered — disarm every place this approval was armed, regardless of outcome.
+  for (const [key, armed] of awaitingReason) if (armed.approvalId === arming.approvalId) awaitingReason.delete(key);
 
   // Already finalized (e.g. ghosted by the sweep): the reply is no longer a
   // reason — let it route normally instead of swallowing it.
