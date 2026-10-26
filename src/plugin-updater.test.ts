@@ -29,7 +29,7 @@ vi.mock('./delivery.js', () => ({ getDeliveryAdapter: vi.fn() }));
 vi.mock('./host-lifecycle.js', () => ({ onHostStart: vi.fn(), onHostShutdown: vi.fn() }));
 
 import { log } from './log.js';
-import { runPluginUpdates } from './plugin-updater.js';
+import { runPluginUpdates, startPluginUpdater, stopPluginUpdater } from './plugin-updater.js';
 
 const FAKE_NPM = `#!/bin/sh
 echo "$PWD $*" >> "$FAKE_NPM_LOG"
@@ -46,7 +46,10 @@ state="$PWD/.git/fake"
 case "$1" in
   rev-parse) if [ -e "$state/pulled" ]; then echo new; else echo old; fi ;;
   pull)
-    [ -e "$state/pull-fails" ] && { echo "fatal: pull boom" >&2; exit 1; }
+    fails=; [ -e "$state/pull-fails" ] && fails=$(cat "$state/pull-fails"; echo .)
+    echo "pull $(env | grep -oE '^(GH_TOKEN|GITHUB_TOKEN)=' | tr -d '=' | tr '\\n' ' ')" >> "$state/pulls"
+    [ "$fails" = "." ] && { echo "fatal: pull boom" >&2; exit 1; }
+    [ -n "$fails" ] && { printf '%s' "\${fails%.}" >&2; exit 1; }
     [ -e "$state/upstream-moved" ] && : > "$state/pulled"
     echo "Updating" ;;
   ls-tree) if [ -e "$state/ls-tree-fails" ]; then echo "fatal: ls-tree boom" >&2; exit 128; fi ;;
@@ -76,7 +79,14 @@ const GIT_DEP_LOCK = JSON.stringify({
 let tmp: string;
 let home: string;
 let npmLog: string;
-const saved = { HOME: process.env.HOME, PATH: process.env.PATH, FAKE_NPM_LOG: process.env.FAKE_NPM_LOG };
+const saved = {
+  HOME: process.env.HOME,
+  PATH: process.env.PATH,
+  FAKE_NPM_LOG: process.env.FAKE_NPM_LOG,
+  GH_TOKEN: process.env.GH_TOKEN,
+  GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+  PLUGIN_UPDATE_NOTIFY_JID: process.env.PLUGIN_UPDATE_NOTIFY_JID,
+};
 
 function writeExecutable(file: string, body: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -310,6 +320,119 @@ describe('with fake git: failures stay inside their plugin', () => {
       'Plugin dependency install failed',
       expect.objectContaining({ plugin: 'p', err: expect.stringContaining('ls-tree boom') }),
     );
+  });
+
+  it('pulls without GH_TOKEN or GITHUB_TOKEN, so gh falls back to the stored login', async () => {
+    process.env.GH_TOKEN = 'gh-token-from-env';
+    process.env.GITHUB_TOKEN = 'github-token-from-env';
+    const dir = fakePlugin('p', { pulls: '' });
+
+    await runPluginUpdates();
+
+    expect(fs.readFileSync(path.join(dir, '.git/fake/pulls'), 'utf-8')).toBe('pull \n');
+  });
+
+  describe('failure notices', () => {
+    const FAILING = 'Plugin update failing (it will not auto-update until fixed):';
+    const completedRuns = () =>
+      vi.mocked(log.info).mock.calls.filter(([msg]) => msg === 'Plugin updater: run complete').length;
+    const nextRun = async (after: number) => {
+      const before = completedRuns();
+      await vi.advanceTimersByTimeAsync(after);
+      await vi.waitFor(() => expect(completedRuns()).toBe(before + 1));
+    };
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+      process.env.PLUGIN_UPDATE_NOTIFY_JID = 'slack:C123';
+    });
+
+    afterEach(() => {
+      stopPluginUpdater();
+      vi.useRealTimers();
+    });
+
+    it('reports a failing plugin once, again when its reason changes, and when it recovers', async () => {
+      const dir = fakePlugin('down', {
+        'pull-fails':
+          'Command failed: git pull --ff-only\nFrom https://example.com/down\n * branch main -> FETCH_HEAD\nfatal: Authentication failed for repo\n',
+      });
+      const notify = vi.fn(async () => {});
+      startPluginUpdater({ notify });
+
+      await nextRun(5 * 60 * 1000);
+      await nextRun(60 * 60 * 1000);
+      write(path.join(dir, '.git/fake/pull-fails'), 'You are not currently on a branch.\n');
+      await nextRun(60 * 60 * 1000);
+      fs.rmSync(path.join(dir, '.git/fake/pull-fails'));
+      await nextRun(60 * 60 * 1000);
+
+      expect(notify.mock.calls).toEqual([
+        ['slack:C123', `${FAILING}\n- down: fatal: Authentication failed for repo`],
+        ['slack:C123', `${FAILING}\n- down: You are not currently on a branch.`],
+        ['slack:C123', 'Plugin update recovered: down'],
+      ]);
+    });
+
+    it('re-sends a notice that failed to deliver, and a plugin the scan cannot read keeps its report', async () => {
+      const dir = fakePlugin('down', { 'pull-fails': 'fatal: Authentication failed for repo\n' });
+      fakePlugin('up', { pulls: '' });
+      const notify = vi.fn(async () => {});
+      notify.mockRejectedValueOnce(new Error('channel down'));
+      startPluginUpdater({ notify });
+
+      await nextRun(5 * 60 * 1000);
+      await nextRun(60 * 60 * 1000);
+      fs.chmodSync(dir, 0o000);
+      try {
+        await nextRun(60 * 60 * 1000);
+      } finally {
+        fs.chmodSync(dir, 0o755);
+      }
+      await nextRun(60 * 60 * 1000);
+
+      const failing = ['slack:C123', `${FAILING}\n- down: fatal: Authentication failed for repo`];
+      expect(notify.mock.calls).toEqual([failing, failing]);
+      expect(log.warn).toHaveBeenCalledWith('Plugin update notify failed', expect.anything());
+    });
+
+    it('skips a tick that lands while the previous run is still delivering its notice', async () => {
+      fakePlugin('down', { 'pull-fails': 'fatal: Authentication failed for repo\n' });
+      let deliver!: () => void;
+      const notify = vi.fn(() => new Promise<void>((resolve) => (deliver = resolve)));
+      startPluginUpdater({ notify, notifyTimeoutMs: 2 * 60 * 60 * 1000 });
+
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+      await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+      expect(log.info).toHaveBeenCalledWith('Plugin updater: previous run still in progress, skipping');
+      deliver();
+      await vi.waitFor(() => expect(completedRuns()).toBe(1));
+      await nextRun(60 * 60 * 1000);
+
+      expect(notify).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives up on a notice that never settles, so the next run is not skipped and re-sends it', async () => {
+      fakePlugin('down', { 'pull-fails': 'fatal: Authentication failed for repo\n' });
+      const notify = vi.fn(async () => {});
+      notify.mockImplementationOnce(() => new Promise<void>(() => {}));
+      startPluginUpdater({ notify });
+
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+      await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+      await nextRun(60 * 1000);
+      await nextRun(60 * 60 * 1000);
+
+      expect(notify).toHaveBeenCalledTimes(2);
+      expect(notify).toHaveBeenLastCalledWith(
+        'slack:C123',
+        expect.stringContaining('- down: fatal: Authentication failed'),
+      );
+      expect(log.warn).toHaveBeenCalledWith('Plugin update notify failed', {
+        err: expect.objectContaining({ message: 'notify timed out after 60000ms' }),
+      });
+    });
   });
 
   it('a failing pull installs nothing and does not stop other plugins', async () => {

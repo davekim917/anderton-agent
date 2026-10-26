@@ -1,6 +1,7 @@
 /**
  * Hourly `git pull --ff-only` of each `~/plugins/<name>`, `npm ci --ignore-scripts` for each existing install whose
- * lockfile it changed, a refresh of the derived Codex surfaces, and a `PLUGIN_UPDATE_NOTIFY_JID` note if any advanced.
+ * lockfile it changed, a refresh of the derived Codex surfaces, and a `PLUGIN_UPDATE_NOTIFY_JID` note if any advanced,
+ * started failing, or recovered.
  */
 import { execFile } from 'child_process';
 import fs from 'fs';
@@ -23,6 +24,7 @@ const STARTUP_DELAY_MS = 5 * 60 * 1000; // let the host settle after boot
 const GIT_PULL_TIMEOUT_MS = 30_000;
 const CODEX_MARKETPLACE_UPGRADE_TIMEOUT_MS = 60_000;
 const NPM_CI_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_NOTIFY_TIMEOUT_MS = 60_000;
 const NPM_LOCKFILE = 'package-lock.json';
 const NPM_SHRINKWRAP = 'npm-shrinkwrap.json';
 const NPM_REGISTRY_HOST = 'registry.npmjs.org';
@@ -37,8 +39,10 @@ interface LockEntry {
 let codexBinaryMissingLogged = false;
 
 export interface PluginUpdaterDeps {
-  /** Called with `PLUGIN_UPDATE_NOTIFY_JID` (channel-qualified platform id) and the text when plugins updated. */
+  /** Called with `PLUGIN_UPDATE_NOTIFY_JID` (channel-qualified platform id) and the text when plugins updated, started failing, or recovered. */
   notify?: (platformId: string, text: string) => Promise<void>;
+  /** How long one notice may take before it counts as undelivered (default 60s). */
+  notifyTimeoutMs?: number;
 }
 
 export interface UpdateResult {
@@ -67,11 +71,18 @@ async function gitHead(pluginPath: string): Promise<string> {
   return stdout.trim();
 }
 
+// gh's git credential helper prefers GH_TOKEN/GITHUB_TOKEN over the operator's stored login.
+function pullEnv(): NodeJS.ProcessEnv {
+  const { GH_TOKEN: _gh, GITHUB_TOKEN: _github, ...env } = process.env;
+  return env;
+}
+
 async function updatePlugin(pluginPath: string, name: string): Promise<UpdateResult> {
   try {
     const before = await gitHead(pluginPath);
     const { stdout } = await execFileAsync('git', ['pull', '--ff-only'], {
       cwd: pluginPath,
+      env: pullEnv(),
       timeout: GIT_PULL_TIMEOUT_MS,
       encoding: 'utf-8',
     });
@@ -318,18 +329,84 @@ export async function refreshCodexPluginSurfaces(): Promise<CodexSurfaceRefreshR
   return result;
 }
 
-async function runOnce(deps: PluginUpdaterDeps): Promise<void> {
-  const results = await runPluginUpdates();
-  const changed = results.filter((r) => r.changed);
-  if (changed.length === 0) return;
+function failureReason(error: string): string {
+  const lines = error.split('\n').filter((l) => l.trim() && !l.startsWith('Command failed:'));
+  const reason =
+    lines.find((l) => /^(fatal|error):/.test(l)) ?? lines.find((l) => !/^(From |hint:|\s)/.test(l)) ?? error;
+  return reason.trim().slice(0, 200);
+}
 
-  const notifyJid = process.env.PLUGIN_UPDATE_NOTIFY_JID;
-  if (notifyJid && deps.notify) {
-    const msg = `Updated ${changed.length} plugin(s): ${changed.map((r) => r.plugin).join(', ')}`;
-    deps.notify(notifyJid, msg).catch((err) => {
-      log.warn('Plugin update notify failed', { err });
-    });
+/** Only an outcome this run observed changes `reported`; a plugin the scan did not reach keeps its entry. */
+function failureNotice(
+  results: UpdateResult[],
+  reported: ReadonlyMap<string, string>,
+): { text: string | null; next: Map<string, string> } {
+  const next = new Map(reported);
+  const fresh: string[] = [];
+  const recovered: string[] = [];
+  for (const r of results) {
+    if (r.error) {
+      const reason = failureReason(r.error);
+      if (reported.get(r.plugin) !== reason) fresh.push(`- ${r.plugin}: ${reason}`);
+      next.set(r.plugin, reason);
+    } else if (next.delete(r.plugin)) {
+      recovered.push(r.plugin);
+    }
   }
+
+  const parts: string[] = [];
+  if (fresh.length > 0) parts.push(`Plugin update failing (it will not auto-update until fixed):\n${fresh.join('\n')}`);
+  if (recovered.length > 0) parts.push(`Plugin update recovered: ${recovered.join(', ')}`);
+  return { text: parts.length > 0 ? parts.join('\n') : null, next };
+}
+
+function createRunner(deps: PluginUpdaterDeps): () => Promise<void> {
+  const notifyTimeoutMs = deps.notifyTimeoutMs ?? DEFAULT_NOTIFY_TIMEOUT_MS;
+  let reported = new Map<string, string>();
+  let running = false;
+
+  async function runOnce(): Promise<void> {
+    const results = await runPluginUpdates();
+    const changed = results.filter((r) => r.changed);
+    const messages: string[] = [];
+    if (changed.length > 0)
+      messages.push(`Updated ${changed.length} plugin(s): ${changed.map((r) => r.plugin).join(', ')}`);
+    const failures = failureNotice(results, reported);
+    if (failures.text) messages.push(failures.text);
+
+    const notifyJid = process.env.PLUGIN_UPDATE_NOTIFY_JID;
+    if (messages.length > 0 && notifyJid && deps.notify) {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          deps.notify(notifyJid, messages.join('\n')),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`notify timed out after ${notifyTimeoutMs}ms`)), notifyTimeoutMs);
+          }),
+        ]);
+      } catch (err) {
+        log.warn('Plugin update notify failed', { err });
+        return;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    reported = failures.next;
+  }
+
+  return async () => {
+    if (running) {
+      log.info('Plugin updater: previous run still in progress, skipping');
+      return;
+    }
+    running = true;
+    try {
+      await runOnce();
+    } finally {
+      running = false;
+      log.info('Plugin updater: run complete', { failing: reported.size });
+    }
+  };
 }
 
 let intervalHandle: NodeJS.Timeout | null = null;
@@ -337,13 +414,14 @@ let startupHandle: NodeJS.Timeout | null = null;
 
 export function startPluginUpdater(deps: PluginUpdaterDeps = {}): void {
   if (intervalHandle || startupHandle) return;
+  const run = createRunner(deps);
   startupHandle = setTimeout(() => {
     startupHandle = null;
-    runOnce(deps).catch((err) => log.error('Plugin updater startup run failed', { err }));
+    run().catch((err) => log.error('Plugin updater startup run failed', { err }));
   }, STARTUP_DELAY_MS);
   startupHandle.unref?.();
   intervalHandle = setInterval(() => {
-    runOnce(deps).catch((err) => log.error('Plugin updater periodic run failed', { err }));
+    run().catch((err) => log.error('Plugin updater periodic run failed', { err }));
   }, INTERVAL_MS);
   intervalHandle.unref?.();
 }
@@ -364,17 +442,11 @@ onHostStart(function pluginUpdaterHostStart() {
   startPluginUpdater({
     notify: async (platformId, text) => {
       const parts = platformId.split(':');
-      if (parts.length < 2) {
-        log.warn('Plugin updater notify: malformed jid', { platformId });
-        return;
-      }
+      if (parts.length < 2) throw new Error(`malformed PLUGIN_UPDATE_NOTIFY_JID: ${platformId}`);
       const channelType = parts[0];
       const realPlatformId = parts.slice(1).join(':');
       const adapter = getDeliveryAdapter();
-      if (!adapter) {
-        log.warn('Plugin updater notify: no delivery adapter yet', { platformId });
-        return;
-      }
+      if (!adapter) throw new Error('no delivery adapter yet');
       await adapter.deliver(channelType, realPlatformId, null, 'chat', JSON.stringify({ text }));
     },
   });
