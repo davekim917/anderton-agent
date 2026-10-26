@@ -58,9 +58,14 @@ ARG AWS_CLI_VERSION=2.37.9
 # SIGTERM instead of being orphaned by the shell entrypoint.
 # ffmpeg: `agent-browser record start/stop` shells out to it — without it the
 # recording starts and then fails at stop with "ffmpeg not found". ~141MB.
+# postgresql-15 + redis-server: a live preview runs the app's backend inside the
+# container. bookworm ships Postgres 15 only; the createcluster override stops
+# the package from initialising a root-owned cluster the agent cannot use.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
+    mkdir -p /etc/postgresql-common/createcluster.d \
+    && echo 'create_main_cluster = false' > /etc/postgresql-common/createcluster.d/no-main-cluster.conf \
+    && apt-get update && apt-get install -y --no-install-recommends \
         chromium \
         fonts-liberation \
         fonts-noto-color-emoji \
@@ -87,7 +92,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         unzip \
         xz-utils \
         postgresql-client \
+        postgresql-15 \
         redis-tools \
+        redis-server \
         ripgrep \
         python3 \
         python3-pip \

@@ -49,7 +49,10 @@ registerResource({
           label: args.label === undefined ? undefined : String(args.label),
         });
       },
-      formatHuman: (data) => `Live preview: ${describePreview(data as PreviewInfo)}. Post the URL here to share it.`,
+      formatHuman: (data) =>
+        `Live preview: ${describePreview(data as PreviewInfo)}. Post the URL here to share it. ` +
+        'Before starting anything for it, and whenever a requested change needs the backend, follow the live-preview skill: ' +
+        'the backend runs in this container, never against production.',
     },
     close: {
       access: 'open',

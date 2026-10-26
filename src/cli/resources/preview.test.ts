@@ -63,6 +63,7 @@ describe('ncl preview', () => {
     });
     expect(human).toContain(url);
     expect(human).toMatch(/open until/);
+    expect(human).toContain('live-preview skill');
   });
 
   it('status shows the open preview, close ends it', async () => {

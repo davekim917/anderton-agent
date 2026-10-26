@@ -30,6 +30,16 @@ command to reopen it. When its container exits, the session's thread gets a note
 there is no agent left to say so, unless a new container already owns the session by then, as an adoption still
 pending at boot does: the host never writes under a container, so that note is skipped.
 
+## Backend changes
+
+A preview's frontend can call a backend the agent runs in the same container, so a backend change shows as fast as
+a frontend one. The image carries Postgres 15 and Redis for this. `ncl preview open` points the agent at the
+`live-preview` container skill (`container/skills/live-preview/SKILL.md`), which sets the rules: check where the app
+points before starting it, never production; local data stores first, a shared non-production database only for
+code changes; start the backend with a clean environment, because the agent's own environment routes outbound
+calls through the credential proxy and an inherited one would let anyone with the link drive real, credentialed
+calls.
+
 ## What the app must do
 
 - Listen on `127.0.0.1`, not `localhost`: Node can resolve `localhost` to `::1` only, which the bridge does not reach.
