@@ -400,7 +400,19 @@ its path has a tenant-wide job shape (`sync`, `publish`, `archive`,
 tenant key in the body or query (`tenantId`, `tenant_id`, `tenant-id`,
 `filter[tenantId]`, ...) names a tenant outside `tenants` (null or
 empty counts as outside); or the seat's token carries no tenant claim, or one
-outside `tenants`. Paths are compared lowercased, percent-decoded and with
+outside `tenants`. A product whose tokens carry no tenant claim (for example,
+`sub` only) lists its writing seats instead, in the optional `seats` key
+(lowercase seat emails from that product's seat registry): a write then needs
+a token this client issued to a listed seat (`foreign-seat`, `no-seat`), any
+tenant claim the token does carry must still be in `tenants`, and every other
+rule above still applies. `check` takes `--seat <email>` for the same test. A
+2xx answer to a POST on `authPaths`, sent with the seat's current token, that
+carries a new token (refresh, role switch) replaces the seat's token only when
+the new token names the same user: every one of `sub`, `userId` and `id` that
+either token carries must be in both and equal. A token with no identity claim
+(an opaque token included) is never adopted, and neither is a login as another
+user; the seat keeps its old token. A replacement writes one line naming the
+seat to `00-timeline.txt`. List a role-switch route in `authPaths`. Paths are compared lowercased, percent-decoded and with
 empty segments dropped; dot segments are refused. A missing, unreadable or
 other-run scope refuses every write. For one release, an allowlist-era file
 (no `mode`, only `tenants`/`brands`/`accounts`/`authPaths`/`readOnlyPosts`)
@@ -422,6 +434,15 @@ only: browser-driven writes and hand-rolled HTTP rest on the standing
 instructions, which must state the same denylist in words. It stops an honest
 lane's mistakes, not a lane set on bypassing it. Request paths must be
 single-slash absolute paths, and redirects are reported (3xx), never followed.
+
+Seat passwords come from the seat helper (`qa-seat-password.sh`) unless the
+deploying group's standing instructions name a private logins file for the
+product: `H(..., logins_file=<path>)`, a JSON object `{"<seat email>":
+"<password>"}`, owned by this user, mode 0600, outside the run directory, never
+a symlink. It is read once per login and only after `smoke-seat-lease.py check`
+passes; a held seat, a missing lease tool, or a missing, loose, unparsable or
+seat-less file refuses the login locally with no request sent, and the refusal
+names the file, never its contents.
 
 Resolve the approved credential location from the deploying group's standing
 instructions and mounts before declaring auth unavailable. Never print or copy

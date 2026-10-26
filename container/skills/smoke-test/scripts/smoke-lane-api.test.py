@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import base64
+import contextlib
 import http.server
+import io
 import importlib
 import json
 import os
@@ -9,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
@@ -21,7 +24,8 @@ SCOPE = {"mode": "deny", "tenants": ["sandbox", "playground"],
          "authPaths": ["/users/login", "/users/refresh"], "readOnlyPosts": ["/widgets/search"],
          "denyPaths": ["/ledger/close", "/widgets/[^/]+/broadcast"], "denyPrefixes": ["/media", "/profile/photo"]}
 SEAT_TENANTS = {"m@example.test": {"tenantId": "sandbox"}, "g@example.test": {"tenantId": "globex"},
-                "n@example.test": {"sub": "9"}, "w@example.test": {"tenantId": "sandbox", "tenant_id": "globex"}}
+                "n@example.test": {"sub": "9"}, "w@example.test": {"tenantId": "sandbox", "tenant_id": "globex"},
+                "o@example.test": {"sub": "11"}}
 
 
 def token_for(claims):
@@ -34,6 +38,7 @@ class Backend(http.server.BaseHTTPRequestHandler):
     store = {}
     modes = {}
     modes_by_auth = {}
+    replies = {}
     auths = []
 
     def log_message(self, format, *args):
@@ -45,6 +50,14 @@ class Backend(http.server.BaseHTTPRequestHandler):
         Backend.seen.append((self.command, self.path, body))
         Backend.auths.append(self.headers.get("Authorization"))
         auth_key = (self.path, self.headers.get("Authorization"))
+        if (self.command, self.path) in Backend.replies:
+            status, out = Backend.replies[(self.command, self.path)]
+            raw = json.dumps(out).encode()
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if self.command == "GET" and (auth_key in Backend.modes_by_auth or self.path in Backend.modes):
             status, out = Backend.modes_by_auth.get(auth_key) or Backend.modes[self.path]
             raw = json.dumps(out).encode()
@@ -61,6 +74,8 @@ class Backend(http.server.BaseHTTPRequestHandler):
             return
         if self.path.startswith("/users/login"):
             out = {"access_token": token_for(SEAT_TENANTS[(body or {}).get("email")])}
+        elif self.path == "/users/switch-role":
+            out = {"data": {"accessToken": token_for({"sub": "9", "role": (body or {}).get("roleType")})}}
         elif self.command == "POST":
             new_id = "fx-{}".format(900 + len(Backend.store))
             Backend.store["{}/{}".format(self.path, new_id)] = dict(body or {}, id=new_id)
@@ -95,6 +110,7 @@ class Harness(unittest.TestCase):
         Backend.store.clear()
         Backend.modes.clear()
         Backend.modes_by_auth.clear()
+        Backend.replies.clear()
         Backend.auths.clear()
         self.tmp = tempfile.TemporaryDirectory()
         self.run_dir = os.path.join(self.tmp.name, RUN_ID)
@@ -681,6 +697,190 @@ class ApprovalModeGuard(Harness):
         with self.assertRaises(api.WriteScopeRefused) as ctx:
             api.judge(self.run_dir, "POST", "/notes", {"k": 1}, ["sandbox"])
         self.assertIn("unreadable-scope", str(ctx.exception), "a tampered pin refuses every write")
+
+
+SEAT_SCOPE = dict(SCOPE, tenants=[], authPaths=["/users/login", "/users/switch-role"], seats=["n@example.test"])
+PASSWORD = "fictional-file-pw-7Qx"
+
+
+class SeatScope(Harness):
+    """A product whose tokens carry only `sub` scopes writes by the seat this client signed in."""
+
+    def setUp(self):
+        super().setUp()
+        self.lease = os.path.join(self.tmp.name, "lease.py")
+        with open(self.lease, "w") as f:
+            f.write("import sys\nsys.exit(69 if sys.argv[2] == 'held@example.test' else 0)\n")
+        self.logins = os.path.join(self.tmp.name, "private", "logins.json")
+        os.makedirs(os.path.dirname(self.logins))
+        self.write_logins({"n@example.test": PASSWORD, "o@example.test": PASSWORD, "g@example.test": PASSWORD,
+                           "held@example.test": PASSWORD})
+
+    def write_logins(self, logins, mode=0o600, path=None):
+        path = path or self.logins
+        with open(path, "w") as f:
+            json.dump(logins, f)
+        os.chmod(path, mode)
+
+    def file_client(self, *login, logins=None):
+        h = api.H(os.path.join(self.run_dir, "lanes", "l1"), run_dir=self.run_dir, base=self.base,
+                  seats={"N": "n@example.test", "O": "o@example.test", "G": "g@example.test", "X": "held@example.test"},
+                  password_helper="/nonexistent/helper.sh", logins_file=logins or self.logins, lease_tool=self.lease)
+        for seat in login:
+            h.login(seat)
+        return h
+
+    def test_a_scoped_seat_writes_without_a_tenant_claim(self):
+        self.pin(SEAT_SCOPE)
+        h = self.file_client("N")
+        self.assert_sent(h, "p1", "POST", "/notes", {"body": "any"}, seat="N")
+        self.assert_sent(h, "p2", "PATCH", "/cards/4402", {"stage": "b"}, seat="N")
+
+    def test_seat_scope_keeps_every_other_refusal(self):
+        self.pin(SEAT_SCOPE)
+        h = self.file_client("N", "O", "G")
+        self.assert_blocked(h, "q1", "POST", "/notes", {"k": 1}, "foreign-seat seat=o@example.test", seat="O")
+        self.assert_blocked(h, "q0", "POST", "/notes", {"k": 1}, "foreign-tenant seat-tenant=globex", seat="G")
+        self.assert_blocked(h, "q2", "POST", "/media/upload", {"k": 1}, "denied-path", seat="N")
+        self.assert_blocked(h, "q3", "POST", "/stock/resync", {"k": 1}, "tenant-wide-shape", seat="N")
+        self.assert_blocked(h, "q4", "POST", "/notes", {"tenantId": "sandbox"}, "foreign-tenant", seat="N")
+
+    def test_a_token_this_client_did_not_issue_has_no_seat(self):
+        self.pin(SEAT_SCOPE)
+        h = self.file_client()
+        before = len(Backend.seen)
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            h.exchange("t1", "N", "POST", "/notes", {"k": 1}, token_for({"sub": "9"}))
+        self.assertIn("no-seat", str(ctx.exception))
+        self.assertEqual(len(Backend.seen), before)
+
+    def test_without_seats_a_claimless_token_still_refuses(self):
+        self.pin(dict(SEAT_SCOPE, seats=[]))
+        h = self.file_client("N")
+        self.assert_blocked(h, "u1", "POST", "/notes", {"k": 1}, "no-tenant", seat="N")
+
+    def test_seats_must_be_canonical_and_are_pinned_only_when_set(self):
+        for bad in ("n@example.test", ["N@example.test"], ["not-an-email"], [5]):
+            with self.assertRaises(ValueError, msg=bad):
+                self.pin(dict(SEAT_SCOPE, seats=bad))
+        self.assertEqual(self.pin(SEAT_SCOPE)["seats"], ["n@example.test"])
+        os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
+        self.assertNotIn("seats", self.pin(), "a tenant-scoped pin is unchanged")
+
+    def test_a_role_switch_token_replaces_the_seats_token(self):
+        self.pin(SEAT_SCOPE)
+        h = self.file_client("N")
+        first = h.tok["N"]
+        self.assertEqual(h.call("sw", "N", "POST", "/users/switch-role", {"roleType": "store"})[0], 201)
+        self.assertNotEqual(h.tok["N"], first)
+        self.assert_sent(h, "after", "POST", "/notes", {"k": 1}, seat="N")
+        self.assertEqual(Backend.auths[-1], "Bearer " + h.tok["N"], "the write carries the switched token")
+        self.assertIn("store", json.dumps(api.claims(h.tok["N"])))
+        with open(os.path.join(h.out, "00-timeline.txt")) as f:
+            timeline = f.read()
+        self.assertIn("[sw] N token replaced by a refresh", timeline)
+        self.assertNotIn(h.tok["N"].split(".")[1], timeline)
+
+    def test_a_refresh_is_adopted_only_on_a_2xx_auth_answer_to_the_seats_own_token_for_the_same_user(self):
+        self.pin(SEAT_SCOPE)
+        h = self.file_client("N", "O")
+        own, other = h.tok["N"], h.tok["O"]
+        role = "/users/switch-role"
+        rows = (("partial", own, role, 201, {"access_token": token_for({"sub": "9", "userId": "77"})}),
+                ("rejected", own, role, 401, {"access_token": token_for({"sub": "9", "role": "admin"})}),
+                ("not-auth", own, "/notes", 201, {"token": token_for({"sub": "9", "role": "admin"})}),
+                ("o-token", other, role, 201, {"access_token": token_for({"sub": "11", "role": "admin"})}))
+        for tag, tok, path, status, reply in rows:
+            Backend.replies[("POST", path)] = (status, reply)
+            self.assertEqual(h.exchange(tag, "N", "POST", path, {"k": 1}, tok)[0], status, tag)
+            self.assertEqual((h.tok["N"], h.tok["O"]), (own, other), tag)
+        with open(os.path.join(h.out, "00-timeline.txt")) as f:
+            self.assertNotIn("token replaced", f.read())
+        same = token_for({"sub": "9", "role": "admin"})
+        Backend.replies[("POST", role)] = (201, {"access_token": same})
+        h.exchange("same", "N", "POST", role, {"k": 1}, own)
+        self.assertEqual(h.tok["N"], same, "the same user's refresh on the seat's own token is adopted")
+
+    def test_a_token_without_an_identity_claim_is_never_adopted(self):
+        self.pin()
+        h = self.client("M")
+        own = h.tok["M"]
+        for i, fresh in enumerate((token_for({"tenantId": "sandbox", "role": "admin"}), "opaque-fictional-token")):
+            Backend.replies[("POST", "/users/refresh")] = (200, {"access_token": fresh})
+            self.assertEqual(h.call("nc%d" % i, "M", "POST", "/users/refresh", {"k": 1})[0], 200)
+            self.assertEqual(h.tok["M"], own, fresh)
+
+    def test_another_users_token_on_an_auth_path_is_not_adopted(self):
+        self.pin(SEAT_SCOPE)
+        h = self.file_client("N")
+        own = h.tok["N"]
+        code, _ = h.call("other", "N", "POST", "/users/login", {"email": "o@example.test", "password": PASSWORD})
+        self.assertEqual(code, 201)
+        self.assertEqual(h.tok["N"], own, "a login as o@ must not become n@'s token")
+        self.assert_sent(h, "after", "POST", "/notes", {"k": 1}, seat="N")
+        self.assertEqual(Backend.auths[-1], "Bearer " + own)
+
+    def test_logins_file_password_never_reaches_evidence_or_stdout(self):
+        self.pin(SEAT_SCOPE)
+        out = os.path.join(self.tmp.name, "stdout.txt")
+        with open(out, "w") as f, contextlib.redirect_stdout(f):
+            h = self.file_client("N")
+            self.assert_sent(h, "v1", "POST", "/notes", {"k": 1}, seat="N")
+        self.assertEqual(Backend.seen[0][2], {"email": "n@example.test", "password": PASSWORD})
+        texts = [out] + [os.path.join(h.out, n) for n in os.listdir(h.out)]
+        for path in texts:
+            with open(path) as f:
+                self.assertNotIn(PASSWORD, f.read(), path)
+
+    def test_logins_file_refusals_send_nothing_and_quote_nothing(self):
+        self.pin(SEAT_SCOPE)
+        inside = os.path.join(self.run_dir, "logins.json")
+        self.write_logins({"n@example.test": PASSWORD}, path=inside)
+        link = os.path.join(self.tmp.name, "link.json")
+        os.symlink(self.logins, link)
+        cases = (("X", None, "SEAT_LEASE_REFUSED"),
+                 ("N", inside, "inside the run's evidence"),
+                 ("N", link, "not a regular file"),
+                 ("N", os.path.join(self.tmp.name, "absent.json"), "is missing"))
+        for seat, logins, reason in cases:
+            self.assert_refused_locally(seat, logins, reason)
+        self.write_logins({"n@example.test": PASSWORD}, mode=0o644)
+        self.assert_refused_locally("N", None, "mode 0600")
+        self.write_logins({"g@example.test": PASSWORD})
+        self.assert_refused_locally("N", None, "no password for n@example.test")
+        with open(self.logins, "w") as f:
+            f.write('{"n@example.test": "%s"' % PASSWORD)
+        self.assert_refused_locally("N", None, "not JSON")
+        self.write_logins({"n@example.test": PASSWORD})
+        with mock.patch.object(api.os, "getuid", return_value=os.getuid() + 1):
+            self.assert_refused_locally("N", None, "must be owned by this user")
+        h = self.file_client(logins=self.logins)
+        h.lease_tool = os.path.join(self.tmp.name, "no-lease.py")
+        with self.assertRaises(SystemExit):
+            h.login("N")
+        self.assertEqual(Backend.seen, [], "no lease tool refuses like the seat helper does")
+
+    def assert_refused_locally(self, seat, logins, reason):
+        h = self.file_client(logins=logins)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            h.login(seat)
+        self.assertEqual(Backend.seen, [], reason)
+        self.assertIn(reason, out.getvalue())
+        self.assertIn("REFUSED locally", out.getvalue())
+        self.assertNotIn(PASSWORD, out.getvalue())
+        self.assertNotIn(seat, h.tok)
+
+    def test_cli_check_takes_the_seat(self):
+        self.pin(SEAT_SCOPE)
+        cli = [sys.executable, os.path.join(HERE, "smoke_lane_api.py"), "check", self.run_dir, "POST", "/notes"]
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        ok = subprocess.run(cli + ["--seat", "n@example.test"], capture_output=True, text=True, env=env)
+        self.assertEqual((ok.returncode, ok.stdout.strip()), (0, "write"))
+        for extra, reason in ((["--seat", "o@example.test"], "foreign-seat"), ([], "no-seat")):
+            no = subprocess.run(cli + extra, capture_output=True, text=True, env=env)
+            self.assertEqual(no.returncode, 77, extra)
+            self.assertIn(reason, no.stderr)
 
 
 if __name__ == "__main__":

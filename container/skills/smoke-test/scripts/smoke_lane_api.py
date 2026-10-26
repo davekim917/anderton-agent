@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import base64
 import datetime
+import errno
 import fcntl
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -14,7 +16,7 @@ import urllib.request
 
 USAGE = """usage:
   smoke_lane_api.py init  <run-dir> --from <scope.json>
-  smoke_lane_api.py check <run-dir> <METHOD> <path> [--body <json>] [--tenant <seat tenant>]"""
+  smoke_lane_api.py check <run-dir> <METHOD> <path> [--body <json>] [--tenant <seat tenant>] [--seat <seat email>]"""
 
 REFUSED = 77
 SCOPE_FILE = "write-scope.json"
@@ -25,6 +27,8 @@ SCOPE_LISTS = ("tenants", "authPaths", "readOnlyPosts", "denyPaths", "denyPrefix
 REQUIRED_LISTS = ("tenants", "denyPaths", "denyPrefixes")
 PINNED_KEYS = {"mode", "schemaVersion", "runId"}
 GUARD_KEY = "approvalModeGuards"
+SEATS_KEY = "seats"
+SEAT_EMAIL = re.compile(r"[a-z0-9][a-z0-9._+-]*@[a-z0-9.-]+")
 GUARD_FIELDS = {"methods", "path", "read", "field", "allow"}
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 PLACEHOLDER = re.compile(r"\{([^{}]*)\}")
@@ -48,6 +52,8 @@ DENY_PATTERNS = (
 )
 NAME_KEYS = {"name", "title", "label", "filename"}
 PASSWORD_HELPER = "/workspace/extra/qa-seat-password.sh"
+LEASE_TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smoke-seat-lease.py")
+LEASE_REFUSED = 69
 SECRET_KEY = re.compile(r"password|secret|token", re.I)
 
 
@@ -90,7 +96,7 @@ def validated_scope(raw):
         return legacy_validated_scope(raw)
     if raw.get("mode") != SCOPE_MODE:
         raise ValueError("mode must be {!r} (an allowlist scope file is no longer accepted)".format(SCOPE_MODE))
-    unknown = sorted(set(raw) - set(SCOPE_LISTS) - PINNED_KEYS - {GUARD_KEY})
+    unknown = sorted(set(raw) - set(SCOPE_LISTS) - PINNED_KEYS - {GUARD_KEY, SEATS_KEY})
     if unknown:
         raise ValueError("unknown keys {}".format(unknown))
     for key in SCOPE_LISTS:
@@ -115,6 +121,11 @@ def validated_scope(raw):
     guards = validated_guards(raw.get(GUARD_KEY, []))
     if guards:
         scope[GUARD_KEY] = guards
+    seats = raw.get(SEATS_KEY, [])
+    if not isinstance(seats, list) or not all(isinstance(v, str) and SEAT_EMAIL.fullmatch(v) for v in seats):
+        raise ValueError("{} must be a list of lowercase seat emails".format(SEATS_KEY))
+    if seats:
+        scope[SEATS_KEY] = list(seats)
     return dict(scope, mode=SCOPE_MODE)
 
 
@@ -289,7 +300,7 @@ def tenant_key(key):
                for part in re.split(r"[\[\]]", key.lower()) if part)
 
 
-def judge(run_dir, method, path, body=None, token_tenants=(), base_path=""):
+def judge(run_dir, method, path, body=None, token_tenants=(), base_path="", seat=None):
     method = method.upper()
     write = method not in READ_METHODS
     route = route_of(path, write)
@@ -316,11 +327,18 @@ def judge(run_dir, method, path, body=None, token_tenants=(), base_path=""):
                for v in scalars(value) if v not in scope["tenants"]]
     if foreign:
         raise WriteScopeRefused("foreign-tenant targets={}".format(",".join(foreign)))
-    if not token_tenants:
-        raise WriteScopeRefused("no-tenant (a write needs a seat token naming a scoped tenant)")
     outside = [t for t in token_tenants if t not in scope["tenants"]]
     if outside:
         raise WriteScopeRefused("foreign-tenant seat-tenant={}".format(",".join(outside)))
+    # A product whose tokens carry no tenant claim scopes writes by the signed-in seat instead.
+    seats = scope.get(SEATS_KEY)
+    if seats:
+        if not seat:
+            raise WriteScopeRefused("no-seat (a write needs a token this client issued to a scoped seat)")
+        if seat.lower() not in seats:
+            raise WriteScopeRefused("foreign-seat seat={}".format(seat.lower()))
+    elif not token_tenants:
+        raise WriteScopeRefused("no-tenant (a write needs a seat token naming a scoped tenant)")
     need_approval_mode(scope, method, path, body, base_path)
     return "write"
 
@@ -363,6 +381,22 @@ def field_value(response, field):
 
 def mode_allowed(value, allow):
     return any(type(value) is type(a) and value == a for a in allow)
+
+
+def token_of(js):
+    token = None
+    if isinstance(js, dict):
+        data = js.get("data")
+        for d in (js, data if isinstance(data, dict) else {}):
+            for k in ("access_token", "accessToken", "token"):
+                token = token or (d.get(k) if isinstance(d.get(k), str) else None)
+    return token
+
+
+def same_user(old, new):
+    a, b = claims(old), claims(new)
+    keys = [k for k in ("sub", "userId", "id") if k in a or k in b]
+    return bool(keys) and all(k in a and k in b and a[k] == b[k] for k in keys)
 
 
 def seat_tenants(token):
@@ -408,9 +442,11 @@ def claims(token):
 
 
 class H:
-    def __init__(self, outdir, run_dir, base, seats, login_path="/users/login", password_helper=PASSWORD_HELPER):
+    def __init__(self, outdir, run_dir, base, seats, login_path="/users/login", password_helper=PASSWORD_HELPER,
+                 logins_file=None, lease_tool=LEASE_TOOL):
         self.out, self.run_dir, self.base, self.seats = outdir, run_dir, base.rstrip("/"), seats
         self.login_path, self.password_helper, self.tok = login_path, password_helper, {}
+        self.logins_file, self.lease_tool, self.issued = logins_file, lease_tool, {}
         os.makedirs(outdir, exist_ok=True)
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
@@ -434,11 +470,14 @@ class H:
         base_path = urllib.parse.urlsplit(self.base).path
         try:
             try:
-                judge(self.run_dir, method, path, body, seat_tenants(tok), base_path)
+                verdict = judge(self.run_dir, method, path, body, seat_tenants(tok), base_path,
+                                self.issued.get(tok) if tok else None)
             except ApprovalModeUnread as need:
                 self.approval_mode(tag, seat, need, base_path, tok)
+                verdict = "write"
         except WriteScopeRefused as e:
             self.refuse(tag, seat, method, path, body, e)
+        return verdict
 
     def approval_mode(self, tag, seat, need, base_path, tok):
         read = need.read_path
@@ -471,7 +510,7 @@ class H:
         self.emit("{} [{}] {} OWN {} -> ledgered as {}".format(now(), tag, seat, path, name))
 
     def req(self, method, path, tok=None, body=None, tag="req", seat="-"):
-        self.guarded(tag, seat, method, path, body, tok)
+        verdict = self.guarded(tag, seat, method, path, body, tok)
         data = json.dumps(body).encode() if body is not None else None
         r = urllib.request.Request(self.base + path, data=data, method=method)
         if tok:
@@ -490,32 +529,75 @@ class H:
             js = json.loads(raw)
         except ValueError:
             js = {"_raw": raw[:300].decode("utf8", "replace")}
+        fresh = token_of(js) if verdict == "auth" and 200 <= code < 300 else None
+        if fresh and tok and tok in self.issued and self.tok.get(seat) == tok and same_user(tok, fresh):
+            self.tok[seat], self.issued[fresh] = fresh, self.issued[tok]
+            self.emit("{} [{}] {} token replaced by a refresh claims={}".format(now(), tag, seat, json.dumps(claims(fresh))))
         return code, js, time.time() - t0
 
     def login(self, seat):
         if seat in self.tok:
             return 200
         self.guarded("login-" + seat, seat, "POST", self.login_path, None)
-        pr = subprocess.run(["bash", self.password_helper, self.seats[seat]], capture_output=True, text=True)
-        pw = pr.stdout.strip()
-        if pr.returncode != 0 or not pw:
-            why = "SEAT_LEASE_REFUSED (seat unavailable)" if pr.returncode == 69 else "derive rc={}".format(pr.returncode)
+        pw, why = self.file_password(self.seats[seat]) if self.logins_file else self.helper_password(self.seats[seat])
+        if not pw:
             self.emit("{} login {} REFUSED locally: {}, no request sent".format(now(), seat, why))
             raise SystemExit(2)
         code, js, _ = self.req("POST", self.login_path, body={"email": self.seats[seat], "password": pw},
                                   tag="login-" + seat, seat=seat)
         pw = None
-        token = None
-        if isinstance(js, dict):
-            data = js.get("data")
-            for d in (js, data if isinstance(data, dict) else {}):
-                for k in ("access_token", "accessToken", "token"):
-                    token = token or (d.get(k) if isinstance(d.get(k), str) else None)
+        token = token_of(js)
         if token:
             self.tok[seat] = token
+            self.issued[token] = self.seats[seat]
         self.emit("{} login {} -> {} token={} claims={}".format(
             now(), seat, code, "yes" if token else "no", json.dumps(claims(token)) if token else "-"))
         return code
+
+    def helper_password(self, email):
+        pr = subprocess.run(["bash", self.password_helper, email], capture_output=True, text=True)
+        pw = pr.stdout.strip()
+        if pr.returncode != 0 or not pw:
+            return None, ("SEAT_LEASE_REFUSED (seat unavailable)" if pr.returncode == LEASE_REFUSED
+                          else "derive rc={}".format(pr.returncode))
+        return pw, None
+
+    def file_password(self, email):
+        """Read one seat's password from a private logins file at use."""
+        if not os.path.isfile(self.lease_tool):
+            return None, "SEAT_LEASE_REFUSED (seat unavailable: no lease tool at {})".format(self.lease_tool)
+        lease = subprocess.run([sys.executable, self.lease_tool, "check", email], capture_output=True, text=True)
+        if lease.returncode != 0:
+            return None, ("SEAT_LEASE_REFUSED (seat unavailable)" if lease.returncode == LEASE_REFUSED
+                          else "lease check rc={}".format(lease.returncode))
+        path = self.logins_file
+        real = os.path.realpath(path)
+        for evidence in (self.run_dir, self.out):
+            root = os.path.realpath(evidence)
+            if real == root or real.startswith(root + os.sep):
+                return None, "logins-file {} is inside the run's evidence ({})".format(path, evidence)
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                return None, "logins-file {} is not a regular file".format(path)
+            if e.errno in (errno.ENOENT, errno.ENOTDIR):
+                return None, "logins-file {} is missing".format(path)
+            return None, "logins-file {} is unreadable or not JSON".format(path)
+        with os.fdopen(fd) as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                return None, "logins-file {} is not a regular file".format(path)
+            if st.st_uid != os.getuid() or st.st_mode & 0o077:
+                return None, "logins-file {} must be owned by this user and mode 0600".format(path)
+            try:
+                logins = json.load(f)
+            except (OSError, ValueError):
+                return None, "logins-file {} is unreadable or not JSON".format(path)
+        pw = logins.get(email, logins.get(email.lower())) if isinstance(logins, dict) else None
+        if not isinstance(pw, str) or not pw:
+            return None, "logins-file {} has no password for {}".format(path, email)
+        return pw, None
 
     def call(self, tag, seat, method, path, body=None, save=True):
         return self.exchange(tag, seat, method, path, body, self.tok.get(seat), save)
@@ -546,11 +628,11 @@ def main(argv):
         return 0
     flags = dict(zip(argv[5::2], argv[6::2]))
     if (len(argv) >= 5 and argv[1] == "check" and len(argv) % 2 == 1
-            and set(flags) <= {"--body", "--tenant"} and len(flags) == (len(argv) - 5) // 2):
+            and set(flags) <= {"--body", "--tenant", "--seat"} and len(flags) == (len(argv) - 5) // 2):
         body = json.loads(flags["--body"]) if "--body" in flags else None
         tenants = [flags["--tenant"]] if "--tenant" in flags else []
         try:
-            print(judge(argv[2], argv[3], argv[4], body, tenants))
+            print(judge(argv[2], argv[3], argv[4], body, tenants, seat=flags.get("--seat")))
         except WriteScopeRefused as e:
             print("WRITE_SCOPE_REFUSED reason={}".format(e), file=sys.stderr)
             return REFUSED
