@@ -37,6 +37,8 @@ the next one. These rules exist because sub-agents share one checkout and one ru
    open one PR for the small fixes and one per big item, each a fresh branch from the base
    carrying only its own commits (cherry-picked), so no big item rides in the small-fix PR. The
    small-fix PR lists each numbered fix.
-7. **Close up when they're done.** When they say ship, or that they're done, run
-   `ncl preview close` and stop the app. An open preview keeps the container up for up to
-   8 hours.
+7. **Finishing a batch is not ending the session.** "Done" after a run of fixes means that batch
+   is done; others in the thread may still be using the link. Run `ncl preview close` and stop
+   the app only when someone says to close the preview, or after shipping. If "done" could mean
+   either, keep everything running and ask once whether to close the preview too. An open
+   preview keeps the container up for up to 8 hours.
