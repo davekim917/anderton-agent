@@ -22,6 +22,7 @@ import {
   applySkill,
   fullyApplied,
   normalizeValue,
+  PROMPT_CANCELLED,
   stepLabel,
   type ApplyEvent,
   type ApplyResult,
@@ -89,19 +90,19 @@ export interface PrompterContext {
 /**
  * The wizard's `resolveInput` implementation: collect an `nc:prompt` through
  * clack (password for secrets, an arrow-key select for an either/or validate
- * regex, text otherwise; a cancel defers), running the interactive re-ask loop
+ * regex, text otherwise; a cancel stops the apply), running the interactive re-ask loop
  * against the prompt's declared `validate:`/`flags:` (the engine's
  * validate-at-bind is the programmatic backstop, not the UX).
  */
 export function clackResolveInput(
   ctx: PrompterContext = {},
-): (name: string, meta: InputMeta) => Promise<string | undefined> {
+): (name: string, meta: InputMeta) => Promise<string | undefined | typeof PROMPT_CANCELLED> {
   // The `?` help-escape is only meaningful at a real terminal: it hands the
   // operator off to an interactive Claude session (stdio inherited). In a
   // headless / non-TTY run nobody can type `?` into a clack prompt anyway, and
   // we must never spawn an interactive child without a TTY — so it's a no-op
   // there (read at ask-time so a re-run picks up a terminal that appears later).
-  async function ask(name: string, meta: InputMeta): Promise<string | undefined> {
+  async function ask(name: string, meta: InputMeta): Promise<string | undefined | typeof PROMPT_CANCELLED> {
     const check = promptValidator(meta.validate, meta.flags, meta.question);
     // Wrap the validator so a lone `?` short-circuits format checks and comes
     // back as a literal "?" instead of being rejected — we intercept it below.
@@ -115,7 +116,7 @@ export function clackResolveInput(
       : meta.secret
         ? await p.password({ message: meta.question, validate: guarded, clearOnError: true })
         : await p.text({ message: meta.question, validate: guarded });
-    if (p.isCancel(ans)) return undefined; // cancelled ⇒ defer
+    if (p.isCancel(ans)) return PROMPT_CANCELLED;
     if (isHelpEscape(ans) && process.stdout.isTTY) {
       // Operator asked for help: hand off to interactive Claude with this
       // prompt's context, then re-ask the same prompt. Recursion is operator-
@@ -456,7 +457,7 @@ export interface RunSkillOptions {
    * collector (`clackResolveInput` — masked secrets, validate re-ask loop, `?`
    * help-escape); inject a fake for tests or a relay for a coding agent.
    */
-  resolveInput?: (name: string, meta: InputMeta) => Promise<string | undefined>;
+  resolveInput?: (name: string, meta: InputMeta) => Promise<string | undefined | typeof PROMPT_CANCELLED>;
   /** Defaults to `hostExec`. */
   exec?: (cmd: string, context?: ExecContext) => string | void | Promise<string | void>;
   /** Defaults to `hostExecStream`. Streaming exec for `nc:run effect:step`. */
@@ -558,6 +559,8 @@ if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
     const res = await runSkill(skillDir, { force });
     if (fullyApplied(res)) {
       p.outro('Done — fully applied.');
+    } else if (res.cancelled) {
+      p.outro(`Cancelled at ${res.cancelled}; nothing after it ran.`);
     } else {
       if (res.deferred.length) p.log.warn(`No value yet for: ${res.deferred.join(', ')}`);
       for (const t of res.agentTasks) p.log.warn(`Needs an agent (${t.kind}): ${t.reason}`);

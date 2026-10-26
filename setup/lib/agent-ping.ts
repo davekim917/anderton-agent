@@ -74,6 +74,17 @@ export function describePingFailure(result: Exclude<PingResult, 'ok'>): {
   }
 }
 
+/** Setup's last line. After a failed ping it points back at the fix already on screen instead of calling setup ready. */
+export function setupClosing(ping: PingResult | undefined, dmTarget: string | null): { ready: boolean; text: string } {
+  if (ping !== undefined && ping !== 'ok') {
+    return {
+      ready: false,
+      text: `Setup finished. ${describePingFailure(ping).headline} The fix is under "Skipping the first chat" above.`,
+    };
+  }
+  return { ready: true, text: dmTarget ? "You're set." : "You're ready! Chat with `pnpm run chat hi`." };
+}
+
 export function pingCliAgent(timeoutMs = 30_000): Promise<PingResult> {
   return new Promise((resolve) => {
     const child = spawn('pnpm', ['run', 'chat', 'ping'], {

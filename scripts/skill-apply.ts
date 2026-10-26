@@ -29,6 +29,9 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDirectives, promptVar, type Directive } from './skill-directives.js';
 
+// A `resolveInput` answer meaning the operator cancelled the prompt: apply stops there, nothing after it runs.
+export const PROMPT_CANCELLED = Symbol('PROMPT_CANCELLED');
+
 // What an `nc:prompt` DECLARES about the value it needs — the core seam's input
 // contract, passed to `resolveInput` so a consumer can run its OWN re-ask loop
 // (clack validate, a chat exchange). Declaration only: how the value is
@@ -254,6 +257,7 @@ export interface ApplyResult {
   applied: string[];
   skipped: string[];
   deferred: string[]; // prompt vars / blocked consumers with no value yet
+  cancelled?: string; // the prompt var the operator cancelled at; nothing after it ran
   agentTasks: AgentTask[]; // bounced to an agent — NOT the human
   operatorMessages: string[]; // `nc:operator` bodies to relay to the human operator
   // Non-secret resolved values (prompt answers + `run capture:<var>` outputs) so
@@ -278,9 +282,9 @@ export interface ApplyOptions {
   // The core input seam: resolve a prompt var the caller didn't pre-supply.
   // `meta` carries the declared semantics (question, secret,
   // validate/flags/normalize) so a consumer can run its OWN re-ask loop.
-  // Returning undefined ⇒ defer. Optional — omit it (with full `inputs`) for a
-  // headless run; a prompt with neither defers.
-  resolveInput?: (name: string, meta: InputMeta) => Promise<string | undefined>;
+  // Returning undefined ⇒ defer; PROMPT_CANCELLED ⇒ stop the apply. Optional —
+  // omit it (with full `inputs`) for a headless run; a prompt with neither defers.
+  resolveInput?: (name: string, meta: InputMeta) => Promise<string | undefined | typeof PROMPT_CANCELLED>;
   // The core output seam: every engine emission — the step-start/step-end
   // brackets and each rendered `nc:operator` block — flows through this one
   // handler, and every call is AWAITED before the engine proceeds (that
@@ -316,7 +320,7 @@ export interface ApplyOptions {
  * fully-headless run-through succeeded.
  */
 export function fullyApplied(res: ApplyResult): boolean {
-  return res.deferred.length === 0 && res.agentTasks.length === 0;
+  return res.deferred.length === 0 && res.agentTasks.length === 0 && res.cancelled === undefined;
 }
 
 /**
@@ -893,8 +897,12 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
         // invalid `inputs` value never falls through to a second acquisition
         // path (validation below rejects it loudly instead). Otherwise resolve
         // via `resolveInput`; still undefined ⇒ defer (headless, no answer).
-        let val = opts.inputs?.[v];
+        let val: string | undefined | typeof PROMPT_CANCELLED = opts.inputs?.[v];
         if (val === undefined) val = await opts.resolveInput?.(v, inputMetaOf(d, secret, validate));
+        if (val === PROMPT_CANCELLED) {
+          res.cancelled = v;
+          break;
+        }
         if (val === undefined) {
           res.deferred.push(v);
           continue;

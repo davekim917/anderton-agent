@@ -2,7 +2,7 @@ import fs from 'node:fs';
 
 import { describe, expect, it } from 'vitest';
 
-import { classifyPingResult, describePingFailure } from './agent-ping.js';
+import { classifyPingResult, describePingFailure, setupClosing } from './agent-ping.js';
 
 describe('classifyPingResult', () => {
   it('treats a normal text reply as ok', () => {
@@ -66,5 +66,23 @@ describe('describePingFailure', () => {
     expect(headline).toMatch(/no credentials/i);
     expect(headline).not.toMatch(/in time/);
     expect(note).toMatch(/sign in to your provider/i);
+  });
+});
+
+describe('setupClosing', () => {
+  it('does not call setup ready when the ping failed, and points at the fix already shown', () => {
+    for (const failure of ['auth_error', 'no_reply', 'socket_error', 'agent_error'] as const) {
+      for (const dmTarget of [null, 'Telegram']) {
+        const { ready, text } = setupClosing(failure, dmTarget);
+        expect(ready).toBe(false);
+        expect(text).not.toMatch(/ready|you're set/i);
+        expect(text).toContain(describePingFailure(failure).headline);
+      }
+    }
+  });
+
+  it('keeps the ready line when the ping answered or never ran', () => {
+    expect(setupClosing('ok', null)).toEqual({ ready: true, text: "You're ready! Chat with `pnpm run chat hi`." });
+    expect(setupClosing(undefined, 'Telegram')).toEqual({ ready: true, text: "You're set." });
   });
 });

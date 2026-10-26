@@ -22,7 +22,7 @@ import * as p from '@clack/prompts';
 
 import { firstFailureHint, fullyApplied, hasBlockingFailure } from '../../scripts/skill-apply.js';
 import * as setupLog from '../logs.js';
-import { BACK_TO_CHANNEL_SELECTION, backGate, type ChannelFlowResult } from '../lib/back-nav.js';
+import { BACK_TO_CHANNEL_SELECTION, CHANNEL_SKIPPED, backGate, type ChannelFlowResult } from '../lib/back-nav.js';
 import { askOperatorRole, type OperatorRole } from '../lib/role-prompt.js';
 import { ensureAnswer, fail, runQuietChild } from '../lib/runner.js';
 import { runSkill, type RunSkillOptions } from '../lib/skill-driver.js';
@@ -117,8 +117,8 @@ export async function runChannelSkill(
   // First-prompt back gate — the very first thing, before any side effect
   // (agent-name/role prompts, the skill run, the wire).
   // Opt-in via offerBack so headless callers + existing tests are unaffected.
+  const label = channel.charAt(0).toUpperCase() + channel.slice(1);
   if (overrides.offerBack) {
-    const label = channel.charAt(0).toUpperCase() + channel.slice(1);
     const gate = await (overrides.backGate ?? backGate)(label);
     if (gate === BACK_TO_CHANNEL_SELECTION) return BACK_TO_CHANNEL_SELECTION;
   }
@@ -137,6 +137,7 @@ export async function runChannelSkill(
   const res = await runSkill(`.claude/skills/add-${channel}`, {
     projectRoot,
     exec: overrides.exec,
+    execStream: overrides.execStream,
     resolveInput: overrides.resolveInput,
     resolveRemote: overrides.resolveRemote,
     // The already-resolved agent name is pre-supplied so a skill that consumes
@@ -158,6 +159,10 @@ export async function runChannelSkill(
     channel: overrides.channel ?? channel,
     step: overrides.step ?? `${channel}-install`,
   });
+  if (res.cancelled) {
+    p.log.info(`Skipped ${label}. Add it later with \`/add-${channel}\` in Claude Code, or re-run setup.`);
+    return CHANNEL_SKIPPED;
+  }
   if (!fullyApplied(res)) {
     if (res.deferred.length) p.log.warn(`Still needs: ${res.deferred.join(', ')}`);
     // A bounced reason can carry a full stderr dump (a Node stacktrace). The

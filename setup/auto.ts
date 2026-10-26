@@ -33,14 +33,16 @@ import path from 'path';
 import * as p from '@clack/prompts';
 import k from 'kleur';
 
-import { BACK_TO_CHANNEL_SELECTION } from './lib/back-nav.js';
+import { BACK_TO_CHANNEL_SELECTION, CHANNEL_SKIPPED, type ChannelFlowResult } from './lib/back-nav.js';
 import { runChannelSkill } from './channels/run-channel-skill.js';
-import { describePingFailure, pingCliAgent, type PingResult } from './lib/agent-ping.js';
+import { describePingFailure, pingCliAgent, setupClosing, type PingResult } from './lib/agent-ping.js';
 import { getSetupProvider, listSetupProviders } from './providers/registry.js';
 import { applyProviderSkill } from './providers/install.js';
 // Provider payloads self-register their picker entry + auth on import.
 import './providers/index.js';
 import { brightSelect } from './lib/bright-select.js';
+import { currentUserName } from './lib/current-user.js';
+import { lingerWarning } from './lib/linger.js';
 import { offerClaudeOnFailure } from './lib/claude-handoff.js';
 import { setPickedProvider } from './lib/picked-provider.js';
 import { upsertEnvVar } from './set-env.js';
@@ -470,6 +472,8 @@ async function main(): Promise<void> {
     if (res.terminal?.fields.DOCKER_SOCKET_ACL === 'true') {
       p.log.info(brandBody('Docker access is granted for now. Reboot once when convenient so it survives a Docker restart.'));
     }
+    const linger = lingerWarning(res.terminal?.fields ?? {}, currentUserName());
+    if (linger) p.log.warn(brandBody(linger));
   }
 
   let displayName: string | undefined;
@@ -487,6 +491,7 @@ async function main(): Promise<void> {
     if (!ok) p.log.warn(brandBody(`Couldn't remove a test agent left by an earlier setup run. See ${rawLog} for details.`));
   }
 
+  let ping: PingResult | undefined;
   if (!skip.has('cli-agent') && detectRegisteredGroups(process.cwd())) {
     skip.add('cli-agent');
     skip.add('first-chat');
@@ -518,7 +523,7 @@ async function main(): Promise<void> {
           ),
         ),
       );
-      const ping = await confirmAssistantResponds();
+      ping = await confirmAssistantResponds();
       if (ping === 'ok') {
         phEmit('first_chat_ready');
         const { ok: cleanedUp, rawLog: cleanupRawLog } = await deletePingAgent(PING_TEST_FOLDER);
@@ -593,7 +598,7 @@ async function main(): Promise<void> {
       if (channelChoice !== 'skip' && channelChoice !== 'other') {
         await resolveDisplayName();
       }
-      let result: void | typeof BACK_TO_CHANNEL_SELECTION = undefined;
+      let result: ChannelFlowResult = undefined;
       if (channelChoice === 'telegram') {
         result = await runChannelSkill('telegram', displayName!, { offerBack: true });
       } else if (channelChoice === 'discord') {
@@ -624,6 +629,7 @@ async function main(): Promise<void> {
         );
       }
       if (result === BACK_TO_CHANNEL_SELECTION) backed = true;
+      if (result === CHANNEL_SKIPPED) channelChoice = 'skip';
     }
   }
 
@@ -713,6 +719,7 @@ async function main(): Promise<void> {
   phEmit('setup_completed', { duration_ms: Date.now() - RUN_START });
 
   const dmTarget = channelDmLabel(channelChoice);
+  const closing = setupClosing(ping, dmTarget);
   if (wiringPending) {
     // No welcome DM exists yet — the one remaining action is the last thing
     // on screen, in the same bright framed style as the "go say hi" banner.
@@ -721,15 +728,17 @@ async function main(): Promise<void> {
       "What's left",
     );
     p.outro(k.green("You're set — one DM to go."));
-  } else if (dmTarget) {
+  } else if (!closing.ready) {
+    p.outro(k.yellow(closing.text));
+  } else {
     // Bright framed banner (not dim) — the whole point of the feedback was
     // that the welcome-message signal was too easy to miss. Use p.note so it
     // renders with a visible box, cyan-bold the directive line, and put it
     // as the last thing before outro.
-    note(`${brandBold('→')} ${k.bold(`Check your ${dmTarget} — your assistant is saying hi.`)}`, 'Go say hi');
-    p.outro(k.green("You're set."));
-  } else {
-    p.outro(k.green("You're ready! Chat with `pnpm run chat hi`."));
+    if (dmTarget) {
+      note(`${brandBold('→')} ${k.bold(`Check your ${dmTarget} — your assistant is saying hi.`)}`, 'Go say hi');
+    }
+    p.outro(k.green(closing.text));
   }
 }
 

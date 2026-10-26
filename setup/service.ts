@@ -14,6 +14,7 @@ import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
 import { writeUpgradeState } from '../src/upgrade-state.js';
 import { cleanupUnhealthyPeers } from './peer-cleanup.js';
 import { commandExists, getPlatform, getNodePath, getServiceManager, isRoot } from './platform.js';
+import { currentUserName } from './lib/current-user.js';
 import { grantDockerSocketAccess } from './lib/docker-socket-access.js';
 import {
   hostLogPaths,
@@ -25,6 +26,7 @@ import {
   waitForHostStart,
   type HostStart,
 } from './lib/host-start.js';
+import { enableLinger } from './lib/linger.js';
 import { emitStatus } from './status.js';
 
 export async function run(_args: string[]): Promise<void> {
@@ -482,14 +484,9 @@ async function setupSystemd(projectRoot: string, nodePath: string, homeDir: stri
 
   // Enable lingering so the user service survives SSH logout.
   // Without linger, systemd terminates all user processes when the last session closes.
-  if (!runningAsRoot) {
-    try {
-      execSync('loginctl enable-linger', { stdio: 'ignore' });
-      log.info('Enabled loginctl linger for current user');
-    } catch (err) {
-      log.warn('loginctl enable-linger failed — service may stop on SSH logout', { err });
-    }
-  }
+  const lingerEnabled = !runningAsRoot && enableLinger(currentUserName());
+  if (lingerEnabled) log.info('Linger is on for the current user');
+  else if (!runningAsRoot) log.warn('Could not enable linger — service will stop on SSH logout');
 
   // Enable and start
   try {
@@ -542,7 +539,7 @@ async function setupSystemd(projectRoot: string, nodePath: string, homeDir: stri
     HOST_START: hostStart,
     ...(dockerGroupStale ? { DOCKER_GROUP_STALE: true } : {}),
     ...(dockerSocketAcl ? { DOCKER_SOCKET_ACL: true } : {}),
-    LINGER_ENABLED: !runningAsRoot,
+    LINGER_ENABLED: lingerEnabled,
     ...loadedStatus(serviceLoaded),
     LOG: 'logs/setup.log',
   });

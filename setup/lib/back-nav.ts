@@ -17,7 +17,10 @@ import { ensureAnswer } from './runner.js';
 
 export const BACK_TO_CHANNEL_SELECTION = Symbol('BACK_TO_CHANNEL_SELECTION');
 
-export type ChannelFlowResult = void | typeof BACK_TO_CHANNEL_SELECTION;
+/** The operator cancelled a credential prompt: the channel was left out, and setup carries on without it. */
+export const CHANNEL_SKIPPED = Symbol('CHANNEL_SKIPPED');
+
+export type ChannelFlowResult = void | typeof BACK_TO_CHANNEL_SELECTION | typeof CHANNEL_SKIPPED;
 
 /**
  * The shared first-prompt back gate. Rendered as the very first interactive

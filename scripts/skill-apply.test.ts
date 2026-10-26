@@ -11,6 +11,7 @@ import {
   firstFailureHint,
   referenceProse,
   stepLabel,
+  PROMPT_CANCELLED,
   type ApplyEvent,
   type InputMeta,
 } from './skill-apply.js';
@@ -109,6 +110,14 @@ describe('apply engine lifecycle', () => {
     expect(res.deferred).toContain('token'); // prompt deferred
     expect(res.deferred.some((d) => /unresolved \{\{token\}\}/.test(d))).toBe(true); // env-set blocked on it
     expect(readFileSync(join(root, '.env'), 'utf8')).not.toContain('DEMO_TOKEN');
+  });
+
+  it('stops at a cancelled prompt: nothing after it runs, and the result is not fully applied', async () => {
+    const res = await applySkill(skillDir, root, { resolveInput: async () => PROMPT_CANCELLED, exec: () => {} });
+    expect(res.cancelled).toBe('token');
+    expect(res.deferred).toEqual([]);
+    expect(res.agentTasks).toEqual([]); // the patch-scheduler step after the prompt never ran
+    expect(fullyApplied(res)).toBe(false);
   });
 
   it('plan marks the unknown step ↳agent and the prompt ? needs-input before any write', () => {
