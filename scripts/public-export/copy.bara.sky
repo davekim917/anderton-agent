@@ -89,6 +89,10 @@ PRODUCT_FILES = glob(
         "scripts/boundary-hooks.test.ts",
         "scripts/pre-push.test.ts",
         "scripts/setup-typecheck-gates.test.ts",
+        # Voice calls reach their voice service through an unpublished endpoint; public-overlay/ ships a stub that
+        # reports the feature unavailable, and the feature's doc stays private with it.
+        "src/modules/voice-call/live.ts",
+        "docs/voice-call.md",
         # This install's fleet MCP defaults; public-overlay/ ships an empty set in their place.
         "src/fleet-mcp-default-servers.ts",
         "src/fleet-mcp-default-servers.test.ts",
