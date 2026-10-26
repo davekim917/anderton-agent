@@ -18,6 +18,7 @@ import { readPluginDenySiblings, type AgentRuntime } from '../src/plugin-skill-d
 import { findCodexSkillsRoot, materializeSymlinkedSkills } from '../src/codex-skill-materialize.js';
 import { openCodeMirrorSkills, syncOpenCodePluginSkills } from '../src/opencode-sync.js';
 import { readContainerConfig, updateContainerConfig } from '../src/container-config.js';
+import { ensureCodexPluginHooks } from './plugin-hook-delivery.js';
 import { GROUPS_DIR } from '../src/config.js';
 
 const PLUGINS_ROOT = path.join(os.homedir(), 'plugins');
@@ -35,6 +36,9 @@ interface Classification {
   codexRegisterable: boolean;
   portableSkills: string[];
   sessionStartHook: boolean;
+  codexHookEvents: string[];
+  codexHooksGenerated: boolean;
+  codexHooksReason: string | null;
   hasAlwaysOnFile: boolean;
   alwaysOnIsStub: boolean;
   hasOwnRuleset: boolean;
@@ -454,6 +458,10 @@ async function main(): Promise<void> {
       }
     : resolveCodexRegistration(dir, name, dryRun);
 
+  const codexHooks = deny.has('codex')
+    ? { events: [], generated: false, reason: 'denied for Codex' }
+    : ensureCodexPluginHooks(dir, dryRun);
+
   const portableSkills = openCodeMirrorSkills(PLUGINS_ROOT)
     .filter((s) => s.plugin === name)
     .map((s) => s.name);
@@ -487,6 +495,9 @@ async function main(): Promise<void> {
     codexRegisterable: codexReg.registerable,
     portableSkills,
     sessionStartHook: detectSessionStartHook(dir),
+    codexHookEvents: codexHooks.events,
+    codexHooksGenerated: codexHooks.generated,
+    codexHooksReason: codexHooks.reason,
     hasAlwaysOnFile,
     alwaysOnIsStub,
     hasOwnRuleset,
@@ -529,6 +540,9 @@ async function main(): Promise<void> {
     `  portable skills:   ${portableSkills.length}${portableSkills.length ? ` (${portableSkills.join(', ')})` : ''}`,
   );
   console.log(`  skills mirrored:   opencode +${opencodeCreated}`);
+  console.log(
+    `  Codex hooks:       ${codexHooks.events.length ? codexHooks.events.join(', ') : 'none'}${codexHooks.generated ? ' (generated)' : ''}${codexHooks.reason ? ` — ${codexHooks.reason}` : ''}`,
+  );
   console.log(
     `  always-on plugin:  ${classification.sessionStartHook ? 'yes (has SessionStart hook)' : 'no (skills-only)'}`,
   );

@@ -13,6 +13,15 @@ Codex/OpenCode. Hook delivery is **conditional, and the condition is the manifes
 Claude always fires a plugin's SessionStart hook, Codex fires it only for a plugin it
 can register — one shipping `.codex-plugin/plugin.json` that declares a hook — and
 OpenCode has no plugin loader, so no hook path at all.
+A plugin that ships Codex hooks only as a per-project install template (`.codex/hooks.json`,
+impeccable's layout) is made registerable: only when a container would trust none of the
+plugin's own hooks (so nothing can be shadowed or run twice), and the template runs the same
+command as the plugin's published Claude hook for an event, the enabler rebases that command onto
+`${PLUGIN_ROOT}` in `.codex-plugin/nanoclaw-codex-hooks.json` and links it from a Codex
+manifest NanoClaw generated (never one the plugin's repo tracks). `Codex hooks:` in the summary
+is what the agent-runner's own registration and trust code reports (run through Bun), so
+`bun` must be on PATH; without it the enabler stops before writing or retiring any Codex hook
+file (manifests generated earlier in the same run stay, and a re-run is idempotent).
 The one OpenCode exception is a module the runner itself lists in the OpenCode config's
 `plugin` array: the destructive guard and bootstrap's comment-rule feedback
 (`commentRulePlugins` in `container/agent-runner/src/providers/opencode.ts`).
