@@ -481,6 +481,31 @@ export async function resolveSpawnSecrets(
 }
 
 /**
+ * Declarations that inject on the same host as another declaration, grouped by host. The gateway applies every
+ * matching grant over rows it reads in no defined order, so two such grants resolve arbitrarily.
+ */
+export async function sharedHostSecrets(declarations: string[]): Promise<Array<{ host: string; secrets: string[] }>> {
+  if (declarations.length < 2) return [];
+  const first = await loadSecrets(false);
+  let rows = first.secrets;
+  if (first.fromCache && declarations.some((declaration) => findSecretRow(rows, declaration) === undefined)) {
+    rows = (await loadSecrets(true)).secrets;
+  }
+  const byHost = new Map<string, Map<string, string>>();
+  for (const declaration of declarations) {
+    const row = findSecretRow(rows, declaration);
+    const host = row?.hostPattern?.trim().toLowerCase();
+    if (!row || !host) continue;
+    const secrets = byHost.get(host) ?? new Map<string, string>();
+    if (!secrets.has(row.id)) secrets.set(row.id, declaration);
+    byHost.set(host, secrets);
+  }
+  return [...byHost]
+    .filter(([, secrets]) => secrets.size > 1)
+    .map(([host, secrets]) => ({ host, secrets: [...secrets.values()] }));
+}
+
+/**
  * The OneCLI secrets granting Slack USER-token access (the owner's DMs), withheld from sessions that are not
  * owner-safe (`isOwnerSafeSlackSession`). `explicitNames` is authoritative when given (case-insensitive
  * intersection); otherwise names containing both "slack" and "user", which excludes bot tokens. Returns names as

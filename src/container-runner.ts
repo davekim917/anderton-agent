@@ -128,6 +128,7 @@ import { stopTypingRefresh } from './modules/typing/index.js';
 import { copySecretFile, DBT_CONTAINER_DIR, stageDbtProfiles } from './credential-stage.js';
 import { log } from './log.js';
 import { applyOnecliContainerConfig, describeDiagnosis } from './onecli-apply.js';
+import { previewProxyEnv } from './modules/preview/preview-identity.js';
 import {
   applyOnecliSecrets,
   ensureOnecliAgent,
@@ -5354,6 +5355,17 @@ async function buildContainerArgs(
       attempts: applyResult.attempts,
       durationsMs: applyResult.durationsMs,
     });
+
+    if (agentIdentifier) {
+      args.push(
+        ...(await previewProxyEnv({
+          agentIdentifier,
+          groupName: agentGroup.name,
+          declarations: containerConfig.previewOnecliSecrets,
+          getContainerConfig: (options) => onecli.getContainerConfig(options),
+        })),
+      );
+    }
 
     // Point tools that check their own CA var at the combined bundle so they trust OneCLI's MITM CA.
     args.push('-e', 'REQUESTS_CA_BUNDLE=/tmp/onecli-combined-ca.pem');

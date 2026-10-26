@@ -40,6 +40,14 @@ code changes; start the backend with a clean environment, because the agent's ow
 calls through the credential proxy and an inherited one would let anyone with the link drive real, credentialed
 calls.
 
+A group whose `container.json` declares `previewOnecliSecrets` (test-mode keys only) gets a second gateway identity,
+`<group>-preview`, granted exactly that list, and its containers receive `PREVIEW_HTTPS_PROXY`, the proxy address for
+that identity. The skill hands that address to the backend, so payments, maps, email and push can run for real in test
+mode while the agent's own live keys stay out of reach. Two declared secrets that inject on the same host are refused
+(the gateway would pick between them arbitrarily, so a live key could ride along). A declaration the gateway cannot
+apply leaves backends stubbed and logs a warning; it never refuses the agent's spawn
+(`src/modules/preview/preview-identity.ts`).
+
 ## What the app must do
 
 - Listen on `127.0.0.1`, not `localhost`: Node can resolve `localhost` to `::1` only, which the bridge does not reach.

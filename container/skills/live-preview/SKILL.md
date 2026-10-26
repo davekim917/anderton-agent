@@ -50,11 +50,27 @@ data stores in this order:
 `env -i HOME="$HOME" PATH="$PATH" NODE_ENV=development <repo vars> <start command>`. Your own
 environment routes outbound calls through a proxy that adds this group's real credentials; a
 backend that inherits it would call real services with them, triggered by anyone holding the
-link. With a clean environment, set each outside service (payments, email, push, AI APIs) to
-the repo's stub or off mode. A service with no such mode stays unconfigured; say that feature
-won't work in the preview. If the backend refuses to boot without a real credential, stop and
-ask; don't pass one in. Turn off schedulers, automations and other outbound side effects too,
-and check that their switch is actually off: some default to on when unset.
+link. Never pass your own proxy settings or a real credential to the backend; if it refuses to
+boot without one, stop and ask.
+
+**Test-mode services.** If `$PREVIEW_HTTPS_PROXY` is set, this group has a separate preview
+identity holding only test-mode keys. Give the backend that proxy instead, in the clean
+environment: `HTTPS_PROXY="$PREVIEW_HTTPS_PROXY" HTTP_PROXY="$PREVIEW_HTTPS_PROXY"
+NODE_USE_ENV_PROXY=1 NODE_EXTRA_CA_CERTS=/tmp/onecli-combined-ca.pem
+SSL_CERT_FILE=/tmp/onecli-combined-ca.pem`, and no `NO_PROXY` for those services' hosts. The
+proxy adds each key to requests for its host, so set the repo's key variables to placeholders
+in the format its code expects (e.g. `sk_test_placeholder`). The proxy address carries a token:
+never print, post or commit it.
+
+Then check each service really goes through it: make one call (a Stripe test-mode request, a
+Places lookup) and confirm a real test-mode response, since some SDKs ignore proxy variables.
+Email and push go only to the team: use the repo's allowlist or redirect mode. A service with no
+preview key stays in its stub or off mode; say that feature won't work in the preview. Inbound
+webhooks need their endpoint registered to this preview's URL, and tools that stream events
+over WebSockets (e.g. `stripe listen`) don't work through the proxy.
+
+Turn off schedulers, automations and other outbound side effects, and check that their switch
+is actually off: some default to on when unset.
 
 Bind the backend and the data stores to `127.0.0.1`; many backends listen on every interface by
 default, which other containers could reach. Never load a seed, dump or fixture that holds real

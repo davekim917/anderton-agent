@@ -557,6 +557,12 @@ export interface ContainerConfig {
    */
   onecliSecrets?: string[];
 
+  /**
+   * OneCLI secret names or UUIDs granted to `<group>-preview`, the identity a live preview's backend calls out
+   * through (test-mode keys only). Absent/empty: no preview identity, backends run their services stubbed.
+   */
+  previewOnecliSecrets?: string[];
+
   /** Host env var holding this group's GitHub token; default `GITHUB_TOKEN_<FOLDER_UPPER>`, then `GITHUB_TOKEN`. */
   githubTokenEnv?: string;
 
@@ -859,6 +865,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     backlogCanvas: raw.backlogCanvas,
     observatory: raw.observatory,
     onecliSecrets: raw.onecliSecrets,
+    previewOnecliSecrets: raw.previewOnecliSecrets,
     workgroup_id: raw.workgroup_id,
     slack_user_token: raw.slack_user_token,
   };
