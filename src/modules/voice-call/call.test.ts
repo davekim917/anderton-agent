@@ -17,7 +17,7 @@ interface Harness {
   written: Promise<void>;
 }
 
-async function connect(): Promise<Harness> {
+async function connect(recent: FeedEvent[] = []): Promise<Harness> {
   const h = {
     appended: [],
     injected: [],
@@ -41,7 +41,7 @@ async function connect(): Promise<Harness> {
     },
     feed: (onEvent) => {
       h.agent = onEvent;
-      return { close: () => undefined };
+      return { recent, close: () => undefined };
     },
     inject: (text, wake) => {
       h.injected.push({ text, wake });
@@ -95,7 +95,7 @@ describe('VoiceCallBridge', () => {
         },
         feed: (onEvent) => {
           agent = onEvent;
-          return { close: () => undefined };
+          return { recent: [], close: () => undefined };
         },
         inject: () => ({ id: 'm1', written: Promise.resolve() }),
         mirror: () => undefined,
@@ -105,15 +105,20 @@ describe('VoiceCallBridge', () => {
     );
     const started = bridge.start('v=0 offer');
     agent({ type: 'reply', text: 'first', inReplyTo: null });
-    agent({ type: 'reply', text: 'second', inReplyTo: null });
+    agent({ type: 'inbound', sender: 'Sam Roe', text: 'second' });
     release();
     await started;
     agent({ type: 'reply', text: 'third', inReplyTo: null });
     expect(h.appended.map((a) => a.text)).toEqual([
       'Atlas posted in the thread: first',
-      'Atlas posted in the thread: second',
+      'In the thread, Sam Roe: second',
       'Atlas posted in the thread: third',
     ]);
+  });
+
+  it('gives the voice the recent thread as opening context', async () => {
+    const h = await connect([{ type: 'inbound', sender: 'Sam Roe', text: 'deploy is red' }]);
+    expect(h.instructions).toContain('Sam Roe: deploy is red');
   });
 
   it('sends a delegated request with what was said, and mirrors it into the thread', async () => {
@@ -144,17 +149,21 @@ describe('VoiceCallBridge', () => {
     h.live({ type: 'delegation', id: 'd2', text: 'Rotate the deploy key.' });
     await new Promise((r) => setTimeout(r, 0));
     expect(h.mirrored.filter((m) => m.startsWith('🎙️'))).toEqual([]);
-    expect(h.appended.map((a) => a.text)).toContain('That request did not reach Atlas. Ask the caller to try again.');
+    expect(h.appended.map((a) => a.text)).toContain(
+      'That request may not have reached Atlas. Ask the caller to check the thread before asking again.',
+    );
   });
 
-  it('ties the agent’s replies to the request they answer, then releases it at turn end', async () => {
+  it('ties the agent’s progress and replies to the request they answer, then releases it at turn end', async () => {
     const h = await connect();
     h.live({ type: 'delegation', id: 'd1', text: 'Check the tests.' });
+    h.agent({ type: 'progress', text: '🔧 Running vitest', inReplyTo: 'm1' });
     h.agent({ type: 'reply', text: 'Two tests fail.', inReplyTo: 'm1' });
     h.agent({ type: 'turn-end' });
     h.agent({ type: 'reply', text: 'Also, the nightly is green.', inReplyTo: 'other-message' });
 
     expect(h.appended).toEqual([
+      { text: '🔧 Running vitest', channel: 'commentary', delegationId: 'd1' },
       { text: 'Two tests fail.', channel: 'speakable', delegationId: 'd1' },
       {
         text: 'Atlas posted in the thread: Also, the nightly is green.',
@@ -172,15 +181,59 @@ describe('VoiceCallBridge', () => {
     expect(h.appended).toEqual([{ text: 'Two tests fail.', channel: 'speakable', delegationId: 'd1' }]);
   });
 
-  it('answers the request a reply names, even while an earlier one is still being answered', async () => {
+  it('drops progress polled after its turn ended, so it cannot revive the request or claim a later reply', async () => {
+    const h = await connect();
+    h.live({ type: 'delegation', id: 'd1', text: 'Check the tests.' });
+    h.agent({ type: 'reply', text: 'Two tests fail.', inReplyTo: 'm1' });
+    h.agent({ type: 'turn-end' });
+    h.agent({ type: 'progress', text: '🔧 Running vitest', inReplyTo: 'm1' });
+    h.agent({ type: 'reply', text: 'Lint is clean.', inReplyTo: 'typed-7' });
+    expect(h.appended).toEqual([
+      { text: 'Two tests fail.', channel: 'speakable', delegationId: 'd1' },
+      { text: 'Atlas posted in the thread: Lint is clean.', channel: 'speakable', delegationId: undefined },
+    ]);
+  });
+
+  it('never gives a finished request’s late progress or reply to the request now active', async () => {
+    const h = await connect();
+    h.live({ type: 'delegation', id: 'd1', text: 'Check the tests.' });
+    h.live({ type: 'delegation', id: 'd2', text: 'Then check lint.' });
+    h.agent({ type: 'reply', text: 'Two tests fail.', inReplyTo: 'm1' });
+    h.agent({ type: 'turn-end' });
+    h.agent({ type: 'reply', text: 'Looking at lint now.', inReplyTo: 'm2' });
+    h.agent({ type: 'progress', text: '🔧 Re-running the failing tests', inReplyTo: 'm1' });
+    h.agent({ type: 'reply', text: 'Correction: three tests fail.', inReplyTo: 'm1' });
+    expect(h.appended.map((a) => [a.text, a.delegationId])).toEqual([
+      ['Two tests fail.', 'd1'],
+      ['Looking at lint now.', 'd2'],
+      ['Atlas posted in the thread: Correction: three tests fail.', undefined],
+    ]);
+  });
+
+  it('keeps a request open when its progress arrives before the previous turn’s end', async () => {
+    const h = await connect();
+    h.live({ type: 'delegation', id: 'd1', text: 'Check the tests.' });
+    h.live({ type: 'delegation', id: 'd2', text: 'Then check lint.' });
+    h.agent({ type: 'reply', text: 'Two tests fail.', inReplyTo: 'm1' });
+    h.agent({ type: 'progress', text: '🔧 Running eslint', inReplyTo: 'm2' });
+    h.agent({ type: 'turn-end' });
+    h.agent({ type: 'reply', text: 'Lint is clean.', inReplyTo: 'm2' });
+    expect(h.appended.map((a) => [a.text, a.delegationId])).toEqual([
+      ['Two tests fail.', 'd1'],
+      ['🔧 Running eslint', 'd2'],
+      ['Lint is clean.', 'd2'],
+    ]);
+  });
+
+  it('answers the request a reply names, even while an earlier one is in progress', async () => {
     const h = await connect();
     h.live({ type: 'delegation', id: 'd1', text: 'Check the tests.' });
     h.live({ type: 'delegation', id: 'd2', text: 'Also check lint.' });
-    h.agent({ type: 'reply', text: 'Tests are running.', inReplyTo: 'm1' });
+    h.agent({ type: 'progress', text: 'tests running', inReplyTo: 'm1' });
     h.agent({ type: 'reply', text: 'Lint is clean.', inReplyTo: 'm2' });
     h.agent({ type: 'reply', text: 'Tests pass too.', inReplyTo: 'unknown' });
     expect(h.appended.map((a) => [a.text, a.delegationId])).toEqual([
-      ['Tests are running.', 'd1'],
+      ['tests running', 'd1'],
       ['Lint is clean.', 'd2'],
       ['Tests pass too.', 'd2'],
     ]);
@@ -194,6 +247,16 @@ describe('VoiceCallBridge', () => {
       h.agent({ type: 'turn-end' });
     }
     expect(h.injected).toHaveLength(9);
+  });
+
+  it('passes what others write in the thread as labelled background, never as a request', async () => {
+    const h = await connect();
+    h.agent({ type: 'inbound', sender: 'Sam Roe', text: 'is the backfill done?' });
+    h.agent({ type: 'progress', text: 'not tied to the call', inReplyTo: 'other-message' });
+    expect(h.appended).toEqual([
+      { text: 'In the thread, Sam Roe: is the backfill done?', channel: 'commentary', delegationId: undefined },
+    ]);
+    expect(h.injected).toEqual([]);
   });
 
   it('on hang-up, wakes the agent with what was said after the last request', async () => {

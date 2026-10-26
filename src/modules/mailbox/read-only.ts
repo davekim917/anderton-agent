@@ -34,15 +34,18 @@ import {
   latestInboundMessageId,
   latestReplyTimestampByTrigger,
   listDuplicateLiveTaskSeriesIds,
+  listInboundFeed,
   listInboundTail,
   listLatestRecurringSeriesRows,
   listLiveOneOffTaskRows,
   listLiveTaskRows,
   listLiveTaskRowsForSeries,
+  listOutboundFeed,
   listOutboundTail,
   listProcessingClaimedMessageIds,
   listRecentTaskFires,
   listTurnUsageSince,
+  type MessageFeedRow,
   type MessageTailRow,
   type ScheduledTaskRow,
   type SessionTurnUsageRow,
@@ -102,6 +105,7 @@ export interface InboundSessionRead {
   hasPendingRecurrence(): boolean;
   hasTriggeredInboundRow(): boolean;
   listInboundTail(limit: number): MessageTailRow[];
+  listInboundFeed(afterSeq: number | null, limit: number): MessageFeedRow[];
   countLiveSeriesRows(seriesId: string): number;
   getLatestTaskRoutingStamp(seriesId: string): TaskRoutingStamp | null;
   getLatestTaskDeliveryRoute(): TaskDeliveryRoute | null;
@@ -115,6 +119,7 @@ export interface OutboundSessionRead {
   latestReplyTimestampByTrigger(): Map<string, string>;
   listTurnUsageSince(afterId: number): SessionTurnUsageRow[];
   listOutboundTail(limit: number): MessageTailRow[];
+  listOutboundFeed(afterSeq: number | null, limit: number): MessageFeedRow[];
 }
 
 /**
@@ -196,6 +201,7 @@ export function readSessionInbound<T>(
       hasPendingRecurrence: () => hasPendingRecurrence(db),
       hasTriggeredInboundRow: () => hasTriggeredInboundRow(db),
       listInboundTail: (limit) => listInboundTail(db, limit),
+      listInboundFeed: (afterSeq, limit) => listInboundFeed(db, afterSeq, limit),
       countLiveSeriesRows: (seriesId) => countLiveSeriesRows(db, seriesId),
       getLatestTaskRoutingStamp: (seriesId) => getLatestTaskRoutingStamp(db, seriesId),
       getLatestTaskDeliveryRoute: () => getLatestTaskDeliveryRoute(db),
@@ -223,6 +229,7 @@ export function readSessionOutbound<T>(
       latestReplyTimestampByTrigger: () => latestReplyTimestampByTrigger(db),
       listTurnUsageSince: (afterId) => listTurnUsageSince(db, afterId),
       listOutboundTail: (limit) => listOutboundTail(db, limit),
+      listOutboundFeed: (afterSeq, limit) => listOutboundFeed(db, afterSeq, limit),
     });
   } finally {
     db.close();

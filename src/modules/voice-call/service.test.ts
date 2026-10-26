@@ -10,6 +10,7 @@ const { h } = vi.hoisted(() => ({
     writes: [] as Array<{ sessionId: string; content: string; trigger: number; threadId: string | null }>,
     liveClosed: 0,
     sessionLookupFails: false,
+    wakeFails: false,
     liveGate: null as Promise<void> | null,
     liveEvent: null as ((event: { type: 'delegation'; id: string; text: string }) => void) | null,
   },
@@ -94,7 +95,12 @@ vi.mock('../../session-manager.js', async (orig) => {
     },
   };
 });
-vi.mock('../../request-wake.js', () => ({ requestWake: async () => true }));
+vi.mock('../../request-wake.js', () => ({
+  requestWake: async () => {
+    if (h.wakeFails) throw new Error('container runtime busy');
+    return true;
+  },
+}));
 vi.mock('./session-feed.js', async (orig) => ({
   ...(await orig<typeof import('./session-feed.js')>()),
   followSessionFeed: () => ({ recent: [], close: () => undefined }),
@@ -170,6 +176,7 @@ beforeEach(async () => {
   h.writes = [];
   h.liveClosed = 0;
   h.sessionLookupFails = false;
+  h.wakeFails = false;
   h.liveGate = null;
   h.liveEvent = null;
   server = http.createServer((req, res) => {
@@ -453,5 +460,17 @@ describe('a claimed call', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('counts a request as delivered once written, even when waking the container fails', async () => {
+    const call = await claim();
+    svc.connectVoiceAudio(call);
+    h.wakeFails = true;
+    h.liveEvent!({ type: 'delegation', id: 'd1', text: 'Check the nightly run.' });
+    await vi.waitFor(() =>
+      expect(h.deliveries.some((d) => d.text.includes('(voice): Check the nightly run.'))).toBe(true),
+    );
+    expect(h.writes.some((w) => w.content.includes('Check the nightly run.'))).toBe(true);
+    expect(svc.getVoiceCall(call.id)?.state).toBe('live');
   });
 });

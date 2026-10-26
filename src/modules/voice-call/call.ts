@@ -1,7 +1,7 @@
 import { log } from '../../log.js';
 import type { ContextChannel, LiveCall, LiveEvent } from './live.js';
 import { greeting, voiceCallEndedText, voiceInstructions, voiceRequestText } from './prompts.js';
-import type { FeedEvent, SessionFeed } from './session-feed.js';
+import { startupContext, type FeedEvent, type SessionFeed } from './session-feed.js';
 
 const OUTPUT_LIMIT_BYTES = 4000;
 const SPOKEN_TRANSCRIPT_LIMIT = 8 * 1024;
@@ -72,6 +72,12 @@ export class VoiceCallBridge {
   /** The session message each request became, to the delegation it answers. */
   private requests = new Map<string, string>();
   private active: string | null = null;
+  /**
+   * Requests answered by a reply in the current turn, and requests whose turn has ended. Only replies retire a request:
+   * they arrive in delivery's order with the turn end, while progress is polled on its own clock and can run ahead.
+   */
+  private inTurn = new Set<string>();
+  private done = new Set<string>();
   private beforeLive: Array<[string, ContextChannel, string | undefined]> = [];
   private sentAny = false;
   private connected = false;
@@ -85,7 +91,9 @@ export class VoiceCallBridge {
 
   async start(offer: string): Promise<string> {
     this.feed = this.ports.feed((event) => this.onFeed(event));
-    const instructions = voiceInstructions(this.party.agentName, this.party.callerName);
+    const context = startupContext(this.feed.recent, this.party.agentName);
+    const instructions =
+      voiceInstructions(this.party.agentName, this.party.callerName) + (context ? `\n\n${context}` : '');
     try {
       this.live = await this.ports.openLive({ offer, instructions, onEvent: (event) => this.onLive(event) });
     } catch (err) {
@@ -149,9 +157,9 @@ export class VoiceCallBridge {
         if (request.trim()) this.ports.mirror(`🎙️ *${this.party.callerName}* (voice): ${request.trim()}`);
       },
       (err: unknown) => {
-        log.warn('Voice call: request did not reach the session', { err });
+        log.warn('Voice call: request may not have reached the session', { err });
         this.context(
-          `That request did not reach ${this.party.agentName}. Ask the caller to try again.`,
+          `That request may not have reached ${this.party.agentName}. Ask the caller to check the thread before asking again.`,
           'speakable',
           id,
         );
@@ -159,22 +167,39 @@ export class VoiceCallBridge {
     );
   }
 
-  private answering(inReplyTo: string | null): string | null {
-    const named = inReplyTo ? this.requests.get(inReplyTo) : undefined;
-    if (named) this.active = named;
-    return named ?? this.active;
+  /** The request a message names: its delegation, `'finished'` once its turn has ended, or null for any other message. */
+  private requestNamed(inReplyTo: string | null): string | 'finished' | null {
+    const id = inReplyTo ? this.requests.get(inReplyTo) : undefined;
+    if (!id) return null;
+    return this.done.has(id) ? 'finished' : id;
   }
 
   private onFeed(event: FeedEvent): void {
     if (this.closed) return;
     switch (event.type) {
+      case 'inbound':
+        this.context(`In the thread, ${event.sender}: ${event.text}`, 'commentary');
+        return;
+      case 'progress': {
+        const named = this.requestNamed(event.inReplyTo);
+        if (named === 'finished') return;
+        const delegation = named ?? this.active;
+        if (delegation) this.context(event.text, 'commentary', delegation);
+        return;
+      }
       case 'reply': {
-        const delegation = this.answering(event.inReplyTo);
-        if (delegation) this.context(event.text, 'speakable', delegation);
-        else this.context(`${this.party.agentName} posted in the thread: ${event.text}`, 'speakable');
+        const named = this.requestNamed(event.inReplyTo);
+        if (named && named !== 'finished') this.active = named;
+        const delegation = named === 'finished' ? null : (named ?? this.active);
+        if (delegation) {
+          this.inTurn.add(delegation);
+          this.context(event.text, 'speakable', delegation);
+        } else this.context(`${this.party.agentName} posted in the thread: ${event.text}`, 'speakable');
         return;
       }
       case 'turn-end':
+        for (const id of this.inTurn) this.done.add(id);
+        this.inTurn.clear();
         this.active = null;
         this.ports.status('Live');
         return;

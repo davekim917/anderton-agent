@@ -414,6 +414,38 @@ export function recentConversationSenders(input: {
   return senders;
 }
 
+/** One agent's view of a thread, oldest first: people's messages and its own posts that landed there. */
+export function recentThreadMessages(input: {
+  agentGroupId: string;
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+  limit: number;
+}): Array<{ role: 'user' | 'assistant'; senderName: string | null; text: string }> {
+  const rows = openDb()
+    .prepare(
+      `SELECT role, sender_name, text
+         FROM messages_archive
+        WHERE agent_group_id = ?
+          AND channel_type = ?
+          AND platform_id = ?
+          AND role IN ('user', 'assistant')
+          AND ((? IS NOT NULL AND thread_id = ?) OR (? IS NULL AND thread_id IS NULL))
+        ORDER BY sent_at DESC, id DESC
+        LIMIT ?`,
+    )
+    .all(
+      input.agentGroupId,
+      input.channelType,
+      input.platformId,
+      input.threadId,
+      input.threadId,
+      input.threadId,
+      input.limit,
+    ) as Array<{ role: 'user' | 'assistant'; sender_name: string | null; text: string }>;
+  return rows.reverse().map((r) => ({ role: r.role, senderName: r.sender_name, text: r.text }));
+}
+
 /** FTS generates candidates only; the pre-turn builder scores and bounds them. */
 export function searchArchiveEvidence(input: {
   memberAgentGroupIds: string[];

@@ -317,6 +317,48 @@ export function listOutboundTail(db: Database.Database, limit: number): MessageT
   return db.prepare(`SELECT ${TAIL_COLUMNS} FROM messages_out ${TAIL_FILTER}`).all(limit) as MessageTailRow[];
 }
 
+export interface MessageFeedRow {
+  seq: number;
+  id: string;
+  kind: string;
+  in_reply_to: string | null;
+  platform_id: string | null;
+  channel_type: string | null;
+  thread_id: string | null;
+  content: string;
+}
+
+function listFeed(db: Database.Database, columns: string, table: string, afterSeq: number | null, limit: number) {
+  const sql =
+    afterSeq === null
+      ? `SELECT * FROM (SELECT ${columns} FROM ${table} ORDER BY seq DESC LIMIT ?) ORDER BY seq`
+      : `SELECT ${columns} FROM ${table} WHERE seq > ? ORDER BY seq LIMIT ?`;
+  const args = afterSeq === null ? [limit] : [afterSeq, limit];
+  return db.prepare(sql).all(...args) as MessageFeedRow[];
+}
+
+/** Rows after `afterSeq`, oldest first; with `afterSeq` null, the newest `limit` rows, oldest first. */
+export function listOutboundFeed(db: Database.Database, afterSeq: number | null, limit: number): MessageFeedRow[] {
+  return listFeed(
+    db,
+    'seq, id, kind, in_reply_to, platform_id, channel_type, thread_id, content',
+    'messages_out',
+    afterSeq,
+    limit,
+  );
+}
+
+/** As `listOutboundFeed`, for the host-written side; `in_reply_to` is always null there. */
+export function listInboundFeed(db: Database.Database, afterSeq: number | null, limit: number): MessageFeedRow[] {
+  return listFeed(
+    db,
+    'seq, id, kind, NULL AS in_reply_to, platform_id, channel_type, thread_id, content',
+    'messages_in',
+    afterSeq,
+    limit,
+  );
+}
+
 /** Scoped to exactly the named sessions, never fleet-wide, so another group's same series id can't satisfy it. */
 export function countLiveSeriesRows(db: Database.Database, seriesId: string): number {
   return (

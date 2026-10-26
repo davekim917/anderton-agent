@@ -96,9 +96,12 @@ async function writeAsCaller(call: VoiceCall, id: string, text: string, wake: bo
     if (err instanceof SessionWriteRefusedError) finish(call, ACCESS_CHANGED);
     throw err;
   }
-  if (wake) {
+  if (!wake) return;
+  try {
     const session = await getSession(call.sessionId);
     if (session) await requestWake(session, 'inbound-message');
+  } catch (err) {
+    log.warn('Voice call: request written but the container did not wake', { callId: call.id.slice(0, 8), err });
   }
 }
 
@@ -130,7 +133,13 @@ function portsFor(call: VoiceCall): CallPorts {
         onEvent,
         login: () => readCodexLogin(VOICE_CALL_CODEX_BIN),
       }),
-    feed: (onEvent) => followSessionFeed(call.sessionId, call.route, onEvent),
+    feed: (onEvent) =>
+      followSessionFeed(
+        { agentGroupId: call.agentGroupId, sessionId: call.sessionId },
+        call.route,
+        requestIdPrefix(call),
+        onEvent,
+      ),
     inject: (text, wake) => injectAsCaller(call, text, wake),
     mirror: (text) =>
       void deliverText(call.route, text).catch((err: unknown) =>
