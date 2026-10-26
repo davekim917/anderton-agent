@@ -23,9 +23,26 @@ export async function deriveCallerId(session: Session): Promise<string | null> {
  * `deriveCallerId`, which also takes a bot's row or a legacy adapter's.
  */
 export async function deriveHumanRequesterId(session: Session): Promise<string | null> {
-  return firstSenderId(session, await recentChatSenders(session, HUMAN_SCAN_DEPTH), (row) =>
+  return (await deriveHumanRequest(session))?.userId ?? null;
+}
+
+export interface HumanRequest {
+  userId: string;
+  /** Where that message came from: the conversation a reply to it belongs in. */
+  route: { channelType: string; platformId: string; threadId: string | null };
+}
+
+export async function deriveHumanRequest(session: Session): Promise<HumanRequest | null> {
+  const found = await firstSender(session, await recentChatSenders(session, HUMAN_SCAN_DEPTH), (row) =>
     isHumanChatSdkContent(row.kind, row.content ?? ''),
   );
+  if (!found) return null;
+  const mg = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
+  const channelType = found.row.channel_type ?? mg?.channel_type;
+  const platformId = found.row.platform_id ?? mg?.platform_id;
+  if (!channelType || !platformId) return null;
+  const threadId = found.row.platform_id ? (found.row.thread_id ?? null) : session.thread_id;
+  return { userId: found.userId, route: { channelType, platformId, threadId } };
 }
 
 async function recentChatSenders(session: Session, depth: number): Promise<InboundChatSenderRow[]> {
@@ -41,6 +58,14 @@ async function firstSenderId(
   rows: InboundChatSenderRow[],
   accept: (row: InboundChatSenderRow) => boolean,
 ): Promise<string | null> {
+  return (await firstSender(session, rows, accept))?.userId ?? null;
+}
+
+async function firstSender(
+  session: Session,
+  rows: InboundChatSenderRow[],
+  accept: (row: InboundChatSenderRow) => boolean,
+): Promise<{ userId: string; row: InboundChatSenderRow } | null> {
   for (const row of rows) {
     if (!row.content || !accept(row)) continue;
     let parsed: Record<string, unknown>;
@@ -57,11 +82,11 @@ async function firstSenderId(
       return null;
     })();
     if (!rawId || rawId === 'system') continue;
-    if (rawId.includes(':')) return rawId;
+    if (rawId.includes(':')) return { userId: rawId, row };
     const mgFallback = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
     const channelType = row.channel_type ?? mgFallback?.channel_type ?? null;
     if (!channelType) continue;
-    return `${channelType}:${rawId}`;
+    return { userId: `${channelType}:${rawId}`, row };
   }
   return null;
 }

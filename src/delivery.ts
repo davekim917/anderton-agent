@@ -47,6 +47,7 @@ import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
 import { humanizeOutboundContent } from './verdict-tokens.js';
 import { archiveMessage } from './message-archive.js';
+import { notifyOutboundDelivered } from './delivery-events.js';
 import { resolveContinueThread } from './continue-thread.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
@@ -1188,6 +1189,12 @@ async function deliverMessage(
   if (msg.kind === 'system') {
     const result = await handleSystemAction(content, session);
     if (result && result.deferAck) return { deferAck: true };
+    notifyOutboundDelivered({
+      sessionId: session.id,
+      outboundId: msg.id,
+      inReplyTo: msg.in_reply_to,
+      action: typeof content.action === 'string' ? content.action : undefined,
+    });
     return {};
   }
 
@@ -1841,6 +1848,12 @@ async function deliverMessage(
       const text =
         typeof parsed.text === 'string' ? parsed.text : typeof parsed.content === 'string' ? parsed.content : '';
       if (text && msg.channel_type && msg.platform_id) {
+        notifyOutboundDelivered({
+          sessionId: session.id,
+          outboundId: msg.id,
+          inReplyTo: msg.in_reply_to,
+          post: { text, channelType: msg.channel_type, platformId: msg.platform_id, threadId: effectiveThreadId },
+        });
         const mg = await getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
         archiveMessage({
           id: msg.id,

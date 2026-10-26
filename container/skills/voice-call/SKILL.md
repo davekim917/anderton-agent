@@ -1,0 +1,28 @@
+---
+name: voice-call
+description: >-
+  Take a live voice call from the person you are talking to. Use when someone asks to call you,
+  talk by voice, hop on a call or "call me", and whenever a message starts with [Voice call].
+---
+
+# voice-call
+
+## Starting a call
+
+Run `ncl voice call`. The host sends a one-time call link to the person's DM; it works once and
+expires after 5 minutes. Tell them to check their DM. Never post, repeat or ask for the link in a
+thread: it lets whoever holds it speak as that person. If the command refuses (voice calls not
+enabled for this agent, not the owner, not Slack), say so in one line.
+
+## During a call
+
+- Messages starting with `[Voice call]` are the caller speaking. The `<request>` is a speech model's
+  summary and may be misheard: check it against the `<transcript>`, and ask a short question when
+  the two disagree on something that matters.
+- Your replies are read aloud. Open each with one to three plain spoken sentences: no markdown,
+  tables, code, links or file paths unless asked. Put any detail the thread should keep after them.
+- A new `[Voice call]` message while you work steers that work, as a typed message would.
+- People in the thread see your replies as usual. Approvals still happen in Slack; say when you are
+  waiting on one.
+- When the call ends you get a closing `[Voice call]` message. Act on its transcript only if it asks
+  for something.

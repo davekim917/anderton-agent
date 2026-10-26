@@ -5,6 +5,7 @@ import type { Duplex } from 'stream';
 import { PREVIEW_ORIGIN_SUFFIX, PREVIEW_PORT } from '../../config.js';
 import { log } from '../../log.js';
 import { openContainerLoopback } from '../browser-takeover/bridge.js';
+import { handleVoiceCallRequest } from '../voice-call/http.js';
 import { PREVIEW_ID_RE, resolvePreview } from './service.js';
 
 // Below Node's default 5s server keepAliveTimeout (Vite's dev server is a Node server), so the proxy drops an idle
@@ -164,6 +165,8 @@ export function createPreviewProxy(deps: PreviewProxyDeps = defaultDeps): http.S
   };
 
   const server = http.createServer((req, res) => {
+    const id = previewIdFromHost(req.headers.host);
+    if (id && handleVoiceCallRequest(id, req, res)) return;
     const target = targetFor(req);
     if (!target) {
       plain(res, 404, NOT_FOUND);

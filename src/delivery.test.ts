@@ -68,6 +68,8 @@ import { unguarded } from './guard/index.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { isContainerRunning } from './container-runner.js';
 import { renderWorkOutcome } from './outcome-reporting-schema.js';
+import { onOutboundDelivered, type DeliveredOutbound } from './delivery-events.js';
+import { _clearSecretsForTest, registerSecrets } from './secret-scrubber.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -3958,5 +3960,97 @@ describe('per-work-item outcome delivery', () => {
       workgroup_id: 'agent-group:ag-1',
       state: 'delivered',
     });
+  });
+});
+
+describe('deliverSessionMessages — delivered-outbound events', () => {
+  it('announces a posted chat as posted and where it landed, and a system action once delivery ran it', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    registerSecrets({ FAKE_API_KEY: 'zx-fake-4d3c2b1a0f9e' });
+    const seen: DeliveredOutbound[] = [];
+    const stop = onOutboundDelivered((e) => seen.push(e));
+    try {
+      setDeliveryAdapter({ deliver: async () => 'plat-1' });
+      insertOutboundKind(
+        'ag-1',
+        session.id,
+        'out-reply',
+        'chat',
+        'telegram',
+        'telegram:123',
+        { text: 'Verdict `NO_GO`; the key zx-fake-4d3c2b1a0f9e is revoked' },
+        null,
+        'in-ask',
+      );
+      await deliverSessionMessages(session);
+      insertOutboundKind('ag-1', session.id, 'out-end', 'system', 'telegram', 'telegram:123', { action: 'turn_end' });
+      await deliverSessionMessages(session);
+
+      expect(seen).toEqual([
+        {
+          sessionId: session.id,
+          outboundId: 'out-reply',
+          inReplyTo: 'in-ask',
+          post: {
+            text: 'Verdict No-go; the key [REDACTED] is revoked',
+            channelType: 'telegram',
+            platformId: 'telegram:123',
+            threadId: null,
+          },
+        },
+        { sessionId: session.id, outboundId: 'out-end', inReplyTo: null, action: 'turn_end' },
+      ]);
+    } finally {
+      stop();
+      _clearSecretsForTest();
+    }
+  });
+
+  it('announces nothing for a post the platform refuses', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const seen: DeliveredOutbound[] = [];
+    const stop = onOutboundDelivered((e) => seen.push(e));
+    try {
+      setDeliveryAdapter({
+        deliver: async () => {
+          throw new Error('channel_not_found');
+        },
+      });
+      insertOutboundKind('ag-1', session.id, 'out-refused', 'chat', 'telegram', 'telegram:123', { text: 'hello' });
+      await deliverSessionMessages(session);
+      expect(seen).toEqual([]);
+    } finally {
+      stop();
+    }
+  });
+
+  it('still delivers when a listener throws', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const stop = onOutboundDelivered(() => {
+      throw new Error('listener bug');
+    });
+    try {
+      const posted: string[] = [];
+      setDeliveryAdapter({
+        deliver: async (_c, _p, _t, _k, content) => {
+          posted.push(JSON.parse(content).text);
+          return 'plat-2';
+        },
+      });
+      insertOutboundKind('ag-1', session.id, 'out-ok', 'chat', 'telegram', 'telegram:123', { text: 'hello' });
+      await deliverSessionMessages(session);
+      expect(posted).toEqual(['hello']);
+      const inDb = openInboundDbAt(inboundDbPath('ag-1', session.id));
+      try {
+        expect(getDeliveredIds(inDb).has('out-ok')).toBe(true);
+      } finally {
+        inDb.close();
+      }
+    } finally {
+      stop();
+    }
   });
 });

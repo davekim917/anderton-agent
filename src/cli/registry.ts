@@ -26,6 +26,7 @@ export const GROUP_SCOPE_RESOURCES = new Set([
   'secrets',
   'browser',
   'preview',
+  'voice',
 ]);
 
 export type Access = 'open' | 'approval' | 'hidden';

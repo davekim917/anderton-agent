@@ -35,6 +35,8 @@ const envConfig = readEnvFile([
   'BROWSER_TAKEOVER_PORT',
   'PREVIEW_ORIGIN_SUFFIX',
   'PREVIEW_PORT',
+  'VOICE_CALL_AGENT_GROUPS',
+  'VOICE_CALL_CODEX_BIN',
 ]);
 
 /**
@@ -209,6 +211,16 @@ export const PREVIEW_ORIGIN_SUFFIX = (process.env.PREVIEW_ORIGIN_SUFFIX || envCo
   .toLowerCase()
   .replace(/^\.+|\.+$/g, '');
 export const PREVIEW_PORT = parseInt(process.env.PREVIEW_PORT || envConfig.PREVIEW_PORT || '3002', 10);
+
+// Voice calls ride the preview tunnel (https://<call id>.<PREVIEW_ORIGIN_SUFFIX>) and are offered only to the agent
+// groups listed here (comma-separated ids). Empty = feature off.
+export const VOICE_CALL_AGENT_GROUPS = new Set(
+  (process.env.VOICE_CALL_AGENT_GROUPS || envConfig.VOICE_CALL_AGENT_GROUPS || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean),
+);
+export const VOICE_CALL_CODEX_BIN = process.env.VOICE_CALL_CODEX_BIN || envConfig.VOICE_CALL_CODEX_BIN || 'codex';
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.

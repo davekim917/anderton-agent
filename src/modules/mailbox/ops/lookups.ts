@@ -12,6 +12,8 @@ export interface InboundChatSenderRow {
   kind: string;
   content?: string;
   channel_type?: string;
+  platform_id?: string | null;
+  thread_id?: string | null;
 }
 
 /**
@@ -21,7 +23,7 @@ export interface InboundChatSenderRow {
 export function getRecentInboundChatSenders(db: Database.Database, limit: number): InboundChatSenderRow[] {
   return db
     .prepare(
-      `SELECT kind, content, channel_type FROM messages_in
+      `SELECT kind, content, channel_type, platform_id, thread_id FROM messages_in
        WHERE kind IN ('chat', 'chat-sdk')
        ORDER BY timestamp DESC
        LIMIT ?`,
