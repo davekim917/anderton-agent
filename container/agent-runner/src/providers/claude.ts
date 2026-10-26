@@ -19,6 +19,7 @@ import {
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
 import { loadExcludedPlugins } from '../excluded-plugins.js';
 import { isExcludedPluginPath, type ExcludedPlugins } from '../plugin-exclusions.js';
+import { marketplaceSubPlugins } from '../plugin-marketplace.js';
 import { recordRateLimitSamples, type AccountIdentity, type RateLimitSample } from '../modules/mailbox/index.js';
 import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session-state.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
@@ -1454,7 +1455,16 @@ export function discoverPlugins(
       continue;
     }
     if (hasManifest(repoPath)) {
-      addPlugin(repoPath);
+      // A repo can carry a root manifest for its own development while its marketplace publishes the installable
+      // plugin from a subdirectory (impeccable: `./plugin`, which alone holds the hooks and agents).
+      const published = marketplaceSubPlugins(repoPath).filter((rel) => hasManifest(path.join(repoPath, rel)));
+      if (published.length === 0) {
+        addPlugin(repoPath);
+        continue;
+      }
+      for (const rel of published) {
+        if (!isExcludedPluginPath(`${entry}/${rel}`, excluded)) addPlugin(path.join(repoPath, rel));
+      }
       continue;
     }
     let subs: string[] = [];

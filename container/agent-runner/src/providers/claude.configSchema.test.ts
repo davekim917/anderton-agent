@@ -56,6 +56,7 @@ mock.module('../worktree-autosave.js', () => ({
 const { CLAUDE_EFFORT_LEVELS, claudeConfigSchema, discoverPlugins } = await import('./claude.js');
 const { ClaudeProvider } = await import('./claude.js');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
+const { splitExcludedPlugins } = await import('../plugin-exclusions.js');
 const TEST_CLAUDE_CONFIG_DIR = '/tmp/nanoclaw-claude-config-schema';
 const ORIGINAL_CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR;
 
@@ -229,6 +230,46 @@ describe('Claude plugin discovery', () => {
 
       const discovery = discoverPlugins(pluginsRoot);
       expect(discovery.plugins).toEqual([{ type: 'local', path: wwbd }]);
+    } finally {
+      fs.rmSync(pluginsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("loads the sub-plugin a repo's own marketplace publishes instead of its development root", () => {
+    const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-plugin-marketplace-'));
+    const writeJson = (file: string, value: unknown) => {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(value));
+    };
+    try {
+      const split = path.join(pluginsRoot, 'designer');
+      writeJson(path.join(split, '.claude-plugin', 'plugin.json'), { name: 'designer' });
+      writeJson(path.join(split, '.claude-plugin', 'marketplace.json'), {
+        plugins: [{ name: 'designer', source: './plugin' }],
+      });
+      writeJson(path.join(split, 'plugin', '.claude-plugin', 'plugin.json'), { name: 'designer' });
+
+      const selfListed = path.join(pluginsRoot, 'humanizer');
+      writeJson(path.join(selfListed, '.claude-plugin', 'plugin.json'), { name: 'humanizer' });
+      writeJson(path.join(selfListed, '.claude-plugin', 'marketplace.json'), {
+        plugins: [{ name: 'humanizer', source: './' }],
+      });
+
+      const dangling = path.join(pluginsRoot, 'dangling');
+      writeJson(path.join(dangling, '.claude-plugin', 'plugin.json'), { name: 'dangling' });
+      writeJson(path.join(dangling, '.claude-plugin', 'marketplace.json'), {
+        plugins: [
+          { name: 'dangling', source: './missing' },
+          { name: 'escape', source: '../designer/plugin' },
+        ],
+      });
+
+      const paths = (excludes: string[]) =>
+        discoverPlugins(pluginsRoot, splitExcludedPlugins(excludes))
+          .plugins.map((p) => path.relative(pluginsRoot, p.path))
+          .sort();
+      expect(paths([])).toEqual(['dangling', path.join('designer', 'plugin'), 'humanizer']);
+      expect(paths(['designer/plugin'])).toEqual(['dangling', 'humanizer']);
     } finally {
       fs.rmSync(pluginsRoot, { recursive: true, force: true });
     }
