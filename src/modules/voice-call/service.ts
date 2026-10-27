@@ -159,6 +159,7 @@ function portsFor(call: VoiceCall): CallPorts {
         log.warn('Voice call: thread post failed', { callId: call.id.slice(0, 8), err }),
       ),
     status: (text) => emit(call, { type: 'status', text }),
+    caption: (role, text, done) => emit(call, { type: 'caption', role, text, done }),
     ended: (text) => finish(call, text),
   };
 }

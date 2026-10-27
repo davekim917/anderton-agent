@@ -21,6 +21,8 @@ export interface CallPorts {
   inject(text: string, wake: boolean): { id: string; written: Promise<void> };
   mirror(text: string): void;
   status(text: string): void;
+  /** A piece of live transcript for the page's captions; `done` closes that side's line. */
+  caption(role: 'caller' | 'voice', text: string, done: boolean): void;
   ended(text: string): void;
 }
 
@@ -141,6 +143,8 @@ export class VoiceCallBridge {
       this.delegate(event.id, event.text);
       return;
     }
+    if (event.type === 'transcript') this.ports.caption(event.role, event.text, false);
+    else this.ports.caption(event.role, '', true);
     this.spoken.add(event);
   }
 

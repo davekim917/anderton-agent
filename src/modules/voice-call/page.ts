@@ -18,6 +18,8 @@ export function callPageHtml(agentName: string): string {
     gap: 28px; padding: 24px 16px; background: var(--bg); color: var(--fg); font: 16px/1.4 -apple-system, system-ui, sans-serif; }
   h1 { margin: 0; font-size: 28px; font-weight: 650; }
   #status { color: var(--muted); min-height: 1.4em; text-align: center; max-width: 32ch; }
+  #caption { color: var(--muted); text-align: center; max-width: 40ch; min-height: 4.2em; display: -webkit-box;
+    -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
   #orb { width: 132px; height: 132px; border-radius: 50%; background: var(--card); box-shadow: 0 0 0 0 var(--accent);
     display: grid; place-items: center; font-size: 44px; transition: box-shadow .25s; }
   #orb.live { box-shadow: 0 0 0 10px color-mix(in srgb, var(--accent) 25%, transparent); }
@@ -40,6 +42,7 @@ export function callPageHtml(agentName: string): string {
     <button id="hangup" hidden>Hang up</button>
   </div>
   <button id="hear" hidden>Tap to hear</button>
+  <div id="caption" aria-live="polite"></div>
   <audio id="out" autoplay playsinline></audio>
 <script>
 (() => {
@@ -111,6 +114,19 @@ export function callPageHtml(agentName: string): string {
       status(TAP_TO_HEAR);
     },
   );
+  const caption = (() => {
+    const lines = { caller: '', voice: '' };
+    const open = { caller: false, voice: false };
+    const NAMES = { caller: 'You', voice: document.querySelector('h1').textContent };
+    return ({ role, text, done }) => {
+      if (!(role in lines)) return;
+      if (done) { open[role] = false; return; }
+      if (!open[role]) { lines[role] = ''; open[role] = true; }
+      lines[role] += text;
+      const shown = lines[role].trim();
+      if (shown) $('caption').textContent = NAMES[role] + ': ' + (shown.length > 240 ? '…' + shown.slice(-240) : shown);
+    };
+  })();
   const keepAwake = async () => { try { wake = await navigator.wakeLock.request('screen'); } catch {} };
   document.addEventListener('visibilitychange', () => { if (!ended && document.visibilityState === 'visible') keepAwake(); });
   $('start').onclick = async () => {
@@ -144,6 +160,7 @@ export function callPageHtml(agentName: string): string {
       events.onmessage = (e) => {
         const msg = JSON.parse(e.data);
         if (msg.type === 'status') status(msg.text);
+        if (msg.type === 'caption') caption(msg);
         if (msg.type === 'ended') finish(msg.text);
       };
       keepAwake();

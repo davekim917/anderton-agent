@@ -12,6 +12,7 @@ interface Harness {
   injected: Array<{ text: string; wake: boolean }>;
   mirrored: string[];
   ended: string[];
+  captions: string[];
   instructions: string;
   liveClosed: boolean;
   written: Promise<void>;
@@ -23,6 +24,7 @@ async function connect(recent: FeedEvent[] = []): Promise<Harness> {
     injected: [],
     mirrored: [],
     ended: [],
+    captions: [],
     instructions: '',
     liveClosed: false,
     written: Promise.resolve(),
@@ -49,6 +51,7 @@ async function connect(recent: FeedEvent[] = []): Promise<Harness> {
     },
     mirror: (text) => h.mirrored.push(text),
     status: () => undefined,
+    caption: (role, text, done) => h.captions.push(done ? `${role}:done` : `${role}:${text}`),
     ended: (text) => h.ended.push(text),
   };
   h.bridge = new VoiceCallBridge({ agentName: 'Atlas', callerName: 'Rae Doe' }, ports);
@@ -100,6 +103,7 @@ describe('VoiceCallBridge', () => {
         inject: () => ({ id: 'm1', written: Promise.resolve() }),
         mirror: () => undefined,
         status: () => undefined,
+        caption: () => undefined,
         ended: () => undefined,
       },
     );
@@ -119,6 +123,22 @@ describe('VoiceCallBridge', () => {
   it('gives the voice the recent thread as opening context', async () => {
     const h = await connect([{ type: 'inbound', sender: 'Sam Roe', text: 'deploy is red' }]);
     expect(h.instructions).toContain('Sam Roe: deploy is red');
+  });
+
+  it('captions both sides as they are spoken, closing each line at the end of its turn', async () => {
+    const h = await connect();
+    h.live({ type: 'transcript', role: 'caller', text: 'Is the nightly ' });
+    h.live({ type: 'transcript', role: 'caller', text: 'green?' });
+    h.live({ type: 'turn-done', role: 'caller', transcript: 'Is the nightly green?' });
+    h.live({ type: 'transcript', role: 'voice', text: 'Checking now.' });
+    h.live({ type: 'turn-done', role: 'voice', transcript: 'Checking now.' });
+    expect(h.captions).toEqual([
+      'caller:Is the nightly ',
+      'caller:green?',
+      'caller:done',
+      'voice:Checking now.',
+      'voice:done',
+    ]);
   });
 
   it('sends a delegated request with what was said, and mirrors it into the thread', async () => {

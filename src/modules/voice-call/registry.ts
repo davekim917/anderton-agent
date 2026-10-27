@@ -14,7 +14,10 @@ export interface CallRoute {
   messagingGroupId: string;
 }
 
-export type CallPageEvent = { type: 'status'; text: string } | { type: 'ended'; text: string };
+export type CallPageEvent =
+  | { type: 'status'; text: string }
+  | { type: 'caption'; role: 'caller' | 'voice'; text: string; done: boolean }
+  | { type: 'ended'; text: string };
 
 export interface VoiceCall {
   id: string;
