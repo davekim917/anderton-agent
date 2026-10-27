@@ -3,7 +3,6 @@
  * opencode.db stays per-session; agent definitions and skills are copied in at spawn from
  * `~/.local/share/opencode-<folder>/`, falling back to `~/.config/opencode`. No credential is staged: every request
  * leaves through the OneCLI gateway, which injects the vault key, so OpenCode only ever holds a placeholder.
- * NO_PROXY is merged so OpenCode still reaches 127.0.0.1 behind OneCLI's HTTPS_PROXY.
  */
 import fs from 'fs';
 import os from 'os';
@@ -229,21 +228,6 @@ const OPENCODE_MODEL_CAPABILITY_VARS = [
   'OPENCODE_MODEL_INPUT_MODALITIES',
 ] as const;
 
-function mergeNoProxy(current: string | undefined, additions: string): string {
-  if (!current?.trim()) return additions;
-  const parts = new Set(
-    current
-      .split(/[\s,]+/)
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
-  for (const addition of additions.split(',')) {
-    const trimmed = addition.trim();
-    if (trimmed) parts.add(trimmed);
-  }
-  return [...parts].join(',');
-}
-
 interface OpenCodeSourcePaths {
   agentsDir: string;
   skillsDir: string;
@@ -401,11 +385,7 @@ registerProviderContainerConfig('opencode', async (ctx) => {
   const slash = model.indexOf('/');
   const modelProvider = slash > 0 ? model.slice(0, slash) : DEFAULT_OPENCODE_PROVIDER;
 
-  const env: Record<string, string> = {
-    ...staged.env,
-    NO_PROXY: mergeNoProxy(ctx.hostEnv.NO_PROXY, '127.0.0.1,localhost'),
-    no_proxy: mergeNoProxy(ctx.hostEnv.no_proxy, '127.0.0.1,localhost'),
-  };
+  const env: Record<string, string> = { ...staged.env };
   env.OPENCODE_MODEL = model;
 
   // opencode's INTERNAL billing/routing provider (opencode = Zen, opencode-go = Go, nvidia, ...), derived from the

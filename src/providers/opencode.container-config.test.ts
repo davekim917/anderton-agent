@@ -115,7 +115,8 @@ describe('opencode provider container-config reconciliation', () => {
       expect(fs.existsSync(path.join(runtime, 'agent', 'global.md'))).toBe(false);
       expect(fs.existsSync(path.join(runtime, 'skill', 'scoped-skill', 'SKILL.md'))).toBe(true);
       expect(fs.existsSync(path.join(runtime, 'skill', 'global-skill'))).toBe(false);
-      expect(contribution.env?.NO_PROXY).not.toContain('opencode.ai');
+      expect(contribution.env).not.toHaveProperty('NO_PROXY');
+      expect(contribution.env).not.toHaveProperty('no_proxy');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -232,8 +233,8 @@ describe('opencode provider container-config reconciliation', () => {
     try {
       const contribution = await fn(ctx);
       expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
-      expect(contribution.env?.NO_PROXY?.split(',')).not.toContain('opencode.ai');
-      expect(contribution.env?.no_proxy?.split(',')).not.toContain('opencode.ai');
+      expect(contribution.env).not.toHaveProperty('NO_PROXY');
+      expect(contribution.env).not.toHaveProperty('no_proxy');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -253,8 +254,8 @@ describe('opencode provider container-config reconciliation', () => {
     try {
       const contribution = await fn(ctx);
       expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
-      expect(contribution.env?.NO_PROXY?.split(',')).not.toContain('opencode.ai');
-      expect(contribution.env?.no_proxy?.split(',')).not.toContain('opencode.ai');
+      expect(contribution.env).not.toHaveProperty('NO_PROXY');
+      expect(contribution.env).not.toHaveProperty('no_proxy');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -328,8 +329,8 @@ describe('opencode provider container-config reconciliation', () => {
 
     try {
       const contribution = await fn(ctx);
-      expect(contribution.env?.NO_PROXY?.split(',')).not.toContain('opencode.ai');
-      expect(contribution.env?.no_proxy?.split(',')).not.toContain('opencode.ai');
+      expect(contribution.env).not.toHaveProperty('NO_PROXY');
+      expect(contribution.env).not.toHaveProperty('no_proxy');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

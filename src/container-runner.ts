@@ -3212,11 +3212,13 @@ export function stripEnvEntry(args: string[], key: string, onlyValue?: string): 
   }
 }
 
+export const LOOPBACK_NO_PROXY_HOSTS = ['localhost', '127.0.0.1'];
+
 /**
  * Merges into existing entries; adds both NO_PROXY and no_proxy when neither exists (Node reads uppercase, many
  * Python/Go tools only lowercase). Mutates args in place.
  */
-function mergeNoProxy(args: string[], host: string): void {
+export function mergeNoProxy(args: string[], host: string): void {
   const keys = ['NO_PROXY', 'no_proxy'];
   let touchedAny = false;
   for (const key of keys) {
@@ -5373,6 +5375,9 @@ async function buildContainerArgs(
     args.push('-e', 'CURL_CA_BUNDLE=/tmp/onecli-combined-ca.pem');
     args.push('-e', 'AWS_CA_BUNDLE=/tmp/onecli-combined-ca.pem');
     args.push('-e', 'GIT_SSL_CAINFO=/tmp/onecli-combined-ca.pem');
+
+    // A proxy on another host cannot reach this container's own loopback servers.
+    for (const host of LOOPBACK_NO_PROXY_HOSTS) mergeNoProxy(args, host);
 
     // NO_PROXY bypasses for hosts where OneCLI's MITM breaks the client or hijacks its auth. OneCLI re-signs every
     // CONNECT even with no injection, so clients with a bundled CA (snowflake-connector, boto3/STS) reject it.

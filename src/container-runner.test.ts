@@ -155,6 +155,8 @@ import {
   persistResolvedWorkgroupAtSpawn,
   resolveWorkgroupIdAtSpawn,
   stripEnvEntry,
+  mergeNoProxy,
+  LOOPBACK_NO_PROXY_HOSTS,
   materializeDockerEnvironment,
   removeDockerEnvironmentFile,
   wikiModelAuth,
@@ -1056,6 +1058,48 @@ describe('stripEnvEntry', () => {
     const args = ['-e', 'ANTHROPIC_API_KEY_2=x', '-e', 'ANTHROPIC_API_KEY=placeholder'];
     stripEnvEntry(args, 'ANTHROPIC_API_KEY', 'placeholder');
     expect(args).toEqual(['-e', 'ANTHROPIC_API_KEY_2=x']);
+  });
+});
+
+describe('loopback NO_PROXY bypass', () => {
+  const envValue = (args: string[], key: string) =>
+    args.filter((a, i) => args[i - 1] === '-e' && a.startsWith(`${key}=`)).map((a) => a.slice(key.length + 1));
+
+  it('covers localhost and 127.0.0.1', () => {
+    expect([...LOOPBACK_NO_PROXY_HOSTS].sort()).toEqual(['127.0.0.1', 'localhost']);
+  });
+
+  it('appends loopback to existing NO_PROXY and no_proxy entries without dropping them', () => {
+    const args = [
+      '-e',
+      'HTTPS_PROXY=http://gateway.invalid:10255',
+      '-e',
+      'NO_PROXY=example.test',
+      '-e',
+      'no_proxy=example.test,localhost',
+    ];
+    for (const host of LOOPBACK_NO_PROXY_HOSTS) mergeNoProxy(args, host);
+    expect(envValue(args, 'NO_PROXY')).toEqual(['example.test,localhost,127.0.0.1']);
+    expect(envValue(args, 'no_proxy')).toEqual(['example.test,localhost,127.0.0.1']);
+    expect(envValue(args, 'HTTPS_PROXY')).toEqual(['http://gateway.invalid:10255']);
+  });
+
+  it('sets both spellings when neither exists', () => {
+    const args: string[] = [];
+    for (const host of LOOPBACK_NO_PROXY_HOSTS) mergeNoProxy(args, host);
+    expect(envValue(args, 'NO_PROXY')).toEqual(['localhost,127.0.0.1']);
+    expect(envValue(args, 'no_proxy')).toEqual(['localhost,127.0.0.1']);
+  });
+
+  it('is merged in the gateway block for every spawn, not under a provider or tool condition', () => {
+    const lines = fs.readFileSync(path.join(import.meta.dirname, 'container-runner.ts'), 'utf8').split('\n');
+    const at = (needle: string) => lines.findIndex((l) => l.includes(needle));
+    const merge = at('for (const host of LOOPBACK_NO_PROXY_HOSTS) mergeNoProxy(args, host);');
+    const caBundle = at("args.push('-e', 'GIT_SSL_CAINFO=/tmp/onecli-combined-ca.pem');");
+    expect(merge).toBeGreaterThan(at('OneCLI gateway applied'));
+    expect(merge).toBeLessThan(at("if (isToolEnabled(tools, 'snowflake')"));
+    expect(lines.slice(caBundle + 1, merge).every((l) => !/[{}]/.test(l))).toBe(true);
+    expect(lines[merge].match(/^ */)![0]).toBe(lines[caBundle].match(/^ */)![0]);
   });
 });
 
