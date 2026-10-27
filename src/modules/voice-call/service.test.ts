@@ -13,13 +13,16 @@ const { h } = vi.hoisted(() => ({
     wakeFails: false,
     liveGate: null as Promise<void> | null,
     liveEvent: null as ((event: { type: 'delegation'; id: string; text: string }) => void) | null,
+    liveVoice: undefined as string | undefined,
   },
 }));
+
+const NOT_ALLOWED = 'Only the owner, admins and members of this agent can call it.';
 
 vi.mock('../../config.js', async (orig) => ({
   ...(await orig<typeof import('../../config.js')>()),
   PREVIEW_ORIGIN_SUFFIX: 'calls.example.test',
-  VOICE_CALL_AGENT_GROUPS: new Set(['ag-atlas']),
+  VOICE_CALL_AGENT_GROUPS: 'ag-atlas:gleam, ag-quiet',
 }));
 vi.mock('../../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
@@ -29,10 +32,10 @@ vi.mock('../../log.js', () => ({
 vi.mock('../../db/sessions.js', () => ({
   getSession: async (id: string) => {
     if (h.sessionLookupFails) throw new Error('central DB unavailable');
-    return /^sess-\d$/.test(id)
+    return /^sess-(\d|quiet)$/.test(id)
       ? {
           id,
-          agent_group_id: 'ag-atlas',
+          agent_group_id: id === 'sess-quiet' ? 'ag-quiet' : 'ag-atlas',
           messaging_group_id: 'mg-thread',
           thread_id: 'slack:C1:111.1',
           agent_provider: null,
@@ -116,8 +119,9 @@ vi.mock('./session-feed.js', async (orig) => ({
 vi.mock('./live.js', async (orig) => ({
   ...(await orig<typeof import('./live.js')>()),
   readCodexLogin: async () => ({ token: 't', accountId: 'a' }),
-  openLiveCall: async ({ onEvent }: { onEvent: (event: never) => void }) => {
+  openLiveCall: async ({ onEvent, voice }: { onEvent: (event: never) => void; voice?: string }) => {
     h.liveEvent = onEvent as typeof h.liveEvent;
+    h.liveVoice = voice;
     if (h.liveGate) await h.liveGate;
     return {
       answer: 'v=0 answer',
@@ -133,6 +137,9 @@ const { _clearSecretsForTest, registerSecrets } = await import('../../secret-scr
 const { closeDb, initMigratedTestDb } = await import('../../db/index.js');
 const { createUser } = await import('../permissions/db/users.js');
 const { grantRole, revokeRole } = await import('../permissions/db/user-roles.js');
+const { addMember } = await import('../permissions/db/agent-group-members.js');
+const { createAgentGroup } =
+  await vi.importActual<typeof import('../../db/agent-groups.js')>('../../db/agent-groups.js');
 const svc = { ...(await import('./service.js')), ...(await import('./registry.js')) };
 const { handleVoiceCallRequest } = await import('./http.js');
 
@@ -187,6 +194,7 @@ beforeEach(async () => {
   h.wakeFails = false;
   h.liveGate = null;
   h.liveEvent = null;
+  h.liveVoice = undefined;
   server = http.createServer((req, res) => {
     const id = (req.headers.host ?? '').split('.')[0];
     if (!handleVoiceCallRequest(id, req, res)) {
@@ -220,7 +228,7 @@ describe('mintVoiceCall', () => {
 
   it.each([
     ['a group not enabled for calls', { agentGroupId: 'ag-other' }, 'not enabled'],
-    ['a non-owner requester during the pilot', { requester: 'slack-acme:U0SAM' }, 'owner only'],
+    ['a requester with no role or membership in this agent', { requester: 'slack-acme:U0SAM' }, NOT_ALLOWED],
     ['a thread no human has written in', { requester: null }, 'no one to call'],
   ])('refuses %s and sends nothing', async (_name, change, message) => {
     const c = change as { agentGroupId?: string; requester?: string | null };
@@ -229,6 +237,37 @@ describe('mintVoiceCall', () => {
       svc.mintVoiceCall({ sessionId: 'sess-1', agentGroupId: c.agentGroupId ?? 'ag-atlas' }),
     ).rejects.toThrow(message);
     expect(h.deliveries).toEqual([]);
+  });
+
+  it.each([
+    ['a member of this agent', 'member', 'ag-atlas', true],
+    ['an admin of this agent', 'admin', 'ag-atlas', true],
+    ['a member of a different agent only', 'member', 'ag-other', false],
+  ])('lets the same people call as may message the agent: %s', async (_name, kind, group, allowed) => {
+    const at = new Date().toISOString();
+    for (const id of ['ag-atlas', 'ag-other'])
+      await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: at });
+    if (kind === 'member')
+      await addMember({ user_id: 'slack-acme:U0SAM', agent_group_id: group, added_by: null, added_at: at });
+    else
+      await grantRole({
+        user_id: 'slack-acme:U0SAM',
+        role: 'admin',
+        agent_group_id: group,
+        granted_by: null,
+        granted_at: at,
+      });
+    h.requester = 'slack-acme:U0SAM';
+
+    const minting = svc.mintVoiceCall({ sessionId: 'sess-1', agentGroupId: 'ag-atlas' });
+
+    if (allowed) {
+      await expect(minting).resolves.toEqual(expect.objectContaining({ sentTo: 'Sam Roe' }));
+      expect(h.deliveries).toHaveLength(1);
+    } else {
+      await expect(minting).rejects.toThrow(NOT_ALLOWED);
+      expect(h.deliveries).toEqual([]);
+    }
   });
 
   it('binds the call to the conversation the request came from, not the session default', async () => {
@@ -397,6 +436,16 @@ describe('a claimed call', () => {
     return call;
   };
 
+  it("opens the voice with the agent's configured voice, and the default when its entry names none", async () => {
+    await claim();
+    expect(h.liveVoice).toBe('gleam');
+
+    await svc.mintVoiceCall({ sessionId: 'sess-quiet', agentGroupId: 'ag-quiet' });
+    const link = h.deliveries.filter((d) => d.text.includes('Tap to call')).at(-1)!.text;
+    await svc.answerVoiceCall(svc.getVoiceCall(/https:\/\/([0-9a-f]{32})\./.exec(link)![1])!, 'v=0 offer');
+    expect(h.liveVoice).toBeUndefined();
+  });
+
   it('drops when the page never reports audio after the answer', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     try {
@@ -460,7 +509,7 @@ describe('a claimed call', () => {
     await svc.mintVoiceCall({ sessionId: 'sess-1', agentGroupId: 'ag-atlas' });
     const call = svc.getVoiceCall(linkId())!;
     await revokeRole('slack-acme:U0RAE', 'owner', null);
-    await expect(svc.answerVoiceCall(call, 'v=0 offer')).rejects.toThrow('owner only');
+    await expect(svc.answerVoiceCall(call, 'v=0 offer')).rejects.toThrow(NOT_ALLOWED);
     expect(svc.getVoiceCall(call.id)).toBeNull();
     expect(h.liveClosed).toBe(0);
   });

@@ -17,7 +17,7 @@ registerResource({
     call: {
       access: 'open',
       description:
-        'Run this when the person asks to call you, talk by voice, or hop on a call. The host sends a one-time call link to their DM (never post or ask for it here); it expires 5 minutes after it is sent. During the call their spoken requests arrive in this conversation as messages marked [Voice call], and your replies are read aloud, so open each reply with one to three plain spoken sentences. Everyone in the thread still sees your replies.',
+        'Run this when the person asks to call you, start a call, talk by voice, or hop on a call. The host sends a one-time call link to their DM (never post or ask for it here); it expires 5 minutes after it is sent. During the call their spoken requests arrive in this conversation as messages marked [Voice call], and your replies are read aloud, so open each reply with one to three plain spoken sentences. Everyone in the thread still sees your replies.',
       args: [],
       examples: ['ncl voice call'],
       handler: async (_args, ctx) => {

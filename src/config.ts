@@ -214,12 +214,8 @@ export const PREVIEW_PORT = parseInt(process.env.PREVIEW_PORT || envConfig.PREVI
 
 // Voice calls ride the preview tunnel (https://<call id>.<PREVIEW_ORIGIN_SUFFIX>) and are offered only to the agent
 // groups listed here (comma-separated ids). Empty = feature off.
-export const VOICE_CALL_AGENT_GROUPS = new Set(
-  (process.env.VOICE_CALL_AGENT_GROUPS || envConfig.VOICE_CALL_AGENT_GROUPS || '')
-    .split(',')
-    .map((id) => id.trim())
-    .filter(Boolean),
-);
+/** `group-id[:voice],…`: the agent groups that take voice calls, each with an optional voice. */
+export const VOICE_CALL_AGENT_GROUPS = process.env.VOICE_CALL_AGENT_GROUPS || envConfig.VOICE_CALL_AGENT_GROUPS || '';
 export const VOICE_CALL_CODEX_BIN = process.env.VOICE_CALL_CODEX_BIN || envConfig.VOICE_CALL_CODEX_BIN || 'codex';
 
 // Timezone for scheduled tasks, message formatting, etc.

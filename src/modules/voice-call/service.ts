@@ -14,7 +14,7 @@ import { scrubSecrets } from '../../secret-scrubber.js';
 import { SessionWriteRefusedError, writeSessionMessage } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import { isChannelVariant, type AgentGroup } from '../../types.js';
-import { isOwner } from '../permissions/db/user-roles.js';
+import { agentGroupAccessUnderLease } from '../permissions/access.js';
 import { getUser } from '../permissions/db/users.js';
 import { ensureUserDm } from '../permissions/user-dm.js';
 import { VoiceCallBridge, type CallPorts } from './call.js';
@@ -28,19 +28,27 @@ export const MAX_CALL_MS = 60 * 60_000;
 export const AUDIO_CONNECT_MS = 60_000;
 const MAX_LIVE_CALLS = 4;
 const RECHECK_MS = 60_000;
-const NOT_ALLOWED = 'Voice calls are open to the owner only during the pilot.';
+const NOT_ALLOWED = 'Only the owner, admins and members of this agent can call it.';
 const ACCESS_CHANGED = 'Your access to voice calls changed, so the call ended.';
 
 /** The pilot's caller rule. Read the central DB, so call it under `withCentralSync`. */
-const mayCall = (userId: string) => isOwner(userId);
-const stillMayCall = (call: VoiceCall) => withCentralSync(() => mayCall(call.callerId), 'voice-call caller check');
+const mayCall = (userId: string, agentGroupId: string) => agentGroupAccessUnderLease(userId, agentGroupId).allowed;
+const stillMayCall = (call: VoiceCall) =>
+  withCentralSync(() => mayCall(call.callerId, call.agentGroupId), 'voice-call caller check');
+
+const enabledGroups = new Map<string, string | undefined>(
+  VOICE_CALL_AGENT_GROUPS.split(',')
+    .map((entry) => entry.split(':').map((part) => part.trim()))
+    .filter(([id]) => id)
+    .map(([id, voice]): [string, string | undefined] => [id, voice || undefined]),
+);
 
 export class VoiceCallRefused extends Error {}
 
 export const voiceCallUrl = (id: string) => `https://${id}.${PREVIEW_ORIGIN_SUFFIX}`;
 
 export function voiceCallsEnabledFor(agentGroupId: string): boolean {
-  return PREVIEW_ORIGIN_SUFFIX !== '' && VOICE_CALL_AGENT_GROUPS.has(agentGroupId);
+  return PREVIEW_ORIGIN_SUFFIX !== '' && enabledGroups.has(agentGroupId);
 }
 
 function emit(call: VoiceCall, event: CallPageEvent): void {
@@ -121,7 +129,10 @@ function write(call: VoiceCall, id: string, text: string, wake: boolean): Promis
       content: JSON.stringify({ text, sender: call.callerName, senderId: call.callerHandle }),
       trigger: wake ? 1 : 0,
     },
-    { guard: () => mayCall(call.callerId) || { ok: false, reason: 'the caller may no longer make voice calls' } },
+    {
+      guard: () =>
+        mayCall(call.callerId, call.agentGroupId) || { ok: false, reason: 'the caller may no longer make voice calls' },
+    },
   );
 }
 
@@ -133,6 +144,7 @@ function portsFor(call: VoiceCall): CallPorts {
         instructions,
         onEvent,
         login: () => readCodexLogin(VOICE_CALL_CODEX_BIN),
+        voice: enabledGroups.get(call.agentGroupId),
       }),
     feed: (onEvent) =>
       followSessionFeed(
@@ -183,7 +195,7 @@ export async function mintVoiceCall(input: { sessionId: string; agentGroupId: st
   const request = await deriveHumanRequest(session);
   if (!request) throw new VoiceCallRefused('No person has asked in this thread, so there is no one to call.');
   const callerId = request.userId;
-  if (!(await withCentralSync(() => mayCall(callerId), 'voice-call caller check'))) {
+  if (!(await withCentralSync(() => mayCall(callerId, input.agentGroupId), 'voice-call caller check'))) {
     throw new VoiceCallRefused(NOT_ALLOWED);
   }
   const caller = await getUser(callerId);

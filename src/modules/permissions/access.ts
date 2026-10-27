@@ -26,13 +26,16 @@ export type AccessDecision =
  */
 export async function canAccessAgentGroup(userId: string, agentGroupId: string): Promise<AccessDecision> {
   if (!(await getUser(userId))) return { allowed: false, reason: 'unknown_user' };
-  return withCentralSync((): AccessDecision => {
-    if (isOwner(userId)) return { allowed: true, reason: 'owner' };
-    if (isGlobalAdmin(userId)) return { allowed: true, reason: 'global_admin' };
-    if (isAdminOfAgentGroup(userId, agentGroupId)) return { allowed: true, reason: 'admin_of_group' };
-    if (isMember(userId, agentGroupId)) return { allowed: true, reason: 'member' };
-    return { allowed: false, reason: 'not_member' };
-  }, 'canAccessAgentGroup');
+  return withCentralSync(() => agentGroupAccessUnderLease(userId, agentGroupId), 'canAccessAgentGroup');
+}
+
+/** The role and membership half of `canAccessAgentGroup`, for a caller already holding the central lease. */
+export function agentGroupAccessUnderLease(userId: string, agentGroupId: string): AccessDecision {
+  if (isOwner(userId)) return { allowed: true, reason: 'owner' };
+  if (isGlobalAdmin(userId)) return { allowed: true, reason: 'global_admin' };
+  if (isAdminOfAgentGroup(userId, agentGroupId)) return { allowed: true, reason: 'admin_of_group' };
+  if (isMember(userId, agentGroupId)) return { allowed: true, reason: 'member' };
+  return { allowed: false, reason: 'not_member' };
 }
 
 /**

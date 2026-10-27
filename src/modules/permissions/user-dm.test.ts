@@ -172,7 +172,7 @@ describe('ensureUserDm privacy-safe logging', () => {
   // otherwise leak a stranger-facing platform handle: approval delivery
   // (pickApprovalDelivery, both branches) and the dashboard-token-issue DM.
   // Every other caller keeps the default detailed shape.
-  it('privacy-safe logs are requested only at approval delivery and the dashboard token issue', async () => {
+  it('privacy-safe logs are requested only at approval delivery and the DMs that carry a credential link', async () => {
     const fs2 = await import('node:fs');
     const path = await import('node:path');
     const repoRoot = path.resolve(__dirname, '..', '..', '..');
@@ -197,7 +197,11 @@ describe('ensureUserDm privacy-safe logging', () => {
       }
     }
     expect(callSites).toEqual(
-      new Set(['src/modules/approvals/primitive.ts', 'src/dashboard/auth/dashboard-token-issue.ts']),
+      new Set([
+        'src/modules/approvals/primitive.ts',
+        'src/dashboard/auth/dashboard-token-issue.ts',
+        'src/modules/voice-call/service.ts',
+      ]),
     );
   });
 

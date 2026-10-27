@@ -2,7 +2,8 @@
 name: voice-call
 description: >-
   Take a live voice call from the person you are talking to. Use when someone asks to call you,
-  talk by voice, hop on a call or "call me", and whenever a message starts with [Voice call].
+  start a call, talk by voice, hop on a call, says "call me" or "I need to call you", and whenever
+  a message starts with [Voice call].
 ---
 
 # voice-call
@@ -12,7 +13,7 @@ description: >-
 Run `ncl voice call`. The host sends a one-time call link to the person's DM; it works once and
 expires after 5 minutes. Tell them to check their DM. Never post, repeat or ask for the link in a
 thread: it lets whoever holds it speak as that person. If the command refuses (voice calls not
-enabled for this agent, not the owner, not Slack), say so in one line.
+enabled for this agent, a person who may not call it, not Slack), say so in one line.
 
 ## During a call
 
