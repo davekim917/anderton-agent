@@ -29,6 +29,7 @@ import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { grantRole } from '../permissions/db/user-roles.js';
 import { requestApproval } from './primitive.js';
+import { canAnswerApproval } from './response-handler.js';
 
 vi.mock('../../container-runner.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../container-runner.js')>()),
@@ -166,5 +167,58 @@ describe('requestApproval delivery failure', () => {
       conversation: { channelType: DM_CHANNEL, platformId: DM_PLATFORM, threadId: null },
       waitWhenElsewhere: true,
     });
+  });
+});
+
+describe('a card bound to its recipient', () => {
+  beforeEach(async () => {
+    setDeliveryAdapter({ deliver: async () => 'pm-1' });
+    await createAgentGroup({ id: 'ag-2', name: 'Other', folder: 'other', agent_provider: null, created_at: now() });
+    for (const [user, group, dm] of [
+      ['slack:admin-a', 'ag-1', 'D-admin-a'],
+      ['slack:admin-b', 'ag-2', 'D-admin-b'],
+    ] as const) {
+      await upsertUser({ id: user, kind: 'slack', display_name: user, created_at: now() });
+      await grantRole({ user_id: user, role: 'admin', agent_group_id: group, granted_by: null, granted_at: now() });
+      await createMessagingGroup({
+        id: `mg-${dm}`,
+        channel_type: DM_CHANNEL,
+        platform_id: dm,
+        name: null,
+        is_group: 0,
+        unknown_sender_policy: 'strict',
+        created_at: now(),
+      });
+      await upsertUserDm({
+        user_id: user,
+        channel_type: DM_CHANNEL,
+        messaging_group_id: `mg-${dm}`,
+        resolved_at: now(),
+      });
+    }
+  });
+
+  it.each([
+    [
+      'only the recipient answers, even an admin of another agent',
+      true,
+      { 'slack:admin-b': true, 'slack:admin-a': false },
+    ],
+    ["otherwise the session group's admins answer", false, { 'slack:admin-b': false, 'slack:admin-a': true }],
+  ])('%s', async (_name, onlyRecipientAnswers, canAnswer) => {
+    await requestApproval({
+      session,
+      agentName: 'Agent',
+      action: 'test_action',
+      payload: {},
+      title: 'Test Approval',
+      question: 'Approve the thing?',
+      approvers: ['slack:admin-b'],
+      onlyRecipientAnswers,
+    });
+    const [row] = await getPendingApprovalsByAction('test_action');
+    for (const [user, expected] of Object.entries(canAnswer)) {
+      expect(await canAnswerApproval(row, user), user).toBe(expected);
+    }
   });
 });

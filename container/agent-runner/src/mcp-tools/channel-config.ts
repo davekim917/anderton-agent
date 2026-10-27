@@ -1,7 +1,7 @@
 /**
  * Channel-config tools: set the wiring row's default_model / default_effort (overrides container.json and host
- * defaults; overridden by per-session `-m`/`-e`). The host authorizes from the session's latest inbound message,
- * not from anything the agent can fake.
+ * defaults; overridden by per-session `-m`/`-e`). The host authorizes the one person who wrote recently, or asks an
+ * approver when that is unclear, never anything the agent can fake.
  */
 import { registerTools } from './server.js';
 import { emitSystemAction, ok } from './tool-helpers.js';

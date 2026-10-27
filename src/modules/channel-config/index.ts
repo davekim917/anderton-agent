@@ -9,7 +9,6 @@
 import { withCentralSync } from '../../db/central-lease.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
-import { deriveCallerId } from '../../caller-identity.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
 import {
@@ -21,7 +20,8 @@ import { parseMessageFlags } from '../../flag-parser.js';
 import { log } from '../../log.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { notifyAgent } from '../approvals/primitive.js';
+import { notifyAgent, registerApprovalHandler } from '../approvals/primitive.js';
+import { requesterOrApproval } from '../permissions/unclear-requester.js';
 import { isAdminOfAgentGroup, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
 
 function hasMutateAuthority(userId: string, agentGroupId: string): Promise<boolean> {
@@ -84,7 +84,11 @@ function parseChannelEffort(effort: string, provider: string): ParsedChannelValu
   return { value: parsed.intent.stickyEffort };
 }
 
-async function handleSetChannelModel(content: Record<string, unknown>, session: Session): Promise<void> {
+async function handleSetChannelModel(
+  content: Record<string, unknown>,
+  session: Session,
+  approvedBy?: string,
+): Promise<void> {
   const args = content as ChannelConfigArgs;
   const channelName = typeof args.channel === 'string' ? args.channel : undefined;
   const model = args.model === null ? null : typeof args.model === 'string' ? args.model : undefined;
@@ -93,11 +97,16 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
     return;
   }
 
-  const callerId = await deriveCallerId(session);
-  if (!callerId) {
-    await notifyAgent(session, 'set_channel_model failed: could not identify the user who sent this message.');
-    return;
-  }
+  const callerId =
+    approvedBy ??
+    (await requesterOrApproval(
+      session,
+      'set_channel_model',
+      content,
+      `set the model for ${channelName ?? 'this channel'} to ${model ?? 'the default'}`,
+      session.agent_group_id,
+    ));
+  if (callerId === null) return;
   const agent = await getAgentGroup(session.agent_group_id);
   if (!agent) {
     await notifyAgent(session, 'set_channel_model failed: agent group not found.');
@@ -155,7 +164,11 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
   ).catch((err) => log.warn('set_channel_model notification failed', { wiringId: wiring.id, err }));
 }
 
-async function handleSetChannelEffort(content: Record<string, unknown>, session: Session): Promise<void> {
+async function handleSetChannelEffort(
+  content: Record<string, unknown>,
+  session: Session,
+  approvedBy?: string,
+): Promise<void> {
   const args = content as ChannelConfigArgs;
   const channelName = typeof args.channel === 'string' ? args.channel : undefined;
   const effort = args.effort === null ? null : typeof args.effort === 'string' ? args.effort : undefined;
@@ -164,11 +177,16 @@ async function handleSetChannelEffort(content: Record<string, unknown>, session:
     return;
   }
 
-  const callerId = await deriveCallerId(session);
-  if (!callerId) {
-    await notifyAgent(session, 'set_channel_effort failed: could not identify the user who sent this message.');
-    return;
-  }
+  const callerId =
+    approvedBy ??
+    (await requesterOrApproval(
+      session,
+      'set_channel_effort',
+      content,
+      `set the effort for ${channelName ?? 'this channel'} to ${effort ?? 'the default'}`,
+      session.agent_group_id,
+    ));
+  if (callerId === null) return;
   const agent = await getAgentGroup(session.agent_group_id);
   if (!agent) {
     await notifyAgent(session, 'set_channel_effort failed: agent group not found.');
@@ -221,7 +239,21 @@ async function handleSetChannelEffort(content: Record<string, unknown>, session:
 }
 
 const CHANNEL_CONFIG_ACTION = unguarded(
-  'handler derives the human caller from session input and enforces owner/admin authority before mutation',
+  'handler acts only for the one person who wrote recently, otherwise holds for an approver, and enforces owner/admin authority before mutation',
 );
-registerDeliveryAction('set_channel_model', handleSetChannelModel, CHANNEL_CONFIG_ACTION);
-registerDeliveryAction('set_channel_effort', handleSetChannelEffort, CHANNEL_CONFIG_ACTION);
+registerDeliveryAction(
+  'set_channel_model',
+  (content, session) => handleSetChannelModel(content, session),
+  CHANNEL_CONFIG_ACTION,
+);
+registerDeliveryAction(
+  'set_channel_effort',
+  (content, session) => handleSetChannelEffort(content, session),
+  CHANNEL_CONFIG_ACTION,
+);
+registerApprovalHandler('set_channel_model', ({ payload, session, userId }) =>
+  handleSetChannelModel(payload, session, userId),
+);
+registerApprovalHandler('set_channel_effort', ({ payload, session, userId }) =>
+  handleSetChannelEffort(payload, session, userId),
+);

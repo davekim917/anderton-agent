@@ -1,6 +1,6 @@
 /**
- * Chat-invokable access grants. The host derives the real caller from the session's latest inbound message and
- * checks its role. `user` accepts a namespaced id, a platform mention (`<@U123>`) or a bare id; the latter two
+ * Chat-invokable access grants. The host acts for the one person who wrote recently, or asks an approver when that
+ * is unclear, and checks their role. `user` accepts a namespaced id, a platform mention (`<@U123>`) or a bare id; the latter two
  * get the session's channel_type prepended. Owner is intentionally not grantable via tool.
  */
 import { registerTools } from './server.js';
@@ -11,7 +11,7 @@ const grantAccessTool: McpToolDefinition = {
   tool: {
     name: 'grant_access',
     description:
-      'Grant a user access to chat with this agent (or another agent group). Host verifies the real caller from the latest inbound message and checks authority — only the owner / a global admin / an admin of the target group can grant; admins can only grant `member`. Use this when someone asks the bot to let a teammate in. The host replies in-chat with success or the reason for denial.',
+      'Grant a user access to chat with this agent (or another agent group). The host works out who asked from who wrote recently (if several people or nobody did, it asks an owner or admin to approve instead and tells you so) and checks authority — only the owner / a global admin / an admin of the target group can grant; admins can only grant `member`. Use this when someone asks the bot to let a teammate in. The host replies in-chat with success or the reason for denial.',
     inputSchema: {
       type: 'object' as const,
       properties: {

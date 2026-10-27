@@ -1,6 +1,6 @@
 /**
- * The human caller behind a container-emitted privileged action (grant.ts, channel-config): never the agent's own
- * claim, but the sender of the session's latest inbound chat row. One implementation for both callers.
+ * Who a container-emitted privileged action (grant.ts, channel-config) is acting for, read only from inbound rows the
+ * host wrote itself, never from the agent's claim or the container's own bookkeeping.
  */
 import { getMessagingGroup } from './db/messaging-groups.js';
 import type { InboundChatSenderRow } from './modules/mailbox/ops/lookups.js';
@@ -8,19 +8,47 @@ import { withExistingMailboxSession } from './session-manager.js';
 import { isHumanChatSdkContent } from './task-list-host.js';
 import type { Session } from './types.js';
 
-/** `notifyAgent` writes `kind='chat'` notices as `senderId: 'system'` after the user's message; scan past them. */
-const SCAN_DEPTH = 20;
 /** Sibling bots in a shared room can post many turns after the human, so the human scan looks further back. */
 const HUMAN_SCAN_DEPTH = 100;
+/** Longer than an agent turn normally takes to reach its action; an older request reads as nobody asking. */
+export const REQUESTER_WINDOW_MS = 15 * 60_000;
 
-/** Namespaced senderId, or null when the session has no mailbox. Opens its own short mailbox session. */
-export async function deriveCallerId(session: Session): Promise<string | null> {
-  return firstSenderId(session, await recentChatSenders(session, SCAN_DEPTH), () => true);
+export type Requester =
+  | { kind: 'one'; userId: string }
+  | { kind: 'unclear'; reason: 'nobody' | 'several' | 'busy' | 'unidentified' };
+
+export async function resolveRequester(session: Session, nowMs = Date.now()): Promise<Requester> {
+  const since = nowMs - REQUESTER_WINDOW_MS;
+  const people = new Set<string>();
+  const rows = await recentChatSenders(session, HUMAN_SCAN_DEPTH);
+  let reachedWindowStart = false;
+  let unidentified = false;
+  for (const row of rows) {
+    if (row.timestamp && Date.parse(row.timestamp) < since) {
+      reachedWindowStart = true;
+      break;
+    }
+    if (!row.content) continue;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(row.content) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const userId = await namespacedSender(session, row, parsed);
+    if (userId) people.add(userId);
+    else if (parsed.senderId !== 'system' && parsed.sender !== 'system') unidentified = true;
+  }
+  if (people.size > 1) return { kind: 'unclear', reason: 'several' };
+  if (!reachedWindowStart && rows.length >= HUMAN_SCAN_DEPTH) return { kind: 'unclear', reason: 'busy' };
+  if (unidentified) return { kind: 'unclear', reason: 'unidentified' };
+  if (people.size === 1) return { kind: 'one', userId: [...people][0] };
+  return { kind: 'unclear', reason: 'nobody' };
 }
 
 /**
  * The latest platform-flagged human (`chat-sdk`, `author.isBot === false`) in the session, or null. Stricter than
- * `deriveCallerId`, which also takes a bot's row or a legacy adapter's.
+ * `resolveRequester`, which also counts a legacy adapter's rows and the host's own voice-call rows.
  */
 export async function deriveHumanRequesterId(session: Session): Promise<string | null> {
   return (await deriveHumanRequest(session))?.userId ?? null;
@@ -53,14 +81,6 @@ async function recentChatSenders(session: Session, depth: number): Promise<Inbou
   );
 }
 
-async function firstSenderId(
-  session: Session,
-  rows: InboundChatSenderRow[],
-  accept: (row: InboundChatSenderRow) => boolean,
-): Promise<string | null> {
-  return (await firstSender(session, rows, accept))?.userId ?? null;
-}
-
 async function firstSender(
   session: Session,
   rows: InboundChatSenderRow[],
@@ -74,19 +94,28 @@ async function firstSender(
     } catch {
       continue;
     }
-    const rawId = (() => {
-      const direct = parsed.senderId;
-      if (typeof direct === 'string' && direct.length > 0) return direct;
-      const author = parsed.author as { userId?: unknown } | undefined;
-      if (typeof author?.userId === 'string' && author.userId.length > 0) return author.userId;
-      return null;
-    })();
-    if (!rawId || rawId === 'system') continue;
-    if (rawId.includes(':')) return { userId: rawId, row };
-    const mgFallback = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
-    const channelType = row.channel_type ?? mgFallback?.channel_type ?? null;
-    if (!channelType) continue;
-    return { userId: `${channelType}:${rawId}`, row };
+    const userId = await namespacedSender(session, row, parsed);
+    if (userId) return { userId, row };
   }
   return null;
+}
+
+async function namespacedSender(
+  session: Session,
+  row: InboundChatSenderRow,
+  parsed: Record<string, unknown>,
+): Promise<string | null> {
+  const direct = parsed.senderId;
+  const author = parsed.author as { userId?: unknown } | undefined;
+  const rawId =
+    typeof direct === 'string' && direct.length > 0
+      ? direct
+      : typeof author?.userId === 'string' && author.userId.length > 0
+        ? author.userId
+        : null;
+  if (!rawId || rawId === 'system') return null;
+  if (rawId.includes(':')) return rawId;
+  const mgFallback = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
+  const channelType = row.channel_type ?? mgFallback?.channel_type ?? null;
+  return channelType ? `${channelType}:${rawId}` : null;
 }

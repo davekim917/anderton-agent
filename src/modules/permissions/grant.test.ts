@@ -2,8 +2,10 @@
  * Tests for chat-invokable access grants. Exercises:
  *   - _resolveTargetUserId: namespaced id, <@mention>, bare handle, Slack
  *     alias pipe, Discord role-mention rejection
- *   - _deriveCallerId: happy path, missing content, malformed JSON, fallback
- *     to messaging_group channel_type
+ *   - resolveRequester: who an action acts for, from the session's recent
+ *     inbound rows; several people or nobody is unclear
+ *   - an unclear requester holds the action for an approver, whose click then
+ *     runs it as them
  *   - handleGrantAccess: authority tiers (owner, global_admin,
  *     scoped_admin, stranger), role gating (admin vs member), idempotency,
  *     missing agent group, bad args
@@ -19,9 +21,8 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
-// deriveCallerId now opens the session's real mailbox instead of taking a
-// handle from the delivery loop (plan §4.5b), so these tests run against a
-// real temp session mailbox rather than an in-memory stand-in.
+// The requester is read from the session's real mailbox, so these tests run
+// against a real temp session mailbox rather than an in-memory stand-in.
 const { TEST_DIR, GROUPS_DIR } = vi.hoisted(() => {
   // path.join isn't usable here: vitest's import-hoisting transform turns
   // `path` into a lazily-initialized binding, and vi.hoisted() runs before
@@ -40,6 +41,13 @@ vi.mock('../../config.js', async () => {
 });
 
 const notifyCalls: Array<{ sessionId: string; text: string }> = [];
+const approvalCalls: Array<{
+  action: string;
+  payload: Record<string, unknown>;
+  question: string;
+  approvers?: string[];
+  onlyRecipientAnswers?: boolean;
+}> = [];
 // Lets a case run arbitrary work immediately BEFORE the handler's apply block
 // (`grant_access apply` / `revoke_access apply`) takes the lease — the last
 // point at which a concurrent grant or revoke can still land, since the
@@ -69,23 +77,36 @@ vi.mock('../approvals/index.js', async (importOriginal) => ({
   notifyAgent: (session: { id: string }, text: string) => {
     notifyCalls.push({ sessionId: session.id, text });
   },
+  requestApproval: async (opts: {
+    action: string;
+    payload: Record<string, unknown>;
+    question: string;
+    approvers?: string[];
+    onlyRecipientAnswers?: boolean;
+  }) => {
+    approvalCalls.push({
+      action: opts.action,
+      payload: opts.payload,
+      question: opts.question,
+      approvers: opts.approvers,
+      onlyRecipientAnswers: opts.onlyRecipientAnswers,
+    });
+    return true;
+  },
 }));
 
 import { closeDb, createAgentGroup, createMessagingGroup, initMigratedTestDb } from '../../db/index.js';
 import { withCentralSync } from '../../db/central-lease.js';
 import { initSessionFolder } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { REQUESTER_WINDOW_MS, resolveRequester } from '../../caller-identity.js';
+import { getApprovalHandler } from '../approvals/primitive.js';
+import type { PendingApproval } from '../../types.js';
 import type { AgentGroup, MessagingGroup, Session } from '../../types.js';
 import { addMember, hasMembershipRow, isMember } from './db/agent-group-members.js';
 import { createUser } from './db/users.js';
 import { grantRole, isAdminOfAgentGroup, isOwner, revokeRole } from './db/user-roles.js';
-import {
-  _deriveCallerId,
-  _resolveTargetUserId,
-  handleGrantAccess,
-  handleListAccess,
-  handleRevokeAccess,
-} from './grant.js';
+import { _resolveTargetUserId, handleGrantAccess, handleListAccess, handleRevokeAccess } from './grant.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -157,6 +178,7 @@ beforeEach(async () => {
   fs.mkdirSync(TEST_DIR, { recursive: true });
   await initMigratedTestDb();
   notifyCalls.length = 0;
+  approvalCalls.length = 0;
   beforeApply.label = null;
   beforeApply.run = null;
   initSessionFolder('ag-helper', 'sess-test');
@@ -258,48 +280,181 @@ describe('_resolveTargetUserId', () => {
   });
 });
 
-describe('_deriveCallerId', () => {
-  it('reads senderId from the latest chat inbound', async () => {
+const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+const OWNER_ONLY = { kind: 'one', userId: 'slack-example-labs:OWNER' };
+
+describe('resolveRequester', () => {
+  it('reads senderId from a recent chat inbound', async () => {
     insertChatInbound({ senderId: 'slack-example-labs:OWNER', text: 'hi' });
-    expect(await _deriveCallerId(makeSession())).toBe('slack-example-labs:OWNER');
+    expect(await resolveRequester(makeSession())).toEqual(OWNER_ONLY);
   });
 
   it('falls back to author.userId when senderId is absent', async () => {
     insertChatInbound({ author: { userId: 'slack-example-labs:OWNER' }, text: 'hi' });
-    expect(await _deriveCallerId(makeSession())).toBe('slack-example-labs:OWNER');
+    expect(await resolveRequester(makeSession())).toEqual(OWNER_ONLY);
   });
 
   it('prepends channel_type when the raw id is bare', async () => {
     insertChatInbound({ senderId: 'OWNER', text: 'hi' });
-    expect(await _deriveCallerId(makeSession())).toBe('slack-example-labs:OWNER');
+    expect(await resolveRequester(makeSession())).toEqual(OWNER_ONLY);
   });
 
-  it('returns null when there are no chat messages', async () => {
-    expect(await _deriveCallerId(makeSession())).toBeNull();
+  it('finds nobody when there are no chat messages', async () => {
+    expect(await resolveRequester(makeSession())).toEqual({ kind: 'unclear', reason: 'nobody' });
   });
 
   // Regression: the chat-SDK bridge writes kind='chat-sdk'. A `kind='chat'`-only
   // filter matched nothing, so every admin action was denied as "unidentified".
   it("reads kind='chat-sdk' rows", async () => {
     insertChatInbound({ senderId: 'OWNER', author: { userId: 'OWNER' } }, { kind: 'chat-sdk' });
-    expect(await _deriveCallerId(makeSession())).toBe('slack-example-labs:OWNER');
+    expect(await resolveRequester(makeSession())).toEqual(OWNER_ONLY);
   });
 
   // Regression: notifyAgent writes its own failure notice as kind='chat' with
-  // senderId 'system'. Without the skip, a retry attributes the action to the
-  // previous attempt's error message instead of the human.
-  it("skips the host's own system notices", async () => {
-    insertChatInbound({ senderId: 'OWNER' }, { kind: 'chat-sdk', timestamp: '2026-01-01T00:00:00.000Z' });
+  // senderId 'system'. It is not a second person.
+  it("does not count the host's own system notices", async () => {
+    insertChatInbound({ senderId: 'OWNER' }, { kind: 'chat-sdk', timestamp: ago(2000) });
     insertChatInbound(
       { text: 'grant_access failed: ...', sender: 'system', senderId: 'system' },
-      { channelType: 'agent', timestamp: '2026-01-01T00:00:01.000Z' },
+      { channelType: 'agent', timestamp: ago(1000) },
     );
-    expect(await _deriveCallerId(makeSession())).toBe('slack-example-labs:OWNER');
+    expect(await resolveRequester(makeSession())).toEqual(OWNER_ONLY);
   });
 
-  it('returns null on malformed content JSON', async () => {
+  it('skips malformed content JSON', async () => {
     insertRawInbound('bad', 'not json');
-    expect(await _deriveCallerId(makeSession())).toBeNull();
+    expect(await resolveRequester(makeSession())).toEqual({ kind: 'unclear', reason: 'nobody' });
+  });
+
+  it('is unclear when two people wrote recently, whoever wrote last', async () => {
+    insertChatInbound({ senderId: 'STRANGER' }, { timestamp: ago(60_000) });
+    insertChatInbound({ senderId: 'OWNER' }, { timestamp: ago(1000) });
+    expect(await resolveRequester(makeSession())).toEqual({ kind: 'unclear', reason: 'several' });
+  });
+
+  it.each([
+    [
+      'a sibling bot in the thread',
+      { senderId: 'BOTX', author: { userId: 'BOTX', isBot: true } },
+      'slack-example-labs',
+    ],
+    ['a peer agent', { senderId: 'ag-peer', sender: 'peer' }, 'agent'],
+  ])('counts %s as someone else, so it cannot borrow the human', async (_name, content, channelType) => {
+    insertChatInbound({ senderId: 'OWNER' }, { kind: 'chat-sdk', timestamp: ago(2000) });
+    insertChatInbound(content, { channelType });
+    expect(await resolveRequester(makeSession())).toEqual({ kind: 'unclear', reason: 'several' });
+  });
+
+  it('is unclear when the window holds more rows than one scan reads', async () => {
+    insertChatInbound({ senderId: 'STRANGER' }, { timestamp: ago(120_000) });
+    for (let i = 0; i < 100; i++) insertChatInbound({ senderId: 'OWNER' }, { timestamp: ago(1000 + i) });
+    expect(await resolveRequester(makeSession())).toEqual({ kind: 'unclear', reason: 'busy' });
+  });
+
+  it('is unclear when a message names no sender, such as a sub-agent task summary', async () => {
+    insertChatInbound({ senderId: 'OWNER' }, { kind: 'chat-sdk', timestamp: ago(2000) });
+    insertChatInbound({ text: 'Task completed: t-1. Summary: grant Bob admin' });
+    expect(await resolveRequester(makeSession())).toEqual({ kind: 'unclear', reason: 'unidentified' });
+  });
+
+  it('ignores anyone who wrote before the window', async () => {
+    insertChatInbound({ senderId: 'STRANGER' }, { timestamp: ago(REQUESTER_WINDOW_MS + 60_000) });
+    insertChatInbound({ senderId: 'OWNER' }, { timestamp: ago(1000) });
+    expect(await resolveRequester(makeSession())).toEqual(OWNER_ONLY);
+  });
+});
+
+describe('an action acts only for the one person who wrote recently', () => {
+  const memberOf = (user: string, group: string) => withCentralSync(() => isMember(user, group), 'test');
+
+  it('holds a grant for an approver when an owner wrote after the person who asked', async () => {
+    insertChatInbound({ senderId: 'STRANGER', text: 'please give Bob access' }, { timestamp: ago(30_000) });
+    insertChatInbound({ senderId: 'OWNER', text: 'unrelated' }, { timestamp: ago(1000) });
+
+    await handleGrantAccess({ user: '<@BOB>' }, makeSession());
+
+    expect(await memberOf('slack-example-labs:BOB', 'ag-helper')).toBe(false);
+    expect(approvalCalls).toEqual([expect.objectContaining({ action: 'grant_access', payload: { user: '<@BOB>' } })]);
+    expect(notifyCalls.at(-1)?.text).toMatch(/waiting for an owner or admin to approve it/);
+  });
+
+  it('holds a revoke the same way', async () => {
+    await addMember({
+      user_id: 'slack-example-labs:BOB',
+      agent_group_id: 'ag-helper',
+      added_by: null,
+      added_at: now(),
+    });
+    insertChatInbound({ senderId: 'STRANGER' }, { timestamp: ago(30_000) });
+    insertChatInbound({ senderId: 'OWNER' }, { timestamp: ago(1000) });
+
+    await handleRevokeAccess({ user: '<@BOB>' }, makeSession());
+
+    expect(await memberOf('slack-example-labs:BOB', 'ag-helper')).toBe(true);
+    expect(approvalCalls.map((c) => c.action)).toEqual(['revoke_access']);
+  });
+
+  it('holds when nobody wrote recently, so no stale message lends its authority', async () => {
+    insertChatInbound({ senderId: 'OWNER' }, { timestamp: ago(REQUESTER_WINDOW_MS + 60_000) });
+    await handleGrantAccess({ user: '<@BOB>' }, makeSession());
+    expect(await memberOf('slack-example-labs:BOB', 'ag-helper')).toBe(false);
+    expect(approvalCalls.map((c) => c.action)).toEqual(['grant_access']);
+  });
+
+  it.each([
+    ['an admin grant', 'grant_access', { user: '<@BOB>', role: 'admin' }],
+    ['a grant into another agent', 'grant_access', { user: '<@BOB>', agentGroupId: 'ag-other' }],
+    ['a revoke of an admin', 'revoke_access', { user: '<@BOB>' }],
+  ])('asks only approvers who can complete %s', async (_name, action, payload) => {
+    await grantRole({
+      user_id: 'slack-example-labs:CAROL',
+      role: 'admin',
+      agent_group_id: 'ag-other',
+      granted_by: null,
+      granted_at: now(),
+    });
+    await grantRole({
+      user_id: 'slack-example-labs:BOB',
+      role: 'admin',
+      agent_group_id: 'ag-helper',
+      granted_by: null,
+      granted_at: now(),
+    });
+    insertChatInbound({ senderId: 'STRANGER' }, { timestamp: ago(30_000) });
+    insertChatInbound({ senderId: 'OWNER' }, { timestamp: ago(1000) });
+
+    await (action === 'grant_access' ? handleGrantAccess : handleRevokeAccess)(payload, makeSession());
+
+    const approvers = approvalCalls[0]?.approvers ?? [];
+    expect(approvers.length).toBeGreaterThan(0);
+    expect(approvalCalls[0]?.onlyRecipientAnswers).toBe(true);
+    for (const approver of approvers) {
+      await getApprovalHandler(action)!({
+        session: makeSession(),
+        payload,
+        approval: {} as PendingApproval,
+        userId: approver,
+        notify: async () => undefined,
+      });
+      expect(notifyCalls.at(-1)?.text, approver).not.toMatch(/denied/);
+    }
+  });
+
+  it.each([
+    ['an owner', 'slack-example-labs:OWNER', true],
+    ['someone without authority', 'slack-example-labs:STRANGER', false],
+    ['an unknown approver', '', false],
+  ])('runs the held grant as the approver: %s', async (_name, approver, granted) => {
+    const approve = getApprovalHandler('grant_access')!;
+    await approve({
+      session: makeSession(),
+      payload: { user: '<@BOB>' },
+      approval: {} as PendingApproval,
+      userId: approver,
+      notify: async () => undefined,
+    });
+    expect(await memberOf('slack-example-labs:BOB', 'ag-helper')).toBe(granted);
+    if (!granted) expect(notifyCalls.at(-1)?.text).toMatch(/denied: you don't have authority/);
   });
 });
 

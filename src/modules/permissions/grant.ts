@@ -1,8 +1,8 @@
 /**
  * Chat-invokable access grants: `grant_access`, `revoke_access`, `list_access`.
  *
- * Caller identity is read from the SESSION's latest inbound chat message, never
- * from anything the agent passes in. Owner / global admin may grant or revoke
+ * The caller is the one person who wrote in the session recently (`resolveRequester`), never anything the agent
+ * passes in; when that is unclear, an approver's click stands in for them. Owner / global admin may grant or revoke
  * `member` or `admin` anywhere; a scoped admin only `member` on their own group.
  * The owner role is never grantable here.
  */
@@ -10,14 +10,14 @@
 import { withCentralSync, withRawDb } from '../../db/central-lease.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
-import { deriveCallerId } from '../../caller-identity.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
-import { notifyAgent } from '../approvals/index.js';
+import { notifyAgent, registerApprovalHandler } from '../approvals/index.js';
 import { ADD_MEMBER_SQL, REMOVE_MEMBER_SQL, getMembers, isMember } from './db/agent-group-members.js';
 import { createUser, getUser, upsertUser } from './db/users.js';
+import { requesterOrApproval } from './unclear-requester.js';
 import {
   getAdminsOfAgentGroup,
   getGlobalAdmins,
@@ -72,9 +72,13 @@ async function ensureUserExists(userId: string): Promise<void> {
   void createUser;
 }
 
-export { deriveCallerId as _deriveCallerId, resolveTargetUserId as _resolveTargetUserId };
+export { resolveTargetUserId as _resolveTargetUserId };
 
-export async function handleGrantAccess(content: Record<string, unknown>, session: Session): Promise<void> {
+export async function handleGrantAccess(
+  content: Record<string, unknown>,
+  session: Session,
+  approvedBy?: string,
+): Promise<void> {
   const args = content as GrantArgs;
   const rawUser = typeof args.user === 'string' ? args.user : '';
   const role = typeof args.role === 'string' ? args.role.trim().toLowerCase() : 'member';
@@ -94,11 +98,16 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     return;
   }
 
-  const callerId = await deriveCallerId(session);
-  if (!callerId) {
-    await notifyAgent(session, 'grant_access failed: could not determine caller (no recent inbound message).');
-    return;
-  }
+  const callerId =
+    approvedBy ??
+    (await requesterOrApproval(
+      session,
+      'grant_access',
+      content,
+      `grant \`${rawUser}\` ${role} access to \`${targetAgentGroupId}\``,
+      role === 'admin' ? null : targetAgentGroupId,
+    ));
+  if (callerId === null) return;
 
   // The role predicates are lease-only.
   const { callerIsGlobal, callerIsScopedAdmin } = await withCentralSync(
@@ -213,7 +222,11 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
   );
 }
 
-export async function handleRevokeAccess(content: Record<string, unknown>, session: Session): Promise<void> {
+export async function handleRevokeAccess(
+  content: Record<string, unknown>,
+  session: Session,
+  approvedBy?: string,
+): Promise<void> {
   const args = content as GrantArgs;
   const rawUser = typeof args.user === 'string' ? args.user : '';
   const targetAgentGroupId = typeof args.agentGroupId === 'string' ? args.agentGroupId : session.agent_group_id;
@@ -227,11 +240,16 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
     return;
   }
 
-  const callerId = await deriveCallerId(session);
-  if (!callerId) {
-    await notifyAgent(session, 'revoke_access failed: could not determine caller.');
-    return;
-  }
+  const callerId =
+    approvedBy ??
+    (await requesterOrApproval(
+      session,
+      'revoke_access',
+      content,
+      `remove \`${rawUser}\`'s access to \`${targetAgentGroupId}\``,
+      null,
+    ));
+  if (callerId === null) return;
 
   const { callerIsGlobal, callerIsScopedAdmin } = await withCentralSync(
     () => ({
@@ -345,8 +363,12 @@ export async function handleListAccess(content: Record<string, unknown>, session
 }
 
 const ACCESS_ACTION = unguarded(
-  'handler derives caller identity from the trusted session and enforces owner/admin authority tiers',
+  'handler acts only for the one person who wrote recently, otherwise holds for an approver, and enforces owner/admin authority tiers',
 );
-registerDeliveryAction('grant_access', handleGrantAccess, ACCESS_ACTION);
-registerDeliveryAction('revoke_access', handleRevokeAccess, ACCESS_ACTION);
+registerDeliveryAction('grant_access', (content, session) => handleGrantAccess(content, session), ACCESS_ACTION);
+registerDeliveryAction('revoke_access', (content, session) => handleRevokeAccess(content, session), ACCESS_ACTION);
+registerApprovalHandler('grant_access', ({ payload, session, userId }) => handleGrantAccess(payload, session, userId));
+registerApprovalHandler('revoke_access', ({ payload, session, userId }) =>
+  handleRevokeAccess(payload, session, userId),
+);
 registerDeliveryAction('list_access', handleListAccess, ACCESS_ACTION);

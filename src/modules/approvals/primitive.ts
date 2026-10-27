@@ -281,6 +281,11 @@ export interface RequestApprovalOptions {
   approverUserId?: string;
   /** Ordered override of the pickApprover chain; ignored when approverUserId is set. */
   approvers?: string[];
+  /**
+   * With `approvers` chosen for one action's authority: only the approver the card reaches may answer it, since the
+   * click check otherwise asks about the session's own agent group, not the action's.
+   */
+  onlyRecipientAnswers?: boolean;
   /** Custom buttons; pair with registerChoiceHandler on the same action, or clicks get approve/reject semantics. */
   options?: RawOption[];
   /**
@@ -318,10 +323,12 @@ export async function requestApprovalOutcome(opts: RequestApprovalOptions): Prom
     deliveryTarget = 'admin',
     approverUserId,
     approvers: approverOverride,
+    onlyRecipientAnswers = false,
     options: customOptions,
   } = opts;
   const cardOptions = customOptions ?? APPROVAL_OPTIONS;
 
+  let answerer = approverUserId ?? null;
   let destination: {
     channelType: string;
     platformId: string;
@@ -370,6 +377,7 @@ export async function requestApprovalOutcome(opts: RequestApprovalOptions): Prom
       await notifyAgent(session, `${action} failed: no DM channel found for any eligible approver.`);
       return 'failed';
     }
+    if (onlyRecipientAnswers) answerer = target.userId;
     destination = {
       channelType: target.messagingGroup.channel_type,
       platformId: target.messagingGroup.platform_id,
@@ -396,7 +404,7 @@ export async function requestApprovalOutcome(opts: RequestApprovalOptions): Prom
     platform_id: destination.platformId,
     thread_id: destination.threadId,
     instance: destination.instance ?? null,
-    approver_user_id: approverUserId ?? null,
+    approver_user_id: answerer,
   });
   // Honour the reservation BEFORE anything is posted: false here is the
   // action-scoped unique index refusing a second live row for this requestId.

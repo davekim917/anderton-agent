@@ -7,6 +7,14 @@ const fixture = vi.hoisted(() => ({
   provider: 'claude',
   updates: [] as Array<{ id: string; patch: Record<string, unknown> }>,
   notices: [] as string[],
+  requester: { kind: 'one', userId: 'slack:U0OWNER' } as
+    | { kind: 'one'; userId: string }
+    | { kind: 'unclear'; reason: 'nobody' | 'several' },
+  approvals: [] as string[],
+  approvalHandlers: new Map<
+    string,
+    (ctx: { payload: Record<string, unknown>; session: Session; userId: string }) => Promise<void>
+  >(),
 }));
 
 vi.mock('../../delivery.js', () => ({
@@ -16,7 +24,10 @@ vi.mock('../../delivery.js', () => ({
   ) => fixture.handlers.set(name, handler),
 }));
 vi.mock('../../db/central-lease.js', () => ({ withCentralSync: async (fn: () => unknown) => fn() }));
-vi.mock('../../caller-identity.js', () => ({ deriveCallerId: async () => 'slack:U0OWNER' }));
+vi.mock('../../caller-identity.js', () => ({
+  REQUESTER_WINDOW_MS: 900_000,
+  resolveRequester: async () => fixture.requester,
+}));
 vi.mock('../../db/agent-groups.js', () => ({
   getAgentGroup: async (id: string) => ({ id, name: 'agent', agent_provider: fixture.provider }),
 }));
@@ -35,6 +46,17 @@ vi.mock('../../session-manager.js', () => ({ withExistingMailboxSession: async (
 vi.mock('../approvals/primitive.js', () => ({
   notifyAgent: async (_session: Session, text: string) => {
     fixture.notices.push(text);
+  },
+  registerApprovalHandler: (action: string, handler: never) => fixture.approvalHandlers.set(action, handler),
+  pickApprover: async () => [],
+}));
+vi.mock('../approvals/index.js', () => ({
+  notifyAgent: async (_session: Session, text: string) => {
+    fixture.notices.push(text);
+  },
+  requestApproval: async (opts: { action: string }) => {
+    fixture.approvals.push(opts.action);
+    return true;
   },
 }));
 vi.mock('../permissions/db/user-roles.js', () => ({
@@ -55,9 +77,24 @@ beforeEach(() => {
   fixture.provider = 'claude';
   fixture.updates.length = 0;
   fixture.notices.length = 0;
+  fixture.requester = { kind: 'one', userId: 'slack:U0OWNER' };
+  fixture.approvals.length = 0;
 });
 
 describe('set_channel_model / set_channel_effort', () => {
+  it.each([
+    ['set_channel_model', { model: 'claude-future-model-9' }, { default_model: 'claude-future-model-9' }],
+    ['set_channel_effort', { effort: 'high' }, { default_effort: 'high' }],
+  ])('%s waits for an approver when several people wrote, then runs as them', async (action, content, patch) => {
+    fixture.requester = { kind: 'unclear', reason: 'several' };
+    await run(action, content);
+    expect(fixture.updates).toEqual([]);
+    expect(fixture.approvals).toEqual([action]);
+
+    await fixture.approvalHandlers.get(action)!({ payload: content, session, userId: 'slack:U0OWNER' });
+    expect(fixture.updates).toEqual([{ id: 'wiring-1', patch }]);
+  });
+
   it.each([
     ['claude', 'claude-future-model-9'],
     ['opencode', 'openrouter/future-model:free'],
