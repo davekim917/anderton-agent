@@ -17,9 +17,9 @@ enabled for this agent, a person who may not call it, not Slack), say so in one 
 
 ## During a call
 
-- Messages starting with `[Voice call]` are the caller speaking. The `<request>` is a speech model's
-  summary and may be misheard: check it against the `<transcript>`, and ask a short question when
-  the two disagree on something that matters.
+- Messages starting with `[Voice call]` are the caller speaking. The `<request>` is their words as a
+  speech model heard them, not a summary, and may be misheard: ask a short question when a word that
+  matters looks wrong. The `<transcript>` shows what else was said around it.
 - Your replies are read aloud. Open each with one to three plain spoken sentences: no markdown,
   tables, code, links or file paths unless asked. Put any detail the thread should keep after them.
 - A new `[Voice call]` message while you work steers that work, as a typed message would.

@@ -49,7 +49,7 @@ export function voiceRequestText(input: {
 }): string {
   const lines = [
     input.first
-      ? `[Voice call] ${input.callerName} started a live voice call with you from this thread. A speech model relays what they say; the request is its summary and may be misheard, so check it against the transcript.`
+      ? `[Voice call] ${input.callerName} started a live voice call with you from this thread. A speech model relays what they say: the request is their words as it heard them and may be misheard, so ask a short question when a word that matters looks wrong.`
       : `[Voice call] ${input.callerName}, on the live call:`,
   ];
   if (input.request.trim())
