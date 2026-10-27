@@ -49,6 +49,14 @@ vi.mock('../../db/messaging-groups.js', () => ({
   }),
 }));
 vi.mock('../../db/agent-groups.js', () => ({ getAgentGroup: async () => ({ id: 'ag-atlas', name: 'atlas' }) }));
+vi.mock('../../container-config.js', async (orig) => ({
+  ...(await orig<typeof import('../../container-config.js')>()),
+  readContainerConfig: () => ({}),
+}));
+vi.mock('../../container-runner.js', () => ({
+  resolveAssistantName: async (_group: unknown, _config: unknown, messagingGroupId: string | null) =>
+    messagingGroupId === 'mg-thread' ? 'Atlas' : 'wrong conversation',
+}));
 vi.mock('../../caller-identity.js', () => ({
   deriveHumanRequest: async () =>
     h.requester
@@ -328,6 +336,43 @@ describe('the call link', () => {
     expect(h.liveClosed).toBe(1);
     expect(svc.voiceCallHeldUntilMs('sess-1')).toBeNull();
     expect((await request(id, 'GET', '/')).status).toBe(404);
+  });
+
+  it("logs the page's audio report at hang-up, keeping only typed numbers and known words", async () => {
+    const { log } = await import('../../log.js');
+    await svc.mintVoiceCall({ sessionId: 'sess-1', agentGroupId: 'ag-atlas' });
+    const id = linkId();
+    const origin = `https://${id}.calls.example.test`;
+    const { token } = JSON.parse((await request(id, 'POST', '/offer?t=', { origin, body: { sdp: 'v=0 offer' } })).body);
+    vi.mocked(log.info).mockClear();
+
+    const stats = {
+      inBytes: 101567,
+      inPackets: 1125,
+      inLost: -3,
+      inEnergy: 0.16744,
+      outBytes: '51712',
+      rttMs: 38,
+      path: 'relay',
+      protocol: 'quic',
+      playback: 'blocked',
+      outPaused: true,
+      note: 'not a field',
+    };
+    const res = await request(id, 'POST', `/hangup?t=${token}`, { origin, body: { dropped: false, stats } });
+
+    expect(res.status).toBe(200);
+    expect(vi.mocked(log.info).mock.calls.find(([msg]) => msg === 'Voice call audio report')?.[1]).toEqual({
+      callId: id.slice(0, 8),
+      inBytes: 101567,
+      inPackets: 1125,
+      inEnergy: 0.167,
+      rttMs: 38,
+      path: 'relay',
+      playback: 'blocked',
+      outPaused: true,
+    });
+    expect(svc.getVoiceCall(id)).toBeNull();
   });
 
   it('expires unused after the ring window', async () => {

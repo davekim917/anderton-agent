@@ -3,6 +3,7 @@ import { randomBytes } from 'crypto';
 import { PREVIEW_ORIGIN_SUFFIX, TIMEZONE, VOICE_CALL_AGENT_GROUPS, VOICE_CALL_CODEX_BIN } from '../../config.js';
 import { deriveHumanRequest } from '../../caller-identity.js';
 import { withCentralSync } from '../../db/central-lease.js';
+import { readContainerConfig } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSession } from '../../db/sessions.js';
@@ -12,7 +13,7 @@ import { requestWake } from '../../request-wake.js';
 import { scrubSecrets } from '../../secret-scrubber.js';
 import { SessionWriteRefusedError, writeSessionMessage } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
-import { isChannelVariant } from '../../types.js';
+import { isChannelVariant, type AgentGroup } from '../../types.js';
 import { isOwner } from '../permissions/db/user-roles.js';
 import { getUser } from '../permissions/db/users.js';
 import { ensureUserDm } from '../permissions/user-dm.js';
@@ -150,6 +151,17 @@ function portsFor(call: VoiceCall): CallPorts {
   };
 }
 
+/** The name the agent goes by in this conversation, as the rest of the host shows it. */
+async function spokenName(agentGroup: AgentGroup, messagingGroupId: string): Promise<string> {
+  try {
+    const { resolveAssistantName } = await import('../../container-runner.js');
+    return await resolveAssistantName(agentGroup, readContainerConfig(agentGroup.folder), messagingGroupId);
+  } catch (err) {
+    log.warn('Voice call: could not resolve the agent name', { agentGroupId: agentGroup.id, err });
+    return agentGroup.name;
+  }
+}
+
 /**
  * Mints a call link for the human who asked in this session and sends it to that person's DM, never into the
  * thread: the link speaks as them. The host picks the caller from the session's latest human message, so an agent
@@ -176,6 +188,7 @@ export async function mintVoiceCall(input: { sessionId: string; agentGroupId: st
   }
   const caller = await getUser(callerId);
   const agentGroup = await getAgentGroup(input.agentGroupId);
+  const agentName = agentGroup ? await spokenName(agentGroup, mg.id) : 'your agent';
   const instance = mg.instance ?? mg.channel_type;
 
   const dm = await ensureUserDm(callerId, { instance, privacySafeLogs: true });
@@ -191,12 +204,11 @@ export async function mintVoiceCall(input: { sessionId: string; agentGroupId: st
   }
 
   const id = randomBytes(16).toString('hex');
-  const agentName = agentGroup?.name || 'your agent';
   const call: VoiceCall = {
     id,
     sessionId: session.id,
     agentGroupId: input.agentGroupId,
-    agentName: agentName.charAt(0).toUpperCase() + agentName.slice(1),
+    agentName,
     callerId,
     callerName: caller?.display_name || 'the caller',
     callerHandle: callerId.slice(callerId.indexOf(':') + 1),
@@ -276,7 +288,33 @@ export async function answerVoiceCall(call: VoiceCall, offer: string): Promise<{
 export function connectVoiceAudio(call: VoiceCall): void {
   if (call.audioTimer) clearTimeout(call.audioTimer);
   call.audioTimer = null;
+  log.info('Voice call audio connected', { callId: call.id.slice(0, 8) });
   call.bridge?.audioConnected();
+}
+
+const AUDIO_NUMBERS = ['inBytes', 'inPackets', 'inLost', 'inEnergy', 'outBytes', 'outPackets', 'rttMs'] as const;
+const AUDIO_WORDS = {
+  path: ['host', 'srflx', 'prflx', 'relay'],
+  protocol: ['udp', 'tcp'],
+  playback: ['none', 'playing', 'blocked'],
+} as const;
+
+/** The page's WebRTC numbers at hang-up, kept only where they are what they claim to be. */
+export function logAudioReport(call: VoiceCall, raw: unknown): void {
+  if (!raw || typeof raw !== 'object') return;
+  const given = raw as Record<string, unknown>;
+  const report: Record<string, number | string | boolean> = {};
+  for (const key of AUDIO_NUMBERS) {
+    const value = given[key];
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0)
+      report[key] = Math.round(value * 1000) / 1000;
+  }
+  for (const [key, allowed] of Object.entries(AUDIO_WORDS)) {
+    const value = given[key];
+    if (typeof value === 'string' && (allowed as readonly string[]).includes(value)) report[key] = value;
+  }
+  if (typeof given.outPaused === 'boolean') report.outPaused = given.outPaused;
+  if (Object.keys(report).length > 0) log.info('Voice call audio report', { callId: call.id.slice(0, 8), ...report });
 }
 
 export function hangUpVoiceCall(call: VoiceCall, dropped: boolean): void {

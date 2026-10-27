@@ -26,6 +26,7 @@ export function callPageHtml(agentName: string): string {
   #start { background: var(--accent); color: #fff; }
   #mute { background: var(--card); color: var(--fg); }
   #hangup { background: var(--danger); color: #fff; }
+  #hear { background: var(--accent); color: #fff; }
   button[hidden] { display: none; }
 </style>
 </head>
@@ -38,12 +39,15 @@ export function callPageHtml(agentName: string): string {
     <button id="mute" hidden>Mute</button>
     <button id="hangup" hidden>Hang up</button>
   </div>
+  <button id="hear" hidden>Tap to hear</button>
   <audio id="out" autoplay playsinline></audio>
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
   const status = (text) => { $('status').textContent = text; };
-  let pc, mic, wake, events, token = '', ended = false;
+  const TAP_TO_HEAR = 'Tap "Tap to hear" to hear the voice.';
+  let pc, mic, wake, events, connecting, sampler, connectedAt = 0, token = '', ended = false, leaving = false, silent = false;
+  let playback = 'none', report = null;
   const withToken = (path) => path + '?t=' + encodeURIComponent(token);
   const post = (path, body) => fetch(withToken(path), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
   const finish = (text) => {
@@ -52,25 +56,81 @@ export function callPageHtml(agentName: string): string {
     status(text);
     $('orb').classList.remove('live');
     $('mute').hidden = $('hangup').hidden = true;
+    clearTimeout(connecting);
+    clearInterval(sampler);
+    $('hear').hidden = true;
     try { events && events.close(); } catch {}
     try { pc && pc.close(); } catch {}
     try { mic && mic.getTracks().forEach((t) => t.stop()); } catch {}
     try { wake && wake.release(); } catch {}
   };
-  const drop = (text) => { if (token && !ended) post('hangup', { dropped: true }); finish(text); };
+  const sample = async () => {
+    if (!pc) return report;
+    try {
+      const stats = await pc.getStats();
+      const r = { inBytes: 0, inPackets: 0, inLost: 0, inEnergy: 0, outBytes: 0, outPackets: 0, rttMs: null, path: null, protocol: null };
+      let pairId = null;
+      stats.forEach((s) => {
+        if (s.type === 'inbound-rtp' && s.kind === 'audio') {
+          r.inBytes += s.bytesReceived || 0; r.inPackets += s.packetsReceived || 0;
+          r.inLost += s.packetsLost || 0; r.inEnergy += s.totalAudioEnergy || 0;
+        }
+        if (s.type === 'outbound-rtp' && s.kind === 'audio') { r.outBytes += s.bytesSent || 0; r.outPackets += s.packetsSent || 0; }
+        if (s.type === 'transport' && s.selectedCandidatePairId) pairId = s.selectedCandidatePairId;
+      });
+      const pair = pairId && stats.get(pairId);
+      const local = pair && stats.get(pair.localCandidateId);
+      if (pair && typeof pair.currentRoundTripTime === 'number') r.rttMs = Math.round(pair.currentRoundTripTime * 1000);
+      if (local) { r.path = local.candidateType || null; r.protocol = local.protocol || null; }
+      report = { ...r, playback, outPaused: $('out').paused };
+      if (!silent && !ended && connectedAt && Date.now() - connectedAt > 10000 && r.inPackets === 0) {
+        silent = true;
+        status('No sound is reaching this phone. This network may be blocking call audio.');
+      }
+    } catch {}
+    return report;
+  };
+  const leave = async (text, dropped) => {
+    if (ended || leaving) return;
+    leaving = true;
+    $('mute').hidden = $('hangup').hidden = true;
+    if (token) post('hangup', { dropped, stats: await sample() });
+    finish(text);
+  };
+  const drop = (text) => leave(text, true);
+  const play = () => $('out').play().then(
+    () => {
+      playback = 'playing';
+      $('hear').hidden = true;
+      if (connectedAt && $('status').textContent === TAP_TO_HEAR) status('Live');
+    },
+    (err) => {
+      if (!err || err.name !== 'NotAllowedError') return;
+      playback = 'blocked';
+      $('hear').hidden = false;
+      status(TAP_TO_HEAR);
+    },
+  );
   const keepAwake = async () => { try { wake = await navigator.wakeLock.request('screen'); } catch {} };
   document.addEventListener('visibilitychange', () => { if (!ended && document.visibilityState === 'visible') keepAwake(); });
   $('start').onclick = async () => {
     $('start').hidden = true;
     status('Connecting…');
+    $('out').play().catch(() => {});
     try {
       mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
       pc = new RTCPeerConnection();
-      pc.ontrack = (e) => { $('out').srcObject = e.streams[0]; };
+      pc.ontrack = (e) => { $('out').srcObject = e.streams[0]; play(); };
       mic.getAudioTracks().forEach((t) => pc.addTrack(t, mic));
       pc.createDataChannel('oai-events');
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'connected') { $('orb').classList.add('live'); post('connected'); }
+        if (pc.connectionState === 'connected') {
+          clearTimeout(connecting);
+          connectedAt = Date.now();
+          $('orb').classList.add('live');
+          status(playback === 'blocked' ? TAP_TO_HEAR : 'Live');
+          post('connected');
+        }
         if (pc.connectionState === 'failed') drop('The call dropped.');
       };
       await pc.setLocalDescription(await pc.createOffer());
@@ -88,7 +148,11 @@ export function callPageHtml(agentName: string): string {
       };
       keepAwake();
       $('mute').hidden = $('hangup').hidden = false;
-      status('Live');
+      sampler = setInterval(sample, 5000);
+      if (pc.connectionState !== 'connected') {
+        status('Connecting audio…');
+        connecting = setTimeout(() => drop("Audio couldn't connect on this network."), 30000);
+      }
     } catch (err) {
       drop(err && err.message ? err.message : 'The call could not start.');
     }
@@ -99,8 +163,11 @@ export function callPageHtml(agentName: string): string {
     track.enabled = !track.enabled;
     $('mute').textContent = track.enabled ? 'Mute' : 'Unmute';
   };
-  $('hangup').onclick = () => { post('hangup'); finish('Call ended.'); };
-  window.addEventListener('pagehide', () => { if (!ended) navigator.sendBeacon(withToken('hangup'), '{}'); });
+  $('hear').onclick = () => play();
+  $('hangup').onclick = () => leave('Call ended.', false);
+  window.addEventListener('pagehide', () => {
+    if (!ended && token) navigator.sendBeacon(withToken('hangup'), JSON.stringify({ stats: report }));
+  });
 })();
 </script>
 </body>

@@ -5,7 +5,14 @@ import { log } from '../../log.js';
 import { VoiceServiceError } from './live.js';
 import { callPageHtml } from './page.js';
 import { getVoiceCall, type CallPageEvent, type VoiceCall } from './registry.js';
-import { answerVoiceCall, connectVoiceAudio, hangUpVoiceCall, voiceCallUrl, VoiceCallRefused } from './service.js';
+import {
+  answerVoiceCall,
+  connectVoiceAudio,
+  hangUpVoiceCall,
+  logAudioReport,
+  voiceCallUrl,
+  VoiceCallRefused,
+} from './service.js';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const SSE_PING_MS = 15_000;
@@ -122,7 +129,11 @@ export function handleVoiceCallRequest(id: string, req: IncomingMessage, res: Se
         return;
       }
       if (url.pathname === '/connected') connectVoiceAudio(call);
-      else hangUpVoiceCall(call, (JSON.parse(body || '{}') as { dropped?: unknown }).dropped === true);
+      else {
+        const ended = JSON.parse(body || '{}') as { dropped?: unknown; stats?: unknown };
+        logAudioReport(call, ended.stats);
+        hangUpVoiceCall(call, ended.dropped === true);
+      }
       json(res, 200, { ok: true });
     } catch (err) {
       const known = err instanceof VoiceCallRefused || err instanceof VoiceServiceError;
