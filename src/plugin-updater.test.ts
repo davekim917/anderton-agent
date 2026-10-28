@@ -47,7 +47,7 @@ case "$1" in
   rev-parse) if [ -e "$state/pulled" ]; then echo new; else echo old; fi ;;
   pull)
     fails=; [ -e "$state/pull-fails" ] && fails=$(cat "$state/pull-fails"; echo .)
-    echo "pull $(env | grep -oE '^(GH_TOKEN|GITHUB_TOKEN)=' | tr -d '=' | tr '\\n' ' ')" >> "$state/pulls"
+    echo "pull $(env | grep -oE '^(HTTPS_PROXY|https_proxy|HTTP_PROXY|http_proxy)=' | tr -d '=' | tr '\\n' ' ')" >> "$state/pulls"
     [ "$fails" = "." ] && { echo "fatal: pull boom" >&2; exit 1; }
     [ -n "$fails" ] && { printf '%s' "\${fails%.}" >&2; exit 1; }
     [ -e "$state/upstream-moved" ] && : > "$state/pulled"
@@ -83,8 +83,10 @@ const saved = {
   HOME: process.env.HOME,
   PATH: process.env.PATH,
   FAKE_NPM_LOG: process.env.FAKE_NPM_LOG,
-  GH_TOKEN: process.env.GH_TOKEN,
-  GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+  HTTPS_PROXY: process.env.HTTPS_PROXY,
+  https_proxy: process.env.https_proxy,
+  HTTP_PROXY: process.env.HTTP_PROXY,
+  http_proxy: process.env.http_proxy,
   PLUGIN_UPDATE_NOTIFY_JID: process.env.PLUGIN_UPDATE_NOTIFY_JID,
 };
 
@@ -322,9 +324,10 @@ describe('with fake git: failures stay inside their plugin', () => {
     );
   });
 
-  it('pulls without GH_TOKEN or GITHUB_TOKEN, so gh falls back to the stored login', async () => {
-    process.env.GH_TOKEN = 'gh-token-from-env';
-    process.env.GITHUB_TOKEN = 'github-token-from-env';
+  it('pulls without the gateway proxy the daemon runs behind', async () => {
+    for (const key of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']) {
+      process.env[key] = 'http://x:token@127.0.0.1:10255';
+    }
     const dir = fakePlugin('p', { pulls: '' });
 
     await runPluginUpdates();

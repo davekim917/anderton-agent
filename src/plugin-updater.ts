@@ -71,9 +71,10 @@ async function gitHead(pluginPath: string): Promise<string> {
   return stdout.trim();
 }
 
-// gh's git credential helper prefers GH_TOKEN/GITHUB_TOKEN over the operator's stored login.
+// The daemon runs under `onecli run`: through its gateway proxy a private plugin's pull fails with
+// "Authentication failed", while the same pull bypassing the proxy succeeds.
 function pullEnv(): NodeJS.ProcessEnv {
-  const { GH_TOKEN: _gh, GITHUB_TOKEN: _github, ...env } = process.env;
+  const { HTTPS_PROXY: _a, https_proxy: _b, HTTP_PROXY: _c, http_proxy: _d, ...env } = process.env;
   return env;
 }
 
