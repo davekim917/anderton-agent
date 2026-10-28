@@ -1,0 +1,44 @@
+{
+  "_comment": "Three rounds of one race at two call sites whose files share two modules equally, a logger and a prompt module, and whose findings name neither. Modelled on a group-call PR whose gate keyed this class to the logger by the alphabet. `sources` keeps the classifier off the disk.",
+  "findings": [
+    {
+      "threadId": "T1",
+      "commentId": 201,
+      "reviewId": "PRR_1",
+      "createdAt": "2026-09-01T09:00:00Z",
+      "path": "src/calls/room.ts",
+      "line": 40,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Recheck the room after the await**\n\nThe room state is read, then the join is written after an await, so a hang-up in between wins the race and the join lands on a room that has ended."
+    },
+    {
+      "threadId": "T2",
+      "commentId": 202,
+      "reviewId": "PRR_2",
+      "createdAt": "2026-09-01T11:00:00Z",
+      "path": "src/calls/relay.ts",
+      "line": 22,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Relay turns in the order they arrived**\n\nTwo relays started concurrently interleave their writes, so the later turn can overtake the earlier one; the same race as the room join."
+    },
+    {
+      "threadId": "T3",
+      "commentId": 203,
+      "reviewId": "PRR_3",
+      "createdAt": "2026-09-01T13:00:00Z",
+      "path": "src/calls/room.ts",
+      "line": 88,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Revalidate the call before starting the bridge**\n\nThe bridge starts after an awaited setup step with nothing rechecking that the call is still live, so an ended call gets a bridge."
+    }
+  ],
+  "sources": {
+    "src/calls/room.ts": "import { log } from '../log.js';\nimport { greeting } from './prompts.js';\n\nexport async function join() {}\n",
+    "src/calls/relay.ts": "import { log } from '../log.js';\nimport { greeting } from './prompts.js';\n\nexport async function relay() {}\n",
+    "src/log.ts": "export const log = { info() {}, warn() {} };\n",
+    "src/calls/prompts.ts": "export const greeting = 'hello';\n"
+  }
+}

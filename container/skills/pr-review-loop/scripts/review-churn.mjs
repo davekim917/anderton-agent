@@ -501,13 +501,34 @@ function blobAt(ref, file, ctx) {
   return value;
 }
 
-/**
- * The seam for a set of flagged files: the module most of them import, with
- * in-repo modules preferred over packages and the number of its bound names
- * mentioned in the findings as the tiebreak. That last term is what picks the
- * module owning `writeSessionMessage` over a logger every file also imports.
- */
 export function seamFor(files, findingText, ctx) {
+  const scored = rankImports(files, findingText, ctx);
+  // A module nothing shares is not a seam. One flagged file is the exception:
+  // its own imports are the only candidates there are.
+  const top = scored.find((s) => s.fileCount >= 2 || files.length === 1);
+  if (!top) return { seam: null, seamInRepo: false, substantiated: false, primitives: [] };
+  const primitives = (top.mentioned.length > 0 ? top.mentioned : top.names).slice(0, 3);
+  // Whether the ranking actually had evidence, as opposed to picking the
+  // best-ranked import of a single file. Two or more flagged files sharing the
+  // module IS the evidence; with one file the only evidence left is that the
+  // findings name something the module exports. Neither, and the seam is a
+  // guess, never named as the primitive. See decideGate.
+  //
+  // A tie is a guess too: when the flagged files share several modules equally
+  // and the findings name none of them, the alphabet picks the winner, and a
+  // logger or config module that every file imports wins it as often as not.
+  const tied = scored.some((s) => s !== top && evidenceOrder(s, top) === 0);
+  const substantiated = !tied && (top.fileCount >= 2 || top.mentioned.length > 0);
+  return { seam: top.spec, seamInRepo: top.inRepo, substantiated, primitives };
+}
+
+function evidenceOrder(a, b) {
+  return b.fileCount - a.fileCount || b.mentioned.length - a.mentioned.length || Number(b.inRepo) - Number(a.inRepo);
+}
+
+// Names the findings mention rank above in-repo-ness: that is what picks the
+// module owning `writeSessionMessage` over a logger the same files import.
+function rankImports(files, findingText, ctx) {
   const bySpec = new Map();
   for (const file of files) {
     const source = readSource(file, ctx);
@@ -543,25 +564,7 @@ export function seamFor(files, findingText, ctx) {
     mentioned: [...e.names.keys()].filter((n) => identifierMatcher(n).test(findingText)),
     names: [...e.names.keys()],
   }));
-  scored.sort(
-    (a, b) =>
-      b.fileCount - a.fileCount ||
-      b.mentioned.length - a.mentioned.length ||
-      Number(b.inRepo) - Number(a.inRepo) ||
-      a.spec.localeCompare(b.spec),
-  );
-  // A module nothing shares is not a seam. One flagged file is the exception:
-  // its own imports are the only candidates there are.
-  const top = scored.find((s) => s.fileCount >= 2 || files.length === 1);
-  if (!top) return { seam: null, seamInRepo: false, substantiated: false, primitives: [] };
-  const primitives = (top.mentioned.length > 0 ? top.mentioned : top.names).slice(0, 3);
-  // Whether the ranking actually had evidence, as opposed to picking the
-  // best-ranked import of a single file. Two or more flagged files sharing the
-  // module IS the evidence; with one file the only evidence left is that the
-  // findings name something the module exports. Neither, and the seam is a
-  // guess, never named as the primitive. See decideGate.
-  const substantiated = top.fileCount >= 2 || top.mentioned.length > 0;
-  return { seam: top.spec, seamInRepo: top.inRepo, substantiated, primitives };
+  return scored.sort((a, b) => evidenceOrder(a, b) || a.spec.localeCompare(b.spec));
 }
 
 // Where a class is when no import places it — imports are read for JS/TS only.
@@ -762,9 +765,14 @@ export function classify(payload) {
       // class can substantiate the seam alone. What it must never do is take
       // one class's naming as evidence for another class's guess, so naming
       // counts only for the class that did the naming.
-      const filesOnSeam = new Set(
-        [...new Set(group.map((f) => f.path).filter(Boolean))].filter((file) => fileImports(file, seam, ctx)),
-      );
+      const groupFiles = [...new Set(group.map((f) => f.path).filter(Boolean))];
+      const filesOnSeam = new Set(groupFiles.filter((file) => fileImports(file, seam, ctx)));
+      // The same tie rule as a class, on files alone so no class's naming is
+      // borrowed: a module the group's files share no more than another one is
+      // the alphabet's pick, not the seam.
+      const ranked = rankImports(groupFiles, '', ctx);
+      const own = ranked.find((s) => s.spec === seam);
+      const rivalled = !own || ranked.some((s) => s !== own && evidenceOrder(s, own) <= 0);
       return {
         seam,
         seamInRepo: entries[0].cls.seamInRepo,
@@ -772,7 +780,7 @@ export function classify(payload) {
         // named the module substantiates ITSELF and gates at the class level.
         // Letting it also vouch for the rollup put a guessed class's rounds
         // behind evidence that was never about them.
-        seamSubstantiated: filesOnSeam.size >= 2,
+        seamSubstantiated: filesOnSeam.size >= 2 && !rivalled,
         rounds: rounds.length,
         findings: group.length,
         lastAt: lastAt(group),
@@ -875,13 +883,17 @@ function primitiveNamed(entry, trailer) {
   return Boolean(entry.seam) && path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, '') === named;
 }
 
-/** Does the trailer name this entry's invariant? */
-function invariantNamed(entry, trailer) {
-  const said = trailer.invariant.toLowerCase();
-  const tokens = [
+function invariantWords(entry) {
+  return [
     ...(entry.families ?? []),
     ...(entry.signature?.startsWith('title:') ? entry.signature.slice(6).split('-') : []),
   ].filter((t) => t && t.length > 3);
+}
+
+/** Does the trailer name this entry's invariant? */
+function invariantNamed(entry, trailer) {
+  const said = trailer.invariant.toLowerCase();
+  const tokens = invariantWords(entry);
   if (tokens.length === 0) return true;
   return tokens.some((t) => said.includes(t.toLowerCase()));
 }
@@ -1125,6 +1137,16 @@ function renderClasses(report) {
   return lines.join('\n');
 }
 
+function acceptedTrailer(entry) {
+  const words = invariantWords(entry);
+  const invariant = words.length ? `<invariant, saying ${words.map((w) => `"${w}"`).join(' or ')}>` : '<invariant>';
+  const named = entry.seamKind === 'path' ? [] : entry.primitives.filter((p) => trailerPrimitive(p) === p);
+  const primitive = named.length
+    ? `<one identifier: ${named.join(', ')}, or one your commit introduces>`
+    : '<one identifier your commit introduces>';
+  return `Reframe: ${invariant} enforced in ${primitive}`;
+}
+
 function renderGate(decision) {
   const bar = '='.repeat(70);
   const reportedLines = (decision.reported ?? []).map(
@@ -1152,6 +1174,7 @@ function renderGate(decision) {
       `  seam: ${e.seam ?? '(none found — name it yourself)'}${e.seamKind === 'path' ? '  (where the sites are; no import names a primitive)' : ''}`,
     );
     lines.push(`  candidate primitive(s): ${e.primitives.length ? e.primitives.join(', ') : '(none found)'}`);
+    lines.push(`  trailer that lifts it: ${acceptedTrailer(e)}`);
     lines.push('');
   }
   if (decision.status === 'override') {

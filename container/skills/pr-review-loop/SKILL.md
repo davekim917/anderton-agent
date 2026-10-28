@@ -136,8 +136,10 @@ independent receipt that asked for changes: each finding listed in a receipt tha
 names a file in the tree counts at that file.
 
 When no import the flagged sites share can be **substantiated** — the sites
-share none, or all of them sit in one file whose findings name nothing the
-guessed module exports — the class gates on its **place** instead: the
+share none, all of them sit in one file whose findings name nothing the
+guessed module exports, or they share several modules equally (a logger and
+a helper, say) and the findings name none of them — the class gates on its
+**place** instead: the
 directory its files sit in, two path components deep (`tools/ingest/`), or the
 file itself at the repo root. That is how a Python, SQL or YAML class gates at
 all. A place names no primitive, so no diff lifts it; only a `Reframe:` trailer

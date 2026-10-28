@@ -533,6 +533,53 @@ describe('review-churn gate', () => {
     expect(decision.report.classes[0].seam).toBe('src/db/messages-out.ts');
   });
 
+  it('gates a class on its place when its files share two modules equally and the findings name neither', () => {
+    // A logger and a prompt module, each imported by both flagged files: only
+    // the alphabet separates them, which is a guess, however many files agree.
+    const decision = expectPlaceGate(fixture('tied-seam'), 'src/calls/');
+    expect(decision.report.classes[0].seamSubstantiated).toBe(false);
+    expect(decision.report.seams.every((seam) => !seam.seamSubstantiated)).toBe(true);
+
+    // Naming one of them is evidence the other lacks, and it settles the tie.
+    const named = fixture('tied-seam');
+    const findings = named.findings as { body: string }[];
+    findings[0].body += ' `greeting` is read after the await too.';
+    const report = classify(named);
+    expect(report.classes[0].seam).toBe('src/calls/prompts.ts');
+    expect(report.classes[0].seamSubstantiated).toBe(true);
+  });
+
+  it('prints the one trailer that lifts each refused class, and that trailer lifts it', () => {
+    const { text } = gate(fixture('tied-seam'));
+    expect(text).toContain(
+      'trailer that lifts it: Reframe: <invariant, saying "race"> enforced in <one identifier your commit introduces>',
+    );
+
+    const filled = {
+      sha: 'ddd3333',
+      date: AFTER,
+      message: 'fix: one lifetime for the call\n\nReframe: race on the call enforced in stillLive\n',
+      files: ['src/calls/lifetime.ts'],
+      before: { 'src/calls/lifetime.ts': '' },
+      after: { 'src/calls/lifetime.ts': 'export async function stillLive() {}\n' },
+    };
+    const { status, decision } = gate({ ...fixture('tied-seam'), commits: [filled] });
+    expect(status).toBe(0);
+    expect(decision.flagged[0].liftedBy).toBe('reframe trailer');
+
+    // A candidate the trailer parser drops as a language word is never offered.
+    const noisy = fixture('tied-seam');
+    for (const file of ['src/calls/room.ts', 'src/calls/relay.ts'])
+      noisy.sources![file] = noisy.sources![file].replace('{ greeting }', '{ method }');
+    noisy.sources!['src/calls/prompts.ts'] = 'export const method = 1;\n';
+    (noisy.findings as { body: string }[])[0].body += ' `method` is read after the await too.';
+    expect(gate(noisy).text).toContain('enforced in <one identifier your commit introduces>');
+
+    expect(gate(fixture('toctou-class')).text).toMatch(
+      /trailer that lifts it: Reframe: <invariant, saying "race"[^>]*> enforced in <one identifier: writeSessionMessage[^>]*, or one your commit introduces>/,
+    );
+  });
+
   it('still gates a single-file class when the findings name what the seam exports', () => {
     const { status, decision } = gate(fixture('named-seam-single-file'));
     expect(status).toBe(3);
