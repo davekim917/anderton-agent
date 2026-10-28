@@ -18,6 +18,7 @@ import {
   SlackApiError,
   slackAuthTest,
   slackCall,
+  slackRead,
   slackConversationsInfo,
   slackConversationsMembers,
   slackConversationsOpen,
@@ -65,6 +66,21 @@ describe('slackCall request shaping', () => {
     expect((init.headers as Record<string, string>)['Content-Type']).toContain('application/json');
     expect(JSON.parse(init.body as string)).toEqual({ channel: 'C1', text: 'hi' });
     expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+});
+
+describe('slackRead request shaping', () => {
+  it('POSTs form-encoded arguments, which the older read methods require', async () => {
+    const fetchMock = mockFetch(async () => jsonResponse({ ok: true, members: [] }));
+
+    await slackRead(TOKEN, 'conversations.members', { channel: 'C1', limit: 200, cursor: 'a b' }, 'my-step');
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://slack.com/api/conversations.members');
+    expect(init.method).toBe('POST');
+    expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${TOKEN}`);
+    expect((init.headers as Record<string, string>)['Content-Type']).toBe('application/x-www-form-urlencoded');
+    expect(init.body).toBe('channel=C1&limit=200&cursor=a+b');
   });
 });
 
@@ -215,10 +231,10 @@ describe('slackConversationsMembers', () => {
     await expect(slackConversationsMembers(TOKEN, 'G1', 's')).resolves.toEqual(['U1', 'U2', 'U3']);
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    const firstBody = JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string);
-    const secondBody = JSON.parse((fetchMock.mock.calls[1] as [string, RequestInit])[1].body as string);
-    expect(firstBody).toEqual({ channel: 'G1', limit: 200 });
-    expect(secondBody).toEqual({ channel: 'G1', limit: 200, cursor: 'cur2' });
+    const firstBody = (fetchMock.mock.calls[0] as [string, RequestInit])[1].body;
+    const secondBody = (fetchMock.mock.calls[1] as [string, RequestInit])[1].body;
+    expect(firstBody).toBe('channel=G1&limit=200');
+    expect(secondBody).toBe('channel=G1&limit=200&cursor=cur2');
   });
 
   it('stops at the page cap even if Slack keeps returning cursors', async () => {

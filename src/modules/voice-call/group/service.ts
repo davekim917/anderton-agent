@@ -1,6 +1,6 @@
 import { randomBytes } from 'crypto';
 
-import { botTokenKeyForChannelType, slackCall } from '../../../channels/slack-lib.js';
+import { botTokenKeyForChannelType, slackRead } from '../../../channels/slack-lib.js';
 import { extractSlackChannelId } from '../../../channels/slack.js';
 import { PREVIEW_ORIGIN_SUFFIX, TIMEZONE, VOICE_CALL_CODEX_BIN } from '../../../config.js';
 import { deriveHumanRequest, type HumanRequest } from '../../../caller-identity.js';
@@ -194,7 +194,7 @@ async function inChannel(call: Pick<GroupCall, 'route' | 'channelId'>, userIds: 
   let pages = 0;
   do {
     if (++pages > MAX_MEMBER_PAGES) throw new VoiceCallRefused('Group calls could not check who is in this channel.');
-    const page = await slackCall(
+    const page = await slackRead(
       token,
       'conversations.members',
       { channel: call.channelId, limit: 1000, ...(cursor ? { cursor } : {}) },

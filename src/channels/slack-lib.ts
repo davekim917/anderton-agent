@@ -32,15 +32,40 @@ export async function slackCall(
   body: Record<string, unknown>,
   step: string,
 ): Promise<Record<string, unknown>> {
+  return send(token, method, 'application/json; charset=utf-8', JSON.stringify(body), step);
+}
+
+/**
+ * Slack's older read methods (`conversations.members`, `conversations.info`) answer a JSON body with
+ * `invalid_arguments`; they take form-encoded arguments.
+ */
+export async function slackRead(
+  token: string,
+  method: string,
+  params: Record<string, string | number>,
+  step: string,
+): Promise<Record<string, unknown>> {
+  const form = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) form.set(key, String(value));
+  return send(token, method, 'application/x-www-form-urlencoded', form.toString(), step);
+}
+
+async function send(
+  token: string,
+  method: string,
+  contentType: string,
+  body: string,
+  step: string,
+): Promise<Record<string, unknown>> {
   let res: Response;
   try {
     res = await fetch(`${slackApiUrl()}${method}`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Type': contentType,
       },
-      body: JSON.stringify(body),
+      body,
       signal: AbortSignal.timeout(30_000),
     });
   } catch (err) {
@@ -97,7 +122,7 @@ export async function slackConversationsInfo(
   channelId: string,
   step: string,
 ): Promise<{ isMpim: boolean; name?: string; creator?: string }> {
-  const json = await slackCall(token, 'conversations.info', { channel: channelId }, step);
+  const json = await slackRead(token, 'conversations.info', { channel: channelId }, step);
   const channel = json.channel as Record<string, unknown> | undefined;
   return {
     isMpim: channel?.is_mpim === true,
@@ -111,7 +136,7 @@ export async function slackConversationsMembers(token: string, channelId: string
   const members: string[] = [];
   let cursor: string | undefined;
   for (let page = 0; page < 10; page++) {
-    const json = await slackCall(
+    const json = await slackRead(
       token,
       'conversations.members',
       { channel: channelId, limit: 200, ...(cursor ? { cursor } : {}) },

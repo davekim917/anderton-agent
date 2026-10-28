@@ -53,7 +53,7 @@ vi.mock('../../../types.js', async (orig) => ({ ...(await orig<object>()), isCha
 vi.mock('../../../db/central-lease.js', () => ({ withCentralSync: async (fn: () => unknown) => fn() }));
 vi.mock('../../../channels/slack-lib.js', () => ({
   botTokenKeyForChannelType: () => 'SLACK_BOT_TOKEN_TEST',
-  slackCall: async (_token: string, _method: string, body: { cursor?: string; limit: number }) => {
+  slackRead: async (_token: string, _method: string, body: { cursor?: string; limit: number }) => {
     await H.slackHold;
     const all = [...H.members];
     const at = Number(body.cursor ?? 0);
