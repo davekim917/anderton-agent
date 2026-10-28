@@ -18,15 +18,16 @@ registerResource({
     call: {
       access: 'open',
       description:
-        'Run this when the person asks to call you, start a call, talk by voice, or hop on a call. Add --group when they ask for a group call or a call with several people, from a channel. When a group call is already live in this conversation, this adds the person who asked to it, with or without --group. The host sends a one-time link to their DM (never post or ask for it here); it expires 5 minutes after it is sent. During a call, spoken requests arrive in this conversation as messages marked [Voice call] or [Group voice call], and your replies are read aloud, so open each reply with one to three plain spoken sentences. Everyone in the thread still sees your replies.',
+        'Run this when the person asks to call you, start a call, talk by voice, or hop on a call. Add --group-call when they ask for a group call or a call with several people, from a channel. When a group call is already live in this conversation, this adds the person who asked to it, with or without --group-call. The host sends a one-time link to their DM (never post or ask for it here); it expires 5 minutes after it is sent. During a call, spoken requests arrive in this conversation as messages marked [Voice call] or [Group voice call], and your replies are read aloud, so open each reply with one to three plain spoken sentences. Everyone in the thread still sees your replies.',
       args: [
-        { name: 'group', type: 'boolean', description: 'Start a group call that others in the channel can join.' },
+        // Not `group`: the group-scope CLI guard reads an arg by that name as an agent group id and refuses it.
+        { name: 'group_call', type: 'boolean', description: 'Start a group call that others in the channel can join.' },
       ],
-      examples: ['ncl voice call', 'ncl voice call --group'],
+      examples: ['ncl voice call', 'ncl voice call --group-call'],
       handler: async (args, ctx) => {
         if (ctx.caller !== 'agent') throw new Error('Only an agent session can start a voice call.');
         const input = { sessionId: ctx.sessionId, agentGroupId: ctx.agentGroupId };
-        if (args.group === true || args.group === 'true' || groupCallLive(ctx.sessionId))
+        if (args.group_call === true || groupCallLive(ctx.sessionId))
           return { group: true, ...(await startOrJoinGroupCall(input)) };
         return mintVoiceCall(input);
       },

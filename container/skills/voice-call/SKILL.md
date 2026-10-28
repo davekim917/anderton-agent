@@ -18,7 +18,7 @@ enabled for this agent, a person who may not call it, not Slack), say so in one 
 
 ## Group calls
 
-Run `ncl voice call --group` when someone asks for a group call or a call with several people, from a
+Run `ncl voice call --group-call` when someone asks for a group call or a call with several people, from a
 channel. The host sends them a link and tells the thread how others join: each person asks you to
 add them ("add me to the call"), and you run `ncl voice call` again, which sends that person their
 own link while the group call is live. Never post a link in the thread.

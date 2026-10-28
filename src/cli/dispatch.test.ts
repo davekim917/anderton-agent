@@ -92,6 +92,16 @@ vi.mock('../modules/approvals/index.js', async (importOriginal) => ({
   requestApproval: approvalState.requestApproval,
 }));
 
+const startGroupCall = vi.hoisted(() =>
+  vi.fn(async () => ({ joined: false, sentTo: 'Someone', expiresAt: '2026-01-01T00:00:00.000Z' })),
+);
+vi.mock('../modules/voice-call/group/service.js', () => ({
+  groupCallLive: () => false,
+  startOrJoinGroupCall: startGroupCall,
+}));
+vi.mock('../modules/voice-call/service.js', () => ({ mintVoiceCall: vi.fn() }));
+import './resources/voice.js';
+
 // Register a test command so dispatch has something to find
 import { register } from './registry.js';
 
@@ -360,6 +370,15 @@ describe('CLI scope enforcement', () => {
       const data = resp.data as { echo: Record<string, unknown> };
       expect(data.echo.id).toBe('g1');
     }
+  });
+
+  it('group: lets an agent start a group call with the flag its instructions name', async () => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'group' });
+
+    const resp = await dispatch({ id: '1', command: 'voice-call', args: { 'group-call': true } }, agentCtx());
+
+    expect(resp.ok).toBe(true);
+    expect(startGroupCall).toHaveBeenCalledWith({ sessionId: 's1', agentGroupId: 'g1' });
   });
 
   it('group: rejects cross-group access', async () => {
