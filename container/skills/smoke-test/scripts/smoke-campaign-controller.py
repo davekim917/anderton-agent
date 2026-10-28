@@ -149,11 +149,14 @@ STEP_OUTCOMES = frozenset((None, "released", "held", "blind", "intake", "lanes",
                            "await_challenger", "synthesis", "verdict", "finished"))
 TERMINAL_VERBS = ("finish", "challenger-timeout")
 # What each machine-readable gate refusal code means (smoke-pr-gate.sh: the
-# `challenger-timeout` code table above that verb, and `lease-unavailable`,
-# which the shared lease fence emits for every lifecycle verb). A code absent
-# from this table -- including none at all -- is treated as permanent and
-# escalated, never guessed toward a publish; only `blind` applies to a verb
-# other than `challenger-timeout` (gate_verb).
+# `challenger-timeout` code table above that verb, and the lease fence's
+# `lease-unavailable` and `lease-lapsed`, which it emits for every lifecycle
+# verb). A code absent from this table -- including none at all, and the
+# fence's `lease-owner-mismatch` -- is treated as permanent and escalated,
+# never guessed toward a publish; only `blind` and the fence's codes apply to a
+# verb other than `challenger-timeout` (gate_verb). `lease-lapsed` waits
+# because this controller's own poll reclaims an expired lease under a fresh
+# token, which the retried verb then carries.
 #   premise-false  the challenger filed: publish the frozen BLOCKED via finish
 #   blind          the gate cannot look: retry the verb, alarm a human
 #   wait           the gate's clock has not reached the deadline: retry
@@ -163,6 +166,7 @@ GATE_REFUSALS = {
     "run-root-unset": "blind",
     "run-root-unreadable": "blind",
     "lease-unavailable": "blind",
+    "lease-lapsed": "wait",
     "deadline-not-passed": "wait",
     "no-deadline": "permanent",
 }
@@ -831,6 +835,8 @@ GATE_ALARM_TEXT = {
                         "No campaign yet; the watcher settles it once the preview is ready."),
     "pr_run_stalled": ("The smoke campaign {runId} on PR #{pr} stopped stamping progress. Resume or abandon it: "
                        "that is a human call."),
+    "pr_run_overrun": ("The smoke campaign {runId} on PR #{pr} has held its slot for {ageHours} hours, past its time "
+                       "limit, and is still stamping progress. Check whether it is stuck before it blocks the next PR."),
     "pr_preflight_failed": "PR #{pr}'s preflight check failed ({reason}); no campaign.",
     "coordinator_lease_unavailable": "The PR smoke watcher could not take the coordinator lease.",
     # The claim renewer's liveness (#1031; smoke-controller-live-worker.py,
@@ -1134,6 +1140,9 @@ class EffectLayer:
             data = hint.get("gateAlarm") or {}
             tmpl = GATE_ALARM_TEXT.get(data.get("trigger"))
             fields = {k: data.get(k) for k in ("missing", "consecutiveFailures", "pr", "runId", "reason")}
+            age = data.get("activeAgeSeconds")
+            if isinstance(age, (int, float)) and not isinstance(age, bool):
+                fields["ageHours"] = "{:.1f}".format(age / 3600)
             try:
                 text = tmpl.format(**fields) if tmpl else None
             except (KeyError, IndexError):
@@ -3091,7 +3100,7 @@ class Controller:
         if result["outcome"] == "refused":
             code = result.get("refusal")
             meaning = GATE_REFUSALS.get(code)
-            if verb != "challenger-timeout" and meaning != "blind":
+            if verb != "challenger-timeout" and meaning != "blind" and code != "lease-lapsed":
                 # Only the lease fence's code applies to every lifecycle verb;
                 # the rest are challenger-timeout's own preconditions, and one
                 # on any other verb is a gate this controller does not know.

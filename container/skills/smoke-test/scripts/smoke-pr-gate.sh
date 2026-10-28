@@ -615,7 +615,7 @@ lease_fence_begin() {  # <pr> <runId> <owner> <command>
      [ "$(jq -r '.pr // 0' <<<"$lease" 2>/dev/null)" != "$pr" ]; then
     jq -cn --argjson pr "$pr" --arg run "$run" --arg owner "$owner" --arg cmd "$command" \
       --argjson lease "$lease" --argjson live "$live" \
-      '{ok:false,error:"live shared coordinator lease does not belong to this lifecycle owner - STOP this campaign; if this is the original owner after expiry, recover with claim using the same run id and owner token",pr:$pr,runId:$run,command:$cmd,requestedBy:$owner,held:$live,leaseOwner:($lease.owner // null),expiresAt:($lease.expiresAt // null)}'
+      '{ok:false,refusal:(if $live then "lease-owner-mismatch" else "lease-lapsed" end),error:"live shared coordinator lease does not belong to this lifecycle owner - STOP this campaign; if this is the original owner after expiry, recover with claim using the same run id and owner token",pr:$pr,runId:$run,command:$cmd,requestedBy:$owner,held:$live,leaseOwner:($lease.owner // null),expiresAt:($lease.expiresAt // null)}'
     flock -u 6; exec 6>&-; lease_lifecycle_end
     return 1
   fi

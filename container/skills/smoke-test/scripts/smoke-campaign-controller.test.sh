@@ -1240,6 +1240,12 @@ listed.clear()
 text, _ = el._render({"runId": run_id, "slot": "root"})
 assert "- BROKEN · orders — same as baseline" in text and "KNOWN" not in text, text
 assert listed == [], listed
+
+# A gate overrun alarm reaches the operator as prose, not a JSON dump.
+text, _ = el._render({"runId": m.PSEUDO_PREFIX + "gate", "slot": "alarm", "hint": {"gateAlarm": {
+    "trigger": "pr_run_overrun", "pr": 7, "runId": "acme-pr-pr7-x", "activeAgeSeconds": 126608}}})
+assert text == ("The smoke campaign acme-pr-pr7-x on PR #7 has held its slot for 35.2 hours, past its time limit, "
+                "and is still stamping progress. Check whether it is stuck before it blocks the next PR."), text
 PY
 
 [ ! -e "$T/effects.log" ] || fail "shadow invoked an effect command: $(cat "$T/effects.log")"

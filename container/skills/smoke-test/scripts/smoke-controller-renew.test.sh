@@ -218,6 +218,8 @@ REFUSAL="$(SMOKE_GATE_CLAIMANT=controller bash "$GATE" progress "$RUN" "$TOKEN" 
 [ "$(jq -r '.ok' <<<"$REFUSAL")" = false ] || fail "control arm: progress unexpectedly succeeded"
 grep -q 'live shared coordinator lease does not belong to this lifecycle owner' <<<"$REFUSAL" ||
   fail "control arm: expected the lease fence refusal, got: $REFUSAL"
+[ "$(jq -r '.refusal' <<<"$REFUSAL")" = lease-lapsed ] ||
+  fail "control arm: an expired lease is refused as lease-lapsed, the code the controller retries on: $REFUSAL"
 ok
 # And nothing invented liveness on the way: the run is stale, not falsely alive.
 [ "$(progress_at)" = "$BEFORE_PROGRESS" ] || fail "control arm: activeProgressAt moved with no renewer"

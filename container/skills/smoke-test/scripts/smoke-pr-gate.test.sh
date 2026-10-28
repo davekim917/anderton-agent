@@ -3422,7 +3422,7 @@ STALE_RELEASE="$(SMOKE_GATE_STATE_DIR="$STATE_A" SMOKE_GATE_LEASE_DIR="$COMMON_L
 jq -e '.ok == false and (.error | test("lease"))' <<<"$STALE_RELEASE" >/dev/null
 STALE_FINISH="$(SMOKE_GATE_STATE_DIR="$STATE_A" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
   bash "$GATE" finish "$STALE_SHA" run-shared-owner NO_GO owner-a || true)"
-jq -e '.ok == false and (.error | test("lease"))' <<<"$STALE_FINISH" >/dev/null
+jq -e '.ok == false and (.error | test("lease")) and .refusal == "lease-owner-mismatch"' <<<"$STALE_FINISH" >/dev/null
 jq -e '.owner == "owner-b"' "$COMMON_LEASE/lease-run-shared-owner.json" >/dev/null
 [ ! -e "$STATE_A/pr-120-verdict.json" ] && [ ! -e "$STATE_A/runs/run-shared-owner/verdict.json" ]
 [ ! -e "$SMOKE_GATE_PUBLISH_FILE" ] && [ ! -e "$SMOKE_GATE_HOLD_FILE" ] && [ ! -e "$SMOKE_GATE_HANDOFF_LEDGER" ]

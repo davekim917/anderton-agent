@@ -1396,8 +1396,8 @@ cite() { # <file> <line> <literal substring the cited line must contain>
     || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
 }
 ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
-for c in 'smoke-pr-gate.sh:5673' 'smoke-campaign-controller.py:1769-1771' \
-         'smoke-run-scaffold.sh:270-272' 'smoke-campaign-controller.py:1758-1768'; do
+for c in 'smoke-pr-gate.sh:5673' 'smoke-campaign-controller.py:1778-1780' \
+         'smoke-run-scaffold.sh:270-272' 'smoke-campaign-controller.py:1767-1777'; do
   grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
 done
 cite smoke-pr-gate.sh 5673 'OWNER_TOKEN="$(new_owner_token'
@@ -1406,9 +1406,9 @@ cite smoke-pr-gate.sh 5707 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
 cite smoke-pr-gate.sh 5755 '.activeLeaseOwner=$owner'
 cite smoke-run-scaffold.sh 271 '[ "$owner" = "$DEFAULT_OWNER" ]'
 cite smoke-run-scaffold.sh 710 'adds NO new authority check of its own'
-cite smoke-campaign-controller.py 1714 'def _owner_wake'
-cite smoke-campaign-controller.py 1764 'os.unlink("brief-{}.ack"'
-cite smoke-campaign-controller.py 1769 'if c.get("wake"):'
+cite smoke-campaign-controller.py 1723 'def _owner_wake'
+cite smoke-campaign-controller.py 1773 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1778 'if c.get("wake"):'
 
 
 fi
@@ -2080,6 +2080,21 @@ jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-blind:"))) |
 jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-refused:")))] | length == 0' | grep -qx true \
   || fail "b13: a blind lease is not escalated as a permanent refusal"
 certified_go b13
+
+# b14) `lease-lapsed`: the coordinator lease expired before `finish` (a renewer
+#      tick held up past the TTL). The controller's poll reclaims an expired
+#      lease under a fresh token, so the verb is retried, never failed_terminal,
+#      never escalated as a permanent refusal, and the next fire finishes.
+new_case lease-lapsed-finish
+jq -cn '{"gate:finish":["refuse-code:lease-lapsed"]}' >"$C/fake/faults.json"
+FAULTY=1 campaign 9
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="lease-lapsed")] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "b14: precondition -- finish reached the gate and was refused lease-lapsed once: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+jr '[.[] | select(.kind=="gate" and .slot=="finish" and .state=="failed_terminal")] | length == 0' | grep -qx true \
+  || fail "b14: a lapsed lease made finish un-reselectable (failed_terminal)"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-refused:")))] | length == 0' | grep -qx true \
+  || fail "b14: a lapsed lease is not escalated as a permanent refusal"
+certified_go b14
 
 # The fake gate parses a deadline as the real one does (epoch_or_zero,
 # smoke-pr-gate.sh:166-173): unparsable has PASSED. smoke-pr-gate.test.sh §7d
