@@ -57,6 +57,7 @@
     "cron-parser": "5.10.1",
     "discord.js": "^14.27.0",
     "kleur": "^4.1.5",
+    "livekit-client": "2.23.0",
     "undici": "8.11.2",
     "yaml": "^2.9.1"
   },

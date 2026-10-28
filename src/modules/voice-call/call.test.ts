@@ -309,6 +309,70 @@ describe('VoiceCallBridge', () => {
     expect(h.injected).toEqual([]);
   });
 
+  it('relays group requests in the order they were spoken, however long each takes to admit', async () => {
+    const injected: string[] = [];
+    const arrivals: number[] = [];
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    let live!: (event: LiveEvent) => void;
+    const ports: CallPorts = {
+      openLive: async ({ onEvent }) => {
+        live = onEvent;
+        return { answer: 'v=0 answer', context: () => undefined, close: () => undefined };
+      },
+      feed: () => ({ recent: [], close: () => undefined }),
+      admit: async (_id, turn, arrivedAtMs) => {
+        arrivals.push(arrivedAtMs);
+        if (turn.startsWith('Pixel, deploy')) await slow;
+        return { text: turn, sender: 'Someone on the call (voice)', mirror: turn };
+      },
+      inject: (text) => {
+        injected.push(text);
+        return { id: `m${injected.length}`, written: Promise.resolve() };
+      },
+      mirror: () => undefined,
+      status: () => undefined,
+      caption: () => undefined,
+      ended: () => undefined,
+    };
+    const bridge = new VoiceCallBridge({ agentName: 'Pixel', callerName: 'the group', group: true }, ports);
+    await bridge.start('v=0 offer');
+
+    live({ type: 'delegation', id: 'd-1', text: 'Pixel, deploy the build.' });
+    live({ type: 'delegation', id: 'd-2', text: "Actually no, don't." });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(injected).toEqual([]);
+    const releasedAt = Date.now();
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(injected).toEqual(['Pixel, deploy the build.', "Actually no, don't."]);
+    expect(arrivals[1]).toBeLessThan(releasedAt);
+  });
+
+  it('opens nothing for a call that ended before it connected', async () => {
+    let feeds = 0;
+    let lives = 0;
+    const ports: CallPorts = {
+      openLive: async () => {
+        lives += 1;
+        return { answer: 'v=0 answer', context: () => undefined, close: () => undefined };
+      },
+      feed: () => {
+        feeds += 1;
+        return { recent: [], close: () => undefined };
+      },
+      inject: () => ({ id: 'm1', written: Promise.resolve() }),
+      mirror: () => undefined,
+      status: () => undefined,
+      caption: () => undefined,
+      ended: () => undefined,
+    };
+    const bridge = new VoiceCallBridge({ agentName: 'Pixel', callerName: 'the group', group: true }, ports);
+    bridge.end({ dropped: false, reason: 'ended' });
+    await expect(bridge.start('v=0 offer')).rejects.toThrow(/ended/);
+    expect([feeds, lives]).toEqual([0, 0]);
+  });
+
   it('ends when the voice service closes the call', async () => {
     const h = await connect();
     h.live({ type: 'closed', reason: null });

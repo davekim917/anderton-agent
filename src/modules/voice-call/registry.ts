@@ -41,6 +41,9 @@ export interface VoiceCall {
 
 export const calls = new Map<string, VoiceCall>();
 
+/** Sessions with a live group call, to the instant that call's hour runs out. */
+export const groupCallSessions = new Map<string, number>();
+
 export function getVoiceCall(id: string): VoiceCall | null {
   if (!CALL_ID_RE.test(id)) return null;
   const call = calls.get(id);
@@ -48,7 +51,8 @@ export function getVoiceCall(id: string): VoiceCall | null {
 }
 
 export function voiceCallHeldUntilMs(sessionId: string, now = Date.now()): number | null {
-  let until: number | null = null;
+  const groupEndsAt = groupCallSessions.get(sessionId);
+  let until: number | null = groupEndsAt === undefined ? null : Math.min(groupEndsAt, now + HOLD_AHEAD_MS);
   for (const call of calls.values()) {
     if (call.sessionId !== sessionId || call.state === 'ended') continue;
     const at = call.state === 'ringing' ? call.expiresAt : Math.min(call.expiresAt, now + HOLD_AHEAD_MS);

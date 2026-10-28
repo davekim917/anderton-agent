@@ -1,6 +1,15 @@
 import { log } from '../../log.js';
 import type { ContextChannel, LiveCall, LiveEvent } from './live.js';
-import { greeting, voiceCallEndedText, voiceInstructions, voiceRequestText } from './prompts.js';
+import {
+  greeting,
+  groupCallEndedText,
+  groupGreeting,
+  groupVoiceInstructions,
+  voiceCallEndedText,
+  voiceInstructions,
+  truncateMiddle,
+  voiceRequestText,
+} from './prompts.js';
 import { startupContext, type FeedEvent, type SessionFeed } from './session-feed.js';
 
 const OUTPUT_LIMIT_BYTES = 4000;
@@ -9,6 +18,15 @@ const SPOKEN_TRANSCRIPT_LIMIT = 8 * 1024;
 export interface CallParty {
   agentName: string;
   callerName: string;
+  /** Several people on one call: requests pass `admit`, and the room's chatter is never written anywhere. */
+  group?: boolean;
+}
+
+/** A group-call request the host accepted, already worded for the agent and for the thread. */
+export interface AdmittedRequest {
+  text: string;
+  sender: string;
+  mirror: string;
 }
 
 export interface CallPorts {
@@ -18,20 +36,18 @@ export interface CallPorts {
    * Writes a message into the call's session as the caller. The id is known before the write lands, so a reply racing
    * the write still finds its request; `wake` false leaves the message as context for the next turn.
    */
-  inject(text: string, wake: boolean): { id: string; written: Promise<void> };
+  inject(text: string, wake: boolean, sender?: string): { id: string; written: Promise<void> };
+  /** Group calls only: the request in a delegated turn, or why it is not one. */
+  admit?(
+    delegationId: string,
+    turn: string,
+    arrivedAtMs: number,
+  ): Promise<AdmittedRequest | 'not-addressed' | 'duplicate'>;
   mirror(text: string): void;
   status(text: string): void;
   /** A piece of live transcript for the page's captions; `done` closes that side's line. */
   caption(role: 'caller' | 'voice', text: string, done: boolean): void;
   ended(text: string): void;
-}
-
-function truncateMiddle(text: string, limit = OUTPUT_LIMIT_BYTES): string {
-  if (Buffer.byteLength(text) <= limit) return text;
-  const half = Math.floor((limit - 20) / 2);
-  const head = Buffer.from(text).subarray(0, half).toString('utf8').replace(/�$/, '');
-  const tail = Buffer.from(text).subarray(-half).toString('utf8').replace(/^�/, '');
-  return `${head}\n…truncated…\n${tail}`;
 }
 
 class SpokenTranscript {
@@ -71,6 +87,7 @@ export class VoiceCallBridge {
   private live: LiveCall | null = null;
   private feed: SessionFeed | null = null;
   private spoken = new SpokenTranscript();
+  private groupRelays: Promise<void> = Promise.resolve();
   /** The session message each request became, to the delegation it answers. */
   private requests = new Map<string, string>();
   private active: string | null = null;
@@ -92,10 +109,13 @@ export class VoiceCallBridge {
   ) {}
 
   async start(offer: string): Promise<string> {
+    if (this.closed) throw new Error('The call ended before it connected.');
     this.feed = this.ports.feed((event) => this.onFeed(event));
     const context = startupContext(this.feed.recent, this.party.agentName);
     const instructions =
-      voiceInstructions(this.party.agentName, this.party.callerName) + (context ? `\n\n${context}` : '');
+      (this.party.group
+        ? groupVoiceInstructions(this.party.agentName)
+        : voiceInstructions(this.party.agentName, this.party.callerName)) + (context ? `\n\n${context}` : '');
     try {
       this.live = await this.ports.openLive({ offer, instructions, onEvent: (event) => this.onLive(event) });
     } catch (err) {
@@ -108,7 +128,8 @@ export class VoiceCallBridge {
       throw new Error('The call ended while it was connecting.');
     }
     for (const [text, channel, delegationId] of this.beforeLive.splice(0)) this.context(text, channel, delegationId);
-    this.ports.mirror(`📞 ${this.party.callerName} started a voice call with ${this.party.agentName}.`);
+    if (!this.party.group)
+      this.ports.mirror(`📞 ${this.party.callerName} started a voice call with ${this.party.agentName}.`);
     return this.live.answer;
   }
 
@@ -120,12 +141,12 @@ export class VoiceCallBridge {
   private greet(): void {
     if (this.greeted || !this.connected || !this.live) return;
     this.greeted = true;
-    this.context(greeting(this.party.agentName), 'speakable');
+    this.context((this.party.group ? groupGreeting : greeting)(this.party.agentName), 'speakable');
   }
 
   private context(text: string, channel: ContextChannel, delegationId?: string): void {
     if (this.closed) return;
-    if (this.live) this.live.context(truncateMiddle(text), channel, delegationId);
+    if (this.live) this.live.context(truncateMiddle(text, OUTPUT_LIMIT_BYTES), channel, delegationId);
     else this.beforeLive.push([text, channel, delegationId]);
   }
 
@@ -149,6 +170,13 @@ export class VoiceCallBridge {
   }
 
   private delegate(id: string, request: string): void {
+    if (this.ports.admit) {
+      const arrivedAtMs = Date.now();
+      this.groupRelays = this.groupRelays
+        .then(() => this.delegateInGroup(id, request, arrivedAtMs))
+        .catch((err: unknown) => log.warn('Voice call: a group request could not be relayed', { err }));
+      return;
+    }
     const transcript = this.spoken.take();
     if (!request.trim() && !transcript) return;
     const text = voiceRequestText({ callerName: this.party.callerName, request, transcript, first: !this.sentAny });
@@ -164,6 +192,45 @@ export class VoiceCallBridge {
         log.warn('Voice call: request may not have reached the session', { err });
         this.context(
           `That request may not have reached ${this.party.agentName}. Ask the caller to check the thread before asking again.`,
+          'speakable',
+          id,
+        );
+      },
+    );
+  }
+
+  private async delegateInGroup(id: string, turn: string, arrivedAtMs: number): Promise<void> {
+    this.spoken.take();
+    let admitted: AdmittedRequest | 'not-addressed' | 'duplicate';
+    try {
+      admitted = await this.ports.admit!(id, turn, arrivedAtMs);
+    } catch (err) {
+      log.warn('Voice call: could not read a group request', { err });
+      admitted = 'not-addressed';
+    }
+    if (this.closed) return;
+    if (admitted === 'not-addressed') {
+      this.context(
+        `No one addressed ${this.party.agentName} by name, so nothing was sent. Stay silent.`,
+        'commentary',
+        id,
+      );
+      return;
+    }
+    if (admitted === 'duplicate') {
+      this.context(`${this.party.agentName} already has this request. Stay silent.`, 'commentary', id);
+      return;
+    }
+    this.sentAny = true;
+    this.ports.status(`${this.party.agentName} is working…`);
+    const injected = this.ports.inject(admitted.text, true, admitted.sender);
+    this.requests.set(injected.id, id);
+    await injected.written.then(
+      () => this.ports.mirror(admitted.mirror),
+      (err: unknown) => {
+        log.warn('Voice call: request may not have reached the session', { err });
+        this.context(
+          `That request may not have reached ${this.party.agentName}. Ask them to check the thread before asking again.`,
           'speakable',
           id,
         );
@@ -215,15 +282,18 @@ export class VoiceCallBridge {
     this.closed = true;
     this.live?.close();
     this.feed?.close();
-    const leftover = this.spoken.callerSpoke ? this.spoken.take() : '';
+    const leftover = !this.party.group && this.spoken.callerSpoke ? this.spoken.take() : '';
     if (leftover || this.sentAny) {
+      const text = this.party.group
+        ? groupCallEndedText()
+        : voiceCallEndedText(this.party.callerName, leftover, dropped);
       this.ports
-        .inject(voiceCallEndedText(this.party.callerName, leftover, dropped), Boolean(leftover))
+        .inject(text, Boolean(leftover))
         .written.catch((err: unknown) =>
           log.warn('Voice call: the end of the call did not reach the session', { err }),
         );
     }
-    this.ports.mirror(`📞 Voice call ${dropped ? 'dropped' : 'ended'}.`);
+    if (!this.party.group) this.ports.mirror(`📞 Voice call ${dropped ? 'dropped' : 'ended'}.`);
     this.ports.ended(reason);
   }
 }

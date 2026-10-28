@@ -5,6 +5,7 @@ import type { Duplex } from 'stream';
 import { PREVIEW_ORIGIN_SUFFIX, PREVIEW_PORT } from '../../config.js';
 import { log } from '../../log.js';
 import { openContainerLoopback } from '../browser-takeover/bridge.js';
+import { handleGroupCallRequest, handleGroupCallUpgrade } from '../voice-call/group/http.js';
 import { handleVoiceCallRequest } from '../voice-call/http.js';
 import { PREVIEW_ID_RE, resolvePreview } from './service.js';
 
@@ -166,7 +167,7 @@ export function createPreviewProxy(deps: PreviewProxyDeps = defaultDeps): http.S
 
   const server = http.createServer((req, res) => {
     const id = previewIdFromHost(req.headers.host);
-    if (id && handleVoiceCallRequest(id, req, res)) return;
+    if (id && (handleVoiceCallRequest(id, req, res) || handleGroupCallRequest(id, req, res))) return;
     const target = targetFor(req);
     if (!target) {
       plain(res, 404, NOT_FOUND);
@@ -233,6 +234,8 @@ export function createPreviewProxy(deps: PreviewProxyDeps = defaultDeps): http.S
         `HTTP/1.1 ${status} ${STATUS_TEXT[status]}\r\nContent-Type: text/plain; charset=utf-8\r\n` +
           `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
       );
+    const id = previewIdFromHost(req.headers.host);
+    if (id && handleGroupCallUpgrade(id, req, socket, head)) return;
     const target = targetFor(req);
     if (!target) return refuse(404, NOT_FOUND);
     const verdict = pathVerdict(req.url);

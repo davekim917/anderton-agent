@@ -25,12 +25,12 @@ const SECURITY_HEADERS = {
   'x-robots-tag': 'noindex',
 };
 
-function send(res: ServerResponse, status: number, body: string, type = 'application/json'): void {
+export function send(res: ServerResponse, status: number, body: string, type = 'application/json'): void {
   res.writeHead(status, { ...SECURITY_HEADERS, 'content-type': `${type}; charset=utf-8` });
   res.end(body);
 }
 
-const json = (res: ServerResponse, status: number, body: unknown) => send(res, status, JSON.stringify(body));
+export const json = (res: ServerResponse, status: number, body: unknown) => send(res, status, JSON.stringify(body));
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -56,17 +56,21 @@ function tokenMatches(call: VoiceCall, url: URL): boolean {
   return expected.length > 0 && given.length === expected.length && timingSafeEqual(given, expected);
 }
 
-function streamEvents(call: VoiceCall, req: IncomingMessage, res: ServerResponse): void {
+/** Streams a call's page events until the page goes; `subscribe` returns its own unsubscribe. */
+export function streamEvents<E extends { type: string }>(
+  req: IncomingMessage,
+  res: ServerResponse,
+  subscribe: (write: (event: E) => void) => () => void,
+): void {
   res.writeHead(200, { ...SECURITY_HEADERS, 'content-type': 'text/event-stream', connection: 'keep-alive' });
-  const write = (event: CallPageEvent) => {
+  const ping = setInterval(() => res.write(': ping\n\n'), SSE_PING_MS);
+  const stop = subscribe((event) => {
     res.write(`data: ${JSON.stringify(event)}\n\n`);
     if (event.type === 'ended') res.end();
-  };
-  const ping = setInterval(() => res.write(': ping\n\n'), SSE_PING_MS);
-  call.listeners.add(write);
+  });
   req.on('close', () => {
     clearInterval(ping);
-    call.listeners.delete(write);
+    stop();
   });
 }
 
@@ -99,7 +103,11 @@ export function handleVoiceCallRequest(id: string, req: IncomingMessage, res: Se
   }
   if (method === 'GET' && url.pathname === '/events') {
     if (!tokenMatches(call, url)) json(res, 403, { error: 'Not this call.' });
-    else streamEvents(call, req, res);
+    else
+      streamEvents<CallPageEvent>(req, res, (write) => {
+        call.listeners.add(write);
+        return () => call.listeners.delete(write);
+      });
     return true;
   }
   if (method !== 'POST' || !['/offer', '/connected', '/hangup'].includes(url.pathname)) {

@@ -37,6 +37,8 @@ const envConfig = readEnvFile([
   'PREVIEW_PORT',
   'VOICE_CALL_AGENT_GROUPS',
   'VOICE_CALL_CODEX_BIN',
+  'VOICE_CALL_PUBLIC_IP',
+  'VOICE_GROUP_SIGNAL_PORT',
 ]);
 
 /**
@@ -217,6 +219,14 @@ export const PREVIEW_PORT = parseInt(process.env.PREVIEW_PORT || envConfig.PREVI
 /** `group-id[:voice],…`: the agent groups that take voice calls, each with an optional voice. */
 export const VOICE_CALL_AGENT_GROUPS = process.env.VOICE_CALL_AGENT_GROUPS || envConfig.VOICE_CALL_AGENT_GROUPS || '';
 export const VOICE_CALL_CODEX_BIN = process.env.VOICE_CALL_CODEX_BIN || envConfig.VOICE_CALL_CODEX_BIN || 'codex';
+// Group calls run a LiveKit room on this host. Its media is published on this public IPv4 only (7881/tcp, 7882/udp);
+// its signaling port stays on loopback, reached only through the preview tunnel's authorizing proxy. Empty = group
+// calls off.
+export const VOICE_CALL_PUBLIC_IP = (process.env.VOICE_CALL_PUBLIC_IP || envConfig.VOICE_CALL_PUBLIC_IP || '').trim();
+export const VOICE_GROUP_SIGNAL_PORT = parseInt(
+  process.env.VOICE_GROUP_SIGNAL_PORT || envConfig.VOICE_GROUP_SIGNAL_PORT || '7880',
+  10,
+);
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.

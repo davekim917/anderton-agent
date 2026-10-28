@@ -63,6 +63,7 @@
     "chokidar": { "kind": "runtime" },
     "cron-parser": { "kind": "runtime" },
     "kleur": { "kind": "runtime" },
+    "livekit-client": { "kind": "runtime" },
     "undici": { "kind": "runtime" },
     "yaml": { "kind": "runtime" },
 

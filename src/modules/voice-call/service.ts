@@ -32,7 +32,8 @@ const NOT_ALLOWED = 'Only the owner, admins and members of this agent can call i
 const ACCESS_CHANGED = 'Your access to voice calls changed, so the call ended.';
 
 /** The pilot's caller rule. Read the central DB, so call it under `withCentralSync`. */
-const mayCall = (userId: string, agentGroupId: string) => agentGroupAccessUnderLease(userId, agentGroupId).allowed;
+export const mayCall = (userId: string, agentGroupId: string) =>
+  agentGroupAccessUnderLease(userId, agentGroupId).allowed;
 const stillMayCall = (call: VoiceCall) =>
   withCentralSync(() => mayCall(call.callerId, call.agentGroupId), 'voice-call caller check');
 
@@ -46,6 +47,8 @@ const enabledGroups = new Map<string, string | undefined>(
 export class VoiceCallRefused extends Error {}
 
 export const voiceCallUrl = (id: string) => `https://${id}.${PREVIEW_ORIGIN_SUFFIX}`;
+
+export const voiceFor = (agentGroupId: string) => enabledGroups.get(agentGroupId);
 
 export function voiceCallsEnabledFor(agentGroupId: string): boolean {
   return PREVIEW_ORIGIN_SUFFIX !== '' && enabledGroups.has(agentGroupId);
@@ -73,7 +76,7 @@ function finish(call: VoiceCall, reason: string): void {
   });
 }
 
-async function deliverText(
+export async function deliverText(
   route: Pick<CallRoute, 'channelType' | 'instance' | 'platformId' | 'threadId'>,
   text: string,
 ) {
@@ -165,7 +168,7 @@ function portsFor(call: VoiceCall): CallPorts {
 }
 
 /** The name the agent goes by in this conversation, as the rest of the host shows it. */
-async function spokenName(agentGroup: AgentGroup, messagingGroupId: string): Promise<string> {
+export async function spokenName(agentGroup: AgentGroup, messagingGroupId: string): Promise<string> {
   try {
     const { resolveAssistantName } = await import('../../container-runner.js');
     return await resolveAssistantName(agentGroup, readContainerConfig(agentGroup.folder), messagingGroupId);
